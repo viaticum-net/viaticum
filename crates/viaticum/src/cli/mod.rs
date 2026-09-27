@@ -404,7 +404,7 @@ fn response_from_http(
     match cmd {
         Command::Status { .. } => {
             let data: StatusData = resp.json().map_err(|e| CliError::Decode(e.to_string()))?;
-            Ok(CliResponse::Status(data))
+            Ok(CliResponse::Status(Box::new(data)))
         }
         Command::Restore { .. } => {
             let data: RestoreData = resp.json().map_err(|e| CliError::Decode(e.to_string()))?;

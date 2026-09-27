@@ -6,9 +6,11 @@
 // symbols are cached on disk anymore — the old local `raw/{esi}.bin` tier is gone.
 //
 // Module layout:
-//   mod.rs      — RestoreCoordinator struct, public API, restore(), run()
+//   mod.rs      — RestoreCoordinator struct, public API, restore(), run(), resolve_path()
 //   pipeline.rs — decode_block(), extract_from_pack()
-//   tests.rs    — all test scenarios
+//   staging/    — atomic per-job staging writer, job record, read-only staging scan
+//   cleanup/    — staging report (never deletes, restore-i8)
+//   tests.rs    — coordinator test scenarios
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,6 +24,7 @@ use viaticum_core::types::{
     SymbolPlacement, Timestamp,
 };
 
+use crate::daemon::restore::staging::record::{JobFailure, JobOutcome, JobRecord, JobState};
 use crate::daemon::restore::staging::{JobId, StagingError, StagingWriter};
 
 pub mod cleanup;
@@ -203,35 +206,123 @@ impl RestoreCoordinator {
     /// 2. Select version per file.
     /// 3. Deduplicate source blocks.
     /// 4. Decode each block.
-    /// 5. Extract + write files.
+    /// 5. Extract + write files (atomically, restore-i14).
+    ///
+    /// The job dir gets `.viaticum-job.json` (`running`) before any file is written
+    /// and the final record (`finished` + outcome) at the end. A path that matches
+    /// nothing creates no job dir.
     ///
     /// Never writes `LocalState` (CS-DR-6): restored files land in staging, not in a
     /// watched folder.
     pub async fn restore(&self, request: RestoreRequest) -> Result<RestoreResult, RestoreError> {
-        info!(path = %request.path, "restore started");
+        info!(path = %request.path, job = %request.job_id, "restore started");
 
         // 1. Resolve path → FileRecords
-        let file_records = self.resolve_path(&request.path)?;
+        let file_records = resolve_path(&self.db, &request.path)?;
         if file_records.is_empty() {
-            // Create a staging dir even for empty results so staging_path is valid.
-            let empty_writer = tokio::task::block_in_place(|| {
-                StagingWriter::open(
-                    &self.config.staging_root,
-                    &self.config.data_dir,
-                    request.job_id,
-                )
-            })?;
+            // Nothing matched: no job dir. Staging is never cleaned up by the daemon
+            // (restore-i8), so a typo must not leave a directory behind.
             return Ok(RestoreResult {
                 files_restored: 0,
                 blocks_fetched: 0,
                 failures: vec![(request.path.clone(), "no matching files found".to_string())],
-                staging_path: empty_writer.staging_path().to_path_buf(),
+                staging_path: PathBuf::new(),
             });
         }
 
+        let (writer, mut record) =
+            tokio::task::block_in_place(|| self.begin_job(&request, file_records.len() as u32))?;
+
+        let mut progress = JobProgress::default();
+        let run = self
+            .restore_files(&request, file_records, &writer, &mut progress)
+            .await;
+
+        // Final record: rewritten even when the job hit a job-level error, so the
+        // outcome survives a restart (restore-i14).
+        let mut failures = progress.failures;
+        if let Err(e) = &run {
+            failures.push((request.path.clone(), e.to_string()));
+        }
+        record.state = JobState::Finished;
+        record.files_restored = progress.restored_paths.len() as u32;
+        record.outcome = Some(JobOutcome::from_counts(
+            record.files_total,
+            record.files_restored,
+            failures.len(),
+            false,
+        ));
+        record.restored_paths = progress.restored_paths;
+        record.failures = failures
+            .iter()
+            .map(|(path, detail)| JobFailure {
+                path: path.clone(),
+                detail: detail.clone(),
+            })
+            .collect();
+        record.finished_at = Some(Timestamp::now().0);
+        if let Err(e) = tokio::task::block_in_place(|| writer.write_job_record(&record)) {
+            error!(job = %request.job_id, "restore: could not write the final job record: {e}");
+        }
+        info!(
+            job = %request.job_id,
+            outcome = record.outcome.map(|o| o.as_str()).unwrap_or("?"),
+            files_restored = record.files_restored,
+            files_total = record.files_total,
+            "restore finished"
+        );
+        run?;
+
+        Ok(RestoreResult {
+            files_restored: record.files_restored as usize,
+            blocks_fetched: progress.blocks_fetched,
+            failures,
+            staging_path: writer.staging_path().to_path_buf(),
+        })
+    }
+
+    /// Open the job dir and write its `running` record — before any file is
+    /// written, so a crash at any later point is reported as `interrupted`, never
+    /// as unknown (restore-i14). Blocking I/O.
+    pub(crate) fn begin_job(
+        &self,
+        request: &RestoreRequest,
+        files_total: u32,
+    ) -> Result<(StagingWriter, JobRecord), RestoreError> {
+        let writer = StagingWriter::open(
+            &self.config.staging_root,
+            &self.config.data_dir,
+            request.job_id,
+        )?;
+        let record = JobRecord {
+            job_id: request.job_id,
+            path: request.path.clone(),
+            state: JobState::Running,
+            files_total,
+            files_restored: 0,
+            restored_paths: Vec::new(),
+            failures: Vec::new(),
+            outcome: None,
+            started_at: Timestamp::now().0,
+            finished_at: None,
+        };
+        writer.write_job_record(&record)?;
+        Ok((writer, record))
+    }
+
+    /// Steps 2-5 of `restore`: select versions, decode blocks by importance, write
+    /// files. Every matched file ends up either in `progress.restored_paths` or in
+    /// `progress.failures`, except when a job-level error (`Err`) cuts the job short.
+    async fn restore_files(
+        &self,
+        request: &RestoreRequest,
+        file_records: Vec<FileRecord>,
+        writer: &StagingWriter,
+        progress: &mut JobProgress,
+    ) -> Result<(), RestoreError> {
         // 2. Select version per file, collect (record, version) pairs
         let mut resolved: Vec<(FileRecord, FileVersion)> = Vec::new();
-        let mut failures: Vec<(String, String)> = Vec::new();
+        let failures = &mut progress.failures;
 
         for record in file_records {
             // select_version borrows record; clone the version before moving record.
@@ -285,19 +376,8 @@ impl RestoreCoordinator {
                 .then_with(|| a.0.cmp(&b.0))
         });
 
-        // Create StagingWriter for this job (blocking I/O).
-        let writer = tokio::task::block_in_place(|| {
-            StagingWriter::open(
-                &self.config.staging_root,
-                &self.config.data_dir,
-                request.job_id,
-            )
-        })?;
-
         // 4 & 5. For each unique block: decode → extract → write
-        let mut files_restored = 0usize;
-        let mut blocks_fetched = 0usize;
-
+        //
         // CS-DR-3: restore is partial-tolerant by design (importance-DESC triage +
         // `failures` list). A single unrecoverable block (BlockNotFound, legacy
         // record, decode/timeout/insufficient-symbols) must NOT abort the whole
@@ -315,7 +395,7 @@ impl RestoreCoordinator {
                 None => {
                     let err = RestoreError::BlockNotFound(*block_id);
                     error!(block = %block_id, "restore: {err}");
-                    Self::record_block_failure(files_in_block, &err, &mut failures);
+                    Self::record_block_failure(files_in_block, &err, &mut progress.failures);
                     continue;
                 }
             };
@@ -328,7 +408,7 @@ impl RestoreCoordinator {
                         "source block has no encrypted_size (legacy record)".to_string(),
                     );
                     error!(block = %block_id, "restore: {err}");
-                    Self::record_block_failure(files_in_block, &err, &mut failures);
+                    Self::record_block_failure(files_in_block, &err, &mut progress.failures);
                     continue;
                 }
             };
@@ -343,15 +423,15 @@ impl RestoreCoordinator {
                 Ok(p) => p,
                 Err(err) => {
                     error!(block = %block_id, "restore: block decode failed: {err}");
-                    Self::record_block_failure(files_in_block, &err, &mut failures);
+                    Self::record_block_failure(files_in_block, &err, &mut progress.failures);
                     continue;
                 }
             };
 
-            blocks_fetched += 1;
+            progress.blocks_fetched += 1;
 
-            // Extract each file from this block; create_dir_all + fs::write
-            // are blocking; wrap in block_in_place (review A1).
+            // Extract each file from this block; staging writes are blocking I/O,
+            // wrap in block_in_place (review A1).
             for (record, version) in files_in_block {
                 let result = tokio::task::block_in_place(|| {
                     self.extract_and_write_file(
@@ -359,7 +439,7 @@ impl RestoreCoordinator {
                         version,
                         &block_record.block_type,
                         &plaintext,
-                        &writer,
+                        writer,
                     )
                 });
                 match result {
@@ -369,25 +449,20 @@ impl RestoreCoordinator {
                         // stays deleted and its delete window keeps running. It is
                         // protected again only when the user moves it into a watched
                         // folder (watcher -> backup, restore-i13).
-                        files_restored += 1;
+                        // restore-i14: counted only now, when the complete file is
+                        // visible under its own name.
+                        progress.restored_paths.push(record.path.clone());
                         info!(path = %record.path, "restored");
                     }
                     Err(e) => {
                         error!(path = %record.path, "failed to write file: {e}");
-                        failures.push((record.path.clone(), e.to_string()));
+                        progress.failures.push((record.path.clone(), e.to_string()));
                     }
                 }
             }
         }
 
-        let staging_path = writer.staging_path().to_path_buf();
-
-        Ok(RestoreResult {
-            files_restored,
-            blocks_fetched,
-            failures,
-            staging_path,
-        })
+        Ok(())
     }
 
     /// Decode one source block.
@@ -628,8 +703,8 @@ impl RestoreCoordinator {
                 }
             })?;
 
-        let out_path = writer
-            .write_file(&validated, &file_bytes)
+        let published = writer
+            .write_file_published(&validated, &file_bytes)
             .map_err(|e| match e {
                 StagingError::AlreadyExists(p) => {
                     RestoreError::Staging(StagingError::AlreadyExists(p))
@@ -637,7 +712,12 @@ impl RestoreCoordinator {
                 other => RestoreError::Staging(other),
             })?;
 
-        debug!(src = %record.path, dst = ?out_path, "wrote restored file to staging");
+        debug!(
+            src = %record.path,
+            dst = ?published.path,
+            method = published.method.as_str(),
+            "wrote restored file to staging"
+        );
         Ok(())
     }
 
@@ -652,21 +732,6 @@ impl RestoreCoordinator {
         let msg = err.to_string();
         for (record, _version) in files_in_block {
             failures.push((record.path.clone(), msg.clone()));
-        }
-    }
-
-    /// Resolve path to FileRecords.
-    ///
-    /// Trailing '/' → prefix query.
-    /// Otherwise: exact lookup, then prefix fallback for folder paths.
-    fn resolve_path(&self, path: &str) -> Result<Vec<FileRecord>, RestoreError> {
-        if path.ends_with('/') {
-            Ok(self.db.list_files_with_prefix(path)?)
-        } else {
-            match self.db.get_file(path)? {
-                Some(r) => Ok(vec![r]),
-                None => Ok(self.db.list_files_with_prefix(path)?),
-            }
         }
     }
 
@@ -721,6 +786,45 @@ impl RestoreCoordinator {
 }
 
 // ─── Free helpers ─────────────────────────────────────────────────────────────
+
+/// Per-file accounting of one running job.
+#[derive(Debug, Default)]
+struct JobProgress {
+    /// Catalog paths of files visible under their own names in the job dir.
+    restored_paths: Vec<String>,
+    /// (catalog path, reason) of files that were not restored.
+    failures: Vec<(String, String)>,
+    blocks_fetched: usize,
+}
+
+/// Resolve a user-supplied restore path to catalog records.
+///
+/// Trailing separator ('/' or `MAIN_SEPARATOR`) → directory prefix query. Otherwise
+/// the exact record first; if none, the directory prefix `path + sep` — the prefix
+/// matches only on a separator boundary (CS-DR-10: "docs/repo" must not capture
+/// "docs/repo-old").
+pub(crate) fn resolve_path(
+    db: &Db,
+    path: &str,
+) -> Result<Vec<FileRecord>, viaticum_core::db::DbError> {
+    const SEP: char = std::path::MAIN_SEPARATOR;
+    if path.ends_with('/') || path.ends_with(SEP) {
+        return db.list_files_with_prefix(path);
+    }
+    if let Some(record) = db.get_file(path)? {
+        return Ok(vec![record]);
+    }
+    let mut records = db.list_files_with_prefix(&format!("{path}/"))?;
+    if SEP != '/' {
+        let seen: std::collections::HashSet<_> = records.iter().map(|r| r.file_id).collect();
+        for r in db.list_files_with_prefix(&format!("{path}{SEP}"))? {
+            if !seen.contains(&r.file_id) {
+                records.push(r);
+            }
+        }
+    }
+    Ok(records)
+}
 
 // Re-export shared helper from core (review A3).
 #[cfg(test)]

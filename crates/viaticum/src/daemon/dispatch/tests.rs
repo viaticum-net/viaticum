@@ -32,6 +32,7 @@ async fn make_test_state() -> Arc<DaemonState> {
         identity_pub,
         device_id,
         restore_tx,
+        restore_staging: Default::default(),
         cluster_state: None,
         master_key,
         seed: vec![0u8; 64],
@@ -288,6 +289,7 @@ async fn dispatch_device_revoke_returns_device_revoked_with_no_router() {
         identity_pub,
         device_id: device_id_a,
         restore_tx,
+        restore_staging: Default::default(),
         cluster_state: Some(cluster_state),
         master_key,
         seed: seed_a.to_vec(),
@@ -937,6 +939,7 @@ async fn revocation_published_only_to_storage_relationship_peers() {
         identity_pub: our_master,
         device_id: our_device_id,
         restore_tx,
+        restore_staging: Default::default(),
         cluster_state: Some(cluster_state),
         master_key,
         seed: seed.to_vec(),
@@ -1094,6 +1097,7 @@ async fn revocation_dedup_peer_is_holder_and_owner() {
         identity_pub: our_master,
         device_id: our_device_id,
         restore_tx,
+        restore_staging: Default::default(),
         cluster_state: Some(cluster_state),
         master_key,
         seed: seed.to_vec(),
@@ -1240,6 +1244,7 @@ async fn _removed_dispatch_connect_two_daemons_registers_peer() {
         device_id: did_a,
         network: handle_a.clone(),
         restore_tx,
+        restore_staging: Default::default(),
         cluster_state: None,
         incoming_tx: tx_a_for_state,
         master_key: master_a,
@@ -1280,4 +1285,257 @@ async fn _removed_dispatch_connect_two_daemons_registers_peer() {
         .get_connection(pk_b)
         .await
         .expect("get_connection after connect");
+}
+
+// ============================================================
+// restore-i8 / i18 / i19: cached restore staging status in status
+// ============================================================
+
+fn staging_test_state(
+    data_dir: &std::path::Path,
+    restore_tx: mpsc::Sender<(
+        RestoreRequest,
+        tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
+    )>,
+    soft_quota_bytes: u64,
+) -> Arc<DaemonState> {
+    let master_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    Arc::new(DaemonState {
+        db: Db::open_in_memory().unwrap(),
+        identity_pub: IdentityPub(master_key.verifying_key().to_bytes()),
+        device_id: DeviceId([0u8; 32]),
+        restore_tx,
+        restore_staging: Default::default(),
+        cluster_state: None,
+        master_key,
+        seed: vec![0u8; 64],
+        data_dir: data_dir.to_path_buf(),
+        soft_quota_bytes,
+        disk_reserve_bytes: 0,
+        hard_quota_bytes: 0,
+        time_scale: 1,
+        swarm_handle: None,
+        watch_admin: None,
+        config_admin: None,
+        restart_gate: None,
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
+        peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
+        mailbox_router: None,
+    })
+}
+
+fn held(total_bytes: u64) -> viaticum_core::types::HoldingRecord {
+    viaticum_core::types::HoldingRecord {
+        source_block_id: viaticum_core::types::SourceBlockId([9u8; 32]),
+        owner_id: IdentityPub([8u8; 32]),
+        esi_ranges: vec![(0, 10)],
+        importance: 0.5,
+        total_bytes,
+        status: viaticum_core::types::HoldingStatus::Active,
+        received_at: viaticum_core::types::Timestamp(100),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    }
+}
+
+/// `status` reports the cached staging status (no disk walk on the request path).
+#[tokio::test]
+async fn dispatch_status_reports_cached_restore_staging_summary() {
+    use crate::daemon::restore::cleanup::{PublishCheck, StagingStatus};
+    use crate::daemon::restore::staging::publish::PublishMethod;
+    let state = make_test_state().await;
+    *state.restore_staging.lock().unwrap() = StagingStatus {
+        job_dirs: 3,
+        bytes: Some(1234),
+        publish: PublishCheck::Works(PublishMethod::RenameNoReplace),
+    };
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert_eq!(data.restore_staging_jobs, 3);
+    assert_eq!(data.restore_staging_bytes, Some(1234));
+    assert_eq!(data.restore_staging_path, "/tmp/restore");
+    assert_eq!(data.restore_publish, "rename_noreplace");
+}
+
+/// W3: before the byte walk finished, `status` says "counting" (None), not 0.
+#[tokio::test]
+async fn dispatch_status_reports_counting_before_first_byte_walk() {
+    use crate::daemon::restore::cleanup::StagingStatus;
+    let state = make_test_state().await;
+    *state.restore_staging.lock().unwrap() = StagingStatus {
+        job_dirs: 2,
+        bytes: None,
+        ..Default::default()
+    };
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert_eq!(data.restore_staging_jobs, 2);
+    assert_eq!(data.restore_staging_bytes, None);
+}
+
+/// restore-i18: holder under disk pressure + non-empty staging → the status flag;
+/// no pressure or empty staging → no flag.
+#[tokio::test]
+async fn dispatch_status_flags_staging_squeezing_holdings_under_pressure() {
+    use crate::daemon::restore::cleanup::StagingStatus;
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let (restore_tx, _rx) = mpsc::channel(1);
+    // Quota 1000 bytes, 950 held: free ratio 5 % < 15 % → pressure.
+    let state = staging_test_state(data_dir.path(), restore_tx, 1000);
+    state.db.upsert_holding(&held(950)).unwrap();
+
+    let status = |bytes: u64| StagingStatus {
+        job_dirs: 1,
+        bytes: Some(bytes),
+        ..Default::default()
+    };
+    *state.restore_staging.lock().unwrap() = status(5 * 1024 * 1024);
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert!(data.restore_staging_squeezes_holdings);
+
+    *state.restore_staging.lock().unwrap() = status(0);
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert!(
+        !data.restore_staging_squeezes_holdings,
+        "empty staging squeezes nothing"
+    );
+
+    let (restore_tx, _rx) = mpsc::channel(1);
+    let relaxed = staging_test_state(data_dir.path(), restore_tx, 1_000_000);
+    relaxed.db.upsert_holding(&held(950)).unwrap();
+    *relaxed.restore_staging.lock().unwrap() = status(5 * 1024 * 1024);
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &relaxed).await else {
+        panic!("expected Status");
+    };
+    assert!(
+        !data.restore_staging_squeezes_holdings,
+        "no pressure, no warning"
+    );
+}
+
+/// After a restore reply the cached status is refreshed from disk, so `status`
+/// counts the new job dir without waiting for the hourly check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispatch_restore_refreshes_cached_staging_summary() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let staging_root = data_dir.path().join("restore");
+    std::fs::create_dir_all(&staging_root).unwrap();
+
+    let (restore_tx, mut restore_rx) = mpsc::channel::<(
+        RestoreRequest,
+        tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
+    )>(4);
+    // Stand-in coordinator: creates the job dir with one file, then replies.
+    let root = staging_root.clone();
+    tokio::spawn(async move {
+        while let Some((req, reply)) = restore_rx.recv().await {
+            let job = root.join(req.job_id.to_string());
+            std::fs::create_dir_all(&job).unwrap();
+            std::fs::write(job.join("f.bin"), [0u8; 10]).unwrap();
+            let _ = reply.send(Ok(RestoreResult {
+                files_restored: 1,
+                blocks_fetched: 1,
+                failures: vec![],
+                staging_path: job,
+            }));
+        }
+    });
+    let state = staging_test_state(data_dir.path(), restore_tx, 0);
+
+    let response = dispatch(
+        CliRequest::Restore {
+            path: "/home/kolya/f.bin".into(),
+            version: None,
+            date: None,
+            dest: None,
+        },
+        &state,
+    )
+    .await;
+    assert!(
+        matches!(response, CliResponse::Restore(_)),
+        "got {response:?}"
+    );
+    let cached = *state.restore_staging.lock().unwrap();
+    assert_eq!(cached.job_dirs, 1);
+    assert_eq!(cached.bytes, Some(10));
+}
+
+#[derive(Clone, Default)]
+struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// restore-i20: at the end of a restore job — not on the hourly tick — the node
+/// WARNs when the fresh staging squeezes friends' data (holder_cleanup may evict
+/// within one pressure round).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispatch_restore_warns_at_once_when_staging_squeezes_holdings() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let staging_root = data_dir.path().join("restore");
+    std::fs::create_dir_all(&staging_root).unwrap();
+
+    let (restore_tx, mut restore_rx) = mpsc::channel::<(
+        RestoreRequest,
+        tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
+    )>(4);
+    // Stand-in coordinator: the job restores 2 MiB into staging.
+    let root = staging_root.clone();
+    tokio::spawn(async move {
+        while let Some((req, reply)) = restore_rx.recv().await {
+            let job = root.join(req.job_id.to_string());
+            std::fs::create_dir_all(&job).unwrap();
+            std::fs::write(job.join("f.bin"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+            let _ = reply.send(Ok(RestoreResult {
+                files_restored: 1,
+                blocks_fetched: 1,
+                failures: vec![],
+                staging_path: job,
+            }));
+        }
+    });
+    // Quota 1000 bytes, 950 held: the holder no longer takes friends' data.
+    let state = staging_test_state(data_dir.path(), restore_tx, 1000);
+    state.db.upsert_holding(&held(950)).unwrap();
+
+    let buf = LogBuf::default();
+    let writer = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let request = CliRequest::Restore {
+        path: "/home/kolya/f.bin".into(),
+        version: None,
+        date: None,
+        dest: None,
+    };
+    let response = tracing::instrument::WithSubscriber::with_subscriber(
+        dispatch(request, &state),
+        tracing::Dispatch::new(subscriber),
+    )
+    .await;
+    assert!(
+        matches!(response, CliResponse::Restore(_)),
+        "got {response:?}"
+    );
+    let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("restore staging 2.0 MB is taking space from your friends' data"),
+        "{logs}"
+    );
 }
