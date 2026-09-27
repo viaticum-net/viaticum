@@ -19,7 +19,7 @@ use viaticum_core::types::Timestamp;
 
 use crate::cli::types::{RestoreFailure, RestoreJob, RestoreJobState, RestoreOutcome};
 use crate::daemon::restore::staging::JobId;
-use crate::daemon::restore::staging::record::{JobRecord, load_job_from_dir};
+use crate::daemon::restore::staging::record::{JobRecord, iso_utc, load_job_from_dir};
 
 #[cfg(test)]
 mod tests;
@@ -45,13 +45,31 @@ struct JobsInner {
 struct Entry {
     record: JobRecord,
     seq: u64,
+    /// Unix seconds until which the running job waits for holders to answer
+    /// (restore-i26). Transient: never written to the job record on disk.
+    waiting_until: Option<u64>,
+}
+
+impl Entry {
+    fn to_wire(&self, staging_root: &Path) -> RestoreJob {
+        let mut wire = self.record.to_wire(staging_root);
+        wire.waiting_for_holders_until = self.waiting_until.map(iso_utc);
+        wire
+    }
 }
 
 impl JobsInner {
     fn insert(&mut self, record: JobRecord) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.jobs.insert(record.job_id, Entry { record, seq });
+        self.jobs.insert(
+            record.job_id,
+            Entry {
+                record,
+                seq,
+                waiting_until: None,
+            },
+        );
     }
 
     /// Drop the oldest finished jobs beyond the cap. Queued and running jobs stay.
@@ -177,12 +195,23 @@ impl RestoreJobs {
         }
     }
 
+    /// The running job waits for holders until `until` (unix seconds), or no longer
+    /// waits (`None`) (restore-i26). No-op for an unknown or finished job.
+    pub fn set_waiting(&self, job_id: JobId, until: Option<u64>) {
+        if let Some(e) = self.lock().jobs.get_mut(&job_id)
+            && e.record.state != RestoreJobState::Finished
+        {
+            e.waiting_until = until;
+        }
+    }
+
     /// Finish the job: outcome from its counts, `interrupted` when the daemon
     /// stopped it. Returns the final record (the coordinator writes it to the job
     /// dir). A job already finished is returned unchanged; unknown → `None`.
     pub fn finish(&self, job_id: JobId, interrupted: bool) -> Option<JobRecord> {
         let mut inner = self.lock();
         let entry = inner.jobs.get_mut(&job_id)?;
+        entry.waiting_until = None;
         let r = &mut entry.record;
         if r.state != RestoreJobState::Finished {
             r.state = RestoreJobState::Finished;
@@ -209,7 +238,7 @@ impl RestoreJobs {
     /// not in memory is not running, and startup already removed its temp files.
     pub fn get(&self, job_id: JobId) -> Option<RestoreJob> {
         if let Some(e) = self.lock().jobs.get(&job_id) {
-            return Some(e.record.to_wire(&self.staging_root));
+            return Some(e.to_wire(&self.staging_root));
         }
         let dir = self.staging_root.join(job_id.to_string());
         if !dir.is_dir() {
@@ -225,7 +254,7 @@ impl RestoreJobs {
         entries.sort_by_key(|e| std::cmp::Reverse(e.seq));
         entries
             .into_iter()
-            .map(|e| e.record.to_wire(&self.staging_root))
+            .map(|e| e.to_wire(&self.staging_root))
             .collect()
     }
 

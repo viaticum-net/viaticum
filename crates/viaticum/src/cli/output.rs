@@ -177,20 +177,80 @@ pub fn render_restore_submitted(job: &RestoreJob) -> String {
     out
 }
 
-/// A progress line while the job is queued or running.
-pub fn render_restore_progress(job: &RestoreJob) -> String {
+/// A progress line while the job is queued or running. `now_unix` (seconds) turns a
+/// wait for holders into "retry in …".
+pub fn render_restore_progress(job: &RestoreJob, now_unix: u64) -> String {
     match job.state {
         RestoreJobState::Queued => format!(
             "queued: waiting for an earlier restore job to finish ({} file(s))\n",
             job.files_total
         ),
+        _ => {
+            let mut line = format!(
+                "running: {}/{} restored, {} failed",
+                job.files_restored,
+                job.files_total,
+                job.failures.len()
+            );
+            // restore-i26: holders did not answer; redialed, retried after a pause.
+            if let Some(until) = &job.waiting_for_holders_until {
+                line.push_str(&format!(
+                    "; holders did not answer, reconnecting, {}",
+                    retry_in(until, now_unix)
+                ));
+            }
+            line.push('\n');
+            line
+        }
+    }
+}
+
+/// "retry in 4 min" for an ISO-8601 UTC time (`YYYY-MM-DDTHH:MM:SSZ`) relative to
+/// `now_unix`; "retry at <raw>" if it does not parse.
+pub(crate) fn retry_in(until_iso: &str, now_unix: u64) -> String {
+    let Some(until) = parse_iso_utc(until_iso) else {
+        return format!("retry at {until_iso}");
+    };
+    let left = until.saturating_sub(now_unix);
+    match left {
+        0 => "retrying now".to_string(),
+        1..60 => format!("retry in {left} s"),
+        60..3600 => format!("retry in {} min", left.div_ceil(60)),
         _ => format!(
-            "running: {}/{} restored, {} failed\n",
-            job.files_restored,
-            job.files_total,
-            job.failures.len()
+            "retry in {} h {} min",
+            left / 3600,
+            (left % 3600).div_ceil(60)
         ),
     }
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` → Unix seconds (days_from_civil, Hinnant). `None` on
+/// any other shape.
+fn parse_iso_utc(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, min, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + h * 3600 + min * 60 + sec).ok()
 }
 
 /// Why a file was not restored, in words.

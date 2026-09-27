@@ -25,6 +25,7 @@ use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKi
 
 use super::{RestoreConfig, RestoreCoordinator, VersionSelector, collect_esis_from_ranges};
 use crate::cli::types::{RestoreFailureKind, RestoreJobState, RestoreOutcome};
+use crate::daemon::restore::no_answer::NoAnswerPauses;
 use crate::daemon::restore::staging::JobId;
 use crate::daemon::restore::staging::record::{RecordStatus, read_job_record, scan_staging};
 
@@ -32,7 +33,7 @@ use crate::daemon::restore::staging::record::{RecordStatus, read_job_record, sca
 
 /// Small source block size for fast tests (2 * SYMBOL_SIZE = ~128 KB).
 const SMALL_BLOCK_SIZE: u64 = 65_535 * 2;
-const TEST_EPOCH_KEY: [u8; 32] = [42u8; 32];
+pub(super) const TEST_EPOCH_KEY: [u8; 32] = [42u8; 32];
 
 /// Build mock holders for backup tests.
 fn test_holders() -> Vec<viaticum_core::placement::HolderCandidate> {
@@ -1081,7 +1082,12 @@ async fn fetch_from_holders_returns_insufficient_when_no_peers_reachable() {
     let params = ErasureParams::compute(65_535_u64, 0.5).unwrap();
 
     let result = coord
-        .fetch_from_holders(&block_id, &placements, &params)
+        .fetch_from_holders(
+            &block_id,
+            &placements,
+            &params,
+            &mut NoAnswerPauses::new(JobId::new(), 1),
+        )
         .await;
 
     assert!(
@@ -1442,20 +1448,30 @@ use viaticum_core::messages::RestoreRequestMsg;
 
 use crate::daemon::restore::jobs::RestoreJobs;
 use crate::daemon::restore::{RestoreError, RestoreRequest, failure_kind};
-use crate::daemon::symbol_fetch::{FetchError, SymbolSource};
+use crate::daemon::symbol_fetch::{FetchError, RestoreSource, SymbolSource};
 
-type RequestHook = Box<dyn Fn() + Send + Sync>;
+pub(super) type RequestHook = Box<dyn Fn() + Send + Sync>;
 
 #[derive(Default)]
-struct FakeHolders {
-    symbols: Mutex<HashMap<(DeviceId, u32), Symbol>>,
-    hang: bool,
+pub(super) struct FakeHolders {
+    /// Bound symbols by (holder, block, ESI).
+    pub(super) symbols: Mutex<HashMap<(DeviceId, SourceBlockId, u32), Symbol>>,
+    pub(super) hang: bool,
     /// Every answered request takes this long (a slow link).
-    delay: std::time::Duration,
+    pub(super) delay: std::time::Duration,
     /// Holders whose first request runs into the 30 s request timeout.
-    silent_first: Mutex<std::collections::HashSet<DeviceId>>,
-    requests: Mutex<Vec<(DeviceId, usize)>>,
-    on_request: Mutex<Option<RequestHook>>,
+    pub(super) silent_first: Mutex<std::collections::HashSet<DeviceId>>,
+    pub(super) requests: Mutex<Vec<(DeviceId, usize)>>,
+    pub(super) on_request: Mutex<Option<RequestHook>>,
+    /// The owner has no connection to any holder: every request fails at once,
+    /// as `send_to_device` does without a live connection (restore-i26).
+    pub(super) offline: std::sync::atomic::AtomicBool,
+    /// Holders that never answer: every request to them fails at once.
+    pub(super) dead: Mutex<std::collections::HashSet<DeviceId>>,
+    /// `reconnect` call number at which `offline` clears (the redial worked).
+    pub(super) online_after_reconnects: Mutex<Option<usize>>,
+    /// Every `reconnect` call: when (tokio clock) and with which holders.
+    pub(super) reconnects: Mutex<Vec<(tokio::time::Instant, Vec<DeviceId>)>>,
 }
 
 #[async_trait::async_trait]
@@ -1472,6 +1488,11 @@ impl SymbolSource for FakeHolders {
         if let Some(hook) = self.on_request.lock().unwrap().as_ref() {
             hook();
         }
+        if self.offline.load(std::sync::atomic::Ordering::SeqCst)
+            || self.dead.lock().unwrap().contains(&holder)
+        {
+            return Err(FetchError::Swarm("peer not authenticated".into()));
+        }
         if self.hang {
             std::future::pending::<()>().await;
         }
@@ -1485,14 +1506,26 @@ impl SymbolSource for FakeHolders {
         Ok(req
             .esi_list
             .iter()
-            .filter_map(|e| map.get(&(holder, *e)).cloned())
+            .filter_map(|e| map.get(&(holder, req.source_block_id, *e)).cloned())
             .collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl RestoreSource for FakeHolders {
+    async fn reconnect(&self, holders: &[DeviceId]) {
+        let mut calls = self.reconnects.lock().unwrap();
+        calls.push((tokio::time::Instant::now(), holders.to_vec()));
+        if *self.online_after_reconnects.lock().unwrap() == Some(calls.len()) {
+            self.offline
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
 /// Spread every symbol of `path`'s block over three holders: placements in the
 /// catalog, bound symbols in `holders`. Call while the source file still exists.
-async fn place_on_fake_holders(db: &Db, path: &str, holders: &FakeHolders) {
+pub(super) async fn place_on_fake_holders(db: &Db, path: &str, holders: &FakeHolders) {
     place_on_fake_holders_with_status(db, path, holders, PlacementStatus::Alive).await;
 }
 
@@ -1541,7 +1574,7 @@ async fn place_on_fake_holders_with_status(
             .filter(|s| s.esi >= start && s.esi < start + count)
         {
             map.insert(
-                (holder, raw.esi),
+                (holder, block.block_id, raw.esi),
                 enc.apply_binding(raw.clone(), &block.block_id, &holder),
             );
         }
@@ -1549,7 +1582,7 @@ async fn place_on_fake_holders_with_status(
 }
 
 /// Back up `name` with `content` as its own block (one flush per file).
-fn backup_one(
+pub(super) fn backup_one(
     db: &Db,
     symbols_dir: &TempDir,
     dir: &std::path::Path,
@@ -1565,7 +1598,7 @@ fn backup_one(
     path
 }
 
-fn coord_with_source(
+pub(super) fn coord_with_source(
     db: Db,
     staging_dir: &TempDir,
     source: Option<Arc<FakeHolders>>,
@@ -1577,11 +1610,11 @@ fn coord_with_source(
         staging_root,
         staging_dir.path().to_path_buf(),
     );
-    config.symbols = source.map(|s| s as Arc<dyn SymbolSource>);
+    config.symbols = source.map(|s| s as Arc<dyn RestoreSource>);
     RestoreCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
 
-fn request(path: &str) -> RestoreRequest {
+pub(super) fn request(path: &str) -> RestoreRequest {
     RestoreRequest {
         path: path.to_string(),
         version_selector: VersionSelector::Latest,
@@ -2246,7 +2279,12 @@ async fn block_fetch_has_no_deadline_slow_holders_past_60s_still_decode() {
     let coord = coord_with_source(db, &staging_dir, Some(holders.clone()));
     let t0 = tokio::time::Instant::now();
     let plaintext = coord
-        .decode_block_local(&block, &rec.erasure_params(), rec.encrypted_size.unwrap())
+        .decode_block_local(
+            &block,
+            &rec.erasure_params(),
+            rec.encrypted_size.unwrap(),
+            &mut NoAnswerPauses::new(JobId::new(), 1),
+        )
         .await
         .expect("a slow holder set is not 'holders unavailable'");
 

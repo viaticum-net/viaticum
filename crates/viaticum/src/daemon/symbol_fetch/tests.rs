@@ -221,8 +221,8 @@ use viaticum_core::messages::RestoreRequestMsg;
 use viaticum_core::types::{ErasureParams, PlacementStatus, SymbolPlacement, Timestamp};
 
 use super::{
-    FetchError, RESTORE_FETCH_CHUNK_BYTES, SymbolSource, chunk_esis, fetch_in_rounds,
-    fetch_unbound_symbols,
+    BlockFetch, FetchError, RESTORE_FETCH_CHUNK_BYTES, RoundEnd, SymbolSource, chunk_esis,
+    fetch_in_rounds, fetch_unbound_symbols,
 };
 
 enum Behavior {
@@ -583,4 +583,155 @@ fn chunk_of_one_esi_when_symbol_larger_than_chunk_budget() {
         chunk_esis(RESTORE_FETCH_CHUNK_BYTES, 0),
         RESTORE_FETCH_CHUNK_BYTES as usize
     );
+}
+
+// ─── restore-i26: how a round ended ─────────────────────────────────────────
+
+/// Every request of the round failed (no connection, timeout): `NoAnswer`, not
+/// "nothing new" — it says nothing about what the holders hold.
+#[tokio::test]
+async fn round_where_every_request_fails_ends_no_answer() {
+    let holders = ScriptedHolders::new(
+        SYMBOL_LEN,
+        vec![(A, Behavior::AlwaysFail), (B, Behavior::AlwaysFail)],
+    );
+    let (enc, blk) = (encoder(), block());
+    let placements = [placement(A, 0, 5), placement(B, 5, 5)];
+    let p = params(5, SYMBOL_LEN as u16);
+    let mut fetch = BlockFetch::new(&enc, &blk, &placements, &p, 3);
+
+    let round = fetch.round(&holders, None).await.unwrap();
+    assert_eq!(round.end, RoundEnd::NoAnswer);
+    assert!(round.answered.is_empty());
+    assert_eq!(round.failed, vec![A, B]);
+    assert_eq!(fetch.holder_ids(), vec![A, B]);
+    assert_eq!(holders.asked(A).len() + holders.asked(B).len(), 2);
+}
+
+/// Every holder asked answered, none gave anything: `NothingNew` (the
+/// restore-i12 verdict).
+#[tokio::test]
+async fn round_where_holders_answer_empty_ends_nothing_new() {
+    let holders =
+        ScriptedHolders::new(SYMBOL_LEN, vec![(A, Behavior::Empty), (B, Behavior::Empty)]);
+    let (enc, blk) = (encoder(), block());
+    let placements = [placement(A, 0, 5), placement(B, 5, 5)];
+    let p = params(5, SYMBOL_LEN as u16);
+    let mut fetch = BlockFetch::new(&enc, &blk, &placements, &p, 3);
+
+    let round = fetch.round(&holders, None).await.unwrap();
+    assert_eq!(round.end, RoundEnd::NothingNew);
+    assert_eq!(round.answered, vec![A, B]);
+    assert!(round.failed.is_empty());
+}
+
+/// restore-i33: right after DR one holder is connected and has nothing, the others
+/// are not connected yet. Their failure is not "they have nothing": `NoAnswer`, so
+/// restore pauses instead of giving the block up in milliseconds.
+#[tokio::test]
+async fn round_where_one_answers_empty_and_others_fail_ends_no_answer() {
+    let holders = ScriptedHolders::new(
+        SYMBOL_LEN,
+        vec![(A, Behavior::Empty), (B, Behavior::AlwaysFail)],
+    );
+    let (enc, blk) = (encoder(), block());
+    let placements = [placement(A, 0, 5), placement(B, 5, 5)];
+    let p = params(5, SYMBOL_LEN as u16);
+    let mut fetch = BlockFetch::new(&enc, &blk, &placements, &p, 3);
+
+    let round = fetch.round(&holders, None).await.unwrap();
+    assert_eq!(round.end, RoundEnd::NoAnswer);
+    assert_eq!(round.answered, vec![A]);
+    assert_eq!(round.failed, vec![B]);
+    // A answered empty: exhausted, never asked again, so no endless retry of it.
+    let round = fetch.round(&holders, None).await.unwrap();
+    assert_eq!(round.end, RoundEnd::NoAnswer);
+    assert!(round.answered.is_empty());
+    assert_eq!(holders.asked(A).len(), 1);
+}
+
+/// No candidate holder: no request, `NobodyToAsk` (never a retry).
+#[tokio::test]
+async fn round_without_candidate_holders_ends_nobody_to_ask() {
+    let holders = ScriptedHolders::new(SYMBOL_LEN, vec![]);
+    let (enc, blk) = (encoder(), block());
+    let p = params(5, SYMBOL_LEN as u16);
+    let mut fetch = BlockFetch::new(&enc, &blk, &[], &p, 3);
+
+    assert_eq!(
+        fetch.round(&holders, None).await.unwrap().end,
+        RoundEnd::NobodyToAsk
+    );
+    assert!(holders.log.lock().unwrap().is_empty());
+}
+
+/// A round nobody answered loses nothing: the next round of the same fetch goes on
+/// from the ESIs already collected.
+#[tokio::test]
+async fn round_after_no_answer_keeps_what_was_collected() {
+    let holders = ScriptedHolders::new(
+        SYMBOL_LEN,
+        vec![
+            (A, Behavior::Serve),
+            (B, Behavior::FailFirst(AtomicU32::new(2))),
+        ],
+    );
+    let (enc, blk) = (encoder(), block());
+    let placements = [placement(A, 0, 3), placement(B, 3, 5)];
+    let p = params(6, SYMBOL_LEN as u16);
+    let mut fetch = BlockFetch::new(&enc, &blk, &placements, &p, 3);
+
+    assert_eq!(
+        fetch.round(&holders, None).await.unwrap().end,
+        RoundEnd::Progress
+    );
+    assert_eq!(fetch.have(), 3);
+    assert_eq!(
+        fetch.round(&holders, None).await.unwrap().end,
+        RoundEnd::NoAnswer
+    );
+    assert_eq!(fetch.have(), 3, "nothing lost");
+    assert_eq!(
+        fetch.round(&holders, None).await.unwrap().end,
+        RoundEnd::Complete
+    );
+    let got = fetch.finish().unwrap();
+    assert_eq!(got.len(), 6);
+    assert_eq!(
+        holders.asked(A).len(),
+        1,
+        "A is not asked again for what it gave"
+    );
+}
+
+/// DR keeps its behaviour (spec §2.15 p. 6): `fetch_in_rounds` stops at a round
+/// nobody answered, with `InsufficientSymbols` (it takes a bare `SymbolSource`, so
+/// it cannot redial).
+#[tokio::test]
+async fn fetch_in_rounds_stops_at_no_answer() {
+    let holders = ScriptedHolders::new(SYMBOL_LEN, vec![(A, Behavior::AlwaysFail)]);
+    let err = fetch_in_rounds(
+        &holders,
+        &encoder(),
+        &block(),
+        &[placement(A, 0, 5)],
+        &params(3, SYMBOL_LEN as u16),
+        None,
+        3,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            FetchError::InsufficientSymbols {
+                got: 0,
+                need: 3,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(holders.asked(A).len(), 1, "one round");
 }

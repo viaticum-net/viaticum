@@ -1,15 +1,20 @@
 // Shared helper for fetching unbound erasure symbols from holders over libp2p.
 //
 // Used by:
-//   - `restore`: normal restore flow (with the daemon's cancel token).
-//   - `dr`:      the SystemState block during disaster recovery (no cancel).
+//   - `restore`: normal restore flow (with the daemon's cancel token), through a
+//     `RestoreSource` (`SwarmSymbols`: requests + redial of holders).
+//   - `dr`:      the SystemState block during disaster recovery (no cancel), through
+//     the bare `SwarmHandle` (a `SymbolSource`: requests only).
 //
 // restore-i12: a slow home link is not "holders unavailable". Each request asks one
 // holder for at most `RESTORE_FETCH_CHUNK_BYTES` of symbols; there is no deadline on
-// a block. The fetch goes in rounds over the holders and gives up only after a full
-// round that accepted no new ESI. A holder whose request fails (the 30 s request
-// timeout, a dial failure) is skipped for the rest of the round and asked again in
-// the next one.
+// a block. The fetch goes in rounds over the holders (`rounds::BlockFetch`) and gives
+// up only after a full round that accepted no new ESI. A holder whose request fails
+// (the 30 s request timeout, a dial failure) is skipped for the rest of the round and
+// asked again in the next one. A round with nothing new where some holder did not
+// answer is a separate outcome (`RoundEnd::NoAnswer`, restore-i33): restore retries
+// it after a redial and a pause (restore-i26); `fetch_in_rounds` (DR) stops there as
+// before.
 //
 // There is no restore gate on the holder (restore-i6): a holder either serves the
 // owner's symbols or answers empty (no active holding for this owner).
@@ -19,14 +24,16 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use viaticum_core::db::Db;
 use viaticum_core::erasure::{ErasureEncoder, Symbol};
 use viaticum_core::messages::{Message, RestoreRequestMsg};
-use viaticum_core::types::{
-    DeviceId, ErasureParams, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
-    ranges_to_esi_list,
-};
+use viaticum_core::types::{DeviceId, ErasureParams, SourceBlockId, SymbolPlacement};
 
 use crate::daemon::network::swarm::SwarmHandle;
+
+mod rounds;
+
+pub(crate) use rounds::{BlockFetch, Round, RoundEnd};
 
 /// Maximum ESI value the raptorq decoder accepts: ESI is a 24-bit field, so any
 /// value `>= 2^24` makes `PayloadId::new(0, esi)` assert-panic inside raptorq.
@@ -61,8 +68,8 @@ pub enum FetchError {
     Cancelled,
 }
 
-/// One `RestoreRequest` to one holder. Implemented for `SwarmHandle`; tests use a
-/// scripted fake.
+/// One `RestoreRequest` to one holder. The bare `SwarmHandle` (DR); tests use
+/// scripted fakes.
 #[async_trait::async_trait]
 pub trait SymbolSource: Send + Sync {
     /// Ask `holder` for the ESIs in `req`; returns the bound symbols it sent.
@@ -73,6 +80,15 @@ pub trait SymbolSource: Send + Sync {
     ) -> Result<Vec<Symbol>, FetchError>;
 }
 
+/// What restore needs on top of requests: a redial of holders that did not answer
+/// before a retry (restore-i26). `SwarmSymbols` in the daemon; tests use fakes.
+#[async_trait::async_trait]
+pub trait RestoreSource: SymbolSource {
+    /// Try to (re)connect to `holders`. Only starts the dials; failures are
+    /// logged, never returned (the retry itself tells).
+    async fn reconnect(&self, holders: &[DeviceId]);
+}
+
 #[async_trait::async_trait]
 impl SymbolSource for SwarmHandle {
     async fn request(
@@ -81,6 +97,46 @@ impl SymbolSource for SwarmHandle {
         req: RestoreRequestMsg,
     ) -> Result<Vec<Symbol>, FetchError> {
         fetch_symbols_from_holder(self, &holder, req).await
+    }
+}
+
+/// The daemon's symbol source for restore: requests over the swarm, redial of
+/// holders from their stored addresses (the auto-dial mechanism, network-i2).
+pub struct SwarmSymbols {
+    swarm: Arc<SwarmHandle>,
+    db: Db,
+}
+
+impl SwarmSymbols {
+    pub fn new(swarm: Arc<SwarmHandle>, db: Db) -> Self {
+        SwarmSymbols { swarm, db }
+    }
+}
+
+#[async_trait::async_trait]
+impl SymbolSource for SwarmSymbols {
+    async fn request(
+        &self,
+        holder: DeviceId,
+        req: RestoreRequestMsg,
+    ) -> Result<Vec<Symbol>, FetchError> {
+        fetch_symbols_from_holder(&self.swarm, &holder, req).await
+    }
+}
+
+#[async_trait::async_trait]
+impl RestoreSource for SwarmSymbols {
+    async fn reconnect(&self, holders: &[DeviceId]) {
+        match crate::daemon::handle::redial::redial_devices(&self.db, &self.swarm, holders).await {
+            Ok(stats) => info!(
+                holders = holders.len(),
+                dialed = stats.dialed,
+                already_connected = stats.already_connected,
+                no_addrs = stats.no_addrs,
+                "fetch: redialed holders before a retry"
+            ),
+            Err(e) => warn!(err = %e, "fetch: redial of holders failed"),
+        }
     }
 }
 
@@ -116,18 +172,11 @@ pub(crate) async fn fetch_unbound_symbols(
     fetch_in_rounds(source, encoder, block_id, placements, params, cancel, chunk).await
 }
 
-/// Per-holder state across rounds.
-struct HolderRound<'a> {
-    placement: &'a SymbolPlacement,
-    /// The holder's assigned ESIs, in order.
-    esis: Vec<u32>,
-    /// ESIs this holder was asked for and did not return (or returned malformed).
-    missing: HashSet<u32>,
-    /// Answered a chunk with nothing usable: not asked again.
-    exhausted: bool,
-}
-
 /// `fetch_unbound_symbols` with the chunk size given (seam for tests).
+///
+/// Stops at the first round that accepted nothing, whatever the reason: a round
+/// nobody answered is not retried here (DR; restore retries it with a pause,
+/// restore-i26).
 pub(crate) async fn fetch_in_rounds(
     source: &dyn SymbolSource,
     encoder: &Arc<dyn ErasureEncoder>,
@@ -137,144 +186,9 @@ pub(crate) async fn fetch_in_rounds(
     cancel: Option<&CancellationToken>,
     chunk: usize,
 ) -> Result<Vec<Symbol>, FetchError> {
-    let k_eff = params.k_eff as usize;
-    let symbol_len = params.t as usize;
-    let chunk = chunk.max(1);
-    let mut unbound_symbols: Vec<Symbol> = Vec::new();
-    // Every ESI already accepted, from any holder: progress toward k_eff is the
-    // size of this set, never a raw symbol count (CS-DR-5).
-    let mut accepted_esis: HashSet<u32> = HashSet::new();
-    let is_cancelled = || cancel.is_some_and(|c| c.is_cancelled());
-
-    let mut holders: Vec<HolderRound<'_>> = placements
-        .iter()
-        .filter(|p| {
-            matches!(
-                p.status,
-                PlacementStatus::Alive | PlacementStatus::Uncertain | PlacementStatus::PresumedLost
-            )
-        })
-        .map(|p| HolderRound {
-            placement: p,
-            esis: ranges_to_esi_list(&p.esi_ranges),
-            missing: HashSet::new(),
-            exhausted: false,
-        })
-        .collect();
-
-    let mut round = 0u32;
-    while accepted_esis.len() < k_eff {
-        round += 1;
-        let before = accepted_esis.len();
-        for holder in holders.iter_mut().filter(|h| !h.exhausted) {
-            // Chunks to this holder until it has nothing left for us, fails, is
-            // exhausted, or the block is complete.
-            while accepted_esis.len() < k_eff {
-                if is_cancelled() {
-                    return Err(FetchError::Cancelled);
-                }
-                let still_needed = k_eff - accepted_esis.len();
-                let wanted: Vec<u32> = holder
-                    .esis
-                    .iter()
-                    .copied()
-                    .filter(|e| !accepted_esis.contains(e) && !holder.missing.contains(e))
-                    .take(chunk.min(still_needed))
-                    .collect();
-                if wanted.is_empty() {
-                    break;
-                }
-                let holder_id = holder.placement.holder_id;
-                let request = RestoreRequestMsg {
-                    v: 1,
-                    source_block_id: *block_id,
-                    esi_list: wanted.clone(),
-                    timestamp: Timestamp::now(),
-                };
-                let reply = match cancel {
-                    Some(c) => tokio::select! {
-                        biased;
-                        _ = c.cancelled() => return Err(FetchError::Cancelled),
-                        r = source.request(holder_id, request) => r,
-                    },
-                    None => source.request(holder_id, request).await,
-                };
-                match reply {
-                    Ok(symbols) => {
-                        debug!(
-                            holder = %holder_id,
-                            block = %block_id,
-                            round,
-                            asked = wanted.len(),
-                            count = symbols.len(),
-                            "fetch: received bound symbols from holder"
-                        );
-                        // The holder's allowed ESIs and the cap on how many symbols
-                        // we accept from it for this chunk (CS-DR-5).
-                        let wanted_set: HashSet<u32> = wanted.iter().copied().collect();
-                        let got = accept_holder_symbols(
-                            encoder,
-                            block_id,
-                            &holder_id,
-                            symbols,
-                            &wanted_set,
-                            wanted.len(),
-                            symbol_len,
-                            k_eff,
-                            &mut accepted_esis,
-                            &mut unbound_symbols,
-                        );
-                        for esi in &wanted {
-                            if !accepted_esis.contains(esi) {
-                                holder.missing.insert(*esi);
-                            }
-                        }
-                        if got == 0 {
-                            holder.exhausted = true;
-                            break;
-                        }
-                    }
-                    Err(FetchError::Cancelled) => return Err(FetchError::Cancelled),
-                    Err(e) => {
-                        warn!(
-                            holder = %holder_id,
-                            block = %block_id,
-                            round,
-                            err = %e,
-                            "fetch: holder did not answer; skipped this round, asked again next round"
-                        );
-                        break;
-                    }
-                }
-            }
-            if accepted_esis.len() >= k_eff {
-                break;
-            }
-        }
-        let accepted_this_round = accepted_esis.len() - before;
-        if accepted_this_round == 0 {
-            break;
-        }
-        if accepted_esis.len() < k_eff {
-            info!(
-                block = %block_id,
-                round,
-                have = accepted_esis.len(),
-                need = k_eff,
-                "fetch: round made progress but the block is not complete; next round"
-            );
-        }
-    }
-
-    if accepted_esis.len() < k_eff {
-        Err(FetchError::InsufficientSymbols {
-            block: *block_id,
-            got: accepted_esis.len(),
-            need: k_eff,
-        })
-    } else {
-        Ok(unbound_symbols)
-    }
+    let mut fetch = BlockFetch::new(encoder, block_id, placements, params, chunk);
+    while fetch.round(source, cancel).await?.end == RoundEnd::Progress {}
+    fetch.finish()
 }
 
 /// Apply the wire-boundary checks to one holder's reply and append the accepted,

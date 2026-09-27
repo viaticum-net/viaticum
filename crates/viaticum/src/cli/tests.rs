@@ -951,6 +951,7 @@ fn job(state: RestoreJobState, restored: u32, total: u32) -> RestoreJob {
         staging_path: "/home/kolya/.local/share/viaticum/restore/3f2a".into(),
         submitted_at: "2026-09-27T10:00:00Z".into(),
         finished_at: None,
+        waiting_for_holders_until: None,
     }
 }
 
@@ -1573,4 +1574,83 @@ fn status_render_counts_files_without_local_source_when_positive() {
         rendered.contains("files without local source: 3 (not re-protected"),
         "got: {rendered}"
     );
+}
+
+// ─── restore-i26: a job waiting for holders does not look hung ───────────────
+
+fn waiting_job(until: &str) -> RestoreJob {
+    RestoreJob {
+        waiting_for_holders_until: Some(until.into()),
+        ..job(RestoreJobState::Running, 1, 3)
+    }
+}
+
+#[test]
+fn render_restore_progress_when_waiting_for_holders_shows_retry_in_relative_time() {
+    // 2026-09-27T10:05:00Z = 1790503500; now = 4 min before.
+    let now = 1_790_503_500 - 240;
+    let line = output::render_restore_progress(&waiting_job("2026-09-27T10:05:00Z"), now);
+    assert!(
+        line.starts_with("running: 1/3 restored, 0 failed"),
+        "{line}"
+    );
+    assert!(
+        line.contains("holders did not answer") && line.contains("retry in 4 min"),
+        "{line}"
+    );
+    let plain = output::render_restore_progress(&job(RestoreJobState::Running, 1, 3), now);
+    assert!(!plain.contains("did not answer"), "{plain}");
+}
+
+#[test]
+fn retry_in_counts_down_from_the_wire_time() {
+    let until = "2026-09-27T10:05:00Z";
+    let t = 1_790_503_500u64;
+    assert_eq!(
+        crate::daemon::dispatch::unix_secs_to_iso(t, true),
+        until,
+        "test anchor matches the daemon's formatter"
+    );
+    assert_eq!(output::retry_in(until, t - 30), "retry in 30 s");
+    assert_eq!(output::retry_in(until, t - 61), "retry in 2 min");
+    assert_eq!(output::retry_in(until, t - 3_720), "retry in 1 h 2 min");
+    assert_eq!(output::retry_in(until, t), "retrying now");
+    assert_eq!(output::retry_in(until, t + 5), "retrying now");
+    assert_eq!(output::retry_in("soon", t), "retry at soon");
+}
+
+#[test]
+fn wait_for_job_reports_when_job_starts_and_stops_waiting_for_holders() {
+    let mut seen: Vec<bool> = Vec::new();
+    wait_for_job(
+        polls(vec![
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(waiting_job("2026-09-27T10:05:00Z"))),
+            Ok(Some(waiting_job("2026-09-27T10:05:00Z"))),
+            Ok(Some(waiting_job("2026-09-27T10:05:00Z"))),
+            Ok(Some(waiting_job("2026-09-27T10:05:00Z"))),
+            Ok(Some(waiting_job("2026-09-27T10:05:00Z"))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(finished_job(RestoreOutcome::Complete))),
+        ]),
+        |_| {},
+        |j| seen.push(j.waiting_for_holders_until.is_some()),
+        FAST,
+    )
+    .unwrap();
+    assert_eq!(seen, vec![false, true, false]);
+}
+
+#[test]
+fn restore_job_wire_omits_waiting_field_unless_waiting() {
+    let plain = serde_json::to_value(job(RestoreJobState::Running, 1, 3)).unwrap();
+    assert!(plain.get("waiting_for_holders_until").is_none(), "{plain}");
+    let waiting = serde_json::to_value(waiting_job("2026-09-27T10:05:00Z")).unwrap();
+    assert_eq!(waiting["waiting_for_holders_until"], "2026-09-27T10:05:00Z");
+    let back: RestoreJob = serde_json::from_value(plain).unwrap();
+    assert_eq!(back.waiting_for_holders_until, None);
 }

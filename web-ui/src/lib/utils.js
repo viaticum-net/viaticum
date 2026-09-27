@@ -156,7 +156,11 @@ export function describeRestoreJob(job) {
       text: job.state === 'queued'
         ? `Restore queued — files will appear in ${job.staging_path}`
         : `Restoring: ${n} of ${m} restored, ${job.failures.length} failed — files appear in ${job.staging_path}`,
-      hint: 'Cold backup: this can take hours. You can close this panel; the restore keeps going.',
+      // restore-i26: holders did not answer; the daemon redialed them and retries
+      // then (shown in the browser's local time).
+      hint: (job.waiting_for_holders_until
+        ? `Holders did not answer; reconnecting and retrying at ${formatTime(job.waiting_for_holders_until)}. `
+        : '') + 'Cold backup: this can take hours. You can close this panel; the restore keeps going.',
       failures: [],
     };
   }

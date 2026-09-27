@@ -4,7 +4,7 @@
 // RepairAgent, SwarmHandle, Processor, Watcher, Scheduler, the mailbox poll/sweep
 // tasks, and CliServer.
 
-mod redial;
+pub(crate) mod redial;
 pub mod shutdown;
 pub mod startup;
 #[cfg(test)]
@@ -628,9 +628,12 @@ impl DaemonHandle {
             db.clone(),
             RestoreConfig {
                 epoch_key: epoch_key_bytes,
-                symbols: Some(
-                    swarm_handle_arc.clone() as Arc<dyn crate::daemon::symbol_fetch::SymbolSource>
-                ),
+                // Requests over the swarm; redial of holders that did not answer
+                // before a retry (restore-i26).
+                symbols: Some(Arc::new(crate::daemon::symbol_fetch::SwarmSymbols::new(
+                    swarm_handle_arc.clone(),
+                    db.clone(),
+                ))),
                 staging_root: staging_root.clone(),
                 data_dir: cfg.data_dir.clone(),
                 jobs: restore_jobs.clone(),
@@ -642,6 +645,7 @@ impl DaemonHandle {
                     soft_quota_bytes: viaticum_core::config::soft_quota_bytes(&app_config),
                     disk_reserve_bytes: viaticum_core::config::disk_reserve_bytes(&app_config),
                 }),
+                time_scale: cfg.time_scale.max(1),
             },
             encoder.clone(),
         );

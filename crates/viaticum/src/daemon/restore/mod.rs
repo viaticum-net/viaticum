@@ -12,6 +12,8 @@
 // Module layout:
 //   mod.rs      — RestoreCoordinator, restore(), run(), resolve_path(), failure_kind()
 //   decode.rs   — decode one block (rebuild / network), write one file
+//   no_answer/  — network fetch of a block; retry after rounds nobody answered,
+//                 the job's pause budget (restore-i26)
 //   pipeline.rs — decrypt_and_decompress(), extract_from_pack()
 //   jobs/       — in-memory job registry, seeded from staging at startup
 //   staging/    — atomic per-job staging writer, job record, staging scan
@@ -31,13 +33,15 @@ use viaticum_core::types::{FileRecord, FileVersion, SourceBlockId, Timestamp};
 use crate::cli::types::{RestoreFailure, RestoreFailureKind};
 use crate::daemon::restore::cleanup::{HoldingsPressure, StagingStatus};
 use crate::daemon::restore::jobs::RestoreJobs;
+use crate::daemon::restore::no_answer::NoAnswerPauses;
 use crate::daemon::restore::staging::record::JobRecord;
 use crate::daemon::restore::staging::{JobId, StagingWriter};
-use crate::daemon::symbol_fetch::SymbolSource;
+use crate::daemon::symbol_fetch::RestoreSource;
 
 pub mod cleanup;
 mod decode;
 pub mod jobs;
+mod no_answer;
 pub mod pipeline;
 pub mod staging;
 
@@ -188,7 +192,7 @@ pub struct RestoreConfig {
     pub epoch_key: [u8; 32],
     /// Where network restore asks holders for symbols (the swarm in the daemon).
     /// `None`: only the owner's own source files can be used.
-    pub symbols: Option<Arc<dyn SymbolSource>>,
+    pub symbols: Option<Arc<dyn RestoreSource>>,
     /// Root directory for per-job restore staging (`data_dir/restore`).
     /// Each job writes to `staging_root/<job_id>/`.
     pub staging_root: PathBuf,
@@ -202,6 +206,8 @@ pub struct RestoreConfig {
     pub staging_status: Arc<Mutex<StagingStatus>>,
     /// Holder-pressure inputs for the end-of-job staging warning (restore-i20).
     pub pressure: Option<HoldingsPressure>,
+    /// Test clock acceleration: the no-answer pauses are divided by it (restore-i26).
+    pub time_scale: u64,
 }
 
 impl RestoreConfig {
@@ -216,6 +222,7 @@ impl RestoreConfig {
             cancel: CancellationToken::new(),
             staging_status: Arc::default(),
             pressure: None,
+            time_scale: 1,
         }
     }
 }
@@ -403,6 +410,8 @@ impl RestoreCoordinator {
 
         // CS-DR-3: restore is partial-tolerant. An unrecoverable block is recorded
         // against every file of it and the job moves on to the next block.
+        // restore-i26: one pause budget for the whole job, not one per block.
+        let mut pauses = NoAnswerPauses::new(job_id, self.config.time_scale);
         let mut blocks_fetched = 0usize;
         for (i, (_, block_id)) in block_order.iter().enumerate() {
             if self.config.cancel.is_cancelled() {
@@ -410,7 +419,7 @@ impl RestoreCoordinator {
                 return (true, blocks_fetched);
             }
             let files_in_block = block_map.get(block_id).expect("block from block_map");
-            let plaintext = match self.decode_block(block_id).await {
+            let plaintext = match self.decode_block(block_id, &mut pauses).await {
                 Ok(p) => p,
                 Err(RestoreError::Cancelled) => {
                     self.interrupt_remaining(job_id, &block_order[i..], &block_map);
@@ -479,7 +488,11 @@ impl RestoreCoordinator {
     }
 
     /// Look up the block record and decode the block.
-    async fn decode_block(&self, block_id: &SourceBlockId) -> Result<DecodedBlock, RestoreError> {
+    async fn decode_block(
+        &self,
+        block_id: &SourceBlockId,
+        pauses: &mut NoAnswerPauses,
+    ) -> Result<DecodedBlock, RestoreError> {
         let block_record = self
             .db
             .get_source_block(block_id)?
@@ -489,7 +502,7 @@ impl RestoreCoordinator {
             .ok_or(RestoreError::LegacyRecord(*block_id))?;
         let params = block_record.erasure_params();
         let bytes = self
-            .decode_block_local(block_id, &params, encrypted_size)
+            .decode_block_local(block_id, &params, encrypted_size, pauses)
             .await?;
         Ok(DecodedBlock {
             block_type: block_record.block_type,
