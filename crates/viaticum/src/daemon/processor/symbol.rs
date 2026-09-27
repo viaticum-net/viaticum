@@ -15,6 +15,7 @@ use viaticum_core::types::{
     SymbolPlacement, Timestamp, hex_encode,
 };
 
+use super::offer_shadow::OfferSnapshot;
 use super::{AcceptedOffer, Processor, ProcessorError, esi_list_to_ranges, ranges_to_esi_list};
 
 // ─── SymbolDropHandler: standalone owner-side DropNotice handler ──────────────
@@ -1090,29 +1091,38 @@ impl Processor {
         Ok(())
     }
 
-    /// Decide whether to accept or reject a SymbolOffer based on disk quota.
+    /// The raw numbers the OLD offer rule decides on, read once (В-0b): the held bytes and the
+    /// free disk. The offer shadow receives the same numbers, so it can log what the old
+    /// rule saw.
+    pub(crate) fn offer_snapshot(&self) -> Result<OfferSnapshot, ProcessorError> {
+        Ok(OfferSnapshot {
+            held_bytes: self.db.total_holding_bytes()?,
+            disk_free: crate::daemon::handle::disk_available_bytes(&self.data_dir),
+        })
+    }
+
+    /// Decide whether to accept or reject a SymbolOffer based on disk quota, over a
+    /// snapshot ([`Processor::offer_snapshot`]).
     ///
     /// Returns `true` = accept, `false` = reject.
-    /// This is a sync helper used by `handle_symbol_offer` and tests.
     ///
-    /// Three-stage rejection (in order):
+    /// Three-stage rejection (in order; stages, order and arithmetic unchanged by В-0b):
     ///   1. Hard quota: held_bytes >= hard_quota → reject (absolute ceiling)
     ///   2. Soft pressure: free_ratio < 15% → reject (prevent reaching hard pressure)
     ///   3. Final fill: held_bytes + offer_bytes > effective → reject (would exceed cap)
-    pub(crate) fn decide_symbol_offer(&self, offer_bytes: u64) -> Result<bool, ProcessorError> {
-        let held_bytes = self.db.total_holding_bytes()?;
+    pub(crate) fn decide_symbol_offer_on(&self, offer_bytes: u64, s: &OfferSnapshot) -> bool {
+        let held_bytes = s.held_bytes;
 
         // Hard quota: absolute ceiling — always reject above this.
         if self.hard_quota_bytes > 0 && held_bytes >= self.hard_quota_bytes {
-            return Ok(false);
+            return false;
         }
 
         // Effective soft quota: min(config_soft_quota, disk_free - reserve).
         // When soft_quota=0, uses all available disk minus reserve.
-        let disk_free = crate::daemon::handle::disk_available_bytes(&self.data_dir);
         let effective = viaticum_core::budget::compute_effective_quota(
             self.soft_quota_bytes,
-            disk_free,
+            s.disk_free,
             self.disk_reserve_bytes,
         );
 
@@ -1120,13 +1130,20 @@ impl Processor {
         // gap where soft pressure was only logged in holder_cleanup but never
         // actually rejected new offers.
         if viaticum_core::budget::should_reject_offers(effective, held_bytes) {
-            return Ok(false);
+            return false;
         }
 
         if held_bytes + offer_bytes > effective {
-            return Ok(false);
+            return false;
         }
-        Ok(true)
+        true
+    }
+
+    /// [`Processor::decide_symbol_offer_on`] over a fresh snapshot (the pre-В-0b API; tests).
+    #[cfg(test)]
+    pub(crate) fn decide_symbol_offer(&self, offer_bytes: u64) -> Result<bool, ProcessorError> {
+        let s = self.offer_snapshot()?;
+        Ok(self.decide_symbol_offer_on(offer_bytes, &s))
     }
 
     /// Receive a SymbolOffer, decide Accept or Reject, return the reply Message.
@@ -1137,7 +1154,11 @@ impl Processor {
     /// Security checks (in order):
     ///   1. Freshness: |now - timestamp| <= MESSAGE_FRESHNESS_SECS
     ///   2. Signature: verify_symbol_offer against owner_id (master identity from handshake)
-    ///   3. Quota: decide_symbol_offer
+    ///   3. Quota: decide_symbol_offer_on (over one snapshot)
+    ///
+    /// В-0b: after the old rule answered, the 4R offer SHADOW is launched off the reply path
+    /// (one slot, a busy slot skips — `offer_shadow.rs`); the reply never waits for it and
+    /// never reads it (4r-i44, 4r-i50).
     ///
     /// Called from dispatch_libp2p; reply is sent via ResponseChannel by caller.
     pub(crate) fn handle_symbol_offer_inner(
@@ -1188,7 +1209,7 @@ impl Processor {
             .map(|&(_start, count)| count as u64 * SYMBOL_SIZE as u64)
             .sum();
 
-        let accept = match self.decide_symbol_offer(offer_bytes) {
+        let snap = match self.offer_snapshot() {
             Ok(v) => v,
             Err(e) => {
                 warn!(
@@ -1206,6 +1227,9 @@ impl Processor {
                 });
             }
         };
+        let accept = self.decide_symbol_offer_on(offer_bytes, &snap);
+        // В-0b: the 4R shadow of this offer — AFTER the old answer, off the reply path.
+        self.spawn_offer_shadow(owner_id, offer.source_block_id, offer_bytes, accept, &snap);
 
         if accept {
             info!(

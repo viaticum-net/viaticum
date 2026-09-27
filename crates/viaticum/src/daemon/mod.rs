@@ -3,6 +3,7 @@ pub mod cluster_sync;
 pub mod config_admin;
 pub mod dispatch;
 pub mod dr;
+pub mod four_r_log;
 pub mod handle;
 pub mod holder_cleanup;
 pub mod holdings_integrity;
