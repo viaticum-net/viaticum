@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER="${VIATICUM_SERVER:-your-user@your-server}"
 # One server dir per checkout (see rtest.sh).
 REMOTE_DIR="projects/$(basename "$SCRIPT_DIR")"
-ARGS="${@:---release -p viaticum}"
+ARGS="${@:---release -p viaticum --features e2e-tools}"
 
 if ssh -o ConnectTimeout=2 -o BatchMode=yes "$SERVER" "echo ok" &>/dev/null; then
     echo "=== Server online, building remotely ==="
