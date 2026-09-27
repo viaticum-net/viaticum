@@ -10,10 +10,10 @@
 // See A2 spec §2.4 for full design.
 
 use libp2p::PeerId;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use viaticum_core::constants::MAILBOX_CANDIDATES_N;
 use viaticum_core::db::Db;
-use viaticum_core::mailbox::{MailboxEngine, MailboxError, MailboxRejectReason};
+use viaticum_core::mailbox::{MailboxClass, MailboxEngine, MailboxError, MailboxRejectReason};
 use viaticum_core::messages::{
     MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse,
 };
@@ -65,7 +65,13 @@ pub fn handle_mailbox_store(
 
     match engine.store(&req.entry, now) {
         Ok(()) => {
-            debug!(target = %req.target, "mailbox: stored entry");
+            // Spec B2 §2.8: a stored SelfPointer is the postman-side oracle of DR
+            // readiness (dr-i9). No catalog fields: the postman does not decode payloads.
+            if req.entry.class == MailboxClass::SelfPointer {
+                info!(target = %req.target, msg_id = ?msg_id, "mailbox: stored SelfPointer entry");
+            } else {
+                debug!(target = %req.target, "mailbox: stored entry");
+            }
             MailboxStoreResponse::Ack { msg_id }
         }
         Err(MailboxError::Duplicate) => {

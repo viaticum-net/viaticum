@@ -146,7 +146,8 @@ restore_from_network() {
         f=""
         [ -n "$root" ] && f=$(find "$root" -type f -name "$base" 2>/dev/null | head -1 || true)
         if [ -n "$f" ]; then
-            # The staging writer is not atomic: wait for the size to settle.
+            # The staging writer publishes only complete files (restore-i14), so the
+            # size check is redundant now; kept until B1.3 rewrites this helper.
             size_now=$(file_size "$f")
             if [ "$size_now" -eq "$size_prev" ]; then
                 got=$(content_hash "$f")

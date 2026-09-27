@@ -4104,3 +4104,51 @@ fn a_damaged_pending_drops_row_reads_as_zeros() {
     assert_eq!(txn.take_pending_drops(&m).unwrap(), pending(1, 0, 0));
     txn.commit().unwrap();
 }
+
+// ============================================================
+// Catalog history and pointer publication (spec B2, dr-i9)
+// ============================================================
+
+#[test]
+fn get_or_create_catalog_lineage_is_idempotent() {
+    let db = test_db();
+    assert_eq!(db.catalog_lineage().unwrap(), None);
+    let a = db.get_or_create_catalog_lineage().unwrap();
+    let b = db.get_or_create_catalog_lineage().unwrap();
+    assert_eq!(a, b);
+    assert_eq!(db.catalog_lineage().unwrap(), Some(a));
+}
+
+#[test]
+fn every_fresh_db_mints_its_own_catalog_lineage() {
+    // Each DB is its own history: two installations never share an id.
+    let a = test_db().get_or_create_catalog_lineage().unwrap();
+    let b = test_db().get_or_create_catalog_lineage().unwrap();
+    assert_ne!(a, b);
+}
+
+#[test]
+fn record_pointer_publication_roundtrip() {
+    use crate::system_state::CatalogLineageId;
+    use crate::system_state::catalog::PointerPublication;
+    let db = test_db();
+    assert_eq!(db.last_pointer_publication().unwrap(), None);
+    let first = PointerPublication {
+        lineage: CatalogLineageId([1u8; 16]),
+        created_at: Timestamp(100),
+        generation: 1,
+        files: 3,
+        acks: 2,
+    };
+    db.record_pointer_publication(&first).unwrap();
+    assert_eq!(db.last_pointer_publication().unwrap(), Some(first));
+    let second = PointerPublication {
+        created_at: Timestamp(200),
+        generation: 2,
+        files: 2,
+        acks: 5,
+        ..first
+    };
+    db.record_pointer_publication(&second).unwrap();
+    assert_eq!(db.last_pointer_publication().unwrap(), Some(second));
+}

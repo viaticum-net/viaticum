@@ -48,6 +48,7 @@ pub fn render_status(data: &StatusData) -> String {
         "  repair needed:  {} blocks\n",
         data.blocks_needing_repair
     ));
+    out.push_str(&render_dr_readiness(data));
     let quota_str = if data.effective_quota_bytes == 0 {
         "unlimited".to_string()
     } else {
@@ -58,6 +59,29 @@ pub fn render_status(data: &StatusData) -> String {
         quota_str,
         format_bytes(data.used_bytes)
     ));
+    // restore-i8: restored files stay until the user moves them out.
+    let staging_size = match data.restore_staging_bytes {
+        Some(b) => format_bytes(b),
+        None => "size still counting".to_string(),
+    };
+    if data.restore_staging_jobs > 0 {
+        out.push_str(&format!(
+            "  restore staging: {} job dir(s), {} in {} — move files out, then delete the directories\n",
+            data.restore_staging_jobs, staging_size, data.restore_staging_path
+        ));
+    }
+    // restore-i18
+    if data.restore_staging_squeezes_holdings {
+        out.push_str(&format!(
+            "  WARNING: restore staging {staging_size} is taking space from your friends' data; move files out and delete it\n"
+        ));
+    }
+    // restore-i19
+    if data.restore_publish == "unavailable" {
+        out.push_str(
+            "  ERROR: restore cannot write files into staging on this filesystem (see the daemon log)\n",
+        );
+    }
     if data.peer_count == 0 {
         out.push_str("  no peers yet\n");
         out.push_str("  WARNING: backup requires >= 2 peers for erasure coding\n");
@@ -98,6 +122,32 @@ pub fn render_status(data: &StatusData) -> String {
                 peer.last_seen
             ));
         }
+    }
+    out
+}
+
+/// The DR readiness (dr-i9) and missing-source (dr-i11) lines of `status`.
+pub fn render_dr_readiness(data: &StatusData) -> String {
+    let mut out = String::new();
+    if data.dr_pointer_published_at > 0 {
+        out.push_str(&format!(
+            "  DR:             ready: recovery pointer published {}, {} files, accepted by {} peer(s)\n",
+            crate::daemon::dispatch::unix_secs_to_iso(data.dr_pointer_published_at, true),
+            data.dr_pointer_files,
+            data.dr_pointer_acks
+        ));
+    } else {
+        out.push_str(
+            "  DR:             NOT READY: this node has not published its recovery pointer yet \
+             (first one ~12 h after install)\n",
+        );
+    }
+    if data.files_without_source > 0 {
+        out.push_str(&format!(
+            "  files without local source: {} (not re-protected until they are back at their \
+             original paths)\n",
+            data.files_without_source
+        ));
     }
     out
 }

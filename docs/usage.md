@@ -105,6 +105,8 @@ Or set `VIATICUM_SERVER` and `VIATICUM_TOKEN` in the environment.
 
 Disaster recovery rebuilds a node from the seed phrase alone, no old database needed. On a fresh machine:
 
-    viaticum dr --mnemonic "<24 words>" --peer <device_id>@<ip>:<port>
+    viaticum dr --mnemonic "<24 words>" --peer /ip4/<ip>/tcp/<port>/p2p/<peer id>
 
-It discovers peers, finds your latest encrypted state snapshot, and restores the database. Then `viaticum daemon` and `viaticum restore` bring the files back.
+(`--peer` is a friend's node address as its `viaticum status` shows it.) It discovers peers, finds your latest encrypted state snapshot, and restores the database. Then `viaticum daemon` and `viaticum restore` bring the files back; `viaticum status` shows how many files are still missing locally until you move the restored copies back to their original paths.
+
+DR is safe to repeat: a mistyped phrase, a folder that belongs to another identity, a running node's folder, a network failure or Ctrl-C all stop it without changing anything. A successful DR into a folder that already had a database keeps the old one as `db.redb.dr-bak` (then `.dr-bak.1`, …). If the network holds more than one catalog for your phrase (for example a node you once started with `init --mnemonic`), DR lists them with their file counts and asks you to pick one with `--catalog <first 8 hex>`.

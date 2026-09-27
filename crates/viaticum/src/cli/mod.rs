@@ -192,6 +192,9 @@ pub enum Command {
         /// Data directory to restore into (default: global --data-dir)
         #[arg(long)]
         data_dir: Option<String>,
+        /// Restore this catalog (hex prefix, at least 8 characters) when DR finds several
+        #[arg(long)]
+        catalog: Option<String>,
     },
 
     /// Open the web UI in the default browser
@@ -404,7 +407,7 @@ fn response_from_http(
     match cmd {
         Command::Status { .. } => {
             let data: StatusData = resp.json().map_err(|e| CliError::Decode(e.to_string()))?;
-            Ok(CliResponse::Status(data))
+            Ok(CliResponse::Status(Box::new(data)))
         }
         Command::Restore { .. } => {
             let data: RestoreData = resp.json().map_err(|e| CliError::Decode(e.to_string()))?;

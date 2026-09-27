@@ -17,6 +17,8 @@ use crate::daemon::handle::DaemonState;
 use crate::daemon::restore::staging::JobId;
 use crate::daemon::restore::{RestoreError, RestoreRequest, VersionSelector};
 
+pub mod missing_sources;
+
 #[cfg(test)]
 mod tests;
 
@@ -248,8 +250,33 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
     };
 
     let by_importance = compute_importance_buckets(&source_blocks);
+    // restore-i8/i18/i19: cached staging status (set before the web API started,
+    // refreshed hourly and after each restore); no disk walk here.
+    let staging = *state
+        .restore_staging
+        .lock()
+        .expect("restore staging status lock poisoned");
+    let effective_quota_bytes = {
+        let disk_free = crate::daemon::handle::disk_available_bytes(&state.data_dir);
+        viaticum_core::budget::compute_effective_quota(
+            state.soft_quota_bytes,
+            disk_free,
+            state.disk_reserve_bytes,
+        )
+    };
+    let staging_squeezes_holdings = crate::daemon::restore::cleanup::staging_squeezes_holdings(
+        crate::daemon::restore::cleanup::holder_stops_taking_data(
+            state.soft_quota_bytes,
+            crate::daemon::restore::cleanup::disk_free_bytes(&state.data_dir),
+            state.disk_reserve_bytes,
+            holdings_bytes,
+        ),
+        staging.bytes,
+    );
+    let mut dr = dr_readiness(&state.db);
+    dr.files_without_source = state.missing_sources.get(&state.db).await;
 
-    CliResponse::Status(StatusData {
+    CliResponse::Status(Box::new(StatusData {
         node_identity,
         device_id,
         node_addr,
@@ -262,14 +289,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         backed_up_bytes,
         blocks_needing_repair,
         peers: peer_summaries,
-        effective_quota_bytes: {
-            let disk_free = crate::daemon::handle::disk_available_bytes(&state.data_dir);
-            viaticum_core::budget::compute_effective_quota(
-                state.soft_quota_bytes,
-                disk_free,
-                state.disk_reserve_bytes,
-            )
-        },
+        effective_quota_bytes,
         used_bytes: holdings_bytes,
         pos_total_challenges,
         pos_total_passes,
@@ -280,7 +300,54 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         blocks_at_risk,
         table_stats: state.db.table_stats().ok(),
         by_importance,
-    })
+        restore_staging_jobs: staging.job_dirs,
+        restore_staging_bytes: staging.bytes,
+        restore_staging_path: state
+            .data_dir
+            .join("restore")
+            .to_string_lossy()
+            .into_owned(),
+        restore_publish: staging.publish.as_str().to_string(),
+        restore_staging_squeezes_holdings: staging_squeezes_holdings,
+        dr_pointer_published_at: dr.published_at,
+        dr_pointer_files: dr.files,
+        dr_pointer_acks: dr.acks,
+        catalog_lineage: dr.lineage,
+        files_without_source: dr.files_without_source,
+    }))
+}
+
+/// Status fields about DR readiness (dr-i9) and missing sources (dr-i11).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DrReadiness {
+    pub(crate) published_at: u64,
+    pub(crate) files: u32,
+    pub(crate) acks: u32,
+    pub(crate) lineage: String,
+    pub(crate) files_without_source: u32,
+}
+
+/// Read-only: the last ACCEPTED pointer publication (never a pointer only built) and
+/// this DB's history id (not minted here). A DB read error leaves the corresponding
+/// fields at their "unknown" zero. `files_without_source` is filled by the caller from
+/// the background-counted `MissingSourceCache` (one stat per file is too slow inline).
+pub(crate) fn dr_readiness(db: &viaticum_core::db::Db) -> DrReadiness {
+    let mut r = DrReadiness::default();
+    match db.last_pointer_publication() {
+        Ok(Some(p)) => {
+            r.published_at = p.created_at.0;
+            r.files = p.files;
+            r.acks = p.acks;
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "status: cannot read the last pointer publication"),
+    }
+    match db.catalog_lineage() {
+        Ok(Some(l)) => r.lineage = l.to_hex(),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "status: cannot read the catalog history id"),
+    }
+    r
 }
 
 // ── Files ─────────────────────────────────────────────────────────────────────
@@ -539,7 +606,40 @@ async fn dispatch_restore(
         return CliResponse::Error("restore coordinator not running".to_string());
     }
 
-    match reply_rx.await {
+    let reply = reply_rx.await;
+    // restore-i8: the job may have added a staging dir; refresh the cached summary.
+    // restore-i20: and check at once whether staging now squeezes friends' data —
+    // not on the hourly tick, holder_cleanup may evict within one round.
+    let pressure = crate::daemon::restore::cleanup::HoldingsPressure {
+        db: state.db.clone(),
+        data_dir: state.data_dir.clone(),
+        soft_quota_bytes: state.soft_quota_bytes,
+        disk_reserve_bytes: state.disk_reserve_bytes,
+    };
+    let staging_root = state.data_dir.join("restore");
+    match tokio::task::spawn_blocking(move || {
+        (
+            crate::daemon::restore::cleanup::staging_summary(&staging_root),
+            pressure.stops_taking_data(),
+        )
+    })
+    .await
+    {
+        Ok((summary, stops_taking_data)) => {
+            state
+                .restore_staging
+                .lock()
+                .expect("restore staging status lock poisoned")
+                .apply(summary);
+            crate::daemon::restore::cleanup::warn_if_squeezing(
+                stops_taking_data,
+                Some(summary.bytes),
+            );
+        }
+        Err(e) => tracing::error!("restore staging summary refresh failed: {e}"),
+    }
+
+    match reply {
         Ok(Ok(result)) => CliResponse::Restore(RestoreData {
             path,
             version_used,
@@ -1067,7 +1167,7 @@ fn timestamp_to_iso_date(ts: Timestamp) -> String {
 /// Minimal ISO-8601-ish formatter without chrono dependency.
 /// Computes year/month/day/hour/min/sec from a Unix timestamp using
 /// the proleptic Gregorian calendar.
-fn unix_secs_to_iso(secs: u64, include_time: bool) -> String {
+pub(crate) fn unix_secs_to_iso(secs: u64, include_time: bool) -> String {
     // Days since epoch.
     let days = (secs / 86400) as u32;
     let time_secs = secs % 86400;

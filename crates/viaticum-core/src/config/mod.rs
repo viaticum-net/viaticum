@@ -118,32 +118,27 @@ pub struct NetworkCfg {
     /// to this relay server instead of bootstrap peers acting as relays.
     /// Format: "http://hostname:port" (dev mode) or "https://hostname" (production).
     /// Default: None (use bootstrap peers / Kademlia-discovered relays).
-    #[serde(default)]
     pub relay_url: Option<String>,
 
     /// Bootstrap peer addresses to connect on startup.
     /// Format: "NodeId_hex@ip:port" or "NodeId_hex@relay_url,ip:port".
     /// Default: [] (empty — no bootstrap peers).
-    #[serde(default)]
     pub bootstrap_peers: Vec<String>,
 
-    /// Additional libp2p/Kademlia bootstrap nodes (Multiaddr strings).
-    /// These supplement the built-in IPFS bootstrap nodes.
-    /// Format: standard libp2p Multiaddr, e.g.
-    ///   "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
-    /// Default: [] (use only IPFS built-in bootstrap nodes).
-    #[serde(default)]
+    /// Kademlia bootstrap nodes of the circle (Multiaddr strings, with /p2p/<peer>).
+    /// The built-in IPFS bootstrap nodes are NOT used unless
+    /// `kademlia_disable_ipfs_bootstrap = false` is set explicitly (network-i11).
+    /// Format: standard libp2p Multiaddr, e.g. "/ip4/203.0.113.7/tcp/4001/p2p/12D3Koo…"
+    /// Default: [] (no bootstrap nodes).
     pub kademlia_bootstrap_peers: Vec<String>,
 
     /// Disable IPFS built-in bootstrap nodes and use only kademlia_bootstrap_peers.
     /// Default: true (IPFS public DHT is a separate network, not useful for Viaticum).
     /// Set to false only if you have custom bootstrap infrastructure on the IPFS DHT.
-    #[serde(default)]
     pub kademlia_disable_ipfs_bootstrap: bool,
 
     /// libp2p TCP listen port. 0 = ephemeral (default). Set to a fixed value
     /// when running behind a firewall that only opens specific ports.
-    #[serde(default)]
     pub listen_port: u16,
 }
 

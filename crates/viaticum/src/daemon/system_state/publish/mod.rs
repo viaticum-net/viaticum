@@ -15,10 +15,11 @@ use std::path::Path;
 
 use viaticum_core::db::Db;
 use viaticum_core::system_state::{
-    BlockRef, DiffOp, HolderHint, SelfPointer, SystemState, sign_self_pointer,
+    BlockRef, CatalogLineageId, CatalogSummary, DiffOp, HolderHint, SelfPointer, SystemState,
+    sign_self_pointer,
 };
 use viaticum_core::types::{
-    PlacementStatus, SourceBlockId, Timestamp, ranges_to_esi_list, to_cbor_bytes,
+    DeviceId, PlacementStatus, SourceBlockId, Timestamp, ranges_to_esi_list, to_cbor_bytes,
 };
 
 use super::block;
@@ -151,6 +152,35 @@ pub fn block_ref_from_placements(db: &Db, block_id: &SourceBlockId) -> anyhow::R
     })
 }
 
+/// What a pointer says about the catalog it restores (spec B2): the history, the
+/// publishing device, and the live file count after the base and after each diff.
+#[derive(Debug, Clone, Copy)]
+pub struct PointerCatalog<'a> {
+    pub lineage: CatalogLineageId,
+    pub publisher: DeviceId,
+    /// `live_file_count` of the state after the base (index 0) and after each diff
+    /// (index i+1 = after diff i). Invariant: `len == diff_ids.len() + 1`.
+    pub files_after: &'a [u32],
+}
+
+impl PointerCatalog<'_> {
+    /// The summary of a pointer that lists `diffs_listed` diffs.
+    fn summary(&self, diffs_listed: usize) -> anyhow::Result<CatalogSummary> {
+        let files = *self.files_after.get(diffs_listed).ok_or_else(|| {
+            anyhow::anyhow!(
+                "catalog file counts out of sync: {} entries for {} listed diffs",
+                self.files_after.len(),
+                diffs_listed
+            )
+        })?;
+        Ok(CatalogSummary {
+            lineage: self.lineage,
+            publisher: self.publisher,
+            files,
+        })
+    }
+}
+
 /// Build and sign the SelfPointer over the current base + diff blocks (W-F).
 #[allow(clippy::too_many_arguments)]
 pub fn build_pointer(
@@ -160,14 +190,16 @@ pub fn build_pointer(
     base_id: &SourceBlockId,
     diff_ids: &[SourceBlockId],
     created_at: Timestamp,
+    catalog: PointerCatalog<'_>,
 ) -> anyhow::Result<SelfPointer> {
     let base = block_ref_from_placements(db, base_id)?;
     let mut diffs = Vec::with_capacity(diff_ids.len());
     for id in diff_ids {
         diffs.push(block_ref_from_placements(db, id)?);
     }
+    let summary = catalog.summary(diffs.len())?;
     Ok(sign_self_pointer(
-        master_key, generation, base, diffs, created_at,
+        master_key, generation, base, diffs, created_at, summary,
     ))
 }
 
@@ -182,7 +214,8 @@ pub fn build_pointer(
 ///   - otherwise include diffs in order, stopping at the first one without holders
 ///     (the omitted tail becomes recoverable on a later tick once it places).
 ///
-/// This keeps DR able to fetch everything the published pointer references.
+/// This keeps DR able to fetch everything the published pointer references. The
+/// pointer's `catalog.files` is the live file count after exactly the listed prefix.
 ///
 /// # Guard correctness for SS base blocks (Bug-G / AC-7)
 ///
@@ -202,6 +235,7 @@ pub fn build_pointer_for_placed(
     base_id: &SourceBlockId,
     diff_ids: &[SourceBlockId],
     created_at: Timestamp,
+    catalog: PointerCatalog<'_>,
 ) -> anyhow::Result<Option<SelfPointer>> {
     let base = block_ref_from_placements(db, base_id)?;
     if base.holders.is_empty() {
@@ -215,7 +249,8 @@ pub fn build_pointer_for_placed(
         }
         diffs.push(r);
     }
+    let summary = catalog.summary(diffs.len())?;
     Ok(Some(sign_self_pointer(
-        master_key, generation, base, diffs, created_at,
+        master_key, generation, base, diffs, created_at, summary,
     )))
 }
