@@ -17,6 +17,8 @@ use crate::daemon::handle::DaemonState;
 use crate::daemon::restore::staging::JobId;
 use crate::daemon::restore::{RestoreError, RestoreRequest, VersionSelector};
 
+pub mod missing_sources;
+
 #[cfg(test)]
 mod tests;
 
@@ -248,6 +250,8 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
     };
 
     let by_importance = compute_importance_buckets(&source_blocks);
+    let mut dr = dr_readiness(&state.db);
+    dr.files_without_source = state.missing_sources.get(&state.db).await;
 
     CliResponse::Status(StatusData {
         node_identity,
@@ -280,7 +284,45 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         blocks_at_risk,
         table_stats: state.db.table_stats().ok(),
         by_importance,
+        dr_pointer_published_at: dr.published_at,
+        dr_pointer_files: dr.files,
+        dr_pointer_acks: dr.acks,
+        catalog_lineage: dr.lineage,
+        files_without_source: dr.files_without_source,
     })
+}
+
+/// Status fields about DR readiness (dr-i9) and missing sources (dr-i11).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DrReadiness {
+    pub(crate) published_at: u64,
+    pub(crate) files: u32,
+    pub(crate) acks: u32,
+    pub(crate) lineage: String,
+    pub(crate) files_without_source: u32,
+}
+
+/// Read-only: the last ACCEPTED pointer publication (never a pointer only built) and
+/// this DB's history id (not minted here). A DB read error leaves the corresponding
+/// fields at their "unknown" zero. `files_without_source` is filled by the caller from
+/// the background-counted `MissingSourceCache` (one stat per file is too slow inline).
+pub(crate) fn dr_readiness(db: &viaticum_core::db::Db) -> DrReadiness {
+    let mut r = DrReadiness::default();
+    match db.last_pointer_publication() {
+        Ok(Some(p)) => {
+            r.published_at = p.created_at.0;
+            r.files = p.files;
+            r.acks = p.acks;
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "status: cannot read the last pointer publication"),
+    }
+    match db.catalog_lineage() {
+        Ok(Some(l)) => r.lineage = l.to_hex(),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "status: cannot read the catalog history id"),
+    }
+    r
 }
 
 // ── Files ─────────────────────────────────────────────────────────────────────
@@ -1067,7 +1109,7 @@ fn timestamp_to_iso_date(ts: Timestamp) -> String {
 /// Minimal ISO-8601-ish formatter without chrono dependency.
 /// Computes year/month/day/hour/min/sec from a Unix timestamp using
 /// the proleptic Gregorian calendar.
-fn unix_secs_to_iso(secs: u64, include_time: bool) -> String {
+pub(crate) fn unix_secs_to_iso(secs: u64, include_time: bool) -> String {
     // Days since epoch.
     let days = (secs / 86400) as u32;
     let time_secs = secs % 86400;

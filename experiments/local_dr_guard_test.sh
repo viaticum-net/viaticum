@@ -10,7 +10,7 @@
 #               know: typo, bad checksum, a foreign phrase into A, a foreign phrase into an
 #               empty folder then the right one, a `daemon` after a failed DR, DR into a
 #               live node.
-# Intent:       dr-i3, dr-i4, dr-i5 (live-daemon half), dr-i12, dr-i26, dr-i28
+# Intent:       dr-i3, dr-i4, dr-i5 (live-daemon half), dr-i12, dr-i23, dr-i26, dr-i28
 # Proves:       every refused/failed DR leaves the folder byte-identical (sha256 of every
 #               file incl. identity.key and db.redb, full listing); a refused phrase never
 #               reaches the network (node-01 logs no new "peer authenticated"); the identity
@@ -20,16 +20,21 @@
 #               aimed at its folder (its status answers with its identity, node-01 still
 #               counts it authenticated, db.redb keeps its inode, no .dr-bak/.dr-new);
 #               `daemon` in a folder left by a failed DR does not start, points to
-#               `viaticum dr`, and node-01 sees no new device.
+#               `viaticum dr`, and node-01 sees no new device; Ctrl-C / SIGTERM while DR
+#               waits on the network cancels it with a non-zero code and "interrupted",
+#               leaving no identity.key, db.redb or drafts.
 # Adversarial:  typo (unknown word); valid words with bad checksum; valid foreign phrase
-#               into a folder with a key; DR against a running daemon's data dir.
+#               into a folder with a key; DR against a running daemon's data dir; stop
+#               signals in the network phase (dead seed keeps DR there).
 # Cannot close: success paths — .dr-bak after a successful DR (dr-i5, first half), catalog
 #               found: they need a published pointer; proven only by local_dr_test steps
 #               4-5 of slice B2.2 (spec B2 §0.3.2), here only by unit tests; the crash
 #               window inside the commit (dr-i29, unit tests only); two
 #               concurrent DRs (unit tests preflight_second_dr_*); filesystems without file
 #               locks (unit test of the decision function only); Windows lock semantics;
-#               SIGKILL inside the commit renames (unit tests in dr/commit).
+#               SIGKILL inside the commit renames (unit tests in dr/commit); a signal
+#               DURING the commit (milliseconds; the commit is a synchronous fn after the
+#               guarded phase — unit test commit_is_a_synchronous_fn).
 # Steps:
 #  1. setup: node-01 daemon; A = `init` (phrase M_A, identity I_A from stdout), daemon
 #     connected to node-01 (node-01 logs A authenticated), stopped; F = `init` (M_F, I_F).
@@ -55,6 +60,13 @@
 #     still prints I_A; node-01 peer_count_authenticated unchanged (≥1); A/db.redb same
 #     inode; no db.redb.dr-bak* / *.dr-new in A; node-01 logs no DR connection (dr-i5, dr-i26)
 #     — check: rc, grep "in use", status, status_num 1, stat -c %i, ls
+#  8. ADVERSARIAL empty folder G: `dr M_A --peer /ip4/127.0.0.1/tcp/1/p2p/<node-01 id>` (dead
+#     seed: DR stays in the network phase up to DR_KAD_STABILIZE_TIMEOUT_SECS) in the
+#     background; poll its stdout ≤ 30 s for the anchor "Network ready. Waiting for Kademlia
+#     bootstrap..." (FAIL if absent); SIGINT → exits within 10 s, code ≠ 0, stderr
+#     "DR interrupted. Nothing was changed."; G has no identity.key, db.redb, *.dr-new.
+#     Repeat with SIGTERM (dr-i23) — check: anchor poll with deadline, wait with deadline,
+#     rc, grep, find G
 #
 # Usage:
 #   ./rbuild.sh      # release binary, built on the server
@@ -467,6 +479,61 @@ if [ "$(auth_lines_on_01 "${I_A:0:16}")" -eq "$A_AUTH_BEFORE" ]; then
 else
     fail "the refused DR connected to node-01 as A (it went to the network)"
 fi
+
+# ── STEP 8: STOP SIGNAL IN THE NETWORK PHASE ─────────────────────
+echo ""
+echo "=== Step 8: ADVERSARIAL Ctrl-C / SIGTERM while DR waits on the network (dr-i23) ==="
+PID_01_ID=$(echo "$ADDR_01" | grep -oE '/p2p/[^/]+$' | cut -d/ -f3)
+DEAD_SEED="/ip4/127.0.0.1/tcp/1/p2p/$PID_01_ID"
+G_DIR="$TEST_DIR/G"
+interrupt_dr() {
+    local sig="$1" out="$TEST_DIR/logs/dr-sig-$1.out" err="$TEST_DIR/logs/dr-sig-$1.err"
+    RUST_LOG=info "$BINARY" --data-dir "$G_DIR" dr --mnemonic "$M_A" --peer "$DEAD_SEED" \
+        > "$out" 2> "$err" &
+    local pid=$!
+    PIDS+=("$pid")
+    local anchored=0
+    for _ in $(seq 1 60); do
+        if grep -q "Network ready. Waiting for Kademlia bootstrap..." "$out" 2>/dev/null; then
+            anchored=1; break
+        fi
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    if [ "$anchored" -ne 1 ]; then
+        fail "$sig: DR never reached the network phase within 30 s (no anchor line)"
+        sed 's/^/    | /' "$out" "$err" | tail -10 || true
+        kill -9 "$pid" 2>/dev/null || true
+        return
+    fi
+    # The key draft and the staging DB exist now (the check is not blind).
+    DRAFTS=$(ls -A "$G_DIR" | tr '\n' ' ')
+    if ! echo "$DRAFTS" | grep -q "identity.key.dr-new" || ! echo "$DRAFTS" | grep -q "db.redb.dr-new"; then
+        fail "$sig: no drafts in G during the network phase ('$DRAFTS'): the check would be blind"
+    fi
+    kill -s "$sig" "$pid"
+    if wait_pid_exit "$pid" 10; then
+        local errline
+        errline=$(sed 's/\x1b\[[0-9;]*m//g' "$err" | grep -a '^error:' | tail -1 || true)
+        if [ "$EXIT_RC" -ne 0 ] && echo "$errline" | grep -q "DR interrupted. Nothing was changed."; then
+            pass "$sig: DR exited $EXIT_RC within 10 s: '$errline'"
+        else
+            fail "$sig: exit $EXIT_RC, error line '${errline:-<none>}'"
+        fi
+    else
+        fail "$sig: DR still running 10 s after the signal"
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    local left
+    left=$(find "$G_DIR" -mindepth 1 2>/dev/null | sed "s|$G_DIR/||" | tr '\n' ' ' || true)
+    if [ -z "$left" ]; then
+        pass "$sig: G is empty again (before the signal it held: ${DRAFTS:-nothing})"
+    else
+        fail "$sig: DR left files in G: '$left'"
+    fi
+}
+interrupt_dr INT
+interrupt_dr TERM
 
 # ── RESULTS ─────────────────────────────────────────────────────
 echo ""

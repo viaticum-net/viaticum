@@ -92,6 +92,14 @@ const META_KEY_NEXT_FILE_ID: &str = "next_file_id";
 /// Meta flag: HOLDINGS keys are owner-first (block‖owner → owner‖block migration done, S-4).
 const META_KEY_HOLDINGS_OWNER_KEYED: &str = "holdings_owner_keyed_v1";
 
+/// Meta key: this DB's catalog history id (CBOR `CatalogLineageId`). Minted once per DB,
+/// never part of the SystemState snapshot (spec B2).
+const META_KEY_CATALOG_LINEAGE: &str = "catalog_lineage_v1";
+
+/// Meta key: this node's last pointer publication accepted by ≥ 1 postman
+/// (CBOR `PointerPublication`, dr-i9).
+const META_KEY_POINTER_PUBLICATION: &str = "pointer_publication_v1";
+
 // --- Indices ---
 
 /// file → holders index. Key = (FileId u64 BE[8] || holder DeviceId[32]) = [u8;40].
@@ -428,6 +436,69 @@ impl Db {
             let mut table = tx.open_table(META)?;
             let bytes = to_cbor_bytes(&value);
             table.insert(META_KEY_NEXT_FILE_ID, bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// This DB's catalog history id, if one was minted.
+    pub fn catalog_lineage(
+        &self,
+    ) -> Result<Option<crate::system_state::CatalogLineageId>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(META)?;
+        match table.get(META_KEY_CATALOG_LINEAGE)? {
+            Some(v) => Ok(Some(from_cbor_bytes(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read this DB's catalog history id, minting a random one if there is none yet.
+    /// One write transaction, so two callers racing on a fresh DB get the same id.
+    pub fn get_or_create_catalog_lineage(
+        &self,
+    ) -> Result<crate::system_state::CatalogLineageId, DbError> {
+        let tx = self.inner.begin_write()?;
+        let id = {
+            let mut table = tx.open_table(META)?;
+            let existing = match table.get(META_KEY_CATALOG_LINEAGE)? {
+                Some(v) => Some(from_cbor_bytes(v.value())?),
+                None => None,
+            };
+            match existing {
+                Some(id) => id,
+                None => {
+                    let id = crate::system_state::CatalogLineageId::random();
+                    table.insert(META_KEY_CATALOG_LINEAGE, to_cbor_bytes(&id).as_slice())?;
+                    id
+                }
+            }
+        };
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// This node's last pointer publication accepted by ≥ 1 postman (dr-i9).
+    pub fn last_pointer_publication(
+        &self,
+    ) -> Result<Option<crate::system_state::catalog::PointerPublication>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(META)?;
+        match table.get(META_KEY_POINTER_PUBLICATION)? {
+            Some(v) => Ok(Some(from_cbor_bytes(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Record a pointer publication accepted by ≥ 1 postman (replaces the previous one).
+    pub fn record_pointer_publication(
+        &self,
+        p: &crate::system_state::catalog::PointerPublication,
+    ) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(META)?;
+            table.insert(META_KEY_POINTER_PUBLICATION, to_cbor_bytes(p).as_slice())?;
         }
         tx.commit()?;
         Ok(())
