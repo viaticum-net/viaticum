@@ -1,6 +1,9 @@
 <script>
-  import { onMount } from 'svelte';
-  import { formatBytes, formatTime, statusBadge, explainRestoreBlocker } from './utils.js';
+  import { onMount, onDestroy } from 'svelte';
+  import {
+    formatBytes, formatTime, statusBadge, restoreAction,
+    explainRestoreRejection, describeRestoreJob,
+  } from './utils.js';
 
   let files = $state([]);            // flat list from API
   let watches = $state([]);          // watch roots from /api/watches
@@ -12,6 +15,7 @@
   let loading = $state(true);
   let error = $state(null);
   let restoreMsg = $state(null);
+  let restorePoll = null;             // interval id while a restore job is watched
 
   async function fetchFiles() {
     loading = true;
@@ -167,7 +171,11 @@
     }
   }
 
+  // A restore is a job in the daemon (restore-i4): POST answers 202 with the job,
+  // then the job is polled every 2 s while this view is mounted. Leaving the view
+  // stops watching, never the restore.
   async function restore(path, version) {
+    stopWatching();
     restoreMsg = null;
     try {
       const res = await fetch('/api/restore', {
@@ -175,35 +183,56 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path, version }),
       });
-      if (res.status === 409) {
-        // Structured RestoreBlocker JSON.
-        const blocker = await res.json();
-        const ex = explainRestoreBlocker(blocker);
-        restoreMsg = {
-          ok: false,
-          text: `Restore blocked. ${ex.reason}`,
-          hint: ex.hint,
-          eta: ex.eta,
-        };
+      const body = await res.json().catch(() => null);
+      if (res.status !== 202 || !body) {
+        restoreMsg = { ok: false, text: explainRestoreRejection(body, res.status), failures: [] };
         return;
       }
-      if (!res.ok) throw new Error(await res.text());
-      const data = await res.json();
-      restoreMsg = {
-        ok: true,
-        text: `Restored to ${data.staging_path || data.path} (v${data.version_used})`,
-      };
+      restoreMsg = describeRestoreJob(body);
+      watchJob(body.job_id);
     } catch (e) {
-      restoreMsg = { ok: false, text: `Restore failed: ${e.message}` };
+      restoreMsg = { ok: false, text: `Restore failed: ${e.message}`, failures: [] };
+    }
+  }
+
+  function watchJob(jobId) {
+    restorePoll = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/restore/jobs/${encodeURIComponent(jobId)}`);
+        if (res.status === 404) {
+          stopWatching();
+          restoreMsg = {
+            ok: false,
+            text: `Lost track of restore job ${jobId} (daemon restarted?). Check its staging directory.`,
+            failures: [],
+          };
+          return;
+        }
+        if (!res.ok) return; // transient; try again on the next tick
+        const job = await res.json();
+        restoreMsg = describeRestoreJob(job);
+        if (job.state === 'finished') stopWatching();
+      } catch (_) {
+        // daemon unreachable for a moment; keep polling
+      }
+    }, 2000);
+  }
+
+  function stopWatching() {
+    if (restorePoll !== null) {
+      clearInterval(restorePoll);
+      restorePoll = null;
     }
   }
 
   function closeVersions() {
     selectedPath = null;
     versions = [];
-    restoreMsg = null;
+    // A watched job keeps reporting here; only a finished report is dismissed.
+    if (restorePoll === null) restoreMsg = null;
   }
 
+  onDestroy(stopWatching);
   onMount(fetchFiles);
 </script>
 
@@ -289,7 +318,12 @@
         <div class="restore-msg" class:restore-ok={restoreMsg.ok} class:restore-err={!restoreMsg.ok}>
           <div>{restoreMsg.text}</div>
           {#if restoreMsg.hint}<div class="restore-hint">{restoreMsg.hint}</div>{/if}
-          {#if restoreMsg.eta}<div class="restore-hint">{restoreMsg.eta}</div>{/if}
+          {#if restoreMsg.failures && restoreMsg.failures.length > 0}
+            <div class="restore-hint">Not restored ({restoreMsg.failures.length}):</div>
+            <ul class="restore-failures">
+              {#each restoreMsg.failures as f}<li class="mono">{f}</li>{/each}
+            </ul>
+          {/if}
         </div>
       {/if}
 
@@ -303,7 +337,7 @@
           <tbody>
             {#each versions as v}
               {@const vb = statusBadge(v.effective_status)}
-              {@const canRestore = !v.restore_blocker}
+              {@const action = restoreAction(v)}
               <tr>
                 <td>{v.version}</td>
                 <td>{formatTime(v.created_at)}</td>
@@ -314,9 +348,11 @@
                 <td>
                   <button
                     class="btn-sm"
-                    disabled={!canRestore}
-                    title={canRestore ? '' : (explainRestoreBlocker(v.restore_blocker).reason)}
+                    disabled={!action.enabled}
                     onclick={() => restore(selectedPath, v.version)}>Restore</button>
+                  {#if action.warning}
+                    <div class="restore-warning">May not restore: {action.warning}</div>
+                  {/if}
                 </td>
               </tr>
             {/each}
@@ -425,6 +461,17 @@
   }
   .restore-ok { background: #1b3d2f; color: #3fb950; }
   .restore-err { background: #3d1b1b; color: #f85149; }
+  .restore-warning {
+    margin-top: 0.2rem;
+    font-size: 0.75rem;
+    color: #d29922;
+    max-width: 22rem;
+  }
+  .restore-failures {
+    margin: 4px 0 0 16px;
+    padding: 0;
+    font-size: 12px;
+  }
   .restore-hint {
     margin-top: 0.3rem;
     font-size: 0.78rem;

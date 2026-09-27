@@ -26,10 +26,10 @@
 #   the seed peer being a non-holder; a stale pointer (the test waits for a pointer that
 #   covers the file, so "DR returns yesterday's catalog" is not exercised); cluster
 #   siblings (single-device master); dr-i9 as the friend sees it (readiness in status
-#   and acceptance by postmen); restore-i3 (honest outcome): NOT proven — the restore
-#   CLI answers exit 0 + "started" even when the job restored nothing, and
-#   e2e_lib.sh:restore_from_network only turns that defect into a FAIL
-#   ("no <file> in staging"), it does not check what the CLI reports.
+#   and acceptance by postmen); restore-i3 (honest outcome) only on the success path:
+#   restore_from_network requires CLI exit 0, job outcome `complete`, the file in the
+#   job's restored_paths and staging == restored_paths; partial / failed outcomes are
+#   local_restore_network_test (B1.4).
 # Steps: 1. backup 256 KB -> restorable per owner — check: wait_file_restorable
 #        2. SS snapshot after placement, then a SelfPointer covering it (dr-i9, log
 #             only) — check: generation/diffs from "SelfPointer published via mailbox"

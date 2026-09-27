@@ -119,9 +119,14 @@ async fn main() -> ExitCode {
         }
         other => {
             let connection = resolve_or_exit(&cli, &global_dir);
-            if let Err(e) = viaticum::cli::run_command(other, &connection) {
-                eprintln!("error: {e}");
-                std::process::exit(1);
+            match viaticum::cli::run_command(other, &connection) {
+                Ok(0) => {}
+                // restore: 2 = partially restored, 1 = nothing / refused / lost contact.
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
     }

@@ -279,7 +279,7 @@ pub fn report_staging_at_startup(staging_root: &Path, warn_threshold_bytes: u64)
     for job in scan_staging(staging_root) {
         let record = match job.record {
             RecordStatus::Finished => "",
-            RecordStatus::NotFinished => " (daemon stopped during restore)",
+            RecordStatus::NotFinished => " (outcome not recorded: daemon stopped or disk error)",
             RecordStatus::Missing => " (no job record)",
             RecordStatus::Unreadable => " (job record unreadable)",
         };

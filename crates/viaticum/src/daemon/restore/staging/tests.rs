@@ -9,9 +9,10 @@ use viaticum_core::path_safety::validate_record_path;
 
 use super::publish::PublishMethod;
 use super::record::{
-    JobFailure, JobOutcome, JobRecord, JobState, RecordStatus, read_job_record, scan_staging,
+    INTERRUPTED_DETAIL, JobRecord, RecordStatus, load_job_from_dir, read_job_record, scan_staging,
 };
 use super::{JOB_RECORD_NAME, JobId, PARTIAL_DIR_NAME, StagingError, StagingWriter};
+use crate::cli::types::{RestoreFailure, RestoreFailureKind, RestoreJobState, RestoreOutcome};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -50,7 +51,7 @@ impl Read for FailAfter {
     }
 }
 
-fn record(state: JobState, outcome: Option<JobOutcome>) -> JobRecord {
+fn record(state: RestoreJobState, outcome: Option<RestoreOutcome>) -> JobRecord {
     JobRecord {
         job_id: JobId::new(),
         path: "/home/kolya/photos/".to_string(),
@@ -61,12 +62,13 @@ fn record(state: JobState, outcome: Option<JobOutcome>) -> JobRecord {
             "/home/kolya/photos/a.jpg".into(),
             "/home/kolya/photos/b.jpg".into(),
         ],
-        failures: vec![JobFailure {
+        failures: vec![RestoreFailure {
             path: "/home/kolya/photos/c.jpg".into(),
+            kind: RestoreFailureKind::HoldersUnavailable,
             detail: "insufficient symbols".into(),
         }],
         outcome,
-        started_at: 1_000,
+        submitted_at: 1_000,
         finished_at: outcome.map(|_| 2_000),
     }
 }
@@ -381,11 +383,11 @@ fn open_creates_partial_dir_with_mode_700() {
 #[test]
 fn write_job_record_rewrites_running_with_finished() {
     let (_data, writer) = open_job();
-    let running = record(JobState::Running, None);
+    let running = record(RestoreJobState::Running, None);
     writer.write_job_record(&running).unwrap();
     let finished = JobRecord {
-        state: JobState::Finished,
-        outcome: Some(JobOutcome::Partial),
+        state: RestoreJobState::Finished,
+        outcome: Some(RestoreOutcome::Partial),
         finished_at: Some(2_000),
         ..running
     };
@@ -399,21 +401,24 @@ fn write_job_record_rewrites_running_with_finished() {
 #[test]
 fn outcome_from_counts_follows_the_rules() {
     assert_eq!(
-        JobOutcome::from_counts(3, 3, 0, false),
-        JobOutcome::Complete
-    );
-    assert_eq!(JobOutcome::from_counts(3, 2, 1, false), JobOutcome::Partial);
-    assert_eq!(
-        JobOutcome::from_counts(3, 0, 3, false),
-        JobOutcome::NothingRestored
+        RestoreOutcome::from_counts(3, 3, 0, false),
+        RestoreOutcome::Complete
     );
     assert_eq!(
-        JobOutcome::from_counts(0, 0, 0, false),
-        JobOutcome::NothingRestored
+        RestoreOutcome::from_counts(3, 2, 1, false),
+        RestoreOutcome::Partial
     );
     assert_eq!(
-        JobOutcome::from_counts(3, 3, 0, true),
-        JobOutcome::Interrupted
+        RestoreOutcome::from_counts(3, 0, 3, false),
+        RestoreOutcome::NothingRestored
+    );
+    assert_eq!(
+        RestoreOutcome::from_counts(0, 0, 0, false),
+        RestoreOutcome::NothingRestored
+    );
+    assert_eq!(
+        RestoreOutcome::from_counts(3, 3, 0, true),
+        RestoreOutcome::Interrupted
     );
 }
 
@@ -442,14 +447,14 @@ fn put_record(dir: &Path, r: &JobRecord) {
 #[test]
 fn scan_staging_partial_leftover_and_running_record_is_interrupted() {
     let (root, dir) = job_dir("j1");
-    put_record(&dir, &record(JobState::Running, None));
+    put_record(&dir, &record(RestoreJobState::Running, None));
     put(&dir, "home/kolya/photos/a.jpg", b"aaaa");
     put(&dir, &format!("{PARTIAL_DIR_NAME}/0b6f-temp"), b"half");
 
     let jobs = scan_staging(root.path());
     assert_eq!(jobs.len(), 1);
     let j = &jobs[0];
-    assert_eq!(j.outcome, JobOutcome::Interrupted);
+    assert_eq!(j.outcome, RestoreOutcome::Interrupted);
     assert_eq!(j.record, RecordStatus::NotFinished);
     assert_eq!(j.path, "/home/kolya/photos/");
     assert_eq!(j.files_total, Some(3));
@@ -466,13 +471,13 @@ fn scan_staging_partial_leftover_and_running_record_is_interrupted() {
 #[test]
 fn scan_staging_finished_record_returns_its_outcome() {
     let (root, dir) = job_dir("j2");
-    let r = record(JobState::Finished, Some(JobOutcome::Partial));
+    let r = record(RestoreJobState::Finished, Some(RestoreOutcome::Partial));
     put_record(&dir, &r);
     put(&dir, "home/kolya/photos/a.jpg", b"aaaa"); // b.jpg already moved out
 
     let j = &scan_staging(root.path())[0];
     assert_eq!(j.record, RecordStatus::Finished);
-    assert_eq!(j.outcome, JobOutcome::Partial);
+    assert_eq!(j.outcome, RestoreOutcome::Partial);
     assert_eq!(j.files_restored, 2);
     assert_eq!(j.restored_paths, r.restored_paths);
 }
@@ -487,7 +492,7 @@ fn scan_staging_without_record_is_interrupted_with_counted_files() {
 
     let j = &scan_staging(root.path())[0];
     assert_eq!(j.record, RecordStatus::Missing);
-    assert_eq!(j.outcome, JobOutcome::Interrupted);
+    assert_eq!(j.outcome, RestoreOutcome::Interrupted);
     assert_eq!(j.path, "?");
     assert_eq!(j.files_total, None);
     assert_eq!(
@@ -506,7 +511,7 @@ fn scan_staging_unreadable_record_is_interrupted() {
     std::fs::write(dir.join(JOB_RECORD_NAME), b"{not json").unwrap();
     let j = &scan_staging(root.path())[0];
     assert_eq!(j.record, RecordStatus::Unreadable);
-    assert_eq!(j.outcome, JobOutcome::Interrupted);
+    assert_eq!(j.outcome, RestoreOutcome::Interrupted);
 }
 
 /// Edge (reported, not in the intent): a finished record wins over a stray temp.
@@ -517,11 +522,11 @@ fn scan_staging_finished_record_wins_over_leftover_temp() {
     let (root, dir) = job_dir("j4");
     put_record(
         &dir,
-        &record(JobState::Finished, Some(JobOutcome::Complete)),
+        &record(RestoreJobState::Finished, Some(RestoreOutcome::Complete)),
     );
     put(&dir, &format!("{PARTIAL_DIR_NAME}/stray"), b"x");
     let j = &scan_staging(root.path())[0];
-    assert_eq!(j.outcome, JobOutcome::Complete);
+    assert_eq!(j.outcome, RestoreOutcome::Complete);
     assert_eq!(j.partial_files, 1);
 }
 
@@ -530,7 +535,7 @@ fn scan_staging_finished_record_wins_over_leftover_temp() {
 #[test]
 fn partial_dir_is_not_counted_as_restored_file() {
     let (root, dir) = job_dir("j5");
-    put_record(&dir, &record(JobState::Running, None));
+    put_record(&dir, &record(RestoreJobState::Running, None));
     put(&dir, &format!("{PARTIAL_DIR_NAME}/t1"), b"1");
     put(&dir, &format!("{PARTIAL_DIR_NAME}/t2"), b"22");
 
@@ -696,4 +701,115 @@ fn production_writer_publishes_via_hard_link_on_a_normal_filesystem() {
     let published = writer.write_file_published(&validated, b"jpeg").unwrap();
     assert_eq!(published.method, PublishMethod::HardLink);
     assert_eq!(std::fs::read(&published.path).unwrap(), b"jpeg");
+}
+
+// ─── load_job_from_dir (restore-i14, i24) ─────────────────────────────────────
+
+/// A finished record is the job as is.
+#[test]
+fn load_job_from_dir_finished_marker_returns_report() {
+    let id = JobId::new();
+    let (_root, dir) = job_dir(&id.to_string());
+    let mut r = record(RestoreJobState::Finished, Some(RestoreOutcome::Partial));
+    r.job_id = id;
+    put_record(&dir, &r);
+
+    assert_eq!(load_job_from_dir(&dir, id, true), r);
+}
+
+/// A `running` record (the daemon died mid-job) → finished + interrupted, with the
+/// complete files on disk counted and one `interrupted` failure for the request.
+#[test]
+fn load_job_from_dir_running_marker_returns_interrupted_with_counted_files() {
+    let id = JobId::new();
+    let (_root, dir) = job_dir(&id.to_string());
+    put_record(&dir, &JobRecord::running(id, "/home/kolya/photos/", 3));
+    put(&dir, "home/kolya/photos/a.jpg", b"a");
+    put(&dir, "home/kolya/photos/sub/b.jpg", b"b");
+
+    let job = load_job_from_dir(&dir, id, true);
+    assert_eq!(job.state, RestoreJobState::Finished);
+    assert_eq!(job.outcome, Some(RestoreOutcome::Interrupted));
+    assert_eq!(job.path, "/home/kolya/photos/");
+    assert_eq!(job.files_total, 3);
+    assert_eq!(job.files_restored, 2);
+    assert_eq!(
+        job.restored_paths,
+        vec![
+            "/home/kolya/photos/a.jpg".to_string(),
+            "/home/kolya/photos/sub/b.jpg".to_string()
+        ]
+    );
+    assert_eq!(
+        job.failures,
+        vec![RestoreFailure {
+            path: "/home/kolya/photos/".into(),
+            kind: RestoreFailureKind::Interrupted,
+            detail: INTERRUPTED_DETAIL.into(),
+        }]
+    );
+    assert_eq!(job.finished_at, None);
+}
+
+/// A job dir without a record (from before B1) → interrupted, path "?", files counted.
+#[test]
+fn load_job_from_dir_without_marker_returns_interrupted() {
+    let id = JobId::new();
+    let (_root, dir) = job_dir(&id.to_string());
+    put(&dir, "home/kolya/old.txt", b"old");
+
+    let job = load_job_from_dir(&dir, id, false);
+    assert_eq!(job.outcome, Some(RestoreOutcome::Interrupted));
+    assert_eq!(job.path, "?");
+    assert_eq!((job.files_total, job.files_restored), (1, 1));
+    assert!(
+        job.submitted_at > 0,
+        "dir mtime stands in for the submit time"
+    );
+}
+
+/// restore-i24: leftover temp files are removed only when asked (a job that is not
+/// running); the user's files and the record stay.
+#[test]
+fn load_job_from_dir_removes_leftover_partials() {
+    let id = JobId::new();
+    let (_root, dir) = job_dir(&id.to_string());
+    put_record(&dir, &JobRecord::running(id, "/p/", 1));
+    put(&dir, "p/done.txt", b"done");
+    put(&dir, &format!("{PARTIAL_DIR_NAME}/t1"), b"half");
+    put(&dir, &format!("{PARTIAL_DIR_NAME}/t2"), b"half");
+
+    load_job_from_dir(&dir, id, false);
+    assert_eq!(
+        std::fs::read_dir(dir.join(PARTIAL_DIR_NAME))
+            .unwrap()
+            .count(),
+        2
+    );
+
+    let job = load_job_from_dir(&dir, id, true);
+    assert_eq!(
+        std::fs::read_dir(dir.join(PARTIAL_DIR_NAME))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(dir.join("p/done.txt").exists());
+    assert!(dir.join(JOB_RECORD_NAME).exists());
+    assert_eq!(job.restored_paths, vec!["/p/done.txt".to_string()]);
+}
+
+/// A B1.2 record (`started_at`, failures without `kind`) still reads.
+#[test]
+fn job_record_from_b1_2_still_parses() {
+    let id = JobId::new();
+    let json = format!(
+        r#"{{"job_id":"{id}","path":"/p/","state":"finished","files_total":2,"files_restored":1,
+        "restored_paths":["/p/a"],"failures":[{{"path":"/p/b","detail":"x"}}],
+        "outcome":"partial","started_at":5,"finished_at":9}}"#
+    );
+    let r: JobRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(r.submitted_at, 5);
+    assert_eq!(r.failures[0].kind, RestoreFailureKind::Internal);
+    assert_eq!(r.outcome, Some(RestoreOutcome::Partial));
 }

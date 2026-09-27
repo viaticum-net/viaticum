@@ -958,25 +958,43 @@ Repair (triggered by PresumedLost / Lost):
 ### 3.3. Restore
 
 ```
-viaticum restore <path> [--version N] [--date YYYY-MM-DD]
+viaticum restore <path> [--version N] [--date YYYY-MM-DD] [--no-wait] [--json]
+viaticum restore --status [JOB_ID] [--json]
 
-1. DB lookup: path → FileRecord → FileVersion
+Restore is a job in the daemon: POST /api/restore → 202 + the job (id, queued);
+GET /api/restore/jobs/{id}, GET /api/restore/jobs. A path not in the catalog, or with
+no backed-up version under it, is refused at once (404 / 422), as is a --version N
+that is not backed up there (404 version_not_found, with the available numbers);
+no job, no staging dir.
+The CLI polls every 2 s with no overall deadline; Ctrl-C detaches the terminal, the
+job goes on. Exit code: 0 all restored / 2 some / 1 none, refused, interrupted, or
+lost contact with the daemon.
+
+1. DB lookup: path → FileRecord → FileVersion (a prefix matches only at a '/')
 2. FileVersion → source_block_id
-3. Dedup: multiple files in same batch → single download
-4. Per source_block:
-   a. Find holders: SymbolPlacement WHERE status=Alive
-   b. (no restore gate on the holder side, §1.8)
-   c. RestoreRequest to K_eff holders in parallel
-   d. Collect K_eff bound symbols (any ESI)
+3. Dedup: several files in one block → one download
+4. Per source_block (by importance):
+   a. source files present → rebuild the block locally, no network
+   b. otherwise candidates: SymbolPlacement status ∈ {Alive, Uncertain, PresumedLost}
+   c. (no restore gate on the holder side, §1.8)
+   d. rounds over the holders: each gets RestoreRequests of ≤ 4 MiB of its ESIs;
+      a holder that does not answer within 30 s is skipped for the round and asked
+      again in the next; no deadline per block — give up only after a round with no
+      new ESI. Only holders with a live authenticated connection are asked; a holder
+      not connected refuses at once and is not dialled (a retry that redials is the
+      separate slice restore-i26)
    e. Unbind: XOR ChaCha20(HKDF(block_id, holder_id))
    f. RaptorQ decode → ciphertext
    g. decrypt (epoch_key) → decompress → plaintext
 5. Pack → PackIndex → extract files by offset+size
-6. Write to disk, FileRecord.local_state → Present
+6. Write into staging <data_dir>/restore/<job>/<path>: a temp file in .viaticum-partial/,
+   visible under its name only when complete; the job outcome in .viaticum-job.json.
+   LocalState is not touched; every file ends restored or as a failure with a kind.
+7. Daemon shutdown: the job is recorded interrupted (requests abandoned, 10 s drain).
 ```
 
 Version selection:
-- `--version N`: specific (0 = oldest, -1 or default = latest)
+- `--version N`: specific, 1-based as listed by `versions` (default = latest backed up)
 - `--date D`: nearest version ≤ D
 
 ### 3.4. Disaster Recovery
