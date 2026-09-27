@@ -287,18 +287,6 @@ pub struct RestoreResponseMsg {
     pub timestamp: Timestamp,
 }
 
-/// Holder → Owner. Escrow not satisfied, restore denied.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct RestoreDeniedMsg {
-    pub v: u8,
-    pub source_block_id: SourceBlockId,
-    pub reason: String,
-    pub current_trust: f64,
-    pub needed_trust: f64,
-    pub restore_budget_gb: f64,
-    pub timestamp: Timestamp,
-}
-
 /// Payload for relay board "device_revocation" broadcast.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RevocationBroadcast {
@@ -433,7 +421,6 @@ pub enum Message {
     SymbolDropNotice(SymbolDropNoticeMsg),
     RestoreRequest(RestoreRequestMsg),
     RestoreResponse(RestoreResponseMsg),
-    RestoreDenied(RestoreDeniedMsg),
     ClusterSyncRequest(ClusterSyncRequestMsg),
     MailboxFetchRequest(MailboxFetchRequest),
     MailboxFetchResponse(MailboxFetchResponse),

@@ -40,16 +40,11 @@ pub const S_CLAMP_MIN: f64 = 0.1;
 /// S ceiling.
 pub const S_CLAMP_MAX: f64 = 1.0;
 
-// === Escrow (contribution-based) ===
-
-/// Days of storage contribution required to earn 1 GB of restore credit.
-/// Formula: restore_budget_gb = stored_gb_days / k_factor.
-/// Default K=7: store 1 GB for 7 days → earn 1 GB restore budget.
-pub const DEFAULT_ESCROW_K_FACTOR: f64 = 7.0;
+// === Offer budget (contribution-based) ===
 
 /// Days of storage contribution required to earn 1 GB of OFFER budget (backup credit).
 /// Formula: earned_offer_gb = Σ(gb_days × master_trust / MAX_COMBINED_TRUST) / K_OFFER.
-/// Smaller than restore-K (7) on purpose — we want self-awareness for fresh
+/// Smaller than the old restore-escrow K (7; that gate was removed in v1) on purpose — we want self-awareness for fresh
 /// owners (a node holding for the network a few days can back up its first
 /// files), and offering cost is already inflated ×overhead_factor by the
 /// caller. Set to 5 (tunable). Sybil mitigation logged in tech-debt.
@@ -499,6 +494,18 @@ pub const PAIR_LEDGER_LAMBDA_SLOW: f64 = 1.0 / 180.0;
 /// clock instead of the 6-month depth clock (asserted below, AC-3h).
 pub const PAIR_LEDGER_LAMBDA_DEM: f64 = 1.0 / 365.0;
 
+/// `λ_drop` — leak rate of the decaying drop-event counters `drop_ann`, `drop_silent`,
+/// `drop_presumed` [day⁻¹]; `τ_drop = 56 days = 8 weeks` ("the system must forgive").
+///
+/// Equal to the simulator's `DynParams::default().lambda_drop` (`sim_dynamic/engine.rs:383`),
+/// guarded by `the_daemon_recorder_leaks_at_exactly_the_model_defaults_this_sim_runs_on`.
+/// The sim derived 8 weeks from ITS PoS window (8 ticks, `POS_WINDOW_LEN`); the daemon's
+/// own P window is 4 weeks (`P_WINDOW_WEEKS`). Kept at the sim's value for comparability,
+/// NOT re-derived from the daemon's window (release map, У-4). OPEN calibration.
+///
+/// The fastest leak in the recorder: it binds the sub-step (28 days, not 30).
+pub const PAIR_LEDGER_LAMBDA_DROP: f64 = 1.0 / 56.0;
+
 /// How long one PoS pass keeps a placement CONFIRMED for the pair ledger [SCALED seconds]
 /// (У-3, decision Д-G: 1 220 400 s = 14 d 3 h).
 ///
@@ -529,8 +536,9 @@ pub const PAIR_LEDGER_CONFIRMATION_WINDOW_SECS: u64 = SECS_PER_WEEK
 /// Largest `λ·Δt` the recorder allows in ONE explicit Euler sub-step.
 ///
 /// `update_capital`'s multiplier is `(1 − λΔt)`: monotone only below 1, oscillating up to
-/// 2, divergent above. 0.5 keeps a comfortable margin (with `λ = 1/60` the sub-step is 30
-/// days). A long outage is split into such steps and integrated, never clamped — clamping
+/// 2, divergent above. 0.5 keeps a comfortable margin for EVERY leak the recorder runs;
+/// the fastest one binds — `λ_drop = 1/56` since У-4, so the sub-step is 28 days (it was
+/// 30 while `λ = 1/60` was the fastest). A long outage is split into such steps and integrated, never clamped — clamping
 /// would silently discard exactly the accrual this layer exists to keep.
 pub const PAIR_LEDGER_MAX_LAMBDA_DT: f64 = 0.5;
 
@@ -600,6 +608,17 @@ pub const PAIR_LEDGER_TICK_SECS: u64 = 3600;
 ///   "3.5 days of confirmed service".
 pub const PAIR_LEDGER_OBSERVED_WINDOW_TICKS: u64 = 3;
 
+// === DN-1: stale DropNotice dedup ===
+
+/// How long the owner remembers an applied DropNotice, in multiples of the (scaled) mailbox TTL
+/// of the DropNotice class (DN-1). What bounds an HONEST re-delivery is not the holder's
+/// `expires_at` alone but the postman's clamp on store plus the polling node's own filter —
+/// one raw TTL from the store, each on its own clock. One TTL covers that; the second TTL is a
+/// margin for clock jumps. Caveat: at `time_scale > 1` the clamp is on the RAW (unscaled) TTL
+/// and does not bite, so a holder clock running ahead by more than the SCALED TTL can re-open
+/// a repeat on multi-machine demos (single-machine E2E shares one clock).
+pub const SEEN_DROP_NOTICE_RETENTION_TTLS: u64 = 2;
+
 // === Compile-time sanity checks ===
 
 const _: () = assert!(S_CLAMP_MIN < S_CLAMP_MAX);
@@ -610,6 +629,10 @@ const _: () = assert!(PAIR_LEDGER_LAMBDA > PAIR_LEDGER_LAMBDA_SLOW);
 // depth, or a silent-but-deep partner's floor would fade on `v_dem`'s clock.
 const _: () = assert!(PAIR_LEDGER_LAMBDA_DEM > 0.0);
 const _: () = assert!(PAIR_LEDGER_LAMBDA_DEM <= PAIR_LEDGER_LAMBDA_SLOW);
+const _: () = assert!(PAIR_LEDGER_LAMBDA_DROP > 0.0);
+// The drop counters are the FASTEST leak and bind the sub-step (Д-L). If this ever flips,
+// the "28-day step" premises in the tests and docs silently become wrong (review N-2).
+const _: () = assert!(PAIR_LEDGER_LAMBDA_DROP >= PAIR_LEDGER_LAMBDA);
 // Д-G: 14 d 3 h. A change here changes what "confirmed" means for every recorded series.
 const _: () = assert!(PAIR_LEDGER_CONFIRMATION_WINDOW_SECS == 1_220_400);
 const _: () = assert!(PAIR_LEDGER_MAX_LAMBDA_DT > 0.0 && PAIR_LEDGER_MAX_LAMBDA_DT < 1.0);
@@ -621,6 +644,8 @@ const _: () = assert!(PAIR_LEDGER_MAX_LAMBDA_DT > 0.0 && PAIR_LEDGER_MAX_LAMBDA_
 // gate). Nothing here can express the scale-dependence — that is checked at run time by
 // `pair_ledger::tests::the_observed_window_is_three_tick_periods_at_every_time_scale`.
 const _: () = assert!(PAIR_LEDGER_OBSERVED_WINDOW_TICKS >= 1);
+// DN-1: a notice must be remembered at least as long as the mailbox hands it out.
+const _: () = assert!(SEEN_DROP_NOTICE_RETENTION_TTLS >= 1);
 const _: () = assert!(OVERHEAD_BASE > 1.0);
 const _: () = assert!(DECODE_OVERHEAD > 0);
 const _: () = assert!(SYMBOL_OFFER_TIMEOUT_SECS < SYMBOL_OFFER_EXPIRY_SECS);

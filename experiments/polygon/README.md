@@ -139,7 +139,7 @@ daemon exports are listed at the end).
   `DiskPressure::{Normal, Soft, Hard}`; priority `= importance·trust_of_owner·(1+age_bonus)`, lowest
   evicted first; `hard_quota_bytes` is a never-evict-below floor.
 - Config knobs (`config/mod.rs`): `[storage] soft_quota_gb / hard_quota_gb / disk_reserve_gb`,
-  `[escrow] k_factor`, `[web_api] enabled/bind`, `[metrics] enabled/push_url/push_interval_secs`,
+  `[web_api] enabled/bind`, `[metrics] enabled/push_url/push_interval_secs`,
   `[backup] source_block_size_mb/max_versions/max_version_age_days`, `[[watch]] path/importance_multiplier`.
   CLI: `--data-dir` (global), `daemon --time-scale <u64> --watch-dir <repeatable>`, `--log-format json|text`.
 - `restore` stages to `<data_dir>/restore/<job_id>/<original_path>` (alpha; `--dest` unsupported).
@@ -296,8 +296,7 @@ or push. Running on the server + review + integration are the human's job. The a
 
 `needs_rust=false`. Optional later daemon exports that would SHARPEN (not enable) v1: a time-integrated
 `gb_days` GIVE ledger (currently approximated by trapezoidal integration of `holding_bytes`/
-`bytes_we_store` over the poll series); a scalar escrow restore-budget (currently read indirectly via
-`RestoreBlocker::EscrowLocked{budget_gb,needed_gb}`); a full (un-capped) per-peer partner list +
+`bytes_we_store` over the poll series); a full (un-capped) per-peer partner list +
 per-relationship gb_days (currently the ≤20-by-trust cap is worked around by unioning all nodes'
 `peers[]`); raw source bytes per version (`FileVersion.source_size`, known tech-debt — irrelevant to
 the data-loss oracle which compares content hashes).

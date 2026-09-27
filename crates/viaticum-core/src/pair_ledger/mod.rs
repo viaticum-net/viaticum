@@ -53,6 +53,12 @@
 //! `c.holder_surfaced`, `sim_dynamic/engine.rs:1855`), while the observed window is OUR
 //! uptime.
 //!
+//! **Drop events (У-4)** — see [`drops`]: the placement-loss sites queue events in the
+//! `pair_ledger_pending_drops` outbox inside their own transaction, and the tick folds them
+//! into `drop_ann` / `drop_silent` / `drop_presumed` in ITS transaction, after decaying the
+//! interval. The counters leak at `λ_drop` (1/56 day⁻¹) inside the same sub-step loop as
+//! everything else.
+//!
 //! **Output of the writer, not a reader.** [`PairLedgerRecorder::tick_report`] returns the
 //! rows it has just written so the scheduler can print one `pair-ledger row` debug line
 //! per pair (target `viaticum::ledger`). That line is the only way an operator — or
@@ -90,22 +96,30 @@
 //! W-3 in the spec: a series in a different unit looks plausible and compares to nothing.
 
 #[cfg(test)]
+mod drop_tests;
+mod drops;
+#[cfg(test)]
 mod tests;
+
+pub use drops::{
+    LossCause, NotCounted, drop_event_for, fold_pending_drops, ledger_master_for_device,
+};
 
 use std::collections::HashMap;
 
 use crate::constants::{
-    BYTES_PER_GB, PAIR_LEDGER_LAMBDA, PAIR_LEDGER_LAMBDA_DEM, PAIR_LEDGER_LAMBDA_SLOW,
-    PAIR_LEDGER_MAX_LAMBDA_DT, PAIR_LEDGER_OBSERVED_WINDOW_TICKS, PAIR_LEDGER_TICK_SECS,
-    SECS_PER_DAY,
+    BYTES_PER_GB, PAIR_LEDGER_LAMBDA, PAIR_LEDGER_LAMBDA_DEM, PAIR_LEDGER_LAMBDA_DROP,
+    PAIR_LEDGER_LAMBDA_SLOW, PAIR_LEDGER_MAX_LAMBDA_DT, PAIR_LEDGER_OBSERVED_WINDOW_TICKS,
+    PAIR_LEDGER_TICK_SECS, SECS_PER_DAY,
 };
 use crate::db::{Db, DbError, MasterStorageBytes};
 use crate::four_r::{update_capital, update_depth, update_v_dem};
 use crate::types::{IdentityPub, PairLedger, Timestamp};
+use drops::leak_drop_counter;
 
 /// Ceiling on Euler sub-steps for ONE accrual call.
 ///
-/// Only a corrupt clock can reach it: at the 30-day sub-step this is 8000 years of
+/// Only a corrupt clock can reach it: at the 28-day sub-step this is ≈7700 years of
 /// simulated calendar. It is not a truncation of accrual — after ~100·τ the integrator has
 /// reached `G* = V_conf/λ` to f64 precision and further steps change nothing — it exists so
 /// that a nonsense `last_update` cannot spin the loop for hours. When it does bite, the
@@ -153,6 +167,8 @@ pub struct AccrualStats {
     /// accepted and never answers, stalled PoS wiring, SystemState blocks). Logged only;
     /// nothing branches on it.
     pub believed_not_confirmed: usize,
+    /// Drop events folded into the ledger this tick, all kinds, all rows (У-4). Logged only.
+    pub drop_events_folded: u64,
 }
 
 /// One ACCRUED row as this tick left it — for the per-row log line only (У-3, Part 0).
@@ -176,6 +192,15 @@ pub struct LedgerRowReport {
     pub depth: f64,
     pub observed_volume: f64,
     pub observed_tau: f64,
+    /// The three drop counters AFTER this tick's decay and fold (У-4).
+    pub drop_ann: f64,
+    pub drop_silent: f64,
+    pub drop_presumed: f64,
+    /// Events folded into this row on this tick, by kind (У-4) — what the outbox held for
+    /// this master when the tick took it.
+    pub ann_events: u32,
+    pub silent_events: u32,
+    pub presumed_events: u32,
 }
 
 /// What one [`PairLedgerRecorder::tick_report`] did: the counters plus one
@@ -234,9 +259,17 @@ impl PairLedgerRecorder {
     /// [`PairLedgerRecorder::tick`], plus what it wrote: one [`LedgerRowReport`] per
     /// accrued row, filled from the very ledger value handed to `upsert_pair_ledgers`.
     ///
-    /// Per accrued row: [`accrue_interval`] (dark part, then the observed tail — `G`, `D`
-    /// and the `v_dem` ratchet), then [`observe_run`] over the observed tail only (the run
-    /// `(V0, τ0)`, Д-H). A seeded row and an idle row touch neither the ratchet nor the run.
+    /// Per accrued row: [`accrue_interval`] (dark part, then the observed tail — `G`, `D`,
+    /// the `v_dem` ratchet and the leak of the drop counters), then [`observe_run`] over the
+    /// observed tail only (the run `(V0, τ0)`, Д-H), then the drop events queued for that
+    /// master since the last fold ([`fold_pending_drops`], У-4 Д-K: decay first, then `+N`).
+    /// A seeded row and an idle row touch neither the ratchet nor the run, and leave their
+    /// queued events for the next accruing tick (a seeded row is not reported, so an event
+    /// folded there would never reach the log).
+    ///
+    /// Taking the queue and writing the rows is ONE write transaction: an event is folded
+    /// into exactly one tick, and a failed commit leaves it queued (Д-K, redb serializes
+    /// writers — A7).
     pub fn tick_report(
         &self,
         my_master: &IdentityPub,
@@ -246,7 +279,9 @@ impl PairLedgerRecorder {
         let observed_days = observed_window_days(time_scale);
         let mut stats = AccrualStats::default();
         let mut reports: Vec<LedgerRowReport> = Vec::new();
-        let mut rows: Vec<(IdentityPub, PairLedger)> = Vec::new();
+        // (master, ledger, index of its report — `Some` only for an ACCRUED row, the only
+        // kind that folds drop events)
+        let mut rows: Vec<(IdentityPub, PairLedger, Option<usize>)> = Vec::new();
 
         // One read of the ledger table for the whole sweep, for the same reason the volumes
         // come from one pass: `get_pair_ledger` per master would open a read transaction per
@@ -268,7 +303,7 @@ impl PairLedgerRecorder {
                 // would invent a history this pair does not have.
                 None => {
                     ledger.last_update = Some(now);
-                    rows.push((volumes.master, ledger));
+                    rows.push((volumes.master, ledger, None));
                     stats.seeded += 1;
                 }
                 // Clock did not move (same second, or wall clock went backwards — then
@@ -307,13 +342,38 @@ impl PairLedgerRecorder {
                         depth: ledger.depth_of_their_service,
                         observed_volume: ledger.observed_volume,
                         observed_tau: ledger.observed_tau,
+                        // Filled after the fold, inside the write transaction below.
+                        drop_ann: ledger.drop_ann,
+                        drop_silent: ledger.drop_silent,
+                        drop_presumed: ledger.drop_presumed,
+                        ann_events: 0,
+                        silent_events: 0,
+                        presumed_events: 0,
                     });
-                    rows.push((volumes.master, ledger));
+                    rows.push((volumes.master, ledger, Some(reports.len() - 1)));
                 }
             }
         }
 
-        self.db.upsert_pair_ledgers(&rows)?;
+        if !rows.is_empty() {
+            let mut txn = self.db.write_txn()?;
+            for (master, ledger, report_index) in &mut rows {
+                if let Some(i) = *report_index {
+                    let pending = txn.take_pending_drops(master)?;
+                    fold_pending_drops(ledger, &pending);
+                    stats.drop_events_folded += pending.total();
+                    let report = &mut reports[i];
+                    report.drop_ann = ledger.drop_ann;
+                    report.drop_silent = ledger.drop_silent;
+                    report.drop_presumed = ledger.drop_presumed;
+                    report.ann_events = pending.announced;
+                    report.silent_events = pending.silent;
+                    report.presumed_events = pending.presumed;
+                }
+                txn.upsert_pair_ledger(master, ledger)?;
+            }
+            txn.commit()?;
+        }
         Ok(TickReport {
             stats,
             rows: reports,
@@ -497,7 +557,9 @@ pub fn observed_window_days(time_scale: u64) -> f64 {
 /// [`update_capital`] at `λ`, the depth through [`update_depth`] at `λ_slow`, the
 /// demonstrated scale through [`update_v_dem`] at `λ_dem`, over the sub-steps of
 /// [`sub_steps`] — so the result is exactly the kernel applied `n` times, not an
-/// approximation of it (AC-1, AC-3b).
+/// approximation of it (AC-1, AC-3b). The three drop counters leak on the same sub-steps
+/// at `λ_drop` through a literal copy of the simulator's sweep expression (У-4, Д-L — there
+/// is no kernel function for it); drop EVENTS are never added here.
 ///
 /// "Their service to us" — `G_they`, `D` and `v_dem` — is charged by the CONFIRMED volume
 /// ([`Volumes::they_store_for_us_confirmed`], Д-F = A); the believed volume is not read
@@ -545,6 +607,13 @@ pub fn accrue(ledger: &mut PairLedger, volumes: &Volumes, dt_days: f64) -> f64 {
             plan.step_days,
             PAIR_LEDGER_LAMBDA_DEM,
         );
+        // У-4, Д-L: the drop counters leak on every sub-step of the whole interval, dark part
+        // included (decay is unconditional, like the sim). Not a kernel call — the sim does it
+        // inline and the kernel has no drop-decay function. Events are added by the tick
+        // after this, never here.
+        ledger.drop_ann = leak_drop_counter(ledger.drop_ann, plan.step_days);
+        ledger.drop_silent = leak_drop_counter(ledger.drop_silent, plan.step_days);
+        ledger.drop_presumed = leak_drop_counter(ledger.drop_presumed, plan.step_days);
     }
     plan.uncovered_days
 }
@@ -563,8 +632,11 @@ pub struct SubStepPlan {
 }
 
 /// Split `dt_days` into equal explicit-Euler sub-steps with
-/// `λ·step ≤ PAIR_LEDGER_MAX_LAMBDA_DT` for ALL THREE leak rates (`λ`, `λ_slow`, `λ_dem`;
-/// the binding one is the fastest, `λ`, so the step is 30 days).
+/// `λ·step ≤ PAIR_LEDGER_MAX_LAMBDA_DT` for ALL FOUR leak rates (`λ`, `λ_slow`, `λ_dem`,
+/// `λ_drop`; the binding one is the fastest, `λ_drop = 1/56` since У-4, so the step is 28
+/// days — it was 30 while `λ` was the fastest). One plan for every leak rather than a
+/// separate one for the counters: two partitions of one interval would be more code for
+/// the same result, and "`λ·step ≤ 0.5` for EACH leak" is the honest invariant (Д-L).
 ///
 /// This is W-2 of the spec. [`crate::types::PairLedger::elapsed_days`] deliberately returns
 /// an UNCLAMPED interval, because clamping a three-month outage would silently throw the
@@ -575,7 +647,8 @@ pub struct SubStepPlan {
 pub fn sub_steps(dt_days: f64) -> SubStepPlan {
     let lambda_max = PAIR_LEDGER_LAMBDA
         .max(PAIR_LEDGER_LAMBDA_SLOW)
-        .max(PAIR_LEDGER_LAMBDA_DEM);
+        .max(PAIR_LEDGER_LAMBDA_DEM)
+        .max(PAIR_LEDGER_LAMBDA_DROP);
     let max_step = PAIR_LEDGER_MAX_LAMBDA_DT / lambda_max;
     if dt_days <= max_step {
         return SubStepPlan {
@@ -586,7 +659,7 @@ pub fn sub_steps(dt_days: f64) -> SubStepPlan {
     }
     let wanted = (dt_days / max_step).ceil();
     if wanted >= MAX_SUB_STEPS as f64 {
-        // Corrupt clock (see MAX_SUB_STEPS): integrate the leading 8000 years, by which
+        // Corrupt clock (see MAX_SUB_STEPS): integrate the leading ≈7700 years, by which
         // point every axis sits on its steady state, and report the rest as uncovered.
         let covered = MAX_SUB_STEPS as f64 * max_step;
         return SubStepPlan {

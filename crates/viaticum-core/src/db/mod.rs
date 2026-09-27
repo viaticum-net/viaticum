@@ -17,10 +17,10 @@ use crate::constants::{
 use crate::mailbox::{MailboxAddress, MailboxClass};
 use crate::trust::{DeviceTrustRecord, MasterTrustRecord};
 use crate::types::{
-    BlockAgg, BudgetRecord, DeviceId, EventEntry, FileId, FileRecord, HoldingRecord, HoldingStatus,
-    IdentityPub, PairLedger, PeerRecord, PlacementAgg, PlacementStatus, SourceBlockId,
-    SourceBlockRecord, SourceBlockStatus, SymbolPlacement, Timestamp, from_cbor_bytes,
-    to_cbor_bytes,
+    BlockAgg, BudgetRecord, DeviceId, DropKind, EventEntry, FileId, FileRecord, HoldingRecord,
+    HoldingStatus, IdentityPub, PairLedger, PeerRecord, PendingDrops, PlacementAgg,
+    PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus, SymbolPlacement,
+    Timestamp, from_cbor_bytes, to_cbor_bytes,
 };
 
 // ============================================================
@@ -69,6 +69,7 @@ const SS_BLOCKS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("ss_bl
 
 /// Total bytes restored per peer (cumulative, append-only counter).
 /// Key = owner IdentityPub [u8;32]. Value = CBOR(u64) — total bytes served.
+/// Accounting only (v1): nothing gates restore on it; input for a future escrow-as-debt.
 const RESTORE_SERVED: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("restore_served");
 
 /// Device trust per DeviceId. Key = DeviceId [u8;32]. Value = CBOR(DeviceTrustRecord).
@@ -90,6 +91,14 @@ const META_KEY_NEXT_FILE_ID: &str = "next_file_id";
 
 /// Meta flag: HOLDINGS keys are owner-first (block‖owner → owner‖block migration done, S-4).
 const META_KEY_HOLDINGS_OWNER_KEYED: &str = "holdings_owner_keyed_v1";
+
+/// Meta key: this DB's catalog history id (CBOR `CatalogLineageId`). Minted once per DB,
+/// never part of the SystemState snapshot (spec B2).
+const META_KEY_CATALOG_LINEAGE: &str = "catalog_lineage_v1";
+
+/// Meta key: this node's last pointer publication accepted by ≥ 1 postman
+/// (CBOR `PointerPublication`, dr-i9).
+const META_KEY_POINTER_PUBLICATION: &str = "pointer_publication_v1";
 
 // --- Indices ---
 
@@ -146,6 +155,24 @@ const MAILBOX_SP_BYTES_BY_TARGET: TableDefinition<&[u8; 32], &[u8]> =
 /// `create_tables` opens it on every `Db::open`, so a database written before this table
 /// existed simply gains it empty (no migration step).
 const PAIR_LEDGER: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("pair_ledger");
+
+/// Outbox of drop events awaiting the next pair-ledger accrual (У-4, Д-K). Key: master
+/// identity (the ledger's key). Value: CBOR([`PendingDrops`]), decoded LENIENTLY (a
+/// damaged row reads as zeros — see [`PendingDrops`]).
+///
+/// Written by the placement-loss sites in the SAME write transaction as the placement change
+/// ([`DbWriteTxn::record_drop_event`]); taken by the accrual tick in the SAME write
+/// transaction as the ledger rows ([`DbWriteTxn::take_pending_drops`]). redb serializes
+/// write transactions, so an event lands in exactly one fold: never lost, never doubled.
+/// Deliberately NOT part of the SystemState snapshot: pending events are lost on DR
+/// (4r-i31), and the `system_state` module is not touched for it.
+///
+/// Orphans: a row is folded only when its master is a row of the accrual sweep (PEERS). The
+/// placeholder master is never written (`record_drop_event` is a no-op for it), but a master
+/// that later leaves PEERS keeps its row here un-folded (today unreachable: peers are never
+/// deleted — `delete_peer` has no production caller, N-5). Harmless: nothing reads it.
+const PAIR_LEDGER_PENDING_DROPS: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("pair_ledger_pending_drops");
 
 // ============================================================
 // Key helpers
@@ -389,6 +416,10 @@ impl Db {
             tx.open_table(MAILBOX_BYTES_BY_TARGET)?;
             tx.open_table(MAILBOX_SP_BYTES_BY_TARGET)?;
             tx.open_table(PAIR_LEDGER)?;
+            tx.open_table(PAIR_LEDGER_PENDING_DROPS)?;
+            // DN-1: applied signed letters + their expiry index (outside snapshot_db, 4r-i51).
+            tx.open_table(seen_signed_letters::SEEN_SIGNED_LETTERS)?;
+            tx.open_table(seen_signed_letters::SEEN_SIGNED_LETTERS_BY_EXPIRY)?;
         }
         tx.commit()?;
         Ok(())
@@ -414,6 +445,69 @@ impl Db {
             let mut table = tx.open_table(META)?;
             let bytes = to_cbor_bytes(&value);
             table.insert(META_KEY_NEXT_FILE_ID, bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// This DB's catalog history id, if one was minted.
+    pub fn catalog_lineage(
+        &self,
+    ) -> Result<Option<crate::system_state::CatalogLineageId>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(META)?;
+        match table.get(META_KEY_CATALOG_LINEAGE)? {
+            Some(v) => Ok(Some(from_cbor_bytes(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read this DB's catalog history id, minting a random one if there is none yet.
+    /// One write transaction, so two callers racing on a fresh DB get the same id.
+    pub fn get_or_create_catalog_lineage(
+        &self,
+    ) -> Result<crate::system_state::CatalogLineageId, DbError> {
+        let tx = self.inner.begin_write()?;
+        let id = {
+            let mut table = tx.open_table(META)?;
+            let existing = match table.get(META_KEY_CATALOG_LINEAGE)? {
+                Some(v) => Some(from_cbor_bytes(v.value())?),
+                None => None,
+            };
+            match existing {
+                Some(id) => id,
+                None => {
+                    let id = crate::system_state::CatalogLineageId::random();
+                    table.insert(META_KEY_CATALOG_LINEAGE, to_cbor_bytes(&id).as_slice())?;
+                    id
+                }
+            }
+        };
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// This node's last pointer publication accepted by ≥ 1 postman (dr-i9).
+    pub fn last_pointer_publication(
+        &self,
+    ) -> Result<Option<crate::system_state::catalog::PointerPublication>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(META)?;
+        match table.get(META_KEY_POINTER_PUBLICATION)? {
+            Some(v) => Ok(Some(from_cbor_bytes(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Record a pointer publication accepted by ≥ 1 postman (replaces the previous one).
+    pub fn record_pointer_publication(
+        &self,
+        p: &crate::system_state::catalog::PointerPublication,
+    ) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(META)?;
+            table.insert(META_KEY_POINTER_PUBLICATION, to_cbor_bytes(p).as_slice())?;
         }
         tx.commit()?;
         Ok(())
@@ -601,6 +695,25 @@ impl Db {
             inner: Arc::new(db),
             hot: Arc::new(RwLock::new(hot)),
         })
+    }
+
+    /// Test seam (DN1-16): overwrite the stored row of placement (block, holder) with bytes that
+    /// do not decode as a `SymbolPlacement`, so [`Db::get_placement`] answers `Err` — a damaged
+    /// row, not a missing one. Bypasses the hot cache on purpose.
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn corrupt_placement_row_for_test(
+        &self,
+        block_id: &SourceBlockId,
+        holder_id: &DeviceId,
+    ) -> Result<(), DbError> {
+        let key = placement_key(block_id, holder_id);
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(SYMBOL_PLACEMENTS)?;
+            table.insert(&key, [0xffu8, 0x00, 0x13].as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Access hot cache for read.
@@ -1641,6 +1754,22 @@ impl Db {
         Ok(out)
     }
 
+    /// All pending drop events (У-4), in master key order. Tests and diagnostics only —
+    /// there is no production reader (AC-7): the accrual tick takes a master's row inside its
+    /// own write transaction ([`DbWriteTxn::take_pending_drops`]) and nothing else looks.
+    pub fn list_pending_drops(&self) -> Result<Vec<(IdentityPub, PendingDrops)>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(PAIR_LEDGER_PENDING_DROPS)?;
+        let mut out = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            let master = IdentityPub(*k.value());
+            let pending = decode_pending_drops(&master, v.value());
+            out.push((master, pending));
+        }
+        Ok(out)
+    }
+
     /// Bytes WE currently store for `master` — the recorder's `V_conf` for the
     /// "our service to this person" axis (`PairLedger::gb_days_we_store_for_them`).
     ///
@@ -1994,7 +2123,7 @@ impl Db {
         Ok(())
     }
 
-    /// All holdings for a given owner. Used by escrow module.
+    /// All holdings for a given owner (storage-balance and GB·days accounting).
     pub fn list_holdings_for_owner(
         &self,
         owner_id: &IdentityPub,
@@ -2877,6 +3006,56 @@ impl<'db> DbWriteTxn<'db> {
         Ok(())
     }
 
+    /// Record one drop event of `kind` for `master` (У-4, Д-K): `+1` on its pending row.
+    ///
+    /// Called in the SAME transaction as the placement change that IS the event, so the
+    /// transition and the event commit or vanish together. The placeholder
+    /// `IdentityPub([0; 32])` is a no-op — not a person, the same rule as the accrual sweep.
+    pub fn record_drop_event(
+        &mut self,
+        master: &IdentityPub,
+        kind: DropKind,
+    ) -> Result<(), DbError> {
+        if master.0 == [0u8; 32] {
+            return Ok(());
+        }
+        let mut table = self.txn.open_table(PAIR_LEDGER_PENDING_DROPS)?;
+        let mut pending = match table.get(&master.0)? {
+            Some(v) => decode_pending_drops(master, v.value()),
+            None => PendingDrops::default(),
+        };
+        pending.add(kind);
+        let bytes = to_cbor_bytes(&pending);
+        table.insert(&master.0, bytes.as_slice())?;
+        Ok(())
+    }
+
+    /// Read AND remove the pending drop events of `master` (default when absent) — the
+    /// accrual tick's side of the outbox. Atomic with whatever else this transaction writes
+    /// (the ledger row the events are folded into): dropped without `commit`, the events stay
+    /// queued.
+    pub fn take_pending_drops(&mut self, master: &IdentityPub) -> Result<PendingDrops, DbError> {
+        let mut table = self.txn.open_table(PAIR_LEDGER_PENDING_DROPS)?;
+        let taken = match table.remove(&master.0)? {
+            Some(v) => decode_pending_drops(master, v.value()),
+            None => PendingDrops::default(),
+        };
+        Ok(taken)
+    }
+
+    /// Transactional twin of [`Db::upsert_pair_ledger`] — the accrual tick writes its rows
+    /// in the same transaction that takes the folded events.
+    pub fn upsert_pair_ledger(
+        &mut self,
+        master: &IdentityPub,
+        ledger: &PairLedger,
+    ) -> Result<(), DbError> {
+        let bytes = to_cbor_bytes(ledger);
+        let mut table = self.txn.open_table(PAIR_LEDGER)?;
+        table.insert(&master.0, bytes.as_slice())?;
+        Ok(())
+    }
+
     /// Commit all writes atomically. Updates hot cache after successful commit.
     /// Consumes self: the guard is unusable after this call.
     pub fn commit(self) -> Result<(), DbError> {
@@ -2953,6 +3132,27 @@ impl<'db> DbWriteTxn<'db> {
     }
 }
 
+/// Lenient decode of a [`PendingDrops`] row: anything that does not decode reads as zeros.
+/// The row is only ever taken and folded, never accrued upon, so the worst case is losing the
+/// pending counts of one master; a strict decode would fail the whole accrual tick instead.
+///
+/// Not silent: a row that fails to decode is logged at `error!` with its master (graceful +
+/// `tracing::error`, the project convention), because the events it held are gone.
+fn decode_pending_drops(master: &IdentityPub, bytes: &[u8]) -> PendingDrops {
+    match from_cbor_bytes(bytes) {
+        Ok(pending) => pending,
+        Err(e) => {
+            tracing::error!(
+                target: "viaticum::ledger",
+                master = %master,
+                err = %e,
+                "pair-ledger: undecodable pending-drops row read as zero events (its queued events are lost)"
+            );
+            PendingDrops::default()
+        }
+    }
+}
+
 impl Db {
     /// Open a multi-table write transaction. All writes on the returned guard
     /// are part of a single redb `WriteTransaction`. Call `guard.commit()` to
@@ -3007,6 +3207,9 @@ pub mod testutil {
         Timestamp(n as u64 * crate::constants::SECS_PER_WEEK)
     }
 }
+
+/// DN-1: applied signed letters by signature (`seen_signed_letters` + expiry index).
+mod seen_signed_letters;
 
 #[cfg(test)]
 mod tests;

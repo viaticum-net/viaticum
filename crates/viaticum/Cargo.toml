@@ -37,6 +37,8 @@ bip39 = { workspace = true }
 notify = { workspace = true }
 ignore = { workspace = true }
 libc = { workspace = true }
+# Start-failure classification matches on redb error variants (daemon-i1).
+redb = { workspace = true }
 reqwest = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
@@ -77,6 +79,8 @@ path = "src/bin/mailbox_probe/main.rs"
 required-features = ["e2e-tools"]
 
 [dev-dependencies]
+# Paused clock for tests that cross the ~64 s listen-port handover wait.
+tokio = { workspace = true, features = ["test-util"] }
 viaticum-core = { workspace = true, features = ["testutil"] }
 tempfile = { workspace = true }
 tower = "0.5"

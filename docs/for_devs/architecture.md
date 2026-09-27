@@ -16,7 +16,6 @@
 │   │         (Db, HotCache, 21 redb tables)                          │    │
 │   │                                                                  │    │
 │   ├──► trust    (TrustEngine: P, I, S)                              │    │
-│   ├──► escrow   (EscrowChecker: trust-based budget gate)            │    │
 │   ├──► budget   (BudgetEngine: GB estimate, willingness)            │    │
 │   ├──► placement (SymbolBudgetEngine: weight = trust/√(1-trust))   │    │
 │   ├──► erasure  (ErasureEncoder trait + RaptorQ impl + binding)    │    │
@@ -67,7 +66,6 @@ crates/viaticum-core/src/
   types/          — all shared types and record structs
   db/             — Db newtype + HotCache + CRUD methods for all tables
   trust/          — TrustEngine (P/I/S formula)
-  escrow/         — EscrowChecker (trust-based gate)
   budget/         — BudgetEngine (GB estimate, eviction priority)
   placement/      — SymbolBudgetEngine (weighted allocation)
   erasure/        — ErasureEncoder trait + RaptorQ impl + per-holder binding
@@ -172,19 +170,6 @@ All newtype ID wrappers, record structs, and helper types.
 **Key methods:** `record_pos_outcome`, `recalculate`, `score`.
 
 **Storage:** in-memory HashMap; populated at startup from the `POS_WEEKLY` redb table via `Db`.
-
----
-
-### escrow
-
-`EscrowChecker` — gate for restore requests.
-
-**Formula:** `restore_budget_gb = stored_gb_days / k_factor`
-
-- `k_factor = DEFAULT_ESCROW_K_FACTOR = 7.0` (days of storage required per 1 GB of restore credit)
-- `stored_gb_days` = bytes_we_store_for_peer × days_held (summed across all holding records)
-
-Contribution-based: earn restore credit by storing data for others.
 
 ---
 
@@ -347,7 +332,7 @@ Opening: `Db::open(path)` — pre-open backup (.redb.bak), `DatabaseBuilder` wit
 | `mailbox_entries` | `&[u8; 49]` (target ∥ msg_id ∥ class) | CBOR(`MailboxEntry`) | Stored mailbox entries (postman side) |
 | `mailbox_bytes_by_target` | `&[u8; 32]` (target identity_pub) | `u64` | Per-target mailbox byte accounting (quota) |
 | `ss_blocks` | `&[u8; 32]` (block_id) | `u32` (generation) | Marks which source blocks are SystemState replicas |
-| `restore_served` | `&[u8; 32]` (requester identity_pub) | CBOR(`u64`) | Bytes served per requester (escrow accounting) |
+| `restore_served` | `&[u8; 32]` (requester identity_pub) | CBOR(`u64`) | Bytes served per requester (accounting only; nothing gates restore on it) |
 | `device_trust` | `&[u8; 32]` (device_id) | CBOR(`DeviceTrustRecord`) | Per-device trust |
 | `master_trust` | `&[u8; 32]` (master identity_pub) | CBOR(`MasterTrustRecord`) | Aggregated cluster trust |
 | `device_to_master` | `&[u8; 32]` (device_id) | CBOR(`IdentityPub`) | Device → master identity mapping |
@@ -529,7 +514,7 @@ Incoming request validation: `device_id` must be in the cluster and not revoked.
 **Router methods** (`routing.rs`):
 - `publish(target, entry)` — deposit with the `MAILBOX_WRITE_FANOUT` (30) closest postmen; durable once ≥1 Acks
 - `poll(my_master_pub, since)` — fetch from the `MAILBOX_READ_FANOUT` (300) closest postmen, dedup by msg_id
-- `dr_walk_for_pointer(my_master_pub)` — expanding-batch [100, 300, 1000] search for the freshest signed `SelfPointer` (disaster recovery)
+- `dr_collect_pointers(my_master_pub)` — expanding-batch [100, 300, 1000] collection of every signed `SelfPointer` of the identity, each peer asked once (disaster recovery; the choice between catalog histories is `system_state::catalog::select_catalog`)
 
 **Postman side** (`processor/mailbox`): `handle_mailbox_store` runs the candidate-set `should_store` check then persists (idempotent on duplicate msg_id); `handle_mailbox_fetch` returns entries only to their own target.
 
@@ -582,7 +567,7 @@ DaemonState {
 - `SymbolReject` → update placement, log
 - `SymbolTransfer` → write symbols to disk, update HoldingRecord
 - `SymbolStored` → log confirmation
-- `RestoreRequest` → escrow check → read symbols → RestoreResponse or RestoreDenied
+- `RestoreRequest` → holding lookup by (block, requester master) → read symbols → RestoreResponse (empty if no holding, or the owner asked to delete it)
 - `ClusterSync*` → forwarded to ClusterSyncManager
 - `Delete/CancelDelete` → update HoldingRecord status
 - `StorageWarning/SymbolDropped/SymbolDropNotice` → log, update placements
@@ -787,6 +772,5 @@ process_sync_response():
 | `max_versions` | 5 | Maximum versions per path |
 | `max_version_age` | 90 days | Maximum age of old versions |
 | `parallel_holders` | 5 | Parallel connections during restore |
-| `escrow_k_factor` | 7.0 | `DEFAULT_ESCROW_K_FACTOR` — GB·days required per 1 GB restore credit |
 
 All numeric protocol parameters are defined in `viaticum-core/src/constants.rs`.

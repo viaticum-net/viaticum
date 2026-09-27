@@ -240,15 +240,6 @@ fn all_message_variants_frame_roundtrip() {
             }],
             timestamp: ts,
         }),
-        Message::RestoreDenied(RestoreDeniedMsg {
-            v: 1,
-            source_block_id: sbid,
-            reason: "insufficient trust".to_string(),
-            current_trust: 0.5,
-            needed_trust: 2.0,
-            restore_budget_gb: 11.0,
-            timestamp: ts,
-        }),
     ];
 
     for msg in msgs {
@@ -563,15 +554,6 @@ fn all_message_variants() -> Vec<Message> {
             }],
             timestamp: ts,
         }),
-        Message::RestoreDenied(RestoreDeniedMsg {
-            v: 1,
-            source_block_id: sbid,
-            reason: "insufficient trust".to_string(),
-            current_trust: 0.5,
-            needed_trust: 2.0,
-            restore_budget_gb: 11.0,
-            timestamp: ts,
-        }),
         Message::ClusterSyncRequest(ClusterSyncRequestMsg {
             v: 1,
             from_device_id: DeviceId([0x03u8; 32]),
@@ -634,7 +616,11 @@ fn all_message_variants() -> Vec<Message> {
 #[test]
 fn all_message_variants_cbor_roundtrip_sweep() {
     let variants = all_message_variants();
-    assert_eq!(variants.len(), 26, "expected 26 Message variants");
+    assert_eq!(
+        variants.len(),
+        25,
+        "expected 25 instances: all 24 live Message variants, MailboxStoreResponse twice"
+    );
     for msg in &variants {
         let bytes = to_cbor(msg).expect("to_cbor must not fail");
         let decoded: Message = from_cbor(&bytes).expect("from_cbor must not fail");
@@ -645,7 +631,11 @@ fn all_message_variants_cbor_roundtrip_sweep() {
 #[test]
 fn all_message_variants_frame_unframe_roundtrip_sweep() {
     let variants = all_message_variants();
-    assert_eq!(variants.len(), 26, "expected 26 Message variants");
+    assert_eq!(
+        variants.len(),
+        25,
+        "expected 25 instances: all 24 live Message variants, MailboxStoreResponse twice"
+    );
     for msg in &variants {
         let framed = frame_message(msg).expect("frame_message must not fail");
         let (decoded, consumed) = unframe_message(&framed).expect("unframe_message must not fail");
@@ -831,12 +821,16 @@ fn unknown_message_variant_from_cbor_does_not_close_stream() {
     }
 }
 
-// ─── MSG-12: all 26 message variants have v == 1 (mailbox: v == 2, CROWN-1 C2) ─
+// ─── MSG-12: all 24 live message variants have v == 1 (mailbox: v == 2, CROWN-1 C2) ─
 
 #[test]
 fn all_messages_have_version_one() {
     let variants = all_message_variants();
-    assert_eq!(variants.len(), 26, "expected 26 Message variants");
+    assert_eq!(
+        variants.len(),
+        25,
+        "expected 25 instances: all 24 live Message variants, MailboxStoreResponse twice"
+    );
 
     for msg in &variants {
         let v = match msg {
@@ -857,7 +851,6 @@ fn all_messages_have_version_one() {
             Message::SymbolDropNotice(m) => m.v,
             Message::RestoreRequest(m) => m.v,
             Message::RestoreResponse(m) => m.v,
-            Message::RestoreDenied(m) => m.v,
             Message::ClusterSyncRequest(m) => m.v,
             Message::ClusterSyncResponse(m) => m.v,
             Message::Ack(m) => m.v,
@@ -885,29 +878,6 @@ fn all_messages_have_version_one() {
             std::mem::discriminant(msg)
         );
     }
-}
-
-// ─── MSG-13: RestoreDeniedMsg struct fields exist (compile-time check) ────────
-
-#[test]
-fn restore_denied_msg_fields_exist() {
-    // Compile-time check that RestoreDeniedMsg has the expected fields.
-    // The GAP spec mentions 'required_weeks'/'current_weeks' but those do not exist
-    // in the current protocol. The actual fields are current_trust and needed_trust.
-    // This test documents the actual structure and would fail to compile if the
-    // fields were removed.
-    let msg = RestoreDeniedMsg {
-        v: 1,
-        source_block_id: make_source_block_id(1),
-        reason: "test".to_string(),
-        current_trust: 0.3,
-        needed_trust: 0.7,
-        restore_budget_gb: 10.0,
-        timestamp: Timestamp(1000),
-    };
-    assert_eq!(msg.v, 1);
-    assert!((msg.current_trust - 0.3).abs() < f64::EPSILON);
-    assert!((msg.needed_trust - 0.7).abs() < f64::EPSILON);
 }
 
 // ─── Delete / CancelDelete signature helpers ─────────────────────────────────

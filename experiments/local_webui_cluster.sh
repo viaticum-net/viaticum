@@ -84,17 +84,13 @@ for i in $(seq 0 $((NUM_NODES-1))); do
 done
 wait
 
-# Per-node config: web_api on its own port, low escrow k_factor for instant restore
+# Per-node config: web_api on its own port
 for i in $(seq 0 $((NUM_NODES-1))); do
     port=$(node_port "$i")
     cat > "$(node_dir "$i")/config.toml" <<CFGEOF
 [storage]
 disk_reserve_gb = 0.0
 soft_quota_gb   = 50.0
-
-[escrow]
-# Tiny k_factor so restore credit accrues immediately — this is a demo cluster.
-k_factor = 0.001
 
 [network]
 bootstrap_peers = []

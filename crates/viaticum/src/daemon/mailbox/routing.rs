@@ -10,7 +10,7 @@
 // which is the right source for a mailbox candidate set (not just currently-connected
 // peers — the whole point is to reach peers that have likely seen the target recently).
 //
-// dr_walk_for_pointer: the spec calls for "expanding Kademlia batches [100, 300, 1000]".
+// dr_collect_pointers: the spec calls for "expanding Kademlia batches [100, 300, 1000]".
 // Live Kademlia get_closest_peers is an async DHT walk not readily queryable synchronously.
 // Design choice: use the DB-sourced XOR-ranked list with expanding batch sizes.
 // This is equivalent when the DB is well-populated (post-bootstrap) and degrades
@@ -51,6 +51,19 @@ use viaticum_core::types::{DeviceId, IdentityPub, ewma_contact_observed, from_cb
 
 use crate::daemon::mailbox::candidate::KademliaRoutingView;
 use crate::daemon::network::swarm::{SwarmHandle, device_id_to_peer_id};
+
+// ─── DR collection result ─────────────────────────────────────────────────────
+
+/// What `MailboxRouter::dr_collect_pointers` found.
+#[derive(Debug, Clone)]
+pub struct DrWalk {
+    /// Every distinct (by signature) signature-verified SelfPointer of the identity.
+    pub pointers: Vec<SelfPointer>,
+    /// Peers the walk could ask (0 = no peer known at all).
+    pub candidates: usize,
+    /// Peers that answered the fetch.
+    pub responders: usize,
+}
 
 // ─── Per-request network timeout ─────────────────────────────────────────────
 
@@ -424,25 +437,21 @@ impl MailboxRouter {
         Ok(entries)
     }
 
-    /// DR variant: expanding walk over MAILBOX_DR_WALK_BATCHES until a SelfPointer is found.
+    /// DR: collect EVERY signature-verified SelfPointer of `my_master_pub` from the
+    /// candidate set (CS-DR-1).
     ///
-    /// Walks batches [100, 300, 1000] of closest peers by XOR distance. For each batch,
-    /// sends MailboxFetchRequest to all peers in the batch (not just new ones), collects
-    /// SelfPointer entries, verifies signatures, and returns the freshest valid pointer.
+    /// Candidates are the DB peers ranked by XOR distance to the target (closest first),
+    /// queried in the expanding batches of `MAILBOX_DR_WALK_BATCHES` ([100, 300, 1000]).
+    /// Each peer is asked at most once: batch k sends only to `ranked[prev_len..size]`;
+    /// a batch that adds no new peer ends the walk. There is no early exit on the first
+    /// batch that returned a pointer — a fresher pointer, or another catalog history of
+    /// the same identity, may sit in a later batch. Choosing between the pointers is the
+    /// caller's job (`system_state::catalog::select_catalog`).
     ///
-    /// Stops at the first batch that yields a valid SelfPointer. This matches the spec
-    /// scenario B: "expanding batches [100, 300, 1000] closest peers by XOR".
-    ///
-    // NOTE(T-9): dr_walk_for_pointer sources candidates from db.list_all_peers(). On a
-    // fresh DR node the DB may be near-empty — seed-peer connections alone do NOT reliably
-    // populate it. T-9 must ensure that Kademlia stabilization
-    // (wait_for_kad_bootstrap_stable) has run and PeerAuthenticated events have upserted
-    // peers via upsert_peer before this function is called; otherwise dr_walk finds zero
-    // candidates and DR fails for a fresh-DB node.
-    pub async fn dr_walk_for_pointer(
-        &self,
-        my_master_pub: &IdentityPub,
-    ) -> anyhow::Result<Option<SelfPointer>> {
+    /// Candidates come from `db.list_all_peers()`: on a fresh DR node the caller must
+    /// have run Kademlia stabilization (peers upserted on authentication) first,
+    /// otherwise `candidates == 0`.
+    pub async fn dr_collect_pointers(&self, my_master_pub: &IdentityPub) -> anyhow::Result<DrWalk> {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -452,9 +461,12 @@ impl MailboxRouter {
         // seed-derived rendezvous box); reading our own master box needs no proof.
         let master_box = MailboxAddress::for_master(my_master_pub);
         let ranked = self.build_ranked_candidates(&master_box);
+        let max_batch = MAILBOX_DR_WALK_BATCHES.last().copied().unwrap_or(0);
+        let candidates = ranked.len().min(max_batch);
 
         tracing::info!(
             ranked_candidates = ranked.len(),
+            candidates,
             "dr_walk: candidates built from DB"
         );
 
@@ -465,13 +477,23 @@ impl MailboxRouter {
             target_proof: None,
         };
 
-        for &batch_size in MAILBOX_DR_WALK_BATCHES {
-            let batch: Vec<DeviceId> = ranked.iter().take(batch_size).map(|(d, _)| *d).collect();
+        let mut pointers: Vec<SelfPointer> = Vec::new();
+        let mut seen_sigs: std::collections::HashSet<[u8; 64]> = std::collections::HashSet::new();
+        let mut responders = 0usize;
+        let mut prev_len = 0usize;
 
-            if batch.is_empty() {
-                tracing::info!("dr_walk: batch size {batch_size} — no candidates in DB, stopping");
+        for &batch_size in MAILBOX_DR_WALK_BATCHES {
+            let end = batch_size.min(ranked.len());
+            if end <= prev_len {
+                tracing::info!(
+                    batch_size,
+                    queried = prev_len,
+                    "dr_walk: no new candidates for this batch, walk complete"
+                );
                 break;
             }
+            let batch: Vec<DeviceId> = ranked[prev_len..end].iter().map(|(d, _)| *d).collect();
+            prev_len = end;
 
             tracing::info!(
                 batch_size,
@@ -479,23 +501,19 @@ impl MailboxRouter {
                 "dr_walk: sending fetch to batch"
             );
 
-            // Send fetch to all peers in this batch in parallel.
             let mut handles = Vec::with_capacity(batch.len());
-            for device_id in &batch {
+            for device_id in batch {
                 let sender = Arc::clone(&self.sender);
                 let req_clone = req.clone();
-                let dev = *device_id;
                 handles.push(tokio::spawn(async move {
-                    (dev, sender.send_fetch(dev, req_clone).await)
+                    (device_id, sender.send_fetch(device_id, req_clone).await)
                 }));
             }
-
-            // Collect SelfPointer candidates from this batch.
-            let mut pointer_candidates: Vec<SelfPointer> = Vec::new();
 
             for handle in handles {
                 match handle.await {
                     Ok((device_id, Ok(resp))) => {
+                        responders += 1;
                         tracing::info!(
                             device = %device_id,
                             entries = resp.entries.len(),
@@ -506,16 +524,17 @@ impl MailboxRouter {
                             if entry.class != MailboxClass::SelfPointer {
                                 continue;
                             }
-                            // Deserialize and verify.
                             match from_cbor_bytes::<SelfPointer>(&entry.payload) {
                                 Ok(pointer) => {
-                                    if verify_self_pointer(&pointer, my_master_pub).is_ok() {
-                                        pointer_candidates.push(pointer);
-                                    } else {
+                                    if verify_self_pointer(&pointer, my_master_pub).is_err() {
                                         debug!(
                                             device = %device_id,
                                             "dr_walk: pointer signature verification failed"
                                         );
+                                        continue;
+                                    }
+                                    if seen_sigs.insert(pointer.signature) {
+                                        pointers.push(pointer);
                                     }
                                 }
                                 Err(e) => {
@@ -536,29 +555,19 @@ impl MailboxRouter {
                     }
                 }
             }
-
-            // Select freshest valid pointer (by created_at, generation as tiebreak).
-            if !pointer_candidates.is_empty() {
-                pointer_candidates
-                    .sort_by_key(|p| std::cmp::Reverse((p.created_at.0, p.generation)));
-                let best = pointer_candidates.into_iter().next().unwrap();
-                debug!(
-                    batch_size,
-                    generation = best.generation,
-                    created_at = best.created_at.0,
-                    "dr_walk: found valid SelfPointer — stopping walk"
-                );
-                return Ok(Some(best));
-            }
-
-            debug!(
-                batch_size,
-                "dr_walk: no SelfPointer found in batch — expanding"
-            );
         }
 
-        debug!("dr_walk: exhausted all batches — no SelfPointer found");
-        Ok(None)
+        tracing::info!(
+            candidates,
+            responders,
+            pointers = pointers.len(),
+            "dr_walk: collection complete"
+        );
+        Ok(DrWalk {
+            pointers,
+            candidates,
+            responders,
+        })
     }
 
     // ─── Peer selection ───────────────────────────────────────────────────────

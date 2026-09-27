@@ -48,6 +48,7 @@ pub fn render_status(data: &StatusData) -> String {
         "  repair needed:  {} blocks\n",
         data.blocks_needing_repair
     ));
+    out.push_str(&render_dr_readiness(data));
     let quota_str = if data.effective_quota_bytes == 0 {
         "unlimited".to_string()
     } else {
@@ -102,6 +103,32 @@ pub fn render_status(data: &StatusData) -> String {
     out
 }
 
+/// The DR readiness (dr-i9) and missing-source (dr-i11) lines of `status`.
+pub fn render_dr_readiness(data: &StatusData) -> String {
+    let mut out = String::new();
+    if data.dr_pointer_published_at > 0 {
+        out.push_str(&format!(
+            "  DR:             ready: recovery pointer published {}, {} files, accepted by {} peer(s)\n",
+            crate::daemon::dispatch::unix_secs_to_iso(data.dr_pointer_published_at, true),
+            data.dr_pointer_files,
+            data.dr_pointer_acks
+        ));
+    } else {
+        out.push_str(
+            "  DR:             NOT READY: this node has not published its recovery pointer yet \
+             (first one ~12 h after install)\n",
+        );
+    }
+    if data.files_without_source > 0 {
+        out.push_str(&format!(
+            "  files without local source: {} (not re-protected until they are back at their \
+             original paths)\n",
+            data.files_without_source
+        ));
+    }
+    out
+}
+
 /// Format and print StatusData to stdout.
 pub fn format_status(data: &StatusData) {
     print!("{}", render_status(data));
@@ -144,20 +171,6 @@ pub fn format_restore_blocked(b: &RestoreBlocker) {
                 "  reason: not enough live holders ({have}/{need} symbols, ~{holders_offline} offline)"
             );
             eprintln!("  hint:   wait for offline peers to come back, or trigger repair");
-        }
-        RestoreBlocker::EscrowLocked {
-            budget_gb,
-            needed_gb,
-            est_seconds,
-        } => {
-            eprintln!(
-                "  reason: holders refused via escrow (budget {budget_gb:.2} GB, needed {needed_gb:.2} GB)"
-            );
-            if let Some(s) = est_seconds {
-                eprintln!("  eta:    ~{} sec until budget catches up", s);
-            } else {
-                eprintln!("  hint:   you need to hold data for other peers to earn restore credit");
-            }
         }
         RestoreBlocker::AllHoldersOffline { last_seen_secs_ago } => {
             eprintln!("  reason: all holders offline (last seen {last_seen_secs_ago}s ago)");

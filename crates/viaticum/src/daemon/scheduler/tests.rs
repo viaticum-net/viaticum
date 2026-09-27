@@ -3587,3 +3587,241 @@ fn an_always_on_holders_pos_cycle_fits_the_confirmation_window_at_every_experime
         );
     }
 }
+
+// ─── У-4: the PoS paths record SILENT / PRESUMED drop events (recorder only) ─────
+//
+// Spec pair_ledger.md "Спека У-4" (Д-I, Д-K), intent 4r-i27/i28/i29. The placement
+// transitions are exactly the ones `apply_pos_outcome` produced before (AC-7); these tests
+// check only which of them the ledger's outbox counts. The ledger master is the device's
+// PeerRecord master — `make_peer_record` sets it to `IdentityPub(device.0)`, deliberately
+// different from the device_to_master mapping used to verify responses (Д-M).
+
+/// A holder device with one PeerRecord, the master key it signs PoS responses with, and a
+/// scheduler over `db` sharing `pending`.
+struct PosDropFixture {
+    db: Db,
+    scheduler: Scheduler,
+    pending: PendingChallenges,
+    block: SourceBlockId,
+    holder: DeviceId,
+    holder_key: ed25519_dalek::SigningKey,
+    holder_master: IdentityPub,
+    ledger_master: IdentityPub,
+}
+
+fn pos_drop_fixture(
+    seed: u8,
+    status: PlacementStatus,
+    misses: u32,
+    placed_at: u64,
+) -> PosDropFixture {
+    let db = Db::open_in_memory().expect("db open");
+    let block = make_block_id(seed);
+    let holder = make_identity(seed.wrapping_add(1));
+    db.upsert_source_block(&make_source_block_record(block))
+        .unwrap();
+    let mut placement = make_placement(block, holder);
+    placement.status = status;
+    placement.consecutive_misses = misses;
+    placement.placed_at = Timestamp(placed_at);
+    db.upsert_placement(&placement).unwrap();
+    db.upsert_peer(&make_peer_record(holder)).unwrap();
+    let holder_key = ed25519_dalek::SigningKey::from_bytes(&[seed.wrapping_add(2); 32]);
+    let holder_master = IdentityPub(holder_key.verifying_key().to_bytes());
+    db.set_master_for_device(&holder, &holder_master).unwrap();
+    let pending = make_pending_challenges();
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let scheduler = Scheduler::new(
+        db.clone(),
+        SchedulerConfig::default_production(),
+        repair_tx,
+        pending.clone(),
+        make_test_router(&db),
+        ledger_my_master(),
+        ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        std::env::temp_dir(),
+    );
+    PosDropFixture {
+        db,
+        scheduler,
+        pending,
+        block,
+        holder,
+        holder_key,
+        holder_master,
+        ledger_master: IdentityPub(holder.0),
+    }
+}
+
+impl PosDropFixture {
+    /// Put one challenge in flight, issued at `issued_at`; returns (challenge_id, expected hash).
+    async fn challenge(&self, issued_at: Timestamp, id: u8) -> ([u8; 16], [u8; 32]) {
+        let challenge_id = [id; 16];
+        let expected = viaticum_core::pos::compute_chain_hash(
+            &challenge_id,
+            &[(0, b"u4-drop-symbol".as_slice())],
+        )
+        .unwrap();
+        self.pending.lock().await.insert(
+            (self.block, self.holder),
+            PendingHashChallenge {
+                source_block_id: self.block,
+                holder_id: self.holder,
+                esi_ranges: vec![(0, 1)],
+                expected_chain_hash: expected,
+                issued_at,
+                challenge_id,
+                holder_master: self.holder_master,
+            },
+        );
+        (challenge_id, expected)
+    }
+
+    /// The holder answers the challenge with a WRONG chain hash, correctly signed.
+    async fn answer_wrong(&self, challenge_id: [u8; 16]) {
+        let response = viaticum_core::messages::build_pos_hash_response(
+            challenge_id,
+            self.block,
+            [0xFF; 32],
+            Timestamp::now(),
+            Some(self.holder),
+            &self.holder_key,
+        );
+        self.scheduler
+            .handle_pos_response_from_mailbox(response)
+            .await
+            .expect("the response resolves");
+    }
+
+    fn placement(&self) -> SymbolPlacement {
+        self.db
+            .get_placement(&self.block, &self.holder)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn pending_drops(&self) -> viaticum_core::types::PendingDrops {
+        let all = self.db.list_pending_drops().unwrap();
+        assert!(
+            all.iter().all(|(m, _)| *m == self.ledger_master),
+            "events only ever under the PeerRecord master: {all:?}"
+        );
+        all.first().map(|(_, p)| *p).unwrap_or_default()
+    }
+}
+
+#[tokio::test]
+async fn a_wrong_hash_response_records_one_silent_event() {
+    // DS-1 (4r-i27). The holder answered — with corrupted bytes. Alive → Lost, one Silent.
+    let f = pos_drop_fixture(0x81, PlacementStatus::Alive, 0, 0);
+    let (id, _) = f.challenge(Timestamp::now(), 0x81).await;
+
+    f.answer_wrong(id).await;
+
+    assert_eq!(f.placement().status, PlacementStatus::Lost);
+    assert_eq!(
+        f.pending_drops(),
+        viaticum_core::types::PendingDrops {
+            silent: 1,
+            ..Default::default()
+        }
+    );
+}
+
+#[tokio::test]
+async fn the_timeout_reaching_presumed_lost_records_one_presumed_event_and_later_timeouts_none() {
+    // DS-2 (4r-i28). Four missed challenges in a row: Uncertain, Uncertain, PresumedLost,
+    // PresumedLost. Only the third — the one that reaches PresumedLost — is an event.
+    let f = pos_drop_fixture(0x83, PlacementStatus::Alive, 0, 0);
+    let mut seen = Vec::new();
+    for round in 0..4u8 {
+        // Ancient but after placed_at = 0: every timeout is evidence of THIS episode.
+        f.challenge(Timestamp(1 + round as u64), 0x90 + round).await;
+        f.scheduler.check_timeouts().await.unwrap();
+        let p = f.placement();
+        seen.push((p.status, p.consecutive_misses, f.pending_drops().presumed));
+    }
+
+    assert_eq!(
+        seen,
+        vec![
+            (PlacementStatus::Uncertain, 1, 0),
+            (PlacementStatus::Uncertain, 2, 0),
+            (PlacementStatus::PresumedLost, 3, 1),
+            (PlacementStatus::PresumedLost, 4, 1),
+        ]
+    );
+    assert_eq!(
+        (f.pending_drops().announced, f.pending_drops().silent),
+        (0, 0)
+    );
+}
+
+#[tokio::test]
+async fn a_single_timeout_to_uncertain_records_nothing() {
+    // DS-3 (4r-i28). "A single timeout does not burn": Alive → Uncertain is not a loss.
+    let f = pos_drop_fixture(0x85, PlacementStatus::Alive, 0, 0);
+    f.challenge(Timestamp(1), 0x85).await;
+
+    f.scheduler.check_timeouts().await.unwrap();
+
+    assert_eq!(f.placement().status, PlacementStatus::Uncertain);
+    assert!(f.db.list_pending_drops().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_fail_after_presumed_lost_records_nothing_more() {
+    // DS-4 (4r-i29). The loss was already recognised as Presumed; a late wrong-hash answer is
+    // the same loss (the first kind recognised wins).
+    let f = pos_drop_fixture(0x87, PlacementStatus::PresumedLost, 3, 0);
+    let (id, _) = f.challenge(Timestamp::now(), 0x87).await;
+
+    f.answer_wrong(id).await;
+
+    assert_eq!(f.placement().status, PlacementStatus::Lost, "premise");
+    assert!(f.db.list_pending_drops().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_timeout_of_a_challenge_issued_before_the_placement_was_replaced_is_not_counted() {
+    // DS-5 (4r-i29, Ф-3). The challenge was issued at 500 against the previous episode;
+    // repair re-placed the block at 1000. Its timeout still moves the status (existing
+    // behaviour, AC-7) but is not evidence about the new episode.
+    let f = pos_drop_fixture(0x89, PlacementStatus::Uncertain, 2, 1_000);
+    f.challenge(Timestamp(500), 0x89).await;
+
+    f.scheduler.check_timeouts().await.unwrap();
+
+    assert_eq!(
+        f.placement().status,
+        PlacementStatus::PresumedLost,
+        "premise"
+    );
+    assert!(f.db.list_pending_drops().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn accrue_pair_ledgers_folds_events_recorded_by_the_pos_paths() {
+    // DS-6 (AC-4f). End to end inside the daemon: the event the PoS path queued is folded by
+    // the scheduler's own accrual tick into the row of the PeerRecord master.
+    let f = pos_drop_fixture(0x8B, PlacementStatus::Alive, 0, 0);
+    let (id, _) = f.challenge(Timestamp::now(), 0x8B).await;
+    f.answer_wrong(id).await;
+    let t0 = Timestamp::now().0;
+
+    f.scheduler.accrue_pair_ledgers(Timestamp(t0)).unwrap(); // seeds; the queue waits
+    let report = f
+        .scheduler
+        .accrue_pair_ledgers_report(Timestamp(t0 + LEDGER_TICK))
+        .unwrap();
+
+    let row = f.db.get_pair_ledger(&f.ledger_master).unwrap().unwrap();
+    assert_eq!(row.drop_silent, 1.0);
+    assert_eq!((row.drop_ann, row.drop_presumed), (0.0, 0.0));
+    assert_eq!(report.rows[0].silent_events, 1);
+    assert_eq!(report.stats.drop_events_folded, 1);
+    assert!(f.db.list_pending_drops().unwrap().is_empty());
+}

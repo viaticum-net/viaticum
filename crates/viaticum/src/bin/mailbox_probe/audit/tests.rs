@@ -3,6 +3,7 @@
 use sha2::{Digest, Sha256};
 use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
 use viaticum_core::messages::SymbolDropNoticeBatchMsg;
+use viaticum_core::system_state::catalog::{CatalogLineageId, CatalogSummary};
 use viaticum_core::system_state::{BlockRef, HolderHint, sign_self_pointer};
 use viaticum_core::types::{
     DeviceId, IdentityPub, SourceBlockId, Timestamp, hex_encode, to_cbor_bytes,
@@ -44,6 +45,11 @@ fn plaintext_pointer(holder: DeviceId) -> (Vec<u8>, ed25519_dalek::SigningKey) {
         },
         vec![],
         Timestamp(5),
+        CatalogSummary {
+            lineage: CatalogLineageId([0xB2; 16]),
+            publisher: DeviceId([0xD0; 32]),
+            files: 1,
+        },
     );
     (to_cbor_bytes(&pointer), key)
 }

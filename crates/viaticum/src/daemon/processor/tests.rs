@@ -178,9 +178,7 @@ async fn make_processor_with_quota(
         holdings_dir.path().to_path_buf(), // data_dir (for disk space queries in tests)
         0,                                 // disk_reserve_bytes (no reserve in tests)
         backup_event_tx,
-        1,    // time_scale
         None, // cluster_state: not needed for handler unit tests
-        viaticum_core::config::EscrowCfg::default(),
         accepted_offers,
         ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     )
@@ -269,9 +267,7 @@ async fn symbol_accept_updates_backup_event() {
         holdings_dir.path().to_path_buf(),
         0,
         backup_event_tx,
-        1,
         None, // cluster_state: not needed for handler unit tests
-        viaticum_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
         ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     );
@@ -837,14 +833,14 @@ async fn restore_request_returns_held_symbols() {
         std::fs::write(block_dir.join(format!("{esi}.bin")), vec![esi as u8; 32]).unwrap();
     }
 
-    // Upsert HoldingRecord with received_at 30 days ago so escrow sees non-zero contribution.
+    // Upsert an Active HoldingRecord for the owner.
     let thirty_days_ago = Timestamp(Timestamp::now().0.saturating_sub(30 * 86_400));
     db.upsert_holding(&HoldingRecord {
         source_block_id: block_id,
         owner_id: owner,
         esi_ranges: vec![(0, 3)],
         importance: 0.5,
-        total_bytes: 1_073_741_824, // 1 GB so budget = 1*30/7 ≈ 4.3 GB
+        total_bytes: 1_073_741_824,
         status: HoldingStatus::Active,
         received_at: thirty_days_ago,
         delete_requested_at: None,
@@ -885,14 +881,14 @@ async fn restore_request_filters_by_esi_list() {
         std::fs::write(block_dir.join(format!("{esi}.bin")), vec![esi as u8; 32]).unwrap();
     }
 
-    // received_at 30 days ago so escrow sees non-zero contribution.
+    // Active HoldingRecord for the owner.
     let thirty_days_ago = Timestamp(Timestamp::now().0.saturating_sub(30 * 86_400));
     db.upsert_holding(&HoldingRecord {
         source_block_id: block_id,
         owner_id: owner,
         esi_ranges: vec![(0, 5)],
         importance: 0.5,
-        total_bytes: 1_073_741_824, // 1 GB so budget = 1*30/7 ≈ 4.3 GB
+        total_bytes: 1_073_741_824,
         status: HoldingStatus::Active,
         received_at: thirty_days_ago,
         delete_requested_at: None,
@@ -916,6 +912,198 @@ async fn restore_request_filters_by_esi_list() {
     let esis: Vec<u32> = response.symbols.iter().map(|s| s.esi).collect();
     assert!(esis.contains(&1), "missing ESI 1");
     assert!(esis.contains(&3), "missing ESI 3");
+}
+
+/// Write `count` symbol files for `block_id` and an Active holding for `owner`
+/// received at `received_at` with `total_bytes` (the old escrow gate's inputs).
+fn put_holding_with_symbols(
+    db: &Db,
+    holdings_dir: &TempDir,
+    owner: IdentityPub,
+    block_id: SourceBlockId,
+    count: u32,
+    total_bytes: u64,
+    received_at: Timestamp,
+) {
+    let block_hex: String = block_id.0.iter().map(|b| format!("{b:02x}")).collect();
+    let block_dir = holdings_dir.path().join(&block_hex);
+    std::fs::create_dir_all(&block_dir).unwrap();
+    for esi in 0..count {
+        std::fs::write(block_dir.join(format!("{esi}.bin")), vec![esi as u8; 32]).unwrap();
+    }
+    db.upsert_holding(&HoldingRecord {
+        source_block_id: block_id,
+        owner_id: owner,
+        esi_ranges: vec![(0, count)],
+        importance: 0.5,
+        total_bytes,
+        status: HoldingStatus::Active,
+        received_at,
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    })
+    .unwrap();
+}
+
+fn restore_all(block_id: SourceBlockId) -> RestoreRequestMsg {
+    RestoreRequestMsg {
+        v: 1,
+        source_block_id: block_id,
+        esi_list: vec![],
+        timestamp: Timestamp::now(),
+    }
+}
+
+/// restore-i6: a holding placed this very second (zero GB·days of contribution — the old
+/// escrow gate's budget was exactly 0) is served in full to its owner.
+#[tokio::test]
+async fn restore_request_serves_owner_right_after_placement() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let processor = make_processor(db.clone(), &holdings_dir).await;
+    let owner = make_identity(21);
+    let block_id = make_block_id(21);
+    put_holding_with_symbols(
+        &db,
+        &holdings_dir,
+        owner,
+        block_id,
+        4,
+        16 * 1_073_741_824,
+        Timestamp::now(),
+    );
+
+    let response = processor
+        .handle_restore_request_inner(owner, restore_all(block_id))
+        .await
+        .expect("fresh holding must be served, not refused");
+
+    assert_eq!(response.symbols.len(), 4);
+}
+
+/// restore-i5/i6: repeats are not refused even when the served-bytes counter already exceeds
+/// anything the holding could have "earned"; the counter keeps growing (accounting only).
+#[tokio::test]
+async fn restore_request_repeats_are_served_and_only_counted() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let processor = make_processor(db.clone(), &holdings_dir).await;
+    let owner = make_identity(22);
+    let block_id = make_block_id(22);
+    put_holding_with_symbols(
+        &db,
+        &holdings_dir,
+        owner,
+        block_id,
+        3,
+        1_073_741_824,
+        Timestamp::now(),
+    );
+    db.record_restore_served(&owner, 1u64 << 50).unwrap();
+
+    for attempt in 1..=3u64 {
+        let response = processor
+            .handle_restore_request_inner(owner, restore_all(block_id))
+            .await
+            .expect("repeat must be served");
+        assert_eq!(response.symbols.len(), 3, "attempt {attempt}");
+        assert_eq!(
+            db.restored_total_bytes(&owner).unwrap(),
+            (1u64 << 50) + attempt * 3 * 32,
+            "attempt {attempt}: served bytes are counted"
+        );
+    }
+}
+
+/// restore-i7: removing the gate must not open the holding to another master — the lookup
+/// is by (block, requester master), a foreign master gets an empty response.
+#[tokio::test]
+async fn restore_request_from_foreign_master_is_empty() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let processor = make_processor(db.clone(), &holdings_dir).await;
+    let owner = make_identity(23);
+    let stranger = make_identity(24);
+    let block_id = make_block_id(23);
+    put_holding_with_symbols(
+        &db,
+        &holdings_dir,
+        owner,
+        block_id,
+        3,
+        1_073_741_824,
+        Timestamp::now(),
+    );
+
+    let response = processor
+        .handle_restore_request_inner(stranger, restore_all(block_id))
+        .await
+        .unwrap();
+
+    assert!(response.symbols.is_empty());
+    assert_eq!(db.restored_total_bytes(&stranger).unwrap(), 0);
+    assert_eq!(db.restored_total_bytes(&owner).unwrap(), 0);
+}
+
+fn set_holding_status(db: &Db, owner: IdentityPub, block_id: SourceBlockId, status: HoldingStatus) {
+    let mut h = db.get_holding(&block_id, &owner).unwrap().unwrap();
+    h.status = status;
+    db.upsert_holding(&h).unwrap();
+}
+
+/// restore-i16: a Silent holding (no PoS, owner quiet) is still the owner's data and is
+/// served to the owner.
+#[tokio::test]
+async fn restore_request_serves_silent_holding_to_owner() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let processor = make_processor(db.clone(), &holdings_dir).await;
+    let owner = make_identity(25);
+    let block_id = make_block_id(25);
+    put_holding_with_symbols(
+        &db,
+        &holdings_dir,
+        owner,
+        block_id,
+        3,
+        1024,
+        Timestamp::now(),
+    );
+    set_holding_status(&db, owner, block_id, HoldingStatus::Silent);
+
+    let response = processor
+        .handle_restore_request_inner(owner, restore_all(block_id))
+        .await
+        .unwrap();
+
+    assert_eq!(response.symbols.len(), 3, "Silent holding must be served");
+}
+
+/// restore-i16 boundary: what the owner itself asked to delete is not served.
+#[tokio::test]
+async fn restore_request_for_holding_marked_for_delete_is_empty() {
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let processor = make_processor(db.clone(), &holdings_dir).await;
+    let owner = make_identity(26);
+    let block_id = make_block_id(26);
+    put_holding_with_symbols(
+        &db,
+        &holdings_dir,
+        owner,
+        block_id,
+        3,
+        1024,
+        Timestamp::now(),
+    );
+    set_holding_status(&db, owner, block_id, HoldingStatus::MarkedForDelete);
+
+    let response = processor
+        .handle_restore_request_inner(owner, restore_all(block_id))
+        .await
+        .unwrap();
+
+    assert!(response.symbols.is_empty());
 }
 
 // ─── handle_peer_announce ────────────────────────────────────────────────────
@@ -1896,9 +2084,7 @@ async fn make_processor_with_cluster_state(
         holdings_dir.path().to_path_buf(),
         0,
         backup_event_tx,
-        1,
         Some(cluster_state.clone()),
-        viaticum_core::config::EscrowCfg::default(),
         super::make_empty_accepted_offers(),
         ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
     );
@@ -4147,3 +4333,303 @@ async fn on_peer_identified_persists_addrs_for_inbound_peer() {
         "on_peer_identified must persist listen_addrs to the PeerRecord"
     );
 }
+
+// ─── У-4: DropNotice → the 4R pair ledger's ANNOUNCED drop events ───────────────
+//
+// Spec pair_ledger.md "Спека У-4" (Д-I, Д-K, Д-M), intent 4r-i25/i26/i29/i34. The event
+// is the TRANSITION of a held placement into Lost, recorded in the transition's own
+// transaction; what `SymbolDropHandler::apply` does to the placement is unchanged (AC-7).
+// These tests live here and not in `mailbox/poll/tests.rs` (line B's file, review N-5).
+
+/// A holder master with one device holding one Alive block of ours since `placed_at`.
+/// `DEVICE_TO_MASTER` maps the device to the SIGNING master (that is how `apply` finds the
+/// placement); the `PeerRecord` carries `ledger_master` (how the ledger keys the event, Д-M).
+struct DropFixture {
+    db: Db,
+    key: ed25519_dalek::SigningKey,
+    signer: IdentityPub,
+    ledger_master: IdentityPub,
+    device: DeviceId,
+    block: SourceBlockId,
+    placed_at: Timestamp,
+}
+
+fn drop_fixture(
+    seed: u8,
+    status: PlacementStatus,
+    ledger_master: Option<IdentityPub>,
+) -> DropFixture {
+    let db = Db::open_in_memory().unwrap();
+    let key = make_signing_key(seed);
+    let signer = master_identity(&key);
+    let ledger_master = ledger_master.unwrap_or(signer);
+    let device = make_device_id(seed);
+    let block = make_block_id(seed.wrapping_add(1));
+    let placed_at = Timestamp(Timestamp::now().0 - 3600);
+    register_holder(&db, signer, device);
+    let mut peer = make_peer_record(device);
+    peer.master_identity = ledger_master;
+    db.upsert_peer(&peer).unwrap();
+    db.upsert_source_block(&make_source_block(block)).unwrap();
+    let mut placement = make_symbol_placement(block, device, vec![(0, 10)], status);
+    placement.placed_at = placed_at;
+    db.upsert_placement(&placement).unwrap();
+    DropFixture {
+        db,
+        key,
+        signer,
+        ledger_master,
+        device,
+        block,
+        placed_at,
+    }
+}
+
+impl DropFixture {
+    /// A notice signed by the holder, stamped `timestamp`, with `deadline`.
+    fn notice(&self, deadline: Timestamp, timestamp: Timestamp) -> SymbolDropNoticeMsg {
+        build_signed_symbol_drop_notice(self.block, vec![(0, 10)], deadline, timestamp, &self.key)
+    }
+    /// An immediate notice ("dropped now") issued `after` seconds after the placement.
+    fn fresh_notice(&self, after: u64) -> SymbolDropNoticeMsg {
+        let ts = Timestamp(self.placed_at.0 + after);
+        self.notice(ts, ts)
+    }
+    fn apply(&self, notice: SymbolDropNoticeMsg) -> bool {
+        super::SymbolDropHandler::new(self.db.clone()).apply(self.signer, notice)
+    }
+    fn pending(&self) -> Vec<(IdentityPub, viaticum_core::types::PendingDrops)> {
+        self.db.list_pending_drops().unwrap()
+    }
+    fn announced_for(&self, m: IdentityPub) -> u32 {
+        self.pending()
+            .into_iter()
+            .find(|(k, _)| *k == m)
+            .map(|(_, p)| p.announced)
+            .unwrap_or(0)
+    }
+    fn status(&self) -> PlacementStatus {
+        self.db
+            .get_placement(&self.block, &self.device)
+            .unwrap()
+            .unwrap()
+            .status
+    }
+}
+
+#[tokio::test]
+async fn a_drop_notice_for_an_alive_placement_records_one_announced_event() {
+    // DP-1 (4r-i25). The placement moves Alive → Lost and, in the same transaction, the
+    // holder master's outbox gets exactly one Announced.
+    let f = drop_fixture(0x31, PlacementStatus::Alive, None);
+
+    assert!(f.apply(f.fresh_notice(10)));
+
+    assert_eq!(f.status(), PlacementStatus::Lost);
+    assert_eq!(
+        f.pending(),
+        vec![(
+            f.ledger_master,
+            viaticum_core::types::PendingDrops {
+                announced: 1,
+                ..Default::default()
+            }
+        )],
+        "one Announced, nothing else"
+    );
+}
+
+#[tokio::test]
+async fn redelivering_the_same_drop_notice_records_nothing_more() {
+    // DP-2 (4r-i25). The mailbox hands the same entry out on every poll for its whole TTL;
+    // the second delivery finds the placement already Lost.
+    let f = drop_fixture(0x33, PlacementStatus::Alive, None);
+    let notice = f.fresh_notice(10);
+
+    f.apply(notice.clone());
+    f.apply(notice.clone());
+    f.apply(notice);
+
+    assert_eq!(f.announced_for(f.ledger_master), 1);
+}
+
+#[tokio::test]
+async fn a_republished_notice_with_a_new_deadline_records_nothing_more() {
+    // DP-3 (4r-i25, WARN-7). Disk pressure republishes the advance notice with a NEW
+    // deadline and timestamp on every tick — a (holder, block, deadline) key would not
+    // collapse it; the transition does.
+    let f = drop_fixture(0x35, PlacementStatus::Alive, None);
+    let t = f.placed_at.0;
+
+    f.apply(f.notice(Timestamp(t + 7 * 86_400), Timestamp(t + 10)));
+    f.apply(f.notice(Timestamp(t + 8 * 86_400), Timestamp(t + 20)));
+    f.apply(f.notice(Timestamp(t + 9 * 86_400), Timestamp(t + 30)));
+
+    assert_eq!(f.announced_for(f.ledger_master), 1);
+}
+
+#[tokio::test]
+async fn the_final_immediate_notice_after_an_advance_notice_records_nothing_more() {
+    // DP-4 (4r-i25). Advance notice (deadline in a week), then the final "dropped now"
+    // (deadline = timestamp) once the window ran out: one loss, one event.
+    let f = drop_fixture(0x37, PlacementStatus::Alive, None);
+    let t = f.placed_at.0;
+
+    f.apply(f.notice(Timestamp(t + 7 * 86_400), Timestamp(t + 10)));
+    f.apply(f.notice(
+        Timestamp(t + 7 * 86_400 + 10),
+        Timestamp(t + 7 * 86_400 + 10),
+    ));
+
+    assert_eq!(f.status(), PlacementStatus::Lost);
+    assert_eq!(f.announced_for(f.ledger_master), 1);
+}
+
+#[tokio::test]
+async fn a_notice_for_a_deleting_or_missing_placement_records_nothing() {
+    // DP-5 (4r-i26). Our own deletion: the placement is Deleting (or already cleaned up)
+    // long before the holder's final notice arrives. Not the friend's drop.
+    let deleting = drop_fixture(0x39, PlacementStatus::Deleting, None);
+    deleting.apply(deleting.fresh_notice(10));
+    assert_eq!(
+        deleting.status(),
+        PlacementStatus::Deleting,
+        "premise: untouched"
+    );
+    assert!(deleting.pending().is_empty());
+
+    let missing = drop_fixture(0x3B, PlacementStatus::Alive, None);
+    missing
+        .db
+        .write_txn()
+        .and_then(|mut t| {
+            t.delete_placement(&missing.block, &missing.device)?;
+            t.commit()
+        })
+        .unwrap();
+    assert!(!missing.apply(missing.fresh_notice(10)));
+    assert!(missing.pending().is_empty());
+}
+
+#[tokio::test]
+async fn a_notice_not_younger_than_the_current_placement_is_not_counted_but_still_marks_it_lost() {
+    // DP-6 (4r-i29). The FIRST delivery of an old notice after repair put the block back on
+    // the same holder: the transition still happens (existing behaviour, AC-7; DN-1 Д-DN1-2 —
+    // time is not part of the rule), but the evidence predates the episode — in the same second
+    // too (review of intent BLOCK-1: at time_scale 100 000 the loss, the repair and the new
+    // Alive fit in one second). Re-deliveries of the same notice are deduplicated (DN-1, see
+    // `tests/drop_notice_dedup.rs`).
+    for (label, before) in [("older", 5u64), ("same second", 0u64)] {
+        let f = drop_fixture(0x3D, PlacementStatus::Alive, None);
+        let ts = Timestamp(f.placed_at.0 - before);
+
+        assert!(f.apply(f.notice(ts, ts)), "{label}: the signature passes");
+
+        assert_eq!(
+            f.status(),
+            PlacementStatus::Lost,
+            "{label}: the first delivery of an old notice still marks it Lost; re-deliveries are deduplicated (DN-1)"
+        );
+        assert!(f.pending().is_empty(), "{label}: but it is not a new drop");
+    }
+}
+
+#[tokio::test]
+async fn a_notice_after_presumed_lost_is_not_counted_again() {
+    // DP-7 (4r-i29). Three missed challenges already recorded the loss as Presumed; the
+    // holder's notice arriving afterwards is the same loss.
+    let f = drop_fixture(0x3F, PlacementStatus::PresumedLost, None);
+
+    f.apply(f.fresh_notice(10));
+
+    assert_eq!(
+        f.status(),
+        PlacementStatus::Lost,
+        "premise: the transition happens"
+    );
+    assert!(f.pending().is_empty());
+}
+
+#[tokio::test]
+async fn a_forged_or_foreign_master_notice_records_nothing() {
+    // DP-8 (4r-i26). A notice not signed by the claimed holder, and a correctly signed
+    // notice from a master that holds no placement of the block: no transition, no event.
+    let f = drop_fixture(0x41, PlacementStatus::Alive, None);
+    let attacker = make_signing_key(0x42);
+    let ts = Timestamp(f.placed_at.0 + 10);
+    let forged = build_signed_symbol_drop_notice(f.block, vec![(0, 10)], ts, ts, &attacker);
+    assert!(!f.apply(forged));
+    assert_eq!(f.status(), PlacementStatus::Alive);
+
+    let stranger_key = make_signing_key(0x43);
+    let stranger = master_identity(&stranger_key);
+    register_holder(&f.db, stranger, make_device_id(0x43));
+    let foreign = build_signed_symbol_drop_notice(f.block, vec![(0, 10)], ts, ts, &stranger_key);
+    assert!(
+        !super::SymbolDropHandler::new(f.db.clone()).apply(stranger, foreign),
+        "the stranger holds no placement of this block"
+    );
+
+    assert_eq!(f.status(), PlacementStatus::Alive);
+    assert!(f.pending().is_empty());
+}
+
+#[tokio::test]
+async fn the_announced_event_is_keyed_by_the_peer_record_master() {
+    // DP-9 (Д-M, AC-4h). `apply` finds the device through device_to_master (the signer),
+    // but the ledger keys the event by the device's PeerRecord master — the key the accrual
+    // sweep groups by, carried through DR (device_to_master is not).
+    let peer_master = make_identity(0x46);
+    let f = drop_fixture(0x45, PlacementStatus::Alive, Some(peer_master));
+    assert_ne!(f.signer, peer_master, "premise: the two sources disagree");
+
+    f.apply(f.fresh_notice(10));
+
+    assert_eq!(f.announced_for(peer_master), 1);
+    assert_eq!(f.announced_for(f.signer), 0);
+}
+
+#[tokio::test]
+async fn a_notice_inside_the_owners_delete_cooldown_is_still_the_friends_drop() {
+    // DP-10 (4r-i34). I deleted the file locally, but the owner cooldown has not run out, so
+    // no Delete went to the holder and its placement is still Alive. The friend dropping
+    // the block now is the friend's drop.
+    let f = drop_fixture(0x47, PlacementStatus::Alive, None);
+    let now = Timestamp::now();
+    let file = viaticum_core::types::FileRecord {
+        file_id: FileId(1),
+        path: "/watch/deleted.txt".to_string(),
+        importance: 0.5,
+        devices: vec![(
+            make_device_id(0x01),
+            viaticum_core::types::LocalState::Deleted(now),
+        )],
+        versions: vec![viaticum_core::types::FileVersion {
+            content_hash: [0x48; 32],
+            source_block_id: f.block,
+            k: 10,
+            t: 1,
+            created_at: Timestamp(0),
+            backed_up_at: Some(Timestamp(0)),
+        }],
+        first_seen: Timestamp(0),
+    };
+    let actions = viaticum_core::deletion::DeletionEngine::new().process_cooldowns(
+        &[file],
+        &f.db.list_all_source_blocks().unwrap(),
+        &f.db.list_all_placements().unwrap(),
+        now,
+        1,
+    );
+    assert!(
+        actions.is_empty(),
+        "premise: inside the owner cooldown no Delete is sent, got {actions:?}"
+    );
+
+    f.apply(f.fresh_notice(10));
+
+    assert_eq!(f.announced_for(f.ledger_master), 1);
+}
+
+// DN-1: one notice — one application (spec f1_stale_drop_notice.md, DN1-1..DN1-18).
+mod drop_notice_dedup;

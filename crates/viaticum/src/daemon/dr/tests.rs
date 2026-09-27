@@ -1,291 +1,234 @@
-// Tests for DR module.
+// Tests for the DR orchestration: SS blob round-trip, the Kademlia lookup key (F12),
+// and the stop-signal guard of the network phase (dr-i23).
 //
-// Unit tests: select_freshest_valid_pointer logic + wait_for_kad_bootstrap_stable
-// seam tests (multi-swarm auth counting + DB upsert, timeout/best-effort).
-//
-// Full happy-path run_dr is NOT cargo-testable (no in-process multi-node DR
-// harness) — covered by local_dr_test.sh E2E test instead.
+// The full happy path of run_dr needs a network of daemons with a published pointer:
+// covered by experiments/local_dr_test.sh.
 
-use std::time::Duration;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use crate::daemon::system_state::{
     SYSTEM_STATE_VERSION, decrypt_and_restore, snapshot_and_encrypt,
 };
-use viaticum_core::cluster::{derive_master_key, master_identity};
-use viaticum_core::system_state::{BlockRef, sign_self_pointer};
-use viaticum_core::types::{SourceBlockId, Timestamp, to_cbor_bytes};
+use viaticum_core::mailbox::MailboxAddress;
+use viaticum_core::types::IdentityPub;
 
-use super::select_freshest_valid_pointer;
+use super::preflight::preflight;
+use super::{DrError, dr_lookup_key, guarded_network_phase};
 
-fn pointer_blob(master: &ed25519_dalek::SigningKey, generation: u32, created_at: u64) -> Vec<u8> {
-    let base = BlockRef {
-        block_id: SourceBlockId([generation as u8; 32]),
-        holders: vec![],
-        encrypted_size: 128,
-    };
-    let p = sign_self_pointer(master, generation, base, vec![], Timestamp(created_at));
-    to_cbor_bytes(&p)
-}
+const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                      abandon abandon abandon abandon abandon abandon abandon abandon \
+                      abandon abandon abandon abandon abandon abandon abandon art";
 
 #[test]
 fn dr_decrypt_and_restore_roundtrip() {
     let db1 = viaticum_core::db::Db::open_in_memory().unwrap();
     let seed = [42u8; 64];
     let blob = snapshot_and_encrypt(&db1, &seed).unwrap();
-
     let db2 = viaticum_core::db::Db::open_in_memory().unwrap();
     let state = decrypt_and_restore(&db2, &blob, &seed).unwrap();
-
     assert_eq!(state.version, SYSTEM_STATE_VERSION);
 }
 
 #[test]
 fn dr_fails_on_empty_blob() {
     let db = viaticum_core::db::Db::open_in_memory().unwrap();
-    let seed = [42u8; 64];
-    assert!(
-        decrypt_and_restore(&db, &[], &seed).is_err(),
-        "decryption of empty blob must fail"
-    );
+    assert!(decrypt_and_restore(&db, &[], &[42u8; 64]).is_err());
 }
 
 #[test]
 fn dr_fails_on_wrong_seed() {
     let db1 = viaticum_core::db::Db::open_in_memory().unwrap();
-    let seed = [42u8; 64];
-    let blob = snapshot_and_encrypt(&db1, &seed).unwrap();
-
+    let blob = snapshot_and_encrypt(&db1, &[42u8; 64]).unwrap();
     let db2 = viaticum_core::db::Db::open_in_memory().unwrap();
-    let wrong_seed = [99u8; 64];
-    assert!(
-        decrypt_and_restore(&db2, &blob, &wrong_seed).is_err(),
-        "decryption with wrong seed must fail"
+    assert!(decrypt_and_restore(&db2, &blob, &[99u8; 64]).is_err());
+}
+
+// ─── F12: the Kademlia lookup key is the preimage ─────────────────────────────
+
+/// libp2p-kad hashes the key given to `get_closest_peers` (`kbucket::Key::new` =
+/// SHA256 of the preimage). Postmen are ranked by `SHA256(master_pub)`
+/// (`KademliaRoutingView::target_key`). So DR must pass `master_pub` itself: libp2p's
+/// hash of `dr_lookup_key(m)` must land exactly on the postmen's key. The mutation
+/// "pass target_key (double hash)" makes the assertions fail.
+#[test]
+fn dr_kad_lookup_key_is_address_preimage() {
+    use crate::daemon::mailbox::candidate::KademliaRoutingView;
+    let m = MailboxAddress::for_master(&IdentityPub([0x5cu8; 32]));
+    let key = dr_lookup_key(&m);
+    let libp2p_key = libp2p::kad::KBucketKey::new(key.clone());
+    assert_eq!(
+        libp2p_key.hashed_bytes(),
+        KademliaRoutingView::target_key(&m).as_slice(),
+        "libp2p's hash of the lookup key must be where the postmen are ranked"
     );
+    assert_eq!(key, m.0.to_vec(), "DR passes the preimage");
 }
 
-#[test]
-fn select_pointer_picks_freshest_created_at() {
-    let master = derive_master_key(&[5u8; 32]).unwrap();
-    let id = master_identity(&master);
-    let blobs: Vec<(u64, Vec<u8>)> = vec![
-        (1000, pointer_blob(&master, 1, 1000)),
-        (3000, pointer_blob(&master, 2, 3000)), // freshest by created_at
-        (2000, pointer_blob(&master, 3, 2000)),
-    ];
-    let picked = select_freshest_valid_pointer(&blobs, &id).expect("a valid pointer exists");
-    assert_eq!(picked.created_at, Timestamp(3000));
-    assert_eq!(picked.generation, 2);
+// ─── dr-i23: stop signal during the network phase ─────────────────────────────
+
+/// A network phase that never ends, holding the staging DB open like the real one.
+struct HangingWork {
+    _db: viaticum_core::db::Db,
 }
 
-#[test]
-fn select_pointer_generation_breaks_created_at_tie() {
-    let master = derive_master_key(&[6u8; 32]).unwrap();
-    let id = master_identity(&master);
-    // Same created_at; higher generation wins the tiebreak.
-    let blobs: Vec<(u64, Vec<u8>)> = vec![
-        (5000, pointer_blob(&master, 4, 5000)),
-        (5000, pointer_blob(&master, 7, 5000)),
-    ];
-    let picked = select_freshest_valid_pointer(&blobs, &id).expect("a valid pointer exists");
-    assert_eq!(picked.generation, 7);
+impl Future for HangingWork {
+    type Output = Result<(), DrError>;
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Pending
+    }
 }
 
-#[test]
-fn select_pointer_rejects_wrong_signer() {
-    let master = derive_master_key(&[7u8; 32]).unwrap();
-    let attacker = derive_master_key(&[8u8; 32]).unwrap();
-    let id = master_identity(&master);
-    // The only blob is a well-formed pointer signed by a DIFFERENT master → rejected.
-    let blobs: Vec<(u64, Vec<u8>)> = vec![(9000, pointer_blob(&attacker, 1, 9000))];
-    assert!(
-        select_freshest_valid_pointer(&blobs, &id).is_none(),
-        "a pointer signed by another master must not be selected"
-    );
-}
-
-#[test]
-fn select_pointer_none_when_empty_or_garbage() {
-    let master = derive_master_key(&[9u8; 32]).unwrap();
-    let id = master_identity(&master);
-    assert!(
-        select_freshest_valid_pointer(&[], &id).is_none(),
-        "empty → None"
-    );
-    let garbage: Vec<(u64, Vec<u8>)> = vec![(1, vec![1, 2, 3]), (2, vec![0xFF; 20])];
-    assert!(
-        select_freshest_valid_pointer(&garbage, &id).is_none(),
-        "non-pointer blobs → None"
-    );
-}
-
-#[test]
-fn select_pointer_skips_invalid_keeps_valid() {
-    let master = derive_master_key(&[10u8; 32]).unwrap();
-    let attacker = derive_master_key(&[11u8; 32]).unwrap();
-    let id = master_identity(&master);
-    // A fresher attacker-signed pointer must NOT shadow the older valid one.
-    let blobs: Vec<(u64, Vec<u8>)> = vec![
-        (1000, pointer_blob(&master, 1, 1000)),   // valid, older
-        (9000, pointer_blob(&attacker, 9, 9000)), // invalid signer, fresher
-        (3, vec![0u8; 8]),                        // garbage
-    ];
-    let picked = select_freshest_valid_pointer(&blobs, &id).expect("the valid pointer survives");
-    assert_eq!(picked.created_at, Timestamp(1000));
-    assert_eq!(picked.generation, 1);
-}
-
-// ─── wait_for_kad_bootstrap_stable tests ─────────────────────────────────────
-
-/// Verify that wait_for_kad_bootstrap_stable correctly counts PeerAuthenticated
-/// events and upserts each authenticated peer into the DB.
-///
-/// Scenario: spin 3 swarms (A, B, C). A dials B and C and waits for both to
-/// authenticate. We simulate the DB-upserting behavior of wait_for_kad_bootstrap_stable
-/// by calling it with A's event_rx and checking that:
-///   - the returned count == 2 (both B and C authenticated)
-///   - both peers appear in the DB after the call
+/// `guarded_network_phase` with an artificial "signal": the key draft is written, the
+/// staging DB is open, the signal arrives → `Interrupted`, and the folder holds no
+/// `*.dr-new`, no `identity.key`, no `db.redb` (only the empty data dir DR created).
 #[tokio::test]
-async fn wait_for_kad_bootstrap_stable_counts_authenticated_peers_and_upserts_db() {
-    use crate::daemon::network::swarm::SwarmHandle;
-    use crate::daemon::network::swarm_test_helpers::{get_listen_addr, make_swarm_config};
+async fn network_phase_interrupt_aborts_and_removes_own_staging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("dr");
+    let mut plan = preflight(&dir, PHRASE).expect("preflight on an empty folder");
+    let file = plan.staging.file.take().expect("staging claimed");
+    let work = async move {
+        let db = viaticum_core::db::Db::create_from_file(file).unwrap();
+        HangingWork { _db: db }.await
+    };
+    let (sig_tx, sig_rx) = tokio::sync::oneshot::channel::<&'static str>();
+    let interrupt = async move { sig_rx.await.unwrap_or("closed") };
 
-    // Build 3 swarms (A, B, C) in the same test cluster.
-    let cfg_a = make_swarm_config(0x01);
-    let cfg_b = make_swarm_config(0x02);
-    let cfg_c = make_swarm_config(0x03);
+    let key_draft = dir.join("identity.key.dr-new");
+    let guarded = guarded_network_phase(&mut plan, work, interrupt);
+    tokio::pin!(guarded);
+    // Let the phase start: the key draft is written before the work runs.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut guarded)
+            .await
+            .is_err(),
+        "the phase must still be running"
+    );
+    assert!(key_draft.exists(), "key draft written in the network phase");
+    assert!(dir.join("db.redb.dr-new").exists());
 
-    let device_id_b =
-        viaticum_core::types::DeviceId(cfg_b.device_signing_key.verifying_key().to_bytes());
-    let device_id_c =
-        viaticum_core::types::DeviceId(cfg_c.device_signing_key.verifying_key().to_bytes());
+    sig_tx.send("SIGINT").unwrap();
+    let result = guarded.await;
+    assert!(matches!(result, Err(DrError::Interrupted)), "{result:?}");
+    assert_eq!(
+        DrError::Interrupted.to_string(),
+        "DR interrupted. Nothing was changed."
+    );
 
-    let (handle_a, mut event_rx_a) = SwarmHandle::start(cfg_a).await.unwrap();
-    let (handle_b, _event_rx_b) = SwarmHandle::start(cfg_b).await.unwrap();
-    let (handle_c, _event_rx_c) = SwarmHandle::start(cfg_c).await.unwrap();
+    let left: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.is_empty(), "the folder must be empty, found {left:?}");
+}
 
-    // Get B and C's listen addresses and peer_ids.
-    let addr_b = get_listen_addr(&handle_b).await;
-    let addr_c = get_listen_addr(&handle_c).await;
-    let pid_b = handle_b.peer_id;
-    let pid_c = handle_c.peer_id;
+/// A failure of the network phase (not a signal) aborts the same way.
+#[tokio::test]
+async fn network_phase_error_aborts_and_removes_own_staging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("dr");
+    let mut plan = preflight(&dir, PHRASE).unwrap();
+    let file = plan.staging.file.take().unwrap();
+    let work = async move {
+        let _db = viaticum_core::db::Db::create_from_file(file).unwrap();
+        Err::<(), _>(DrError::NoCandidates)
+    };
+    let result = guarded_network_phase(&mut plan, work, std::future::pending()).await;
+    assert!(matches!(result, Err(DrError::NoCandidates)));
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+}
 
-    // Dial B and C from A.
-    handle_a.dial(pid_b, addr_b).await.unwrap();
-    handle_a.dial(pid_c, addr_c).await.unwrap();
+/// `commit` runs after the guarded phase and is synchronous: a signal queued during
+/// the commit cannot cut it (review item of spec B2 §2.13, checked by the compiler).
+#[test]
+fn commit_is_a_synchronous_fn() {
+    let _f: fn(super::preflight::DrPlan) -> Result<super::commit::CommitOutcome, DrError> =
+        super::commit::commit;
+}
 
-    // Run wait_for_kad_bootstrap_stable: should count 2 authenticated peers.
-    let db = viaticum_core::db::Db::open_in_memory().unwrap();
-    let count = super::wait_for_kad_bootstrap_stable(
-        &handle_a,
-        &mut event_rx_a,
-        &db,
-        10, // 10 second timeout — plenty for loopback
-        2,  // stop at 2 authenticated peers
+// ─── dr-i35: an older pointer of the same history when the newest fails ───────
+
+fn test_pointer(created_at: u64) -> viaticum_core::system_state::SelfPointer {
+    let master = viaticum_core::cluster::derive_master_key(&[7u8; 32]).unwrap();
+    viaticum_core::system_state::sign_self_pointer(
+        &master,
+        1,
+        viaticum_core::system_state::BlockRef {
+            block_id: viaticum_core::types::SourceBlockId([created_at as u8; 32]),
+            holders: vec![],
+            encrypted_size: 10,
+        },
+        vec![],
+        viaticum_core::types::Timestamp(created_at),
+        viaticum_core::system_state::CatalogSummary {
+            lineage: viaticum_core::system_state::CatalogLineageId([1; 16]),
+            publisher: viaticum_core::types::DeviceId([2; 32]),
+            files: 1,
+        },
+    )
+}
+
+#[tokio::test]
+async fn first_fetchable_falls_back_to_an_older_pointer_when_the_newest_fails() {
+    let pointers = vec![test_pointer(300), test_pointer(200), test_pointer(100)];
+    let mut tried = Vec::new();
+    let got = super::first_fetchable(
+        &pointers,
+        async |p: &viaticum_core::system_state::SelfPointer| {
+            tried.push(p.created_at.0);
+            if p.created_at.0 == 300 {
+                Err("holders gone".to_string())
+            } else {
+                Ok(p.created_at.0)
+            }
+        },
     )
     .await;
-
-    assert_eq!(
-        count, 2,
-        "should have authenticated exactly 2 peers (B and C)"
-    );
-
-    // Both peers should now be in the DB.
-    let peer_b = db.get_peer(&device_id_b).unwrap();
-    let peer_c = db.get_peer(&device_id_c).unwrap();
-    assert!(
-        peer_b.is_some(),
-        "peer B must be upserted into DB after authentication"
-    );
-    assert!(
-        peer_c.is_some(),
-        "peer C must be upserted into DB after authentication"
-    );
+    assert_eq!(got, Ok((1, 200)), "the next older pointer is used");
+    assert_eq!(tried, vec![300, 200], "stops at the first that works");
 }
 
-/// Verify that wait_for_kad_bootstrap_stable returns 0 quickly when there are
-/// no peers (isolated node) — must NOT hang past the timeout.
-///
-/// Scenario: single swarm, no other peers. Call with timeout=3s, min_peers=1.
-/// Expect: returns 0 within ~3s (best-effort), no hang.
 #[tokio::test]
-async fn wait_for_kad_bootstrap_stable_returns_zero_on_timeout_no_hang() {
-    use crate::daemon::network::swarm::SwarmHandle;
-    use crate::daemon::network::swarm_test_helpers::make_swarm_config;
-
-    let cfg = make_swarm_config(0x10);
-    let (handle, mut event_rx) = SwarmHandle::start(cfg).await.unwrap();
-    let db = viaticum_core::db::Db::open_in_memory().unwrap();
-
-    let start = std::time::Instant::now();
-    // Use a short 3-second timeout.
-    let count = super::wait_for_kad_bootstrap_stable(
-        &handle,
-        &mut event_rx,
-        &db,
-        3, // 3 second timeout
-        1, // min_peers = 1 — will never be reached since no one connects
+async fn first_fetchable_reports_every_error_when_all_fail() {
+    let pointers = vec![test_pointer(300), test_pointer(200)];
+    let got = super::first_fetchable(
+        &pointers,
+        async |p: &viaticum_core::system_state::SelfPointer| {
+            Err::<(), _>(format!("fail {}", p.created_at.0))
+        },
     )
     .await;
+    assert_eq!(
+        got,
+        Err(vec!["fail 300".to_string(), "fail 200".to_string()])
+    );
+}
 
-    let elapsed = start.elapsed();
-    assert_eq!(count, 0, "isolated node should authenticate 0 peers");
+#[tokio::test]
+async fn malformed_catalog_prefix_is_refused_before_anything_is_touched() {
+    // N4: a bad --catalog stops run_dr before preflight: not even the data dir appears,
+    // and no network is started (no --peer needed).
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("dr");
+    let err = super::run_dr(super::DrOptions {
+        mnemonic: PHRASE.to_string(),
+        peers: vec![],
+        data_dir: dir.clone(),
+        catalog: Some("abc".to_string()),
+    })
+    .await
+    .unwrap_err();
     assert!(
-        elapsed < Duration::from_secs(5),
-        "wait_for_kad_bootstrap_stable should not hang beyond timeout (elapsed={elapsed:?})"
+        matches!(
+            err,
+            DrError::Catalog(
+                viaticum_core::system_state::catalog::CatalogSelectError::BadPrefix { .. }
+            )
+        ),
+        "{err:?}"
     );
-}
-
-// ─── CS-DR-12: upsert_peer_minimal must not plant a zero-identity zombie ───────
-
-#[test]
-fn upsert_peer_minimal_stores_real_identity_for_new_peer() {
-    use viaticum_core::types::{DeviceId, IdentityPub};
-    let db = viaticum_core::db::Db::open_in_memory().unwrap();
-    let device = DeviceId([7u8; 32]);
-    let identity = IdentityPub([0x42u8; 32]);
-
-    super::upsert_peer_minimal(&db, device, identity);
-
-    let stored = db.get_peer(&device).unwrap().expect("peer was upserted");
-    assert_eq!(
-        stored.master_identity, identity,
-        "new peer must keep the real identity from the auth event, not zeros"
-    );
-}
-
-#[test]
-fn upsert_peer_minimal_fills_in_zero_identity_on_existing_record() {
-    use viaticum_core::types::{DeviceId, IdentityPub};
-    let db = viaticum_core::db::Db::open_in_memory().unwrap();
-    let device = DeviceId([8u8; 32]);
-
-    // First, a record lands with a placeholder (zero) identity.
-    super::upsert_peer_minimal(&db, device, IdentityPub([0u8; 32]));
-    // Later, we learn the real identity from a PeerAuthenticated event.
-    let real = IdentityPub([0x99u8; 32]);
-    super::upsert_peer_minimal(&db, device, real);
-
-    let stored = db.get_peer(&device).unwrap().expect("peer exists");
-    assert_eq!(
-        stored.master_identity, real,
-        "a zero-identity zombie must be repaired once the real identity is known"
-    );
-}
-
-#[test]
-fn upsert_peer_minimal_does_not_clobber_existing_real_identity() {
-    use viaticum_core::types::{DeviceId, IdentityPub};
-    let db = viaticum_core::db::Db::open_in_memory().unwrap();
-    let device = DeviceId([9u8; 32]);
-
-    let original = IdentityPub([0x11u8; 32]);
-    super::upsert_peer_minimal(&db, device, original);
-    // A later call with a different identity must NOT overwrite the established one.
-    super::upsert_peer_minimal(&db, device, IdentityPub([0x22u8; 32]));
-
-    let stored = db.get_peer(&device).unwrap().expect("peer exists");
-    assert_eq!(
-        stored.master_identity, original,
-        "an established real identity must not be clobbered"
-    );
+    assert!(err.to_string().ends_with("Nothing was changed."), "{err}");
+    assert!(!dir.exists());
 }

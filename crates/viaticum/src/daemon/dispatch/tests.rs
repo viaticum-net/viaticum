@@ -47,6 +47,7 @@ async fn make_test_state() -> Arc<DaemonState> {
         shutdown_token: tokio_util::sync::CancellationToken::new(),
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: None,
+        missing_sources: Default::default(),
     })
 }
 
@@ -303,6 +304,7 @@ async fn dispatch_device_revoke_returns_device_revoked_with_no_router() {
         shutdown_token: tokio_util::sync::CancellationToken::new(),
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: None, // no router → revocation goes nowhere (best-effort)
+        missing_sources: Default::default(),
     });
 
     // Revoke device B.
@@ -952,6 +954,7 @@ async fn revocation_published_only_to_storage_relationship_peers() {
         shutdown_token: tokio_util::sync::CancellationToken::new(),
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: Some(router),
+        missing_sources: Default::default(),
     });
 
     // Revoke device.
@@ -1112,6 +1115,7 @@ async fn revocation_dedup_peer_is_holder_and_owner() {
         shutdown_token: tokio_util::sync::CancellationToken::new(),
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: Some(router),
+        missing_sources: Default::default(),
     });
 
     let revoked_hex: String = revoked_device_id
@@ -1286,4 +1290,111 @@ async fn _removed_dispatch_connect_two_daemons_registers_peer() {
         .get_connection(pk_b)
         .await
         .expect("get_connection after connect");
+}
+
+// ============================================================
+// DR readiness (dr-i9) and files without a local source (dr-i11)
+// ============================================================
+
+fn catalog_file(
+    path: &std::path::Path,
+    states: Vec<viaticum_core::types::LocalState>,
+) -> viaticum_core::types::FileRecord {
+    viaticum_core::types::FileRecord {
+        file_id: viaticum_core::types::FileId(1),
+        path: path.display().to_string(),
+        importance: 0.5,
+        devices: states
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| (DeviceId([i as u8 + 1; 32]), s))
+            .collect(),
+        versions: vec![],
+        first_seen: viaticum_core::types::Timestamp(1),
+    }
+}
+
+#[tokio::test]
+async fn status_counts_files_without_source() {
+    use viaticum_core::types::LocalState;
+    let dir = tempfile::tempdir().unwrap();
+    let here = dir.path().join("here.txt");
+    std::fs::write(&here, b"x").unwrap();
+    let state = make_test_state().await;
+    let files = [
+        catalog_file(&here, vec![LocalState::Present]),
+        catalog_file(&dir.path().join("gone-1.txt"), vec![LocalState::Present]),
+        catalog_file(&dir.path().join("gone-2.txt"), vec![LocalState::Present]),
+    ];
+    for (i, mut f) in files.into_iter().enumerate() {
+        f.file_id = viaticum_core::types::FileId(i as u64 + 1);
+        state.db.upsert_file(&f).unwrap();
+    }
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert_eq!(data.files_without_source, 2);
+}
+
+#[test]
+fn status_ignores_files_deleted_everywhere() {
+    use viaticum_core::types::{LocalState, Timestamp};
+    let db = Db::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let files = vec![
+        // Deleted on every device: not live, not "missing".
+        catalog_file(
+            &dir.path().join("deleted.txt"),
+            vec![LocalState::Deleted(Timestamp(5))],
+        ),
+        // Deleted on one device, present on another: live, missing here.
+        catalog_file(
+            &dir.path().join("half.txt"),
+            vec![LocalState::Deleted(Timestamp(5)), LocalState::Present],
+        ),
+    ];
+    for (i, mut f) in files.into_iter().enumerate() {
+        f.file_id = viaticum_core::types::FileId(i as u64 + 1);
+        db.upsert_file(&f).unwrap();
+    }
+    assert_eq!(
+        super::missing_sources::count_files_without_source(&db).unwrap(),
+        1
+    );
+}
+
+#[test]
+fn status_reports_not_ready_and_mints_nothing_on_a_fresh_db() {
+    let db = Db::open_in_memory().unwrap();
+    let r = super::dr_readiness(&db);
+    assert_eq!(r, super::DrReadiness::default());
+    assert_eq!(
+        db.catalog_lineage().unwrap(),
+        None,
+        "status must only read, never mint a history"
+    );
+}
+
+#[tokio::test]
+async fn status_reports_dr_pointer_from_last_publication() {
+    use viaticum_core::system_state::catalog::PointerPublication;
+    let state = make_test_state().await;
+    let lineage = state.db.get_or_create_catalog_lineage().unwrap();
+    state
+        .db
+        .record_pointer_publication(&PointerPublication {
+            lineage,
+            created_at: viaticum_core::types::Timestamp(1_790_000_000),
+            generation: 3,
+            files: 4,
+            acks: 2,
+        })
+        .unwrap();
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert_eq!(data.dr_pointer_published_at, 1_790_000_000);
+    assert_eq!(data.dr_pointer_files, 4);
+    assert_eq!(data.dr_pointer_acks, 2);
+    assert_eq!(data.catalog_lineage, lineage.to_hex());
 }

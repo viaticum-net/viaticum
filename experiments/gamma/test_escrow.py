@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# OBSOLETE (B1, 2026-09): escrow gate removed (restore-i6); the escrow phases no longer hold. Not maintained.
 """
 T8: Escrow contribution-based restore budget test.
 

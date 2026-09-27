@@ -17,7 +17,7 @@
 // served_msg_ids field is populated and returned but nothing acts on it yet.
 
 use libp2p::PeerId;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use viaticum_core::constants::MAILBOX_CANDIDATES_N;
 use viaticum_core::db::Db;
 use viaticum_core::mailbox::{
@@ -114,7 +114,13 @@ pub fn handle_mailbox_store(
     let engine = MailboxEngine::new(db.clone());
     match engine.store(entry, now_secs) {
         Ok(()) => {
-            debug!(target = %target, class = ?entry.class, "mailbox: stored entry");
+            // Spec B2 §2.8: a stored SelfPointer is the postman-side oracle of DR
+            // readiness (dr-i9). No catalog fields: the postman does not decode payloads.
+            if entry.class == MailboxClass::SelfPointer {
+                info!(target = %target, msg_id = ?msg_id, "mailbox: stored SelfPointer entry");
+            } else {
+                debug!(target = %target, class = ?entry.class, "mailbox: stored entry");
+            }
             MailboxStoreResponse::Ack { msg_id }
         }
         Err(MailboxError::Duplicate) => {

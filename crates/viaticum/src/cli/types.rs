@@ -37,7 +37,12 @@ pub enum CliRequest {
 }
 
 /// Response from daemon to CLI process.
+///
+/// `Status` is the large variant (the full status report). One value exists per CLI
+/// request and is serialized right away, so the size difference costs nothing worth
+/// a `Box` at every construction and match site.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum CliResponse {
     Status(StatusData),
     Restore(RestoreData),
@@ -129,6 +134,23 @@ pub struct StatusData {
     /// Empty buckets have block_count=0, mean_p_recoverable=0.0, status="empty".
     #[serde(default)]
     pub by_importance: Vec<viaticum_core::types::ImportanceBucketStats>,
+    /// dr-i9: unix secs of this node's last recovery-pointer publication accepted by
+    /// ≥ 1 postman; 0 = never (DR from the phrase would not find this catalog yet).
+    #[serde(default)]
+    pub dr_pointer_published_at: u64,
+    /// Live files in the catalog that publication restores.
+    #[serde(default)]
+    pub dr_pointer_files: u32,
+    /// Postmen that accepted that publication.
+    #[serde(default)]
+    pub dr_pointer_acks: u32,
+    /// Hex of this DB's catalog history id; "" before the node minted one.
+    #[serde(default)]
+    pub catalog_lineage: String,
+    /// dr-i11: live catalog files whose path does not exist on this machine (not
+    /// re-protected until they are back).
+    #[serde(default)]
+    pub files_without_source: u32,
 }
 
 /// Peer summary shown in `viaticum status`.
@@ -200,8 +222,8 @@ pub struct DeviceEntry {
     pub revoked: bool,
 }
 
-/// Lifecycle state for a file's latest version, computed from placement counts
-/// + escrow estimate. Drives the badge in the UI. See `compute_effective_status`.
+/// Lifecycle state for a file's latest version, computed from placement counts.
+/// Drives the badge in the UI. See `compute_effective_status`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EffectiveStatus {
@@ -210,17 +232,9 @@ pub enum EffectiveStatus {
     /// Source block created, holders haven't accepted enough.
     /// `live` = placements in Alive; `target` = `k_eff` for the block.
     Replicating { live: u32, target: u32 },
-    /// `live >= target` (k_eff alive), restore would also succeed today
-    /// (escrow budget is sufficient). Greenlight.
+    /// `live >= target` (k_eff alive): the network can rebuild it. Greenlight.
+    /// No holder-side gate can refuse the owner (restore-i6).
     Restorable { live: u32, target: u32 },
-    /// `live >= target` but restore would be denied — escrow budget is below
-    /// what this block needs. Common right after first replication when
-    /// contribution hasn't accrued yet.
-    ReplicatedCold {
-        live: u32,
-        target: u32,
-        est_seconds_to_restorable: Option<u64>,
-    },
     /// We had `target` Alive at some point; now `live < target` after losses.
     /// Repair pipeline is responsible for bringing it back.
     Degraded { live: u32, lost: u32, target: u32 },
@@ -237,14 +251,6 @@ pub enum RestoreBlocker {
         have: u32,
         need: u32,
         holders_offline: u32,
-    },
-    /// All holders refused via escrow because we haven't earned enough
-    /// contribution yet. `est_seconds` is a rough wait-time estimate or None
-    /// if we can't predict (e.g. nothing accruing).
-    EscrowLocked {
-        budget_gb: f64,
-        needed_gb: f64,
-        est_seconds: Option<u64>,
     },
     /// All `Alive` holders are unreachable (last_seen too old).
     AllHoldersOffline { last_seen_secs_ago: u64 },

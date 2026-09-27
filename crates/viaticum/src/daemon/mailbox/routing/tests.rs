@@ -8,7 +8,7 @@
 // Required spec scenarios:
 //   publish_sends_to_write_fanout_peers
 //   poll_returns_deduplicated_entries_from_read_fanout
-//   dr_walk_stops_at_first_batch_with_pointer
+//   dr_walk_prefers_fresher_pointer_in_later_batch (CS-DR-1: collect from every batch)
 //
 // Additional unit tests:
 //   select_write_peers_orders_by_combined_trust_times_avail_ewma
@@ -28,7 +28,9 @@ use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
 use viaticum_core::messages::{
     MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse,
 };
-use viaticum_core::system_state::{BlockRef, sign_self_pointer};
+use viaticum_core::system_state::{
+    BlockRef, CatalogLineageId, CatalogSummary, SelfPointer, sign_self_pointer,
+};
 use viaticum_core::types::{
     DeviceId, IdentityPub, PeerRecord, SourceBlockId, Timestamp, ewma_contact_observed,
 };
@@ -481,123 +483,6 @@ async fn poll_returns_deduplicated_entries_from_read_fanout() {
 }
 
 #[tokio::test]
-async fn dr_walk_stops_at_first_batch_with_pointer() {
-    // Spec scenario: dr_walk_for_pointer stops at the first batch [100, 300, 1000]
-    // that returns a valid SelfPointer entry.
-    //
-    // Setup: first batch (100 peers) returns no pointer;
-    //        second batch (300 peers, including first batch) returns a valid pointer
-    //        from peer at index 150 (not in first batch).
-    // Expected: dr_walk returns a pointer and does NOT fetch from the third batch (1000).
-    //
-    // We verify by checking that fetch_calls contains peers from the second batch
-    // but not from a third-batch-only peer (index 500+).
-
-    // Generate keys for 300 peers.
-    let n_peers = 350usize; // more than second batch (300) but fewer than third (1000)
-    let db = test_db();
-    let mut device_ids = Vec::with_capacity(n_peers);
-
-    for i in 0..n_peers {
-        // Use varied seeds so XOR distances are different.
-        let seed = (i & 0xff) as u8;
-        let key = viaticum_core::cluster::derive_device_key(
-            &{
-                let mut k = [0u8; 64];
-                k[0] = seed;
-                k[1] = (i >> 8) as u8;
-                k
-            },
-            &{
-                let mut s = [0u8; 32];
-                s[0] = seed;
-                s[1] = 0xBB;
-                s
-            },
-        )
-        .unwrap();
-        let device_id = DeviceId(key.verifying_key().to_bytes());
-        let record = make_peer_record(device_id, INITIAL_TRUST_P, 0.0, AVAIL_EWMA_INITIAL);
-        db.upsert_peer(&record).unwrap();
-        device_ids.push(device_id);
-    }
-
-    // Build a real master key for signing the SelfPointer.
-    let master_key = viaticum_core::cluster::derive_master_key(&[0xABu8; 64]).expect("master key");
-    let my_master_pub = viaticum_core::cluster::master_identity(&master_key);
-
-    // Build a valid SelfPointer payload for device at index 150 to return.
-    let pointer = sign_self_pointer(
-        &master_key,
-        1,
-        BlockRef {
-            block_id: SourceBlockId([0xCC; 32]),
-            encrypted_size: 256,
-            holders: vec![],
-        },
-        vec![],
-        Timestamp::now(),
-    );
-    let pointer_payload = viaticum_core::types::to_cbor_bytes(&pointer);
-
-    // The pointer entry will be returned by "some peer in 101..300 range".
-    // We inject it for device at index 120 (will be in 2nd batch but not 1st).
-    // The key insight is that the XOR ordering determines which peers are in which batch.
-    // Instead of manipulating XOR ordering, we inject the pointer for ALL 300 peers.
-    // dr_walk sends to all peers in each batch (inclusive); stopping at first batch with
-    // a result means: if batch 2 (300 peers) has the pointer, we don't fetch batch 3 (1000).
-    // Since n_peers = 350, and batch sizes are [100, 300, 1000], the 3rd batch would
-    // need 1000 peers but we only have 350 → dr_walk exhausts known peers at batch 2.
-    //
-    // Simplify: inject pointer for device at index 100 (present in 2nd batch, not 1st).
-    // This requires knowing which device is XOR-ranked at position 100 for my_master_pub.
-    // That's hard to control deterministically. Instead:
-    //
-    // Alternative: inject the pointer for ALL 350 peers. With batch 1 = 100 peers, all
-    // 100 of them return the pointer. dr_walk should stop after batch 1 and return it.
-    // This still tests "stops at first batch" — just at batch 1.
-    //
-    // But the spec says "stops at first batch WITH pointer". If all peers have it, the
-    // first batch (100) yields a pointer and we stop there.
-
-    let pointer_entry = MailboxEntry {
-        target: MailboxAddress::for_master(&my_master_pub),
-        msg_id: make_msg_id(77),
-        class: MailboxClass::SelfPointer,
-        payload_version: 1,
-        payload: pointer_payload,
-        expires_at: u64::MAX,
-        stored_at: 1_000_000,
-        sender: None,
-    };
-
-    // Inject for all devices — first batch will find it and stop.
-    let mut fetch_responses: HashMap<DeviceId, Vec<MailboxEntry>> = HashMap::new();
-    for &device_id in &device_ids {
-        fetch_responses.insert(device_id, vec![pointer_entry.clone()]);
-    }
-
-    let sender = Arc::new(MockSender::new().with_fetch_responses(fetch_responses));
-    let sender_arc = Arc::clone(&sender);
-    let router = MailboxRouter::with_sender(sender_arc, db);
-
-    let result = router.dr_walk_for_pointer(&my_master_pub).await.unwrap();
-
-    assert!(result.is_some(), "dr_walk must return a SelfPointer");
-    let found = result.unwrap();
-    assert_eq!(found.generation, 1, "must return the pointer we signed");
-
-    // Verify that fetch_calls contains at most 100 unique devices (first batch stopped).
-    let fetch_calls = sender.fetch_calls();
-    let unique_fetched: std::collections::HashSet<DeviceId> = fetch_calls.iter().cloned().collect();
-    assert!(
-        unique_fetched.len() <= 100,
-        "dr_walk must stop at first batch (≤100 unique peers fetched), got {}",
-        unique_fetched.len()
-    );
-}
-
-#[tokio::test]
 async fn publish_returns_zero_acks_when_all_fail() {
     // If all peers fail at network level, publish returns 0 acks and warns (no panic).
     let mut sender = MockSender::new();
@@ -764,230 +649,232 @@ async fn publish_records_avail_on_ack() {
     );
 }
 
-// ─── FIX-5: dr_walk batch expansion ───────────────────────────────────────────
+// ─── CS-DR-1: DR collects every pointer from every batch ─────────────────────
 
-#[tokio::test]
-async fn dr_walk_expands_to_next_batch_when_first_misses() {
-    // dr_walk_for_pointer must expand to the next batch when the first batch
-    // returns no valid SelfPointer. Concretely: batch 1 (100 closest peers) returns
-    // nothing; a peer that lands in batch 2 (101..300) holds the pointer.
-    // The walk must find the pointer and return it.
-    //
-    // Implementation note: we cannot deterministically control which device ends up
-    // at which XOR-rank. Instead we use a small peer set (200 peers) so the first
-    // batch (100) necessarily covers only half of them. We inject the pointer for
-    // ONLY the second half (by DB-insertion order, which is a proxy for varied keys).
-    // Since XOR ordering is hash-based (unpredictable), we must be conservative:
-    // inject the pointer for ALL 200 peers but make batch-1 peers return an EMPTY
-    // response, and batch-2 peers return the pointer. We achieve this by using
-    // separate device_ids for "batch-1 only" and "batch-2+" peers and routing the
-    // MockSender accordingly — but that requires knowing the XOR order in advance.
-    //
-    // Simpler, still meaningful: build 200 peers, give the pointer to peers with
-    // index >= 100. Since the XOR order is random, approximately half of batch 1
-    // will have no pointer. But the test would be flaky. Instead:
-    //
-    // Correct approach — two distinct populations:
-    //   - "no_pointer_peers": 100 peers whose MockSender response is always empty.
-    //   - "pointer_peer": 1 peer whose MockSender response contains the pointer.
-    // We insert all 101 into the DB, then force the pointer_peer to be ranked
-    // beyond position 100 by giving it an XOR distance larger than all no_pointer_peers.
-    // XOR distance is SHA256(target) XOR SHA256(peer_id) — impossible to force without
-    // controlling the keys. We cannot reliably force a specific key to rank > 100.
-    //
-    // Practical alternative that still tests the expansion invariant without XOR control:
-    // Use MAILBOX_DR_WALK_BATCHES = [100, 300, 1000]. Build 101 peers total. The first
-    // batch asks 100 of them; if all 100 return empty, we must expand to 300. With 101
-    // peers the second batch will include the 101st peer. We inject the pointer for
-    // exactly ONE peer (whose position we do not control). With 101 peers in DB:
-    //   - P(pointer_peer is in first 100) ≈ 100/101 ≈ 99% → test would pass batch-1
-    //     99% of the time (wrong behavior, test would be vacuously green).
-    //
-    // The reliable approach: inject the pointer for ALL peers but set batch 1 to return
-    // an *invalid* (bad signature) pointer, and batch 2 peers return the *valid* one.
-    // That requires per-peer routing in MockSender.
-    //
-    // Extend MockSender in-test with two response maps: "invalid" (fails verify_self_pointer)
-    // and "valid". Assign invalid pointer to devices in the first 100 by XOR rank; valid
-    // to the rest. Since we don't know XOR rank statically, we do it the other way:
-    // build the router, call build_ranked_candidates (not exposed), or — simplest —
-    // just use a large enough population with valid pointer only in positions > 100 in
-    // DB insertion order, accept that XOR shuffles them, and assert final result is Some.
-    // This tests expansion (if batch 1 had the pointer, fine — expansion is not needed
-    // and the test still passes, just tests a different code path). The thing we MUST
-    // test is that the walk DOES NOT give up after batch 1 if batch 1 returns nothing.
-    //
-    // Final design: 200 peers, NO pointer for any of them. Confirm walk returns None.
-    // Then add ONE more peer (index 201) with the pointer. Confirm walk returns Some.
-    // This proves the walk can find a pointer at all (regression: walk not stopping early
-    // when it shouldn't). The specific batch-expansion is implicitly tested because if
-    // the walk only ever looked at batch 1 (100 peers) it would miss the peer at position
-    // 101+ (by XOR rank, random) with probability ~50%.
-    //
-    // To make the expansion test definitive without XOR control: use ONLY 1 peer total
-    // and give it the pointer but set candidates_n = 0 for batch 1 (impossible via API).
-    //
-    // ── FINAL PRAGMATIC APPROACH ──────────────────────────────────────────────────
-    // Build exactly 101 peers. Inject the pointer for ALL 101 peers but use a custom
-    // MockSender that returns the pointer only for the LAST-inserted DeviceId (which has
-    // a random XOR rank). Repeat the assertion 1 time. If the walk returns Some, it
-    // expanded past batch 1 (if last-inserted happens to be rank > 100) OR found it in
-    // batch 1 (if rank <= 100). Either way the walk finds the pointer — that's the
-    // regression we care about. The "expansion specifically" path is definitively
-    // covered by `dr_walk_stops_at_first_batch_with_pointer` (all 350 peers return it,
-    // so batch 1 always wins) combined with this test (only 1 peer returns it, and only
-    // after the walk considers all batches does it succeed ~50% at batch 1, ~50% at
-    // batch 2). Since we cannot deterministically force batch-2, we use 1 peer total
-    // (smaller than batch 1 = 100) — that guarantees we test the "only 1 peer in DB"
-    // path, but doesn't test expansion per se.
-    //
-    // ── ACTUALLY DETERMINISTIC APPROACH ──────────────────────────────────────────
-    // The only way to test expansion definitively is to control XOR order. We CAN do
-    // that by using a two-tier MockSender: all peers return an INVALID pointer (bad
-    // payload), except one peer that returns a VALID one. Even if the valid peer is in
-    // batch 1, the valid pointer will be found. Since all peers hold something
-    // (invalid or valid), the walk doesn't "miss" batch 1 — but it correctly picks the
-    // valid one. This tests sig-verification gating but not expansion.
-    //
-    // ── SIMPLEST TEST THAT ADDS REAL VALUE ───────────────────────────────────────
-    // Test: 300 peers, NONE have a pointer in batch 1 (first 100 by XOR rank).
-    // A peer in position 100..300 returns the pointer. Since XOR is random, we cannot
-    // guarantee which 100 are "batch 1". Instead: set ALL 300 peers to return no
-    // pointer EXCEPT peers with a specific DeviceId (the "pointer_peer"). We build
-    // the router, drive a dr_walk, and check the result. We use 1 pointer_peer and
-    // 299 no-pointer peers. The walk will:
-    //   - If pointer_peer is in first 100 by XOR: find it in batch 1 (≤ 100/300 chance).
-    //   - If pointer_peer is in 100..300: find it in batch 2 (≥ 200/300 chance).
-    //   - Either way: walk returns Some → test passes.
-    // This always passes when the walk is correct, and always fails when the walk
-    // stops early (after batch 1 returning nothing for the non-pointer peers, it would
-    // need to expand to batch 2 to find pointer_peer). But with prob ~1/3 the pointer
-    // is in batch 1 so the test would not catch early-stop. Not reliable enough.
-    //
-    // ── DEFINITIVE APPROACH (what we actually implement) ─────────────────────────
-    // Use the internal `build_ranked_candidates` ordering by building the router, calling
-    // `build_ranked_candidates` (private — not exposed). Instead, replicate the XOR rank
-    // computation in the test: compute XOR(SHA256(target), SHA256(peer_id)) for each
-    // peer, sort ascending, take positions 100+ as "batch-2 only". Inject pointer for
-    // those; inject empty for batch-1 peers. This deterministically ensures batch 1
-    // returns nothing and batch 2 finds the pointer.
-
-    use sha2::{Digest, Sha256};
-    use viaticum_core::constants::MAILBOX_DR_WALK_BATCHES;
-
-    // Build master key first — my_master_pub is the XOR target for dr_walk.
-    let master_key = viaticum_core::cluster::derive_master_key(&[0xCDu8; 64]).expect("master key");
-    let my_master_pub = viaticum_core::cluster::master_identity(&master_key);
-
-    // Replicate KademliaRoutingView XOR distance computation (must match routing.rs).
-    let xor_dist = |target: &IdentityPub, peer_id: &libp2p::PeerId| -> [u8; 32] {
-        let target_hash: [u8; 32] = Sha256::digest(target.0).into();
-        let pid_bytes = peer_id.to_bytes();
-        let peer_hash: [u8; 32] = Sha256::digest(&pid_bytes).into();
-        let mut dist = [0u8; 32];
-        for i in 0..32 {
-            dist[i] = target_hash[i] ^ peer_hash[i];
-        }
-        dist
-    };
-
-    // Generate enough peers to populate at least 2 batches.
-    // batch sizes: [100, 300, 1000]. We need at least 101 peers so batch 2 adds new ones.
-    let n_peers = 200usize;
-    let db = test_db();
-    let mut devices: Vec<(DeviceId, libp2p::PeerId)> = Vec::with_capacity(n_peers);
-
-    for i in 0..n_peers {
-        let key = viaticum_core::cluster::derive_device_key(
-            &{
-                let mut k = [0u8; 64];
-                k[0] = (i & 0xff) as u8;
-                k[1] = ((i >> 8) & 0xff) as u8;
-                k[2] = 0xF5; // distinct from other tests
-                k
-            },
-            &{
-                let mut s = [0u8; 32];
-                s[0] = (i & 0xff) as u8;
-                s[1] = 0xE1;
-                s
-            },
-        )
-        .unwrap();
-        let device_id = DeviceId(key.verifying_key().to_bytes());
-        let peer_id = device_id_to_peer_id(&device_id).unwrap();
-        let record = make_peer_record(device_id, INITIAL_TRUST_P, 0.0, AVAIL_EWMA_INITIAL);
-        db.upsert_peer(&record).unwrap();
-        devices.push((device_id, peer_id));
-    }
-
-    // Compute XOR order using my_master_pub as target — same target dr_walk_for_pointer uses.
-    let mut ranked: Vec<(DeviceId, libp2p::PeerId, [u8; 32])> = devices
-        .iter()
-        .map(|(d, p)| (*d, *p, xor_dist(&my_master_pub, p)))
+/// `n` real-key peers in a fresh DB, returned in the XOR order `dr_collect_pointers`
+/// uses for `target` (closest first) — replicates `build_ranked_candidates`.
+fn ranked_peers(
+    db: &viaticum_core::db::Db,
+    n: usize,
+    tag: u8,
+    target: &IdentityPub,
+) -> Vec<DeviceId> {
+    use crate::daemon::mailbox::candidate::KademliaRoutingView;
+    let target_key = KademliaRoutingView::target_key(&MailboxAddress::for_master(target));
+    let mut ranked: Vec<([u8; 32], DeviceId)> = (0..n)
+        .map(|i| {
+            let key = viaticum_core::cluster::derive_device_key(
+                &{
+                    let mut k = [0u8; 64];
+                    k[0] = (i & 0xff) as u8;
+                    k[1] = ((i >> 8) & 0xff) as u8;
+                    k[2] = tag;
+                    k
+                },
+                &[tag; 32],
+            )
+            .unwrap();
+            let device_id = DeviceId(key.verifying_key().to_bytes());
+            db.upsert_peer(&make_peer_record(
+                device_id,
+                INITIAL_TRUST_P,
+                0.0,
+                AVAIL_EWMA_INITIAL,
+            ))
+            .unwrap();
+            let peer_key =
+                KademliaRoutingView::peer_key(&device_id_to_peer_id(&device_id).unwrap());
+            (
+                KademliaRoutingView::xor_distance(&target_key, &peer_key),
+                device_id,
+            )
+        })
         .collect();
-    ranked.sort_by_key(|(_, _, dist)| *dist);
+    ranked.sort_by_key(|(d, _)| *d);
+    ranked.into_iter().map(|(_, d)| d).collect()
+}
 
-    // First batch size (MAILBOX_DR_WALK_BATCHES[0]).
-    let first_batch_size = MAILBOX_DR_WALK_BATCHES[0];
-
-    let pointer = sign_self_pointer(
-        &master_key,
-        2,
+fn signed_pointer(
+    master: &ed25519_dalek::SigningKey,
+    lineage: u8,
+    files: u32,
+    generation: u32,
+    created_at: u64,
+) -> SelfPointer {
+    sign_self_pointer(
+        master,
+        generation,
         BlockRef {
-            block_id: SourceBlockId([0xEE; 32]),
+            block_id: SourceBlockId([generation as u8; 32]),
             encrypted_size: 128,
             holders: vec![],
         },
         vec![],
-        Timestamp::now(),
-    );
-    let pointer_payload = viaticum_core::types::to_cbor_bytes(&pointer);
+        Timestamp(created_at),
+        CatalogSummary {
+            lineage: CatalogLineageId([lineage; 16]),
+            publisher: DeviceId([0xD0; 32]),
+            files,
+        },
+    )
+}
 
-    let pointer_entry = MailboxEntry {
-        target: MailboxAddress::for_master(&my_master_pub),
-        msg_id: make_msg_id(88),
+fn pointer_entry(target: IdentityPub, p: &SelfPointer, msg: u8) -> MailboxEntry {
+    MailboxEntry {
+        target: MailboxAddress::for_master(&target),
+        msg_id: make_msg_id(msg),
         class: MailboxClass::SelfPointer,
         payload_version: 1,
-        payload: pointer_payload,
+        payload: viaticum_core::types::to_cbor_bytes(p),
         expires_at: u64::MAX,
-        stored_at: 2_000_000,
+        stored_at: 1_000_000 + msg as u64,
         sender: None,
-    };
-
-    // Give the pointer ONLY to peers that are NOT in the first batch (positions >= first_batch_size).
-    // Peers in positions 0..first_batch_size get empty responses.
-    // This guarantees batch 1 returns nothing; the walk MUST expand to batch 2 to find the pointer.
-    let mut fetch_responses: HashMap<DeviceId, Vec<MailboxEntry>> = HashMap::new();
-    for (idx, (device_id, _peer_id, _dist)) in ranked.iter().enumerate() {
-        if idx >= first_batch_size {
-            fetch_responses.insert(*device_id, vec![pointer_entry.clone()]);
-        } else {
-            fetch_responses.insert(*device_id, vec![]);
-        }
     }
+}
 
-    let sender = Arc::new(MockSender::new().with_fetch_responses(fetch_responses));
-    let sender_arc = Arc::clone(&sender);
-    let router = MailboxRouter::with_sender(sender_arc, db);
+/// The first batch (100 closest) holds an older pointer, a peer of the second batch
+/// holds a fresher one of the same history. The old walk stopped at batch 1 and
+/// returned the stale pointer; the collection must return both, so the choice gets
+/// the fresh one.
+#[tokio::test]
+async fn dr_walk_prefers_fresher_pointer_in_later_batch() {
+    use viaticum_core::constants::MAILBOX_DR_WALK_BATCHES;
+    use viaticum_core::system_state::catalog::select_catalog;
 
-    let result = router.dr_walk_for_pointer(&my_master_pub).await.unwrap();
+    let master = viaticum_core::cluster::derive_master_key(&[0xA1u8; 64]).unwrap();
+    let me = viaticum_core::cluster::master_identity(&master);
+    let db = test_db();
+    let ranked = ranked_peers(&db, 150, 0xA1, &me);
+    let first = MAILBOX_DR_WALK_BATCHES[0];
 
-    assert!(
-        result.is_some(),
-        "dr_walk must find the pointer in batch 2 after batch 1 misses"
+    let stale = signed_pointer(&master, 7, 3, 1, 1_000);
+    let fresh = signed_pointer(&master, 7, 4, 2, 2_000);
+    let mut responses: HashMap<DeviceId, Vec<MailboxEntry>> = HashMap::new();
+    responses.insert(ranked[0], vec![pointer_entry(me, &stale, 1)]);
+    responses.insert(ranked[first + 10], vec![pointer_entry(me, &fresh, 2)]);
+
+    let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
+    let router = MailboxRouter::with_sender(sender.clone(), db);
+    let walk = router.dr_collect_pointers(&me).await.unwrap();
+
+    assert_eq!(walk.pointers.len(), 2, "both batches are collected");
+    let choice = select_catalog(walk.pointers, None).unwrap();
+    assert_eq!(
+        choice.selected.generation, 2,
+        "the fresher pointer of batch 2 wins"
     );
-    let found = result.unwrap();
-    assert_eq!(found.generation, 2, "must return the pointer from batch 2");
+    assert_eq!(choice.selected.catalog.files, 4);
+}
 
-    // Confirm batch 1 was contacted (the walk did start).
-    let fetch_calls = sender.fetch_calls();
-    let unique_fetched: std::collections::HashSet<DeviceId> = fetch_calls.iter().cloned().collect();
+#[tokio::test]
+async fn dr_collect_queries_each_candidate_once() {
+    let master = viaticum_core::cluster::derive_master_key(&[0xA2u8; 64]).unwrap();
+    let me = viaticum_core::cluster::master_identity(&master);
+    let db = test_db();
+    let ranked = ranked_peers(&db, 150, 0xA2, &me);
+
+    let sender = Arc::new(MockSender::new());
+    let router = MailboxRouter::with_sender(sender.clone(), db);
+    let walk = router.dr_collect_pointers(&me).await.unwrap();
+
+    let calls = sender.fetch_calls();
+    let unique: std::collections::HashSet<DeviceId> = calls.iter().copied().collect();
+    assert_eq!(
+        calls.len(),
+        150,
+        "every peer asked exactly once (no re-asking batch 1)"
+    );
+    assert_eq!(unique.len(), 150);
+    assert_eq!(unique, ranked.iter().copied().collect());
+    assert_eq!(walk.candidates, 150);
+    assert_eq!(walk.responders, 150);
+}
+
+#[tokio::test]
+async fn dr_collect_returns_pointers_of_all_lineages() {
+    let master = viaticum_core::cluster::derive_master_key(&[0xA3u8; 64]).unwrap();
+    let me = viaticum_core::cluster::master_identity(&master);
+    let db = test_db();
+    let ranked = ranked_peers(&db, 20, 0xA3, &me);
+    let owner = signed_pointer(&master, 1, 3, 5, 1_000);
+    let shadow = signed_pointer(&master, 2, 0, 1, 9_000);
+    let mut responses: HashMap<DeviceId, Vec<MailboxEntry>> = HashMap::new();
+    // The same owner pointer at two postmen (dedup), the shadow's at a third.
+    responses.insert(ranked[0], vec![pointer_entry(me, &owner, 1)]);
+    responses.insert(ranked[1], vec![pointer_entry(me, &owner, 1)]);
+    responses.insert(ranked[2], vec![pointer_entry(me, &shadow, 2)]);
+
+    let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
+    let router = MailboxRouter::with_sender(sender, db);
+    let walk = router.dr_collect_pointers(&me).await.unwrap();
+
+    assert_eq!(
+        walk.pointers.len(),
+        2,
+        "distinct pointers, deduplicated by signature"
+    );
+    let lineages: std::collections::HashSet<CatalogLineageId> =
+        walk.pointers.iter().map(|p| p.catalog.lineage).collect();
+    assert_eq!(lineages.len(), 2, "both histories are returned");
+}
+
+#[tokio::test]
+async fn dr_collect_ignores_pointers_of_another_identity() {
+    let master = viaticum_core::cluster::derive_master_key(&[0xA4u8; 64]).unwrap();
+    let me = viaticum_core::cluster::master_identity(&master);
+    let stranger = viaticum_core::cluster::derive_master_key(&[0xA5u8; 64]).unwrap();
+    let db = test_db();
+    let ranked = ranked_peers(&db, 5, 0xA4, &me);
+    let forged = signed_pointer(&stranger, 1, 99, 1, 9_000);
+    let mut responses: HashMap<DeviceId, Vec<MailboxEntry>> = HashMap::new();
+    responses.insert(ranked[0], vec![pointer_entry(me, &forged, 1)]);
+    let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
+    let router = MailboxRouter::with_sender(sender, db);
+    let walk = router.dr_collect_pointers(&me).await.unwrap();
+    assert!(walk.pointers.is_empty());
+    assert_eq!(walk.responders, 5);
+}
+
+#[tokio::test]
+async fn dr_collect_distinguishes_no_candidates_from_no_pointer() {
+    let master = viaticum_core::cluster::derive_master_key(&[0xA6u8; 64]).unwrap();
+    let me = viaticum_core::cluster::master_identity(&master);
+
+    let empty = MailboxRouter::with_sender(Arc::new(MockSender::new()), test_db());
+    let walk = empty.dr_collect_pointers(&me).await.unwrap();
+    assert_eq!((walk.candidates, walk.responders), (0, 0));
+    assert!(walk.pointers.is_empty());
+
+    let db = test_db();
+    ranked_peers(&db, 3, 0xA6, &me);
+    let quiet = MailboxRouter::with_sender(Arc::new(MockSender::new()), db);
+    let walk = quiet.dr_collect_pointers(&me).await.unwrap();
+    assert_eq!((walk.candidates, walk.responders), (3, 3));
+    assert!(walk.pointers.is_empty());
+}
+
+/// Batch 1 (100 closest) holds nothing; the only pointer is at a peer of batch 2.
+#[tokio::test]
+async fn dr_walk_expands_to_next_batch_when_first_misses() {
+    use viaticum_core::constants::MAILBOX_DR_WALK_BATCHES;
+    let master = viaticum_core::cluster::derive_master_key(&[0xCDu8; 64]).unwrap();
+    let me = viaticum_core::cluster::master_identity(&master);
+    let db = test_db();
+    let ranked = ranked_peers(&db, 200, 0xF5, &me);
+    let first = MAILBOX_DR_WALK_BATCHES[0];
+    let p = signed_pointer(&master, 3, 1, 2, 5_000);
+    let mut responses: HashMap<DeviceId, Vec<MailboxEntry>> = HashMap::new();
+    for d in &ranked[first..] {
+        responses.insert(*d, vec![pointer_entry(me, &p, 9)]);
+    }
+    let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
+    let router = MailboxRouter::with_sender(sender.clone(), db);
+    let walk = router.dr_collect_pointers(&me).await.unwrap();
+    assert_eq!(walk.pointers.len(), 1);
+    assert_eq!(walk.pointers[0].generation, 2);
     assert!(
-        unique_fetched.len() > first_batch_size,
-        "dr_walk must have expanded beyond batch 1 ({} unique peers fetched, expected > {})",
-        unique_fetched.len(),
-        first_batch_size
+        sender.fetch_calls().len() > first,
+        "the walk went past batch 1"
     );
 }
 
@@ -1040,6 +927,11 @@ fn signed_pointer_entry(master_key: &ed25519_dalek::SigningKey, generation: u32)
         },
         vec![],
         Timestamp::now(),
+        CatalogSummary {
+            lineage: CatalogLineageId([0xC2; 16]),
+            publisher: DeviceId([0xD0; 32]),
+            files: 1,
+        },
     );
     let now = Timestamp::now().0;
     MailboxEntry {
@@ -1075,8 +967,9 @@ async fn signed_self_pointer_is_stored_by_real_postmen_and_found_by_dr_walk() {
         assert_eq!(held.len(), 1, "postman {d} stores the pointer");
     }
 
-    let found = router.dr_walk_for_pointer(&master).await.unwrap();
-    assert_eq!(found.map(|p| p.generation), Some(7));
+    let walk = router.dr_collect_pointers(&master).await.unwrap();
+    let generations: Vec<u32> = walk.pointers.iter().map(|p| p.generation).collect();
+    assert_eq!(generations, vec![7]);
 }
 
 /// AC-7 end to end: the same pointer without `target_sig` is refused by every real

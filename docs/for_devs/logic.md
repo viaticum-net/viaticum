@@ -163,35 +163,17 @@ Economically irrational for cold backup target (home NAS, metered upload):
 
 Acknowledged limitation — not fixed in alpha. Would require either random ESI subset challenges (incompatible with current chain hash) or shorter timeouts forcing constant reconstruction.
 
-## Escrow
+## Restore access (no escrow gate in v1)
 
-Contribution-based restore gating. Prevents hit-and-run: a peer cannot dump data and immediately restore — it must first store other peers' data for some time to accumulate restore budget.
+The holder serves the owner's own symbols while it holds them. There is no restore budget and no
+refusal: a legitimate owner must get their files back on the worst day, including the first week
+after install and on every retry. The holding is found by the pair (block, requester master), so a
+foreign master gets an empty response. Every holding status is served except `MarkedForDelete`
+(the owner itself asked to delete it; restore-i16).
 
-```
-restore_budget_gb = stored_gb_days / k_factor
-remaining_budget  = restore_budget_gb - already_restored_gb
-```
-
-Where `stored_gb_days` is the cumulative GB·day contribution the owner earned by hosting symbols for other peers (integrated over time since each placement was `received_at`).
-
-**Constants:** `DEFAULT_ESCROW_K_FACTOR = 7.0` (i.e. store 1 GB for 7 days → earn 1 GB of restore credit). See `viaticum-core/src/constants.rs`.
-
-**Example:** hold 100 GB for 14 days → `stored_gb_days = 1400`, budget = `1400 / 7 = 200 GB`. After restoring 50 GB, `remaining_budget = 150 GB`.
-
-Unlike the earlier trust-based formula, the new scheme has NO free tier: a brand-new peer with zero contribution has zero restore budget. `FREE_TIER_GB` still exists but now belongs to the owner-side budget planner (minimum outgoing backup budget), not escrow.
-
-**Accounting:**
-- `stored_gb_days` grows monotonically as time passes (holder-side, `db::stored_for_peer_gb_days`).
-- `already_restored_gb` is `restored_total_bytes / BYTES_PER_GB` from `record_restore_served` — also monotonic.
-- Budget therefore always grows unless a restore is served.
-- Atomic read-modify-write in `record_restore_served` closes a TOCTOU race on concurrent restores (see db/mod.rs).
-
-**Check on RestoreRequest:**
-1. Holder looks up `stored_gb_days(owner, now)` and `already_restored_gb(owner)`.
-2. Computes `remaining = (stored_gb_days / k_factor) - already_restored_gb`.
-3. If `requested_gb > remaining` → `RestoreDenied { restore_budget_gb, already_restored_gb, needed_gb_days }`.
-
-**No trust dependency.** The earlier `max_restorable_gb = FREE_TIER_GB + trust * escrow_trust_factor` formula is obsolete — trust now controls only placement weights (P, I, S factors), not restore gating.
+**Accounting only:** `record_restore_served` keeps a per-owner count of bytes served (atomic
+read-modify-write). Nothing reads it for a decision; it is input for a future escrow-as-debt in an
+open network.
 
 ## Repair
 

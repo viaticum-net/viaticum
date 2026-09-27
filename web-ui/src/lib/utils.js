@@ -42,7 +42,7 @@ export function formatTime(s) {
 
 // Render an EffectiveStatus value (from FileEntry.effective_status or
 // VersionEntry.effective_status) as a UI-ready badge spec.
-// Returns { label, kind, tooltip } where kind ∈ {pending, working, cold, ok, bad}.
+// Returns { label, kind, tooltip } where kind ∈ {pending, working, ok, bad}.
 //
 // `live` / `target` / `lost` are SYMBOL counts (RaptorQ ESIs), not holders.
 // We need `target` symbols to decode; each holder typically carries many.
@@ -63,12 +63,6 @@ export function statusBadge(s) {
         label: 'Protected',
         kind: 'ok',
         tooltip: `Fully protected: ${s.live} symbols available, only ${s.target} needed. Restore is available now.`,
-      };
-    case 'replicated_cold':
-      return {
-        label: 'Cold',
-        kind: 'cold',
-        tooltip: `Symbols are placed (${s.live}/${s.target}), but restore is held by escrow until you accumulate enough storage contribution. Typical wait: a few days.`,
       };
     case 'degraded': {
       const lostPct = pct(s.lost, s.target);
@@ -94,16 +88,6 @@ export function explainRestoreBlocker(b) {
         hint: 'Will succeed once enough holders are reachable. Try again after a few minutes, or trigger repair.',
         eta: '',
       };
-    case 'escrow_locked': {
-      const eta = (b.est_seconds && Number.isFinite(b.est_seconds))
-        ? `Estimated unlock in ~${Math.round(b.est_seconds / 3600)}h.`
-        : 'No ETA — depends on how long you hold data for other peers.';
-      return {
-        reason: `Holders refused via escrow. Your restore budget is ${(b.budget_gb ?? 0).toFixed(2)} GB; this block needs ${Number.isFinite(b.needed_gb) ? b.needed_gb.toFixed(2) + ' GB' : 'more than that'}.`,
-        hint: 'You earn restore credit by holding other peers\' data. Add more peers (Connect page) and let them place data on you.',
-        eta,
-      };
-    }
     case 'all_holders_offline':
       return {
         reason: 'All known holders for this block are offline.',
