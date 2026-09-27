@@ -167,7 +167,7 @@ async fn handle_status(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<Json<StatusData>, (StatusCode, String)> {
     match dispatch(CliRequest::Status, &state).await {
-        CliResponse::Status(data) => Ok(Json(data)),
+        CliResponse::Status(data) => Ok(Json(*data)),
         CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
         _ => Err((
             StatusCode::INTERNAL_SERVER_ERROR,

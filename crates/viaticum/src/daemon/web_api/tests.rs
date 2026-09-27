@@ -50,6 +50,7 @@ async fn make_test_state_with_restore(staging_path: std::path::PathBuf) -> Arc<D
         identity_pub,
         device_id,
         restore_tx,
+        restore_staging: Default::default(),
         cluster_state: None,
         master_key,
         seed: vec![0u8; 64],

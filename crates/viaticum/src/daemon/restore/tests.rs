@@ -26,6 +26,9 @@ use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKi
 
 use super::{RestoreConfig, RestoreCoordinator, VersionSelector, collect_esis_from_ranges};
 use crate::daemon::restore::staging::JobId;
+use crate::daemon::restore::staging::record::{
+    JobOutcome, JobState, RecordStatus, read_job_record, scan_staging,
+};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -541,6 +544,254 @@ async fn restore_missing_path_returns_empty_result() {
     assert_eq!(result.failures[0].0, "/nonexistent/file.txt");
 }
 
+/// CS-DR-10 + restore-i8: a path that matches nothing creates no job dir (staging
+/// is never cleaned up by the daemon, so a typo must leave nothing behind).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_of_unmatched_path_creates_no_staging_dir() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+    db.upsert_file(&catalog_record("/a/bc/file.txt", 1))
+        .unwrap();
+
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
+    for path in ["/nope.bin", "/a/b"] {
+        let result = restore
+            .restore(super::RestoreRequest {
+                path: path.to_string(),
+                version_selector: VersionSelector::Latest,
+                job_id: JobId::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.files_restored, 0, "{path}");
+        assert!(result.staging_path.as_os_str().is_empty(), "{path}");
+    }
+    let job_dirs = std::fs::read_dir(staging_dir.path().join("restore"))
+        .unwrap()
+        .count();
+    assert_eq!(
+        job_dirs, 0,
+        "no job dir may be created for an unmatched path"
+    );
+}
+
+/// restore-i14: a successful job leaves a finished record naming the restored file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_writes_finished_job_record_with_restored_paths() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+    let path = write_file(&files_dir, "rec.txt", b"job record content");
+
+    let mut backup = test_backup_coord(db.clone(), &symbols_dir);
+    backup.process_event(added_event(&path)).unwrap();
+    backup.flush_all(true, &Default::default()).unwrap();
+
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
+    let job_id = JobId::new();
+    let result = restore
+        .restore(super::RestoreRequest {
+            path: path.clone(),
+            version_selector: VersionSelector::Latest,
+            job_id,
+        })
+        .await
+        .unwrap();
+
+    let record = read_job_record(&result.staging_path).unwrap().unwrap();
+    assert_eq!(record.job_id, job_id);
+    assert_eq!(record.path, path);
+    assert_eq!(record.state, JobState::Finished);
+    assert_eq!(record.outcome, Some(JobOutcome::Complete));
+    assert_eq!((record.files_total, record.files_restored), (1, 1));
+    assert_eq!(record.restored_paths, vec![path.clone()]);
+    assert!(record.failures.is_empty());
+    assert!(record.finished_at.is_some());
+
+    // The scan after a "restart" reports the same outcome, and the staged file is
+    // not confused with the service entries.
+    let jobs = scan_staging(&staging_dir.path().join("restore"));
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].outcome, JobOutcome::Complete);
+    assert_eq!(
+        jobs[0].partial_files, 0,
+        "no temp may remain after a clean job"
+    );
+}
+
+/// N1 / restore-i14: the job dir carries a `running` record before the first file
+/// is written, so a crash at any later point reads as `interrupted`, not unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn begin_job_writes_running_record_before_any_file() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+    let restore = test_restore_coord(db, &symbols_dir, &staging_dir);
+    let request = super::RestoreRequest {
+        path: "/home/kolya/photos/".to_string(),
+        version_selector: VersionSelector::Latest,
+        job_id: JobId::new(),
+    };
+
+    let (writer, record) = restore.begin_job(&request, 7).unwrap();
+
+    let on_disk = read_job_record(writer.staging_path()).unwrap().unwrap();
+    assert_eq!(on_disk, record);
+    assert_eq!(on_disk.state, JobState::Running);
+    assert_eq!(on_disk.job_id, request.job_id);
+    assert_eq!(on_disk.files_total, 7);
+    // "Crash" now: the scan reports the job as interrupted, with 0 files.
+    let jobs = scan_staging(&staging_dir.path().join("restore"));
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].record, RecordStatus::NotFinished);
+    assert_eq!(jobs[0].outcome, JobOutcome::Interrupted);
+    assert_eq!(jobs[0].files_restored, 0);
+}
+
+/// W2 / restore-i14: a file whose target is taken (a directory already sits there)
+/// fails with AlreadyExists after its block was decoded; it is not counted, it is
+/// in failures, and the files on disk are exactly the record's restored_paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_with_taken_target_counts_only_published_files() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+    let a = write_file(&files_dir, "a.txt", b"file a content");
+    let b = write_file(&files_dir, "b.txt", b"file b content");
+
+    let mut backup = test_backup_coord(db.clone(), &symbols_dir);
+    backup.process_event(added_event(&a)).unwrap();
+    backup.process_event(added_event(&b)).unwrap();
+    backup.flush_all(true, &Default::default()).unwrap();
+
+    let job_id = JobId::new();
+    let job_dir = staging_dir.path().join("restore").join(job_id.to_string());
+    std::fs::create_dir_all(job_dir.join(b.trim_start_matches('/'))).unwrap();
+
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
+    let prefix = files_dir.path().to_string_lossy().to_string() + "/";
+    let result = restore
+        .restore(super::RestoreRequest {
+            path: prefix,
+            version_selector: VersionSelector::Latest,
+            job_id,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.files_restored, 1, "failures: {:?}", result.failures);
+    assert!(
+        result
+            .failures
+            .iter()
+            .any(|(p, d)| p == &b && d.contains("already exists")),
+        "b must fail with AlreadyExists: {:?}",
+        result.failures
+    );
+    let record = read_job_record(&job_dir).unwrap().unwrap();
+    assert_eq!(record.outcome, Some(JobOutcome::Partial));
+    assert_eq!(record.files_restored, 1);
+    assert_eq!(record.restored_paths, vec![a.clone()]);
+    assert_eq!(record.failures.len(), 1);
+    assert_eq!(record.failures[0].path, b);
+
+    // The disk agrees with the record: regular files outside `.viaticum-*`.
+    let mut on_disk = Vec::new();
+    collect_user_files(&job_dir, &job_dir, &mut on_disk);
+    assert_eq!(on_disk, record.restored_paths);
+}
+
+/// Regular files under `job_dir` (top-level `.viaticum-*` skipped) as catalog paths.
+fn collect_user_files(job_dir: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if dir == job_dir && e.file_name().to_string_lossy().starts_with(".viaticum-") {
+            continue;
+        }
+        let m = std::fs::symlink_metadata(&p).unwrap();
+        if m.is_dir() {
+            collect_user_files(job_dir, &p, out);
+        } else if m.is_file() {
+            out.push(format!("/{}", p.strip_prefix(job_dir).unwrap().display()));
+        }
+    }
+    out.sort();
+}
+
+// ─── CS-DR-10: resolve_path ───────────────────────────────────────────────────
+
+fn catalog_record(path: &str, id: u64) -> FileRecord {
+    FileRecord {
+        file_id: FileId(id),
+        path: path.to_string(),
+        importance: 0.5,
+        devices: vec![],
+        versions: vec![make_version(Some(200))],
+        first_seen: Timestamp(0),
+    }
+}
+
+fn resolved_paths(db: &Db, path: &str) -> Vec<String> {
+    let mut v: Vec<String> = super::resolve_path(db, path)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+    v.sort();
+    v
+}
+
+/// CS-DR-10: "/a/b" is a directory prefix only on a separator boundary; it must not
+/// capture the sibling "/a/bc".
+#[test]
+fn resolve_path_prefix_without_separator_does_not_match_sibling() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_file(&catalog_record("/a/b/x.txt", 1)).unwrap();
+    db.upsert_file(&catalog_record("/a/b/sub/y.txt", 2))
+        .unwrap();
+    db.upsert_file(&catalog_record("/a/bc/z.txt", 3)).unwrap();
+    db.upsert_file(&catalog_record("/a/b-old/w.txt", 4))
+        .unwrap();
+
+    assert_eq!(
+        resolved_paths(&db, "/a/b"),
+        vec!["/a/b/sub/y.txt".to_string(), "/a/b/x.txt".to_string()]
+    );
+    assert!(
+        resolved_paths(&db, "/a/bc/z").is_empty(),
+        "no partial-name match"
+    );
+    assert!(
+        resolved_paths(&db, "/a/b/x").is_empty(),
+        "no file-name prefix match"
+    );
+}
+
+/// An exact record wins over a directory of the same name.
+#[test]
+fn resolve_path_prefers_exact_record_over_prefix() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_file(&catalog_record("/a/report", 1)).unwrap();
+    db.upsert_file(&catalog_record("/a/report/inner.txt", 2))
+        .unwrap();
+    assert_eq!(
+        resolved_paths(&db, "/a/report"),
+        vec!["/a/report".to_string()]
+    );
+}
+
+/// A trailing separator is a plain prefix query (the directory's contents only).
+#[test]
+fn resolve_path_trailing_separator_is_prefix_query() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_file(&catalog_record("/a/b/x.txt", 1)).unwrap();
+    db.upsert_file(&catalog_record("/a/bc/z.txt", 2)).unwrap();
+    assert_eq!(resolved_paths(&db, "/a/b/"), vec!["/a/b/x.txt".to_string()]);
+}
+
 /// CS-DR-6 / restore-i11: restore writes the file into staging and leaves the
 /// catalog's per-device state alone (no `Present` for the restoring device, no new
 /// device entry).
@@ -761,6 +1012,16 @@ async fn one_unrecoverable_block_does_not_abort_remaining_blocks() {
         "the unrecoverable block's file must appear in failures, got: {:?}",
         result.failures
     );
+
+    // restore-i14: the job record carries the same per-file outcome.
+    let record = read_job_record(&result.staging_path).unwrap().unwrap();
+    assert_eq!(record.state, JobState::Finished);
+    assert_eq!(record.outcome, Some(JobOutcome::Partial));
+    assert_eq!(record.files_total, 2);
+    assert_eq!(record.files_restored, 1);
+    assert_eq!(record.restored_paths, vec![good_path_str.clone()]);
+    assert_eq!(record.failures.len(), 1);
+    assert_eq!(record.failures[0].path, bad_path_str);
 }
 
 // ─── collect_esis_from_ranges unit tests ──────────────────────────────────────
@@ -1111,331 +1372,6 @@ async fn restore_result_contains_staging_path() {
         "staging_path {:?} must be an existing directory",
         result.staging_path
     );
-}
-
-// ─── StagingWriter tests ───────────────────────────────────────────────────────
-
-mod staging_tests {
-    use crate::daemon::restore::staging::{JobId, StagingError, StagingWriter};
-    use std::path::Path;
-    use tempfile::TempDir;
-    use viaticum_core::path_safety::validate_record_path;
-
-    /// G1: staging writer creates file at the correct relative path.
-    #[test]
-    fn staging_writer_creates_file_at_correct_path() {
-        let data_dir = TempDir::new().unwrap();
-        let staging_root = data_dir.path().join("restore");
-        std::fs::create_dir_all(&staging_root).unwrap();
-
-        let job_id = JobId::new();
-        let writer = StagingWriter::open(&staging_root, data_dir.path(), job_id).unwrap();
-
-        let validated = validate_record_path("home/alice/docs/report.docx").unwrap();
-        let out = writer.write_file(&validated, b"report content").unwrap();
-
-        // File must exist at the returned path.
-        assert!(out.exists(), "file must exist at {out:?}");
-        let content = std::fs::read(&out).unwrap();
-        assert_eq!(content, b"report content");
-
-        // Path must be rooted in staging_path.
-        assert!(
-            out.starts_with(writer.staging_path()),
-            "file must be inside staging dir"
-        );
-    }
-
-    /// Basic open test: job dir is created.
-    #[test]
-    fn staging_writer_open_creates_job_dir() {
-        let data_dir = TempDir::new().unwrap();
-        let staging_root = data_dir.path().join("restore");
-        std::fs::create_dir_all(&staging_root).unwrap();
-
-        let job_id = JobId::new();
-        let writer = StagingWriter::open(&staging_root, data_dir.path(), job_id).unwrap();
-
-        assert!(
-            writer.staging_path().is_dir(),
-            "job staging dir must exist: {:?}",
-            writer.staging_path()
-        );
-        // Job dir name must be the UUID string.
-        let dir_name = writer.staging_path().file_name().unwrap().to_string_lossy();
-        assert_eq!(
-            dir_name,
-            job_id.to_string(),
-            "job dir name must be the UUID"
-        );
-    }
-
-    /// Mode 0o600 on written files (Unix only).
-    #[cfg(unix)]
-    #[test]
-    fn staging_writer_mode_is_600_on_unix() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let data_dir = TempDir::new().unwrap();
-        let staging_root = data_dir.path().join("restore");
-        std::fs::create_dir_all(&staging_root).unwrap();
-
-        let writer = StagingWriter::open(&staging_root, data_dir.path(), JobId::new()).unwrap();
-        let validated = validate_record_path("secret.txt").unwrap();
-        let out = writer.write_file(&validated, b"secret").unwrap();
-
-        let meta = std::fs::metadata(&out).unwrap();
-        let mode = meta.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "file mode must be 0o600, got {:o}", mode);
-    }
-
-    /// Mode 0o700 on job staging directory (Unix only).
-    #[cfg(unix)]
-    #[test]
-    fn staging_writer_job_dir_mode_is_700_on_unix() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let data_dir = TempDir::new().unwrap();
-        let staging_root = data_dir.path().join("restore");
-        std::fs::create_dir_all(&staging_root).unwrap();
-
-        let writer = StagingWriter::open(&staging_root, data_dir.path(), JobId::new()).unwrap();
-
-        let meta = std::fs::metadata(writer.staging_path()).unwrap();
-        let mode = meta.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "job dir mode must be 0o700, got {:o}", mode);
-    }
-
-    /// C1: Writing the same path twice in the same job fails on the second attempt.
-    #[test]
-    fn write_twice_same_path_fails_second() {
-        let data_dir = TempDir::new().unwrap();
-        let staging_root = data_dir.path().join("restore");
-        std::fs::create_dir_all(&staging_root).unwrap();
-
-        let writer = StagingWriter::open(&staging_root, data_dir.path(), JobId::new()).unwrap();
-        let validated = validate_record_path("docs/file.txt").unwrap();
-
-        // First write succeeds.
-        writer.write_file(&validated, b"first content").unwrap();
-
-        // Second write fails with AlreadyExists.
-        let result = writer.write_file(&validated, b"second content");
-        assert!(
-            matches!(result, Err(StagingError::AlreadyExists(_))),
-            "second write must fail with AlreadyExists, got: {result:?}"
-        );
-
-        // First file must be intact.
-        let out_path = writer.staging_path().join(validated.to_relative_path());
-        let content = std::fs::read(&out_path).unwrap();
-        assert_eq!(content, b"first content", "first file must remain intact");
-    }
-
-    /// B2: staging_root that is a symlink pointing outside data_dir is rejected.
-    #[cfg(unix)]
-    #[test]
-    fn staging_root_symlink_outside_data_dir_is_rejected() {
-        let data_dir = TempDir::new().unwrap();
-        // Create a separate "outside" directory.
-        let outside_dir = TempDir::new().unwrap();
-
-        // Create staging_root as a symlink to outside_dir.
-        let staging_root = data_dir.path().join("restore");
-        std::os::unix::fs::symlink(outside_dir.path(), &staging_root).unwrap();
-
-        let job_id = JobId::new();
-        let result = StagingWriter::open(&staging_root, data_dir.path(), job_id);
-
-        assert!(
-            matches!(result, Err(StagingError::OutsideDataDir { .. })),
-            "symlinked staging_root outside data_dir must be rejected, got: {result:?}"
-        );
-    }
-
-    /// B1: Write through a symlink in the staging tree — cap_std prevents symlink following.
-    /// The write should either succeed (capping to staging dir) or fail with an error,
-    /// but must NOT end up writing to the symlink target.
-    #[cfg(unix)]
-    #[test]
-    fn staging_write_does_not_follow_symlink_in_tree() {
-        let data_dir = TempDir::new().unwrap();
-        let staging_root = data_dir.path().join("restore");
-        std::fs::create_dir_all(&staging_root).unwrap();
-
-        let job_id = JobId::new();
-        let writer = StagingWriter::open(&staging_root, data_dir.path(), job_id).unwrap();
-
-        // Create a symlink inside the job dir that points to /tmp.
-        let job_dir = writer.staging_path();
-        let link_path = job_dir.join("link");
-        std::os::unix::fs::symlink("/tmp", &link_path).unwrap();
-
-        // Attempt to write "link/attack_file" — cap_std should not follow the symlink.
-        let validated = validate_record_path("link/attack_file").unwrap();
-        let result = writer.write_file(&validated, b"malicious content");
-
-        // The write must either fail (cap_std rejects symlink in tree) or succeed
-        // but land inside the staging dir (not in /tmp).
-        match result {
-            Err(_) => {
-                // Rejected by cap_std — the ideal outcome.
-                assert!(
-                    !Path::new("/tmp/attack_file").exists(),
-                    "/tmp/attack_file must not be created"
-                );
-            }
-            Ok(out_path) => {
-                // Allowed — but must not be at /tmp/attack_file.
-                assert!(
-                    out_path.starts_with(job_dir),
-                    "written file must be inside staging dir, not symlink target: {out_path:?}"
-                );
-                assert!(
-                    !Path::new("/tmp/attack_file").exists(),
-                    "/tmp/attack_file must not exist"
-                );
-            }
-        }
-    }
-
-    /// G2: Two restore jobs get different job_ids.
-    #[test]
-    fn two_restore_jobs_get_different_job_ids() {
-        let id1 = JobId::new();
-        let id2 = JobId::new();
-        assert_ne!(
-            id1, id2,
-            "two JobId::new() calls must produce different IDs"
-        );
-    }
-}
-
-// ─── Cleanup tests ────────────────────────────────────────────────────────────
-// Moved here from cleanup.rs per convention (tests in separate files).
-
-mod cleanup_tests {
-    use crate::daemon::restore::cleanup::{
-        check_staging_warn, evict_stale_stagings, should_warn, staging_total_bytes,
-    };
-    use std::path::Path;
-    use std::time::Duration;
-    use tempfile::TempDir;
-
-    #[test]
-    fn staging_total_bytes_returns_zero_for_missing_dir() {
-        let total = staging_total_bytes(Path::new("/nonexistent/path/that/does/not/exist"));
-        assert_eq!(total, 0);
-    }
-
-    #[test]
-    fn staging_total_bytes_returns_correct_sum() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("a.bin"), b"hello").unwrap(); // 5 bytes
-        std::fs::write(dir.path().join("b.bin"), b"world!!").unwrap(); // 7 bytes
-
-        let total = staging_total_bytes(dir.path());
-        assert_eq!(total, 12, "expected 5+7=12 bytes");
-    }
-
-    #[test]
-    fn staging_total_bytes_recurses_into_subdirectories() {
-        let dir = TempDir::new().unwrap();
-        let sub = dir.path().join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(dir.path().join("root.bin"), [0u8; 100]).unwrap();
-        std::fs::write(sub.join("nested.bin"), [0u8; 200]).unwrap();
-
-        let total = staging_total_bytes(dir.path());
-        assert_eq!(total, 300, "expected 100+200=300 bytes");
-    }
-
-    /// W2: should_warn returns false when used <= threshold.
-    #[test]
-    fn should_warn_returns_false_when_under_threshold() {
-        assert!(
-            !should_warn(4, 1_073_741_824),
-            "4 bytes must not exceed 1 GB threshold"
-        );
-    }
-
-    /// W2: should_warn returns true when used > threshold.
-    #[test]
-    fn should_warn_returns_true_when_over_threshold() {
-        assert!(should_warn(10, 5), "10 bytes must exceed 5-byte threshold");
-    }
-
-    /// W2: should_warn returns false when equal to threshold.
-    #[test]
-    fn should_warn_returns_false_when_equal_to_threshold() {
-        assert!(!should_warn(5, 5), "equal to threshold must not warn");
-    }
-
-    #[test]
-    fn staging_cleanup_warn_not_emitted_when_under_threshold() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("small.bin"), b"tiny").unwrap();
-
-        // Threshold = 1 GB; actual = 4 bytes → should not warn (no panic/error).
-        check_staging_warn(dir.path(), 1_073_741_824);
-        // No assertion — just verifying it doesn't panic or error.
-    }
-
-    #[test]
-    fn staging_cleanup_warn_emitted_when_over_threshold() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("big.bin"), b"0123456789").unwrap();
-
-        // 10 bytes > 5-byte threshold → should_warn must be true for this size.
-        assert!(should_warn(10, 5), "total must exceed threshold");
-        // check_staging_warn runs without panic.
-        check_staging_warn(dir.path(), 5);
-    }
-
-    #[test]
-    fn evict_stale_stagings_returns_zero_for_missing_root() {
-        let evicted = evict_stale_stagings(
-            Path::new("/nonexistent/staging/root"),
-            Duration::from_secs(1),
-        );
-        assert_eq!(evicted, 0);
-    }
-
-    #[test]
-    fn evict_stale_stagings_keeps_fresh_dirs() {
-        let root = TempDir::new().unwrap();
-        let job = root.path().join("job-fresh");
-        std::fs::create_dir_all(&job).unwrap();
-        std::fs::write(job.join("file.bin"), b"data").unwrap();
-
-        // TTL = 1 hour; dir just created → age << TTL → kept.
-        let evicted = evict_stale_stagings(root.path(), Duration::from_secs(3600));
-        assert_eq!(evicted, 0, "fresh dir must not be evicted");
-        assert!(job.exists(), "fresh dir must remain");
-    }
-
-    #[test]
-    fn evict_stale_stagings_removes_old_dirs() {
-        let root = TempDir::new().unwrap();
-        let job = root.path().join("job-stale");
-        std::fs::create_dir_all(&job).unwrap();
-        std::fs::write(job.join("file.bin"), b"data").unwrap();
-
-        // TTL = 0: any dir with age > 0 (created microseconds ago) is stale.
-        let evicted = evict_stale_stagings(root.path(), Duration::ZERO);
-        assert_eq!(evicted, 1, "stale dir must be evicted");
-        assert!(!job.exists(), "stale dir must be removed");
-    }
-
-    #[test]
-    fn evict_stale_stagings_ignores_files_at_root() {
-        let root = TempDir::new().unwrap();
-        // A loose file (not a job dir) at staging root must be left alone.
-        std::fs::write(root.path().join("loose.txt"), b"x").unwrap();
-        let evicted = evict_stale_stagings(root.path(), Duration::ZERO);
-        assert_eq!(evicted, 0, "files at root are not job dirs — never evicted");
-        assert!(root.path().join("loose.txt").exists());
-    }
 }
 
 // ─── Issue K: fetch timeout tests ────────────────────────────────────────────
