@@ -755,49 +755,104 @@ pub fn eviction_order(
     depth_params: &DepthParams,
     cap: &RetentionCap,
 ) -> EvictionDecision {
-    // --- Relay latch with hysteresis on the lower (evict) gap. ---
+    // κ_O once per owner from the kernel's single-`DepthParams` key; the decision itself is
+    // [`eviction_order_by_key`] (one sort for every consumer, В-0a).
+    let kappa: Vec<f64> = owners
+        .iter()
+        .map(|v| kappa_key(v.obs.g_holder_from_owner, v.depth, depth_params))
+        .collect();
+    eviction_order_by_key(owners, &kappa, phi, hyst, prev, cap)
+}
+
+/// A.14 inter-owner order: ascending κ_O (`kappa[i]` for `owners[i]`), tie
+/// `obs.observed_tau` ascending (longer-held owner-pair dropped LAST), then INPUT order
+/// (stable sort). Extracted from [`eviction_order`] so every consumer — the eviction
+/// lists, the holder shadow's owner ranking, the preemption victim — reads ONE sort.
+///
+/// Panics if `kappa.len() != owners.len()` (a caller bug, not data).
+pub fn owner_order_by_key(owners: &[OwnerEvictionView], kappa: &[f64]) -> Vec<usize> {
+    assert_eq!(
+        kappa.len(),
+        owners.len(),
+        "owner_order_by_key: kappa has {} entries for {} owners",
+        kappa.len(),
+        owners.len()
+    );
+    let mut owner_idx: Vec<usize> = (0..owners.len()).collect();
+    owner_idx.sort_by(|&i, &j| {
+        kappa[i].total_cmp(&kappa[j]).then(
+            owners[i]
+                .obs
+                .observed_tau
+                .total_cmp(&owners[j].obs.observed_tau),
+        )
+    });
+    owner_idx
+}
+
+/// [`eviction_order`] with κ_O supplied per owner (`kappa[i]` for `owners[i]`).
+///
+/// Why the key comes from outside: the daemon's κ_O has PER-PAIR depth params
+/// (`d_ref = τ_ref·v_dem`, `g* = v_dem/λ`, holder bridge `four_r_holder`), which the
+/// single-`DepthParams` signature of [`eviction_order`] cannot carry. The Р-7 cap reads the
+/// SAME `kappa[i]` (one key, A.14). Everything else — latch, two-level order, cap trims,
+/// `accept_ok` — is exactly the rule documented on [`eviction_order`], which is now a thin
+/// wrapper over this function (golden-pinned, K-0).
+///
+/// Panics if `kappa.len() != owners.len()` (a caller bug, not data).
+pub fn eviction_order_by_key(
+    owners: &[OwnerEvictionView],
+    kappa: &[f64],
+    phi: f64,
+    hyst: Hysteresis,
+    prev: EvictPhase,
+    cap: &RetentionCap,
+) -> EvictionDecision {
+    let phase = relay_latch(phi, hyst, prev);
+    eviction_order_in_phase(owners, kappa, phi, hyst, phase, cap)
+}
+
+/// The relay latch with hysteresis on the lower (evict) gap: ON when `φ < s_hard`, OFF when
+/// `φ ≥ s_target`, otherwise (the `Δ_evict` deadband, and a NaN `φ`) the previous state.
+/// The one latch rule of [`eviction_order_by_key`].
+pub fn relay_latch(phi: f64, hyst: Hysteresis, prev: EvictPhase) -> EvictPhase {
     let mut evicting = prev.evicting;
     if phi < hyst.s_hard {
         evicting = true;
     } else if phi >= hyst.s_target {
         evicting = false;
     }
-    // (s_hard ≤ φ < s_target ⇒ hold previous state: this is the Δ_evict deadband.)
+    EvictPhase { evicting }
+}
 
+/// [`eviction_order_by_key`] in a relay `phase` the CALLER has already decided (normally
+/// [`relay_latch`]; `eviction_order_by_key` is exactly that composition). The holder bridge
+/// uses it to FREEZE the latch on a tick whose φ it cannot trust (the node did not read its
+/// disk, `4r-i66`): the phase stays the previous one, the lists and `accept_ok` follow the
+/// usual rule for that phase. `phi` is read only by `accept_ok` (`φ > s_soft` and not
+/// evicting).
+///
+/// Panics if `kappa.len() != owners.len()` (a caller bug, not data).
+pub fn eviction_order_in_phase(
+    owners: &[OwnerEvictionView],
+    kappa: &[f64],
+    phi: f64,
+    hyst: Hysteresis,
+    phase: EvictPhase,
+    cap: &RetentionCap,
+) -> EvictionDecision {
+    let evicting = phase.evicting;
     let (cap_drops, drop_order) = if evicting {
-        // INTER-owner rank (SHARED by both lists): ascending κ_O (kappa_key: the fast
-        // reciprocal capital `g_ho` plus the slow W10 depth floor) — the owner that has
+        // INTER-owner rank (SHARED by both lists): ascending κ_O — the owner that has
         // served ME least loses disk first — with the `observed_tau` retention
         // tie-breaker (longer-held owner-pair dropped LAST).
-        let kappa =
-            |v: &OwnerEvictionView| kappa_key(v.obs.g_holder_from_owner, v.depth, depth_params);
-        let mut owner_idx: Vec<usize> = (0..owners.len()).collect();
-        owner_idx.sort_by(|&i, &j| {
-            kappa(&owners[i]).total_cmp(&kappa(&owners[j])).then(
-                owners[i]
-                    .obs
-                    .observed_tau
-                    .total_cmp(&owners[j].obs.observed_tau),
-            )
-        });
+        let owner_idx = owner_order_by_key(owners, kappa);
 
         // INTRA-owner ladder (per owner): ascending ι, [`SymbolId`] tie-break. Computed
         // ONCE and reused by BOTH lists — ι is sorted ONLY within an owner, never across
         // owners, so a high-ι symbol of a low-κ owner still drops before any symbol of a
         // higher-κ owner. This is the structural ban on cross-owner ×ι (H2).
-        let sorted_syms: Vec<Vec<usize>> = owners
-            .iter()
-            .map(|o| {
-                let mut idx: Vec<usize> = (0..o.symbols.len()).collect();
-                idx.sort_by(|&a, &b| {
-                    o.symbols[a]
-                        .importance
-                        .total_cmp(&o.symbols[b].importance)
-                        .then(o.symbols[a].id.cmp(&o.symbols[b].id))
-                });
-                idx
-            })
-            .collect();
+        let sorted_syms: Vec<Vec<usize>> = owners.iter().map(intra_owner_order).collect();
 
         // Р-7 cap_drops (A.14 ⭐): MANDATORY tariff enforcement. For each owner in κ_O
         // order, trim its parked volume down to V_ret = v_free + κ_O/c_recip by dropping
@@ -810,7 +865,7 @@ pub fn eviction_order(
         let mut cap_drops: Vec<SymbolSlot> = Vec::new();
         if cap.active() {
             for &oi in &owner_idx {
-                let v_ret = cap.v_ret(kappa(&owners[oi]));
+                let v_ret = cap.v_ret(kappa[oi]);
                 let mut parked: f64 = owners[oi].symbols.iter().map(|s| s.volume).sum();
                 if parked <= v_ret {
                     continue;
@@ -858,6 +913,224 @@ pub fn eviction_order(
         drop_order,
         accept_ok,
         phase: EvictPhase { evicting },
+    }
+}
+
+/// INTRA-owner ladder of ONE owner: symbol indices by ascending ι, [`SymbolId`] tie-break
+/// (deterministic). Shared by the eviction lists and the preemption victim's symbols.
+fn intra_owner_order(o: &OwnerEvictionView) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..o.symbols.len()).collect();
+    idx.sort_by(|&a, &b| {
+        o.symbols[a]
+            .importance
+            .total_cmp(&o.symbols[b].importance)
+            .then(o.symbols[a].id.cmp(&o.symbols[b].id))
+    });
+    idx
+}
+
+// ============================================================
+// A.12-2 — offer admission with preemption (holder side, В-0b).
+// ============================================================
+
+/// The offering owner as the holder sees it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdmitOfferer {
+    /// Index in `owners` if the offerer already parks data on this holder, else `None`.
+    pub index: Option<usize>,
+    /// κ_O of the offerer — from the SAME key function as the `kappa` slice (A.14).
+    pub kappa: f64,
+    /// `V_parked(offerer)` [gb] on this holder (0 if absent).
+    pub v_parked: f64,
+}
+
+/// Dials of [`admit_offer`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdmitParams {
+    pub hyst: Hysteresis,
+    pub cap: RetentionCap,
+    /// `θ_p`; negative or non-finite DISABLES preemption (the sim's `preempt_enabled`).
+    pub theta_p: f64,
+    /// `V_min` [gb]: floor of the offer volume in the margin.
+    pub v_min: f64,
+    /// `λ` [1/day] of the fast capital (the margin is measured in its steady state).
+    pub lambda: f64,
+}
+
+/// The holder's answer to an offer, as the kernel decides it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdmitDecision {
+    /// Room and above the accept gate: take it.
+    Free,
+    /// Contended: displace these symbols (indices into `owners[victim_owner].symbols`, in
+    /// drop order) of the least-reciprocal other owner.
+    Preempt {
+        victim_owner: usize,
+        victim_symbols: Vec<usize>,
+    },
+    /// Refuse, and why.
+    Reject(AdmitReject),
+}
+
+/// Why [`admit_offer`] refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitReject {
+    /// Contended and `θ_p` disables preemption.
+    PreemptDisabled,
+    /// The offerer's own `V_ret` cannot hold its parked volume plus this offer (B-1).
+    Guard,
+    /// No other owner with data here to displace.
+    NoVictim,
+    /// `κ(offerer) ≤ κ(victim) + margin`: not reciprocal enough to displace anyone.
+    Margin,
+    /// Even all of the victim's symbols are smaller than the offer.
+    VictimTooSmall,
+    /// The victim would leave only through its notice window; there is no room NOW.
+    NoRoomNow,
+}
+
+/// Preemption margin [gb·days] = `θ_p · max(V_offer, V_min) / λ` — the steady fast capital
+/// of the larger of the offer and `V_min`, scaled by `θ_p`. `λ ≤ 0` ⇒ 0 (no steady state).
+pub fn preemption_margin(theta_p: f64, v_offer: f64, v_min: f64, lambda: f64) -> f64 {
+    theta_p * capital_steady_state(v_offer.max(v_min), lambda)
+}
+
+/// The preemption victim OWNER: the least-reciprocal owner (`argmin kappa[i]`) other than
+/// `exclude`, among owners with at least one symbol here. Ties: the first minimal index
+/// (strict `<`). `None` when there is no such owner.
+pub fn preemption_victim_owner(
+    owners: &[OwnerEvictionView],
+    kappa: &[f64],
+    exclude: Option<usize>,
+) -> Option<usize> {
+    assert_eq!(
+        kappa.len(),
+        owners.len(),
+        "preemption_victim_owner: kappa has {} entries for {} owners",
+        kappa.len(),
+        owners.len()
+    );
+    let mut best: Option<usize> = None;
+    let mut k_min = f64::INFINITY;
+    for (i, o) in owners.iter().enumerate() {
+        if Some(i) == exclude || o.symbols.is_empty() {
+            continue;
+        }
+        if kappa[i] < k_min {
+            k_min = kappa[i];
+            best = Some(i);
+        }
+    }
+    best
+}
+
+/// The holder accept/preemption gate (A.12-2) — the kernel transcription of the simulator's
+/// `sim_dynamic/engine.rs::admit_offer` (≈ 1462-1635), pure (no side effects: the caller
+/// applies a `Preempt`). Checks, in the sim's order:
+///
+/// 1. `φ > s_soft ∧ ¬evicting ∧ free_now ≥ v_offer` → [`AdmitDecision::Free`] (the free path
+///    is NOT gated by the cap).
+/// 2. `θ_p` non-finite or `< 0` → `Reject(PreemptDisabled)`.
+/// 3. margin = [`preemption_margin`]`(θ_p, v_offer, V_min, λ)`.
+/// 4. cap active ∧ `offerer.v_parked + v_offer > V_ret(offerer.kappa)` → `Reject(Guard)`. With
+///    `V_free = 0` an owner with κ = 0 and anything parked here is stopped HERE, before the
+///    margin.
+/// 5. victim = [`preemption_victim_owner`] (not the offerer, З-2) → none: `Reject(NoVictim)`.
+/// 6. `offerer.kappa ≤ kappa[victim] + margin` → `Reject(Margin)`.
+/// 7. the victim's symbols ascending (ι, [`SymbolId`]), accumulated until `≥ v_offer`; all of
+///    them `< v_offer` → `Reject(VictimTooSmall)`.
+/// 8. `free_now < v_offer` → `Reject(NoRoomNow)`.
+/// 9. `Preempt { victim_owner, victim_symbols }`.
+///
+/// **Deviations from the sim — the complete list** (the shadow predicts the DAEMON's enforce,
+/// not the sim; audit review W-5):
+/// 1. **View** — the caller passes holdings without notified ones, without MarkedForDelete
+///    and without its own master (sim: every live symbol, `engine.rs:1553-1558` guard,
+///    `:1570-1574` victims).
+/// 2. **Victim ties** — the first minimal owner in INPUT order (the daemon: master bytes);
+///    the sim takes the first minimal in its holdings storage order with strict `<`
+///    (`:1580`). Both "first minimal", over different orders.
+/// 3. **κ** — per-pair `DepthParams` (`d_ref = τ_ref·v_dem`, `g* = v_dem/λ`) supplied by the
+///    caller through `kappa`; the sim uses global ones from `V_sym` (`depth_params_of`,
+///    `:498-504`).
+/// 4. **Margin** — `θ_p · max(V_offer, V_min)/λ`; the sim: `θ_p · g*(V_sym)` (`:1536`).
+/// 5. **Several symbols of the victim** (З-3); the sim displaces exactly one symbol.
+/// 6. **`NoRoomNow` instead of the swap on a full disk** — the sim checks `free + v_victim ≥
+///    v` and swaps instantly (`:1605`, `t_n = 0`); in the daemon the victim leaves through its
+///    notice window, so room is needed NOW (Р-15 / З-5).
+/// 7. **No holder will** (`accept_rate = 1`, З-4) and none of the sim's adversary hooks
+///    (enclosure, group-only).
+/// 8. **Р-26 and Р-17** (a re-offer of a notified block; the guard on the free path while the
+///    offerer has notified holdings) live in the holder layer
+///    (`four_r_holder::shadow_offer`), not here.
+///
+/// Panics if `kappa.len() != owners.len()` or `offerer.index` is out of range (caller bugs).
+#[allow(clippy::too_many_arguments)]
+pub fn admit_offer(
+    owners: &[OwnerEvictionView],
+    kappa: &[f64],
+    offerer: &AdmitOfferer,
+    v_offer: f64,
+    phi: f64,
+    free_now: f64,
+    phase: EvictPhase,
+    p: &AdmitParams,
+) -> AdmitDecision {
+    assert_eq!(
+        kappa.len(),
+        owners.len(),
+        "admit_offer: kappa has {} entries for {} owners",
+        kappa.len(),
+        owners.len()
+    );
+    if let Some(i) = offerer.index {
+        assert!(
+            i < owners.len(),
+            "admit_offer: offerer index {i} out of range"
+        );
+    }
+    // (1) Abundance: accept freely above the accept gate, when not evicting, with room.
+    if phi > p.hyst.s_soft && !phase.evicting && free_now >= v_offer {
+        return AdmitDecision::Free;
+    }
+    // (2) Contended / frozen → preemption, if enabled.
+    if !(p.theta_p.is_finite() && p.theta_p >= 0.0) {
+        return AdmitDecision::Reject(AdmitReject::PreemptDisabled);
+    }
+    // (3) The margin in steady fast capital.
+    let margin = preemption_margin(p.theta_p, v_offer, p.v_min, p.lambda);
+    // (4) Accept-guard (B-1): never admit what the offerer's own V_ret would trim next.
+    if p.cap.active() && offerer.v_parked + v_offer > p.cap.v_ret(offerer.kappa) {
+        return AdmitDecision::Reject(AdmitReject::Guard);
+    }
+    // (5) The least-reciprocal OTHER owner (never the offerer itself, З-2).
+    let Some(victim) = preemption_victim_owner(owners, kappa, offerer.index) else {
+        return AdmitDecision::Reject(AdmitReject::NoVictim);
+    };
+    // (6) Only a clearly more reciprocal owner displaces (a parasite never clears this).
+    if offerer.kappa <= kappa[victim] + margin {
+        return AdmitDecision::Reject(AdmitReject::Margin);
+    }
+    // (7) The victim's LOWEST-ι symbols, as many as the offer needs.
+    let mut acc = 0.0f64;
+    let mut victim_symbols = Vec::new();
+    for si in intra_owner_order(&owners[victim]) {
+        if acc >= v_offer {
+            break;
+        }
+        acc += owners[victim].symbols[si].volume;
+        victim_symbols.push(si);
+    }
+    if acc < v_offer {
+        return AdmitDecision::Reject(AdmitReject::VictimTooSmall);
+    }
+    // (8) The victim leaves through its notice window: the room must be there now.
+    if free_now < v_offer {
+        return AdmitDecision::Reject(AdmitReject::NoRoomNow);
+    }
+    AdmitDecision::Preempt {
+        victim_owner: victim,
+        victim_symbols,
     }
 }
 

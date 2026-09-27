@@ -135,9 +135,10 @@ const MAILBOX_BYTES_BY_TARGET: TableDefinition<&[u8; 32], &[u8]> =
 /// This does NOT make "no decision reads the ledger" structural — `Db` is reachable from
 /// every module and `get_pair_ledger` is an ordinary `pub` method. The actual guarantee
 /// today is only WHICH call sites read it: the recorder that writes it
-/// ([`crate::pair_ledger`], which reads the previous row to continue the integral) and the
-/// SystemState snapshot/restore pair that carries it through disaster recovery. No
-/// placement, eviction, offer-admission or PoS-cadence path touches it.
+/// ([`crate::pair_ledger`], which reads the previous row to continue the integral), the
+/// SystemState snapshot/restore pair that carries it through disaster recovery, and the 4R
+/// shadow (В-0, [`crate::four_r_holder`]) whose outputs are only log lines and its own latch
+/// row. No placement, eviction, offer-admission or PoS-cadence path decides on it.
 ///
 /// `create_tables` opens it on every `Db::open`, so a database written before this table
 /// existed simply gains it empty (no migration step).
@@ -406,6 +407,8 @@ impl Db {
             // DN-1: applied signed letters + their expiry index (outside snapshot_db, 4r-i51).
             tx.open_table(seen_signed_letters::SEEN_SIGNED_LETTERS)?;
             tx.open_table(seen_signed_letters::SEEN_SIGNED_LETTERS_BY_EXPIRY)?;
+            // В-0: 4R holder latch (shadow only; outside snapshot_db, node-local).
+            tx.open_table(four_r_state::FOUR_R_STATE)?;
         }
         tx.commit()?;
         Ok(())
@@ -634,6 +637,19 @@ impl Db {
         {
             let mut table = tx.open_table(SYMBOL_PLACEMENTS)?;
             table.insert(&key, [0xffu8, 0x00, 0x13].as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Test seam (В-0, D-1b): overwrite the pair-ledger row of `master` with bytes that do not
+    /// decode as a `PairLedger`, so [`Db::list_pair_ledgers`] answers `Err`.
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn corrupt_pair_ledger_row_for_test(&self, master: &IdentityPub) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(PAIR_LEDGER)?;
+            table.insert(&master.0, [0xffu8, 0x00, 0x13].as_slice())?;
         }
         tx.commit()?;
         Ok(())
@@ -3454,6 +3470,9 @@ pub mod testutil {
 
 /// DN-1: applied signed letters by signature (`seen_signed_letters` + expiry index).
 mod seen_signed_letters;
+
+/// В-0: 4R holder state (`four_r_state`: the relay latch row).
+mod four_r_state;
 
 #[cfg(test)]
 mod tests;

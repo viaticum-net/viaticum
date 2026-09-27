@@ -942,6 +942,10 @@ impl DaemonHandle {
             // Wire WorkPipeline event channel to Processor so on_peer_authenticated
             // sends WorkEvent::PeerAuthenticated to wake the worker.
             processor.set_work_event_tx(work_event_tx.clone());
+            // В-0b: the [four_r] dials drive the 4R offer shadow (logs only, off the reply path).
+            processor.set_four_r(viaticum_core::four_r_holder::FourRParams::from_cfg(
+                &app_config.four_r,
+            ));
 
             // ── Spawn WorkPipeline worker ──────────────────────────────────────
             {
@@ -1271,6 +1275,9 @@ impl DaemonHandle {
             let cleanup_master_key = master_key.clone();
             let cleanup_interval = (3600 / time_scale).max(1);
             let pressure_interval = (3600 / time_scale).max(60);
+            // В-0: the [four_r] dials drive the 4R shadow of the pressure tick (logs only).
+            let cleanup_four_r =
+                viaticum_core::four_r_holder::FourRParams::from_cfg(&app_config.four_r);
             tasks.push((
                 "holder_cleanup",
                 tokio::spawn(async move {
@@ -1286,6 +1293,7 @@ impl DaemonHandle {
                         pressure_interval,
                         time_scale,
                         cleanup_master_key,
+                        cleanup_four_r,
                         cleanup_cancel,
                     )
                     .await

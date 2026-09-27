@@ -4242,3 +4242,253 @@ fn the_daemon_recorder_leaks_at_exactly_the_model_defaults_this_sim_runs_on() {
         "λ_drop: the drop counters must forgive at the sim's rate"
     );
 }
+
+// ============================================================
+// В-0b SIM-1 — the kernel `four_r::admit_offer` vs the sim's gate
+// ============================================================
+
+/// One SIM-1 fixture on holder 1: its live holdings `(owner, block, ι)` (one symbol of
+/// volume `v` each), the pair capitals `(owner, g_ho, depth)`, the offering owner, the
+/// holder's free room in symbols, the latch and the preemption factor.
+struct Sim1Case {
+    name: &'static str,
+    holdings: Vec<(usize, usize, f64)>,
+    capital: Vec<(usize, f64, f64)>,
+    offerer: usize,
+    free_symbols: f64,
+    evicting: bool,
+    theta: f64,
+}
+
+/// SIM-1 (В-0b): on fixtures where none of the daemon's deviations bites (accept_rate = 1,
+/// every owner a DIFFERENT κ, one victim symbol ≥ `v_per_symbol`, `free_disk ≥ v_per_symbol`,
+/// no notified holdings, `V_min = 0`, `v_offer = v_per_symbol`, κ via
+/// `kappa_key(depth_params_of(..))`), `admit_offer_for_test` and the kernel `admit_offer`
+/// take the same decision — and a preemption displaces the same symbol.
+#[test]
+fn the_kernel_admit_offer_agrees_with_the_sim_gate_where_the_models_coincide() {
+    use viaticum_core::four_r::{
+        AdmitDecision, AdmitOfferer, AdmitParams, OwnerEvictionView, SymbolDecl, SymbolId,
+        admit_offer, kappa_key,
+    };
+
+    use crate::sim_dynamic::engine::{depth_params_of, retention_cap};
+
+    let base = params_v_free_pinned();
+    let holder = 1usize;
+    let v = base.block_volume / base.k_eff as f64;
+    let cases = vec![
+        Sim1Case {
+            name: "abundance",
+            holdings: vec![(2, 0, 0.5)],
+            capital: vec![(2, 500.0, 0.0), (4, 3.0, 0.0)],
+            offerer: 4,
+            free_symbols: 17.0,
+            evicting: false,
+            theta: 0.2,
+        },
+        Sim1Case {
+            name: "contended_reciprocal_offerer_preempts_the_parasite",
+            holdings: vec![(2, 0, 0.5), (3, 0, 0.8), (3, 1, 0.2)],
+            capital: vec![(2, 500.0, 0.0), (3, 0.0, 0.0), (4, 600.0, 0.0)],
+            offerer: 4,
+            free_symbols: 1.5,
+            evicting: false,
+            theta: 0.2,
+        },
+        Sim1Case {
+            name: "contended_parasite_offerer",
+            holdings: vec![(2, 0, 0.5), (3, 0, 0.8)],
+            capital: vec![(2, 500.0, 0.0), (3, 1.0, 0.0), (5, 0.0, 0.0)],
+            offerer: 5,
+            free_symbols: 1.5,
+            evicting: false,
+            theta: 0.2,
+        },
+        Sim1Case {
+            name: "contended_offerer_over_its_v_ret_is_guarded",
+            holdings: vec![(2, 0, 0.5), (2, 1, 0.6), (2, 2, 0.7), (3, 0, 0.8)],
+            capital: vec![(2, 1.0, 0.0), (3, 0.0, 0.0)],
+            offerer: 2,
+            free_symbols: 1.5,
+            evicting: false,
+            theta: 0.2,
+        },
+        Sim1Case {
+            name: "latched_with_room_preempts",
+            holdings: vec![(2, 0, 0.5), (3, 0, 0.8), (3, 1, 0.3)],
+            capital: vec![(2, 200.0, 0.0), (3, 50.0, 0.0), (4, 900.0, 0.0)],
+            offerer: 4,
+            free_symbols: 10.0,
+            evicting: true,
+            theta: 0.2,
+        },
+        Sim1Case {
+            name: "deep_partner_is_not_the_victim",
+            holdings: vec![(2, 0, 0.5), (3, 0, 0.5)],
+            capital: vec![(2, 0.0, 1e9), (3, 0.0, 0.0), (4, 700.0, 0.0)],
+            offerer: 4,
+            free_symbols: 1.5,
+            evicting: false,
+            theta: 0.2,
+        },
+        Sim1Case {
+            name: "preemption_disabled",
+            holdings: vec![(2, 0, 0.5), (3, 0, 0.8)],
+            capital: vec![(2, 500.0, 0.0), (3, 0.0, 0.0), (4, 600.0, 0.0)],
+            offerer: 4,
+            free_symbols: 1.5,
+            evicting: false,
+            theta: -1.0,
+        },
+    ];
+    let mut n_admit = 0;
+    let mut n_preempt = 0;
+    for c in &cases {
+        let params = DynParams {
+            preempt_theta: c.theta,
+            ..base
+        };
+        let mut world = mk_clean_world(&params, 7);
+        let h = &mut world.nodes[holder];
+        h.disk_cap = 20.0 * v;
+        for &(owner, block, iota) in &c.holdings {
+            h.holdings.push(HeldSymbol {
+                owner,
+                block,
+                iota,
+                volume: v,
+                alive: true,
+                cream: false,
+            });
+        }
+        h.disk.own_data = h.disk_cap - c.holdings.len() as f64 * v - c.free_symbols * v;
+        h.evict_phase = EvictPhase {
+            evicting: c.evicting,
+        };
+        for &(o, g, d) in &c.capital {
+            world.capital[o][holder].g_ho = g;
+            world.capital[o][holder].depth_ho = d;
+        }
+        assert!(
+            world.nodes[holder].free_disk() >= v,
+            "{}: free_disk ≥ v_per_symbol",
+            c.name
+        );
+
+        // The kernel's inputs, read from the same world BEFORE the sim mutates it.
+        let dp = depth_params_of(&params, v);
+        let kap = |o: usize| {
+            kappa_key(
+                world.capital[o][holder].g_ho,
+                world.capital[o][holder].depth_ho,
+                &dp,
+            )
+        };
+        let mut order: Vec<usize> = Vec::new();
+        for s in world.nodes[holder].holdings.iter().filter(|s| s.alive) {
+            if !order.contains(&s.owner) {
+                order.push(s.owner);
+            }
+        }
+        let views: Vec<OwnerEvictionView> = order
+            .iter()
+            .map(|&o| OwnerEvictionView {
+                // The gate reads only κ and the symbols; any first-hand obs will do.
+                obs: observe_pair(&world.capital[o][holder], &world.nodes[o], DAYS_PER_TICK, v),
+                depth: world.capital[o][holder].depth_ho,
+                symbols: world.nodes[holder]
+                    .holdings
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.alive && s.owner == o)
+                    .map(|(i, s)| SymbolDecl {
+                        id: SymbolId(i as u64),
+                        importance: s.iota,
+                        volume: s.volume,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let kappa: Vec<f64> = order.iter().map(|&o| kap(o)).collect();
+        let mut distinct = kappa.clone();
+        distinct.push(kap(c.offerer));
+        distinct.sort_by(f64::total_cmp);
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            kappa.len() + usize::from(!order.contains(&c.offerer)),
+            "{}: κ must differ",
+            c.name
+        );
+        let idx = order.iter().position(|&o| o == c.offerer);
+        let offerer = AdmitOfferer {
+            index: idx,
+            kappa: kap(c.offerer),
+            v_parked: idx.map_or(0.0, |i| views[i].symbols.iter().map(|s| s.volume).sum()),
+        };
+        let p = AdmitParams {
+            hyst: params.hyst,
+            cap: retention_cap(&params, v),
+            theta_p: params.preempt_theta,
+            v_min: 0.0,
+            lambda: params.lambda,
+        };
+        let kernel = admit_offer(
+            &views,
+            &kappa,
+            &offerer,
+            v,
+            world.nodes[holder].phi_free_ratio(),
+            world.nodes[holder].free_disk(),
+            world.nodes[holder].evict_phase,
+            &p,
+        );
+        let before: Vec<bool> = world.nodes[holder]
+            .holdings
+            .iter()
+            .map(|s| s.alive)
+            .collect();
+        let sim = admit_offer_for_test(&mut world, c.offerer, holder, v, &params, 0);
+        let kernel_admits = matches!(kernel, AdmitDecision::Free | AdmitDecision::Preempt { .. });
+        assert_eq!(
+            sim, kernel_admits,
+            "{}: sim {sim} vs kernel {kernel:?}",
+            c.name
+        );
+        let killed: Vec<usize> = before
+            .iter()
+            .zip(&world.nodes[holder].holdings)
+            .enumerate()
+            .filter(|(_, (b, s))| **b && !s.alive)
+            .map(|(i, _)| i)
+            .collect();
+        match &kernel {
+            AdmitDecision::Preempt {
+                victim_owner,
+                victim_symbols,
+            } => {
+                n_preempt += 1;
+                assert_eq!(
+                    victim_symbols.len(),
+                    1,
+                    "{}: one symbol covers v_per_symbol",
+                    c.name
+                );
+                let sym = views[*victim_owner].symbols[victim_symbols[0]].id.0 as usize;
+                assert_eq!(killed, vec![sym], "{}: same displaced symbol", c.name);
+            }
+            _ => assert!(
+                killed.is_empty(),
+                "{}: the sim displaced {killed:?}",
+                c.name
+            ),
+        }
+        n_admit += usize::from(sim);
+    }
+    // The fixtures must exercise both answers and the preemption path.
+    assert!(
+        n_admit >= 3 && n_preempt >= 3,
+        "admit {n_admit}, preempt {n_preempt}"
+    );
+}
