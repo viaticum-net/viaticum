@@ -33,7 +33,11 @@ impl KademliaRoutingView {
     /// Compute the Kademlia target key for a mailbox target identity.
     ///
     /// target_key = SHA256(target_pub.0)
-    /// This is stable across restarts and matches the DHT lookup key used in DR.
+    /// Stable across restarts. This is the point in the Kademlia key space where
+    /// postmen are ranked. It is NOT what DR passes to `get_closest_peers`: libp2p-kad
+    /// hashes the key it is given (`kbucket::Key::new` = SHA256 of the preimage), so DR
+    /// passes the PREIMAGE `target_pub.0` (`dr::dr_lookup_key`, F12) and libp2p arrives
+    /// at this same key. Passing this hash would walk to SHA256(SHA256(target_pub)).
     pub fn target_key(target_pub: &IdentityPub) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(target_pub.0);

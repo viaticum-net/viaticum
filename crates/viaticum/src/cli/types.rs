@@ -37,7 +37,12 @@ pub enum CliRequest {
 }
 
 /// Response from daemon to CLI process.
+///
+/// `Status` is the large variant (the full status report). One value exists per CLI
+/// request and is serialized right away, so the size difference costs nothing worth
+/// a `Box` at every construction and match site.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum CliResponse {
     Status(StatusData),
     Restore(RestoreData),
@@ -129,6 +134,23 @@ pub struct StatusData {
     /// Empty buckets have block_count=0, mean_p_recoverable=0.0, status="empty".
     #[serde(default)]
     pub by_importance: Vec<viaticum_core::types::ImportanceBucketStats>,
+    /// dr-i9: unix secs of this node's last recovery-pointer publication accepted by
+    /// ≥ 1 postman; 0 = never (DR from the phrase would not find this catalog yet).
+    #[serde(default)]
+    pub dr_pointer_published_at: u64,
+    /// Live files in the catalog that publication restores.
+    #[serde(default)]
+    pub dr_pointer_files: u32,
+    /// Postmen that accepted that publication.
+    #[serde(default)]
+    pub dr_pointer_acks: u32,
+    /// Hex of this DB's catalog history id; "" before the node minted one.
+    #[serde(default)]
+    pub catalog_lineage: String,
+    /// dr-i11: live catalog files whose path does not exist on this machine (not
+    /// re-protected until they are back).
+    #[serde(default)]
+    pub files_without_source: u32,
 }
 
 /// Peer summary shown in `viaticum status`.

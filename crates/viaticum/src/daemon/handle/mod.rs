@@ -115,6 +115,9 @@ pub struct DaemonState {
     /// revocation entries to storage-relationship peers instead of relay broadcast.
     /// None in tests that do not wire up a MailboxRouter.
     pub mailbox_router: Option<std::sync::Arc<crate::daemon::mailbox::routing::MailboxRouter>>,
+    /// dr-i11: background-counted "files without a local source" for `status`.
+    pub missing_sources:
+        std::sync::Arc<crate::daemon::dispatch::missing_sources::MissingSourceCache>,
 }
 
 /// Web API pieces prepared before the swarm starts (see step 9.4 of `start`).
@@ -688,6 +691,7 @@ impl DaemonHandle {
             peer_backoff: Arc::clone(&peer_backoff),
             // T-13b-2: router shared with dispatch_device_revoke for directed revocation publish.
             mailbox_router: Some(std::sync::Arc::clone(&early_mailbox_router)),
+            missing_sources: Default::default(),
         });
 
         // Clone state for web API and metrics pusher.
@@ -1234,6 +1238,8 @@ impl DaemonHandle {
             let ss_interval = (6 * 3600 / time_scale).max(60);
             let ss_mailbox_router = std::sync::Arc::clone(&mailbox_router);
             let ss_my_master_pub = identity_pub;
+            // Spec B2 (dr-i19): pointers name the device that published them.
+            let ss_publisher = device_id;
             let ss_current_pointer = std::sync::Arc::clone(&current_pointer);
             let cancel_ss = cancel.clone();
             tasks.push((
@@ -1250,6 +1256,7 @@ impl DaemonHandle {
                         cancel_ss,
                         ss_mailbox_router,
                         ss_my_master_pub,
+                        ss_publisher,
                         ss_current_pointer,
                     )
                     .await
