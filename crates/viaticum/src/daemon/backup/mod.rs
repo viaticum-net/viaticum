@@ -192,7 +192,8 @@ pub struct BackupCoordinator {
     /// Holders that accepted symbols this flush cycle (reset after persist).
     ///
     /// NOTE (post-W11b/A4): a companion to `offered_this_cycle`. It still
-    /// increments on `BackupEvent::SymbolAccept`, but since `offered_this_cycle`
+    /// increments on `BackupEvent::SymbolAccepted`, only for a placement in `Offered`
+    /// (other statuses are ignored), but since `offered_this_cycle`
     /// is now permanently 0, `persist_cycle_budget` early-returns before resetting
     /// it — so it accumulates (saturating) and is never read. Harmless zombie until
     /// the offer→accept accounting is re-homed to the worker in phase-4R.
@@ -726,7 +727,16 @@ impl BackupCoordinator {
     }
 
     /// Handle a BackupEvent from the Processor.
+    ///
+    /// Rule "an incoming answer without a request is ignored" (repair-i2, agreed with
+    /// line A 2026-09-27): a holder's `SymbolAccept` / `SymbolReject` may only move a
+    /// placement that is still `Offered` (the one state in which the owner is waiting
+    /// for that answer). In any other state the message is not an answer to anything
+    /// we asked: applying it would let a silent holder turn `Uncertain`/`PresumedLost`
+    /// into `Alive` without a PoS verdict, or turn a verified `Alive` into `Lost`. Such
+    /// messages are ignored and logged at DEBUG.
     fn handle_backup_event(&mut self, event: BackupEvent) {
+        use viaticum_core::types::PlacementStatus;
         match event {
             BackupEvent::SymbolAccepted {
                 holder_id,
@@ -737,14 +747,19 @@ impl BackupCoordinator {
                     block_id = %source_block_id,
                     "holder accepted symbols"
                 );
-                // Update placement status to Alive (confirmed by holder).
+                // Update placement status to Alive (confirmed by holder) — only from Offered.
                 match self.db.get_placement(&source_block_id, &holder_id) {
                     Ok(Some(mut placement)) => {
-                        if placement.status == viaticum_core::types::PlacementStatus::Alive {
-                            // Already alive — nothing to do.
+                        if placement.status != PlacementStatus::Offered {
+                            tracing::debug!(
+                                holder = %holder_id,
+                                block_id = %source_block_id,
+                                status = ?placement.status,
+                                "SymbolAccept ignored: placement is not Offered (no request outstanding)"
+                            );
                             return;
                         }
-                        placement.status = viaticum_core::types::PlacementStatus::Alive;
+                        placement.status = PlacementStatus::Alive;
                         if let Err(e) = self.db.upsert_placement(&placement) {
                             tracing::error!(
                                 holder = %holder_id,
@@ -769,19 +784,19 @@ impl BackupCoordinator {
                                 &source_block_id,
                             );
                         }
+                        self.accepted_this_cycle = self.accepted_this_cycle.saturating_add(1);
                     }
                     Ok(None) => {
-                        tracing::warn!(
+                        tracing::debug!(
                             holder = %holder_id,
                             block_id = %source_block_id,
-                            "SymbolAccept for unknown placement"
+                            "SymbolAccept ignored: no placement (no request outstanding)"
                         );
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "DB error on SymbolAccept");
                     }
                 }
-                self.accepted_this_cycle = self.accepted_this_cycle.saturating_add(1);
             }
             BackupEvent::SymbolRejected {
                 holder_id,
@@ -794,10 +809,20 @@ impl BackupCoordinator {
                     reason = %reason,
                     "holder rejected symbols"
                 );
-                // Mark placement as Lost — triggers repair to find new holder.
+                // Mark placement as Lost — triggers repair to find new holder. Only from
+                // Offered: a reject cannot un-verify symbols the holder already proved.
                 match self.db.get_placement(&source_block_id, &holder_id) {
                     Ok(Some(mut placement)) => {
-                        placement.status = viaticum_core::types::PlacementStatus::Lost;
+                        if placement.status != PlacementStatus::Offered {
+                            tracing::debug!(
+                                holder = %holder_id,
+                                block_id = %source_block_id,
+                                status = ?placement.status,
+                                "SymbolReject ignored: placement is not Offered (no request outstanding)"
+                            );
+                            return;
+                        }
+                        placement.status = PlacementStatus::Lost;
                         if let Err(e) = self.db.upsert_placement(&placement) {
                             tracing::error!(
                                 error = %e,
@@ -805,7 +830,13 @@ impl BackupCoordinator {
                             );
                         }
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        tracing::debug!(
+                            holder = %holder_id,
+                            block_id = %source_block_id,
+                            "SymbolReject ignored: no placement (no request outstanding)"
+                        );
+                    }
                     Err(e) => {
                         tracing::error!(error = %e, "DB error on SymbolReject");
                     }

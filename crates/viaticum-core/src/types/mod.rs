@@ -366,7 +366,7 @@ pub struct ImportanceBucketStats {
     /// Constant per bucket; computed at call time, not hardcoded.
     pub target_p: f64,
 
-    /// "healthy" if mean_p_recoverable >= target_p, "degraded" if below,
+    /// "healthy" if `reliability::meets_target(mean_p_recoverable, target_p)`, "degraded" if below,
     /// "empty" if block_count == 0.
     pub status: String,
 }
@@ -443,6 +443,19 @@ pub enum PlacementStatus {
     Lost,
     /// Delete in progress.
     Deleting,
+}
+
+impl PlacementStatus {
+    /// The owner believes the holder may still have these symbols, and only a PoS
+    /// verdict may change that belief (Pass → Alive, Fail/NotHeld → Lost).
+    /// The worker must not offer this block to such a holder again, and must not
+    /// overwrite its placement record (repair-i2).
+    pub fn may_hold_symbols(self) -> bool {
+        matches!(
+            self,
+            PlacementStatus::Alive | PlacementStatus::Uncertain | PlacementStatus::PresumedLost
+        )
+    }
 }
 
 /// 4R pair-ledger accumulators for ONE economic pair: this node and one **master

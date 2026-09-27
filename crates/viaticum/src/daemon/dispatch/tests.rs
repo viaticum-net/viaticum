@@ -1281,3 +1281,33 @@ async fn _removed_dispatch_connect_two_daemons_registers_peer() {
         .await
         .expect("get_connection after connect");
 }
+
+// ============================================================
+// R1-e1 (repair-i3): one tolerance-aware "at target"
+// ============================================================
+
+#[tokio::test]
+async fn dispatch_files_is_safe_to_delete_at_float_boundary_of_target() {
+    // Five full copies at p = 0.9 compute to 0.9999899999999999 in f64, one ulp under
+    // target_reliability(1.0): mathematically at target, and shown as such.
+    let state = make_test_state().await;
+    let target = viaticum_core::reliability::target_reliability(1.0);
+    insert_file_with_block(&state, "notes.txt", 0.9999899999999999, target, true);
+    assert!(safe_to_delete_flag(&state, "notes.txt").await);
+}
+
+#[test]
+fn importance_bucket_is_healthy_at_float_boundary() {
+    // The spec's example (importance 1.0 at 0.9999899999999999) is healthy even with a
+    // raw `>=`: the critical bucket's target is target(0.95) ≈ 0.999982. The float
+    // boundary of a bucket is its own target: one ulp below it must read "healthy".
+    for (importance, bucket) in [(1.0, "critical"), (0.55, "medium")] {
+        let midpoint = if bucket == "critical" { 0.95 } else { 0.55 };
+        let target = viaticum_core::reliability::target_reliability(midpoint);
+        let one_ulp_below = f64::from_bits(target.to_bits() - 1);
+        let block = make_block(1, importance, one_ulp_below, SourceBlockStatus::Active);
+        let buckets = compute_importance_buckets(&[block]);
+        let b = buckets.iter().find(|b| b.bucket == bucket).unwrap();
+        assert_eq!(b.status, "healthy", "{bucket}");
+    }
+}

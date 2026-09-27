@@ -2848,3 +2848,112 @@ fn extract_file_from_pack_rejects_overflowing_entry_without_panic() {
         "error should name the overflow condition"
     );
 }
+
+// ─── R1-e: "an incoming answer without a request is ignored" (repair-i2) ─────
+
+fn placement_in(
+    block_id: SourceBlockId,
+    holder_id: DeviceId,
+    status: PlacementStatus,
+) -> SymbolPlacement {
+    SymbolPlacement {
+        source_block_id: block_id,
+        holder_id,
+        file_id: viaticum_core::types::FileId(1),
+        esi_ranges: vec![(0, 4)],
+        binding_seed: [0u8; 32],
+        status,
+        last_verified: Some(Timestamp(1_000)),
+        placed_at: Timestamp(0),
+        consecutive_misses: 2,
+    }
+}
+
+/// A holder whose placement awaits a PoS verdict cannot make itself Alive by sending
+/// an unsolicited SymbolAccept: only PoS moves Uncertain/PresumedLost.
+#[test]
+fn symbol_accepted_is_ignored_when_placement_is_not_offered() {
+    for status in [
+        PlacementStatus::Uncertain,
+        PlacementStatus::PresumedLost,
+        PlacementStatus::Lost,
+        PlacementStatus::Deleting,
+    ] {
+        let db = Db::open_in_memory().unwrap();
+        let symbols_dir = TempDir::new().unwrap();
+        let mut coord = test_coord(db.clone(), &symbols_dir);
+        let holder_id = DeviceId([0x81u8; 32]);
+        let block_id = SourceBlockId([0x82u8; 32]);
+        db.upsert_source_block(&make_block_for_hook(block_id))
+            .unwrap();
+        let before = placement_in(block_id, holder_id, status);
+        db.upsert_placement(&before).unwrap();
+
+        coord.handle_backup_event(BackupEvent::SymbolAccepted {
+            holder_id,
+            source_block_id: block_id,
+        });
+
+        let after = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
+        assert_eq!(
+            viaticum_core::types::to_cbor_bytes(&after),
+            viaticum_core::types::to_cbor_bytes(&before),
+            "{status:?} must be left untouched"
+        );
+        assert_eq!(
+            coord.accepted_this_cycle, 0,
+            "{status:?}: not an accepted offer"
+        );
+    }
+}
+
+/// A reject cannot un-verify a holder: only an Offered placement becomes Lost.
+#[test]
+fn symbol_rejected_is_ignored_when_placement_is_not_offered() {
+    for status in [
+        PlacementStatus::Alive,
+        PlacementStatus::Uncertain,
+        PlacementStatus::PresumedLost,
+    ] {
+        let db = Db::open_in_memory().unwrap();
+        let symbols_dir = TempDir::new().unwrap();
+        let mut coord = test_coord(db.clone(), &symbols_dir);
+        let holder_id = DeviceId([0x83u8; 32]);
+        let block_id = SourceBlockId([0x84u8; 32]);
+        let before = placement_in(block_id, holder_id, status);
+        db.upsert_placement(&before).unwrap();
+
+        coord.handle_backup_event(BackupEvent::SymbolRejected {
+            holder_id,
+            source_block_id: block_id,
+            reason: "QuotaFull".into(),
+        });
+
+        let after = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
+        assert_eq!(
+            viaticum_core::types::to_cbor_bytes(&after),
+            viaticum_core::types::to_cbor_bytes(&before),
+            "{status:?} must be left untouched"
+        );
+    }
+}
+
+#[test]
+fn symbol_rejected_moves_offered_placement_to_lost() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let mut coord = test_coord(db.clone(), &symbols_dir);
+    let holder_id = DeviceId([0x85u8; 32]);
+    let block_id = SourceBlockId([0x86u8; 32]);
+    db.upsert_placement(&placement_in(block_id, holder_id, PlacementStatus::Offered))
+        .unwrap();
+
+    coord.handle_backup_event(BackupEvent::SymbolRejected {
+        holder_id,
+        source_block_id: block_id,
+        reason: "QuotaFull".into(),
+    });
+
+    let after = db.get_placement(&block_id, &holder_id).unwrap().unwrap();
+    assert_eq!(after.status, PlacementStatus::Lost);
+}

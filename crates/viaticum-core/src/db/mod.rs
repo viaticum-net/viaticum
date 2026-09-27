@@ -217,10 +217,34 @@ pub struct WeeklyPosEntry {
 /// Hot layer: in-memory aggregates loaded at startup.
 /// Per-block worker cooldown (B-4). RAM-only: never persisted, so it resets on
 /// daemon restart — a restart is a fine moment to re-attempt every block.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BlockCooldown {
     pub last_attempted_at: Option<Timestamp>,
     pub last_pool_signature: u64,
+    /// Last attempt found nobody to take symbols (no candidate / empty allocation /
+    /// pool too small / no swarm / unreadable source). A parked block is skipped until
+    /// the pool signature changes, a placement of this block changes status, cooldowns
+    /// are reset, or `parked_cooldown` elapses (repair-i4).
+    pub parked: bool,
+}
+
+/// Clear the worker park flag of `block_id` if the placement's status changed
+/// (None → Some, Some(a) → Some(b≠a), Some → None). Called with the hot write lock
+/// held, from every path that updates `hot.placements`, so no status writer
+/// (scheduler, processor, deletion, DR) needs to know about parking (repair-i4).
+/// The normal cooldown (`last_attempted_at`) is kept: only the long park is lifted.
+fn unpark_on_status_change(
+    hot: &mut HotCache,
+    block_id: &SourceBlockId,
+    old: Option<PlacementStatus>,
+    new: Option<PlacementStatus>,
+) {
+    if old == new {
+        return;
+    }
+    if let Some(cd) = hot.block_cooldown.get_mut(block_id) {
+        cd.parked = false;
+    }
 }
 
 pub struct HotCache {
@@ -817,11 +841,15 @@ impl Db {
     /// Record a worker attempt on `block_id` (B-4). Cooldown lives only in RAM,
     /// so this performs no disk write — it replaces the per-attempt fsync that
     /// persisting `last_attempted_at`/`last_pool_signature` used to incur.
+    ///
+    /// `parked = true` records that the attempt found nobody to take symbols; see
+    /// [`BlockCooldown::parked`] and [`Db::next_work_item`].
     pub fn set_block_cooldown(
         &self,
         block_id: &SourceBlockId,
         last_attempted_at: Option<Timestamp>,
         last_pool_signature: u64,
+        parked: bool,
     ) {
         let mut hot = self.hot.write().unwrap_or_else(|e| e.into_inner());
         hot.block_cooldown.insert(
@@ -829,6 +857,7 @@ impl Db {
             BlockCooldown {
                 last_attempted_at,
                 last_pool_signature,
+                parked,
             },
         );
     }
@@ -955,11 +984,17 @@ impl Db {
     /// Return the highest-priority source block that needs work, or `None` if nothing to do.
     ///
     /// "Needs work" means: `status == Active`, `target_reliability > 0.0`, and
-    /// `current_reliability < target_reliability`.
+    /// `!reliability::meets_target(current_reliability, target_reliability)` (repair-i3:
+    /// the single tolerance-aware definition of "at target").
     ///
     /// Blocks in cooldown are excluded. A block is in cooldown when:
-    /// - it was attempted recently (`last_attempted_at` is `Some(t)` with `now - t < cooldown`), AND
+    /// - it was attempted recently (`last_attempted_at` is `Some(t)` with
+    ///   `now - t < cooldown`, or `< parked_cooldown` if the block is parked), AND
     /// - the authenticated peer pool has not changed (`last_pool_signature == current_pool_sig`).
+    ///
+    /// A parked block (last attempt found nobody to take symbols, repair-i4) is also
+    /// released early by a placement-status change of the block (the park flag is
+    /// cleared in the hot cache) or by `clear_all_block_cooldowns`.
     ///
     /// Cooldown is skipped entirely when `current_pool_sig == 0` (no authenticated peers).
     ///
@@ -971,6 +1006,7 @@ impl Db {
     ///
     /// * `coef` — completion bonus coefficient from `ReliabilityConfig`. Typically 1.5.
     /// * `cooldown` — cooldown window. Typically `Duration::from_secs(cfg.reliability.cooldown_base_secs)`.
+    /// * `parked_cooldown` — the longer window applied to parked blocks (repair-i4).
     /// * `now` — current time. Pass `Timestamp::now()` in production; pass a fixed value in tests.
     /// * `current_pool_sig` — XxHash64 of the sorted authenticated peer DeviceId set at this moment.
     ///   `0` = no authenticated peers (cooldown bypassed).
@@ -996,11 +1032,13 @@ impl Db {
         &self,
         coef: f64,
         cooldown: Duration,
+        parked_cooldown: Duration,
         now: Timestamp,
         current_pool_sig: u64,
     ) -> Result<Option<SourceBlockRecord>, DbError> {
         let all = self.list_all_source_blocks()?;
         let cooldown_secs = cooldown.as_secs();
+        let parked_cooldown_secs = parked_cooldown.as_secs();
         // Cooldown state is RAM-only (B-4); take one read lock for the whole pass.
         let hot = self.hot();
         let cooldown_of = |id: &SourceBlockId| -> BlockCooldown {
@@ -1011,14 +1049,21 @@ impl Db {
             if b.status != SourceBlockStatus::Active {
                 return false;
             }
-            if b.target_reliability <= 0.0 || b.current_reliability >= b.target_reliability {
+            if b.target_reliability <= 0.0
+                || crate::reliability::meets_target(b.current_reliability, b.target_reliability)
+            {
                 return false;
             }
             if current_pool_sig != 0 {
                 let cd = cooldown_of(&b.block_id);
                 if let Some(last_at) = cd.last_attempted_at {
                     let elapsed = now.0.saturating_sub(last_at.0);
-                    if elapsed < cooldown_secs && cd.last_pool_signature == current_pool_sig {
+                    let window = if cd.parked {
+                        parked_cooldown_secs
+                    } else {
+                        cooldown_secs
+                    };
+                    if elapsed < window && cd.last_pool_signature == current_pool_sig {
                         return false;
                     }
                 }
@@ -1113,13 +1158,22 @@ impl Db {
             block_agg.total_alive_symbols.saturating_sub(old_alive) + new_alive;
 
         // Update per-(block, holder) aggregate.
-        hot.placements.insert(
-            (record.source_block_id, record.holder_id),
-            PlacementAgg {
-                symbol_count: count,
-                status: record.status,
-                last_pos: record.last_verified,
-            },
+        let old_status = hot
+            .placements
+            .insert(
+                (record.source_block_id, record.holder_id),
+                PlacementAgg {
+                    symbol_count: count,
+                    status: record.status,
+                    last_pos: record.last_verified,
+                },
+            )
+            .map(|agg| agg.status);
+        unpark_on_status_change(
+            &mut hot,
+            &record.source_block_id,
+            old_status,
+            Some(record.status),
         );
 
         Ok(())
@@ -1206,7 +1260,11 @@ impl Db {
         // DB is committed; now apply delta to the hot cache.
         if let Some(ref old_rec) = old_record {
             let mut hot = self.hot.write().unwrap_or_else(|e| e.into_inner());
-            hot.placements.remove(&(*block_id, *holder_id));
+            let old_status = hot
+                .placements
+                .remove(&(*block_id, *holder_id))
+                .map(|agg| agg.status);
+            unpark_on_status_change(&mut hot, block_id, old_status, None);
 
             if matches!(
                 old_rec.status,
@@ -3200,14 +3258,18 @@ impl<'db> DbWriteTxn<'db> {
                         block_agg.total_alive_symbols.saturating_sub(old_alive) + new_alive;
 
                     // Update per-(block, holder) aggregate.
-                    hot.placements.insert(
-                        (block_id, holder_id),
-                        PlacementAgg {
-                            symbol_count: new_count,
-                            status: new_status,
-                            last_pos: new_last_pos,
-                        },
-                    );
+                    let old_status = hot
+                        .placements
+                        .insert(
+                            (block_id, holder_id),
+                            PlacementAgg {
+                                symbol_count: new_count,
+                                status: new_status,
+                                last_pos: new_last_pos,
+                            },
+                        )
+                        .map(|agg| agg.status);
+                    unpark_on_status_change(&mut hot, &block_id, old_status, Some(new_status));
                 }
                 HotCacheDelta::PlacementDeleted {
                     block_id,
@@ -3215,7 +3277,11 @@ impl<'db> DbWriteTxn<'db> {
                     was_alive,
                     old_count,
                 } => {
-                    hot.placements.remove(&(block_id, holder_id));
+                    let old_status = hot
+                        .placements
+                        .remove(&(block_id, holder_id))
+                        .map(|agg| agg.status);
+                    unpark_on_status_change(&mut hot, &block_id, old_status, None);
 
                     if was_alive {
                         if let Some(agg) = hot.blocks.get_mut(&block_id) {

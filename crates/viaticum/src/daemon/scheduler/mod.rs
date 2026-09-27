@@ -425,10 +425,14 @@ impl Scheduler {
         let mut updated = placement;
         updated.status = transition.new_status;
         updated.consecutive_misses = transition.new_consecutive_misses;
-        if matches!(outcome, viaticum_core::pos::VerifyOutcome::Pass) {
-            updated.last_verified = Some(Timestamp::now());
+        // A verdict on a placement that holds no symbols is stale (pos-i3): leave the
+        // record untouched so a concurrent worker rewrite is not clobbered.
+        if old_status.may_hold_symbols() {
+            if matches!(outcome, viaticum_core::pos::VerifyOutcome::Pass) {
+                updated.last_verified = Some(Timestamp::now());
+            }
+            self.db.upsert_placement(&updated)?;
         }
-        self.db.upsert_placement(&updated)?;
 
         if updated.status != old_status {
             crate::daemon::processor::recompute_and_persist_block_cached_fields(
@@ -462,10 +466,15 @@ impl Scheduler {
             );
         }
 
+        // old_status/new_status make the PoS state machine observable in E2E: a
+        // silent holder that comes back leaves PresumedLost only through this line
+        // (repair-i2 exit door).
         info!(
             block_id = %block_id,
             holder = %holder_id,
             outcome = ?outcome,
+            old_status = ?old_status,
+            new_status = ?updated.status,
             "scheduler: mailbox PosResponse resolved"
         );
 
@@ -983,27 +992,31 @@ impl Scheduler {
                 }
             };
 
+            let stale = !placement.status.may_hold_symbols();
             let transition = apply_pos_outcome(&placement, &VerifyOutcome::Timeout);
 
-            // Persist updated status.
-            let mut updated = placement;
-            updated.status = transition.new_status;
-            updated.consecutive_misses = transition.new_consecutive_misses;
+            // A timeout on a placement that holds no symbols is stale (pos-i3): nothing
+            // to persist, and writing the record back would clobber a concurrent rewrite.
+            if !stale {
+                let mut updated = placement;
+                updated.status = transition.new_status;
+                updated.consecutive_misses = transition.new_consecutive_misses;
 
-            if let Err(e) = self.db.upsert_placement(&updated) {
-                error!(
-                    block_id = %block_id,
-                    holder_id = %holder_id,
-                    "scheduler: DB error updating placement after timeout: {e}"
+                if let Err(e) = self.db.upsert_placement(&updated) {
+                    error!(
+                        block_id = %block_id,
+                        holder_id = %holder_id,
+                        "scheduler: DB error updating placement after timeout: {e}"
+                    );
+                    // Don't remove from pending if we couldn't persist — retry next cycle.
+                    continue;
+                }
+
+                // Recompute cached fields after successful placement update (best-effort).
+                crate::daemon::processor::recompute_and_persist_block_cached_fields(
+                    &self.db, &block_id,
                 );
-                // Don't remove from pending if we couldn't persist — retry next cycle.
-                continue;
             }
-
-            // Recompute cached fields after successful placement update (best-effort).
-            crate::daemon::processor::recompute_and_persist_block_cached_fields(
-                &self.db, &block_id,
-            );
 
             // Record timeout as a challenged-but-not-passed event for trust.
             let week = crate::daemon::processor::current_week_number_scaled(scale);
@@ -1017,6 +1030,7 @@ impl Scheduler {
                 new_status = ?transition.new_status,
                 misses = transition.new_consecutive_misses,
                 trigger_repair = transition.trigger_repair,
+                stale,
                 "scheduler: PoS challenge timed out"
             );
 

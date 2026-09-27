@@ -1814,7 +1814,13 @@ async fn handle_symbol_drop_notice_block_becomes_eligible_for_worker() {
 
     // Confirm block is NOT eligible before DropNotice (reliability >= target).
     let before = db
-        .next_work_item(1.0, Duration::from_secs(0), Timestamp::now(), 0)
+        .next_work_item(
+            1.0,
+            Duration::from_secs(0),
+            std::time::Duration::from_secs(3600),
+            Timestamp::now(),
+            0,
+        )
         .unwrap();
     assert!(
         before.is_none(),
@@ -1837,7 +1843,13 @@ async fn handle_symbol_drop_notice_block_becomes_eligible_for_worker() {
 
     // Block must now be eligible for the worker.
     let after = db
-        .next_work_item(1.0, Duration::from_secs(0), Timestamp::now(), 0)
+        .next_work_item(
+            1.0,
+            Duration::from_secs(0),
+            std::time::Duration::from_secs(3600),
+            Timestamp::now(),
+            0,
+        )
         .unwrap();
     assert!(
         after.is_some(),
@@ -3625,7 +3637,7 @@ fn recompute_and_persist_preserves_last_attempted_at_and_pool_signature() {
     let sentinel_sig = 0xDEADBEEF_12345678u64;
     let block = make_source_block_for_hook(block_id, 0.5);
     db.upsert_source_block(&block).unwrap();
-    db.set_block_cooldown(&block_id, Some(sentinel_time), sentinel_sig);
+    db.set_block_cooldown(&block_id, Some(sentinel_time), sentinel_sig, false);
 
     db.upsert_placement(&make_hook_placement(
         block_id,
