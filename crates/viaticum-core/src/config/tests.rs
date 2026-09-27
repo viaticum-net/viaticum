@@ -915,14 +915,16 @@ fn restore_staging_warn_gb_negative_is_rejected() {
 }
 
 #[test]
-fn restore_fetch_timeout_zero_is_rejected() {
-    let mut cfg = AppConfig::default();
-    cfg.restore.fetch_timeout_secs = 0;
-    let err = cfg.validate().unwrap_err();
-    assert!(
-        matches!(err, ConfigError::Validation { ref field, .. } if field == "restore.fetch_timeout_secs"),
-        "expected Validation error for restore.fetch_timeout_secs, got: {err:?}"
+fn config_with_legacy_escrow_and_fetch_timeout_still_parses() {
+    // restore-i6 / restore-i12: `[escrow]` and `restore.fetch_timeout_secs` are gone;
+    // a config that still has them loads, and the rest of `[restore]` applies.
+    let f = write_toml(
+        "[escrow]\nk_factor = 7.0\n\n[restore]\nstaging_warn_gb = 12.5\nfetch_timeout_secs = 60\n",
     );
+    let cfg = AppConfig::load(f.path()).unwrap();
+    assert_eq!(cfg.restore.staging_warn_gb, 12.5);
+    let text = toml::to_string(&cfg).unwrap();
+    assert!(!text.contains("fetch_timeout"), "{text}");
 }
 
 // ============================================================
