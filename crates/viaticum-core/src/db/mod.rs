@@ -403,6 +403,9 @@ impl Db {
             tx.open_table(MAILBOX_BYTES_BY_TARGET)?;
             tx.open_table(PAIR_LEDGER)?;
             tx.open_table(PAIR_LEDGER_PENDING_DROPS)?;
+            // DN-1: applied signed letters + their expiry index (outside snapshot_db, 4r-i51).
+            tx.open_table(seen_signed_letters::SEEN_SIGNED_LETTERS)?;
+            tx.open_table(seen_signed_letters::SEEN_SIGNED_LETTERS_BY_EXPIRY)?;
         }
         tx.commit()?;
         Ok(())
@@ -615,6 +618,25 @@ impl Db {
             inner: Arc::new(db),
             hot: Arc::new(RwLock::new(hot)),
         })
+    }
+
+    /// Test seam (DN1-16): overwrite the stored row of placement (block, holder) with bytes that
+    /// do not decode as a `SymbolPlacement`, so [`Db::get_placement`] answers `Err` — a damaged
+    /// row, not a missing one. Bypasses the hot cache on purpose.
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn corrupt_placement_row_for_test(
+        &self,
+        block_id: &SourceBlockId,
+        holder_id: &DeviceId,
+    ) -> Result<(), DbError> {
+        let key = placement_key(block_id, holder_id);
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(SYMBOL_PLACEMENTS)?;
+            table.insert(&key, [0xffu8, 0x00, 0x13].as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Access hot cache for read.
@@ -3429,6 +3451,9 @@ pub mod testutil {
         Timestamp(n as u64 * crate::constants::SECS_PER_WEEK)
     }
 }
+
+/// DN-1: applied signed letters by signature (`seen_signed_letters` + expiry index).
+mod seen_signed_letters;
 
 #[cfg(test)]
 mod tests;

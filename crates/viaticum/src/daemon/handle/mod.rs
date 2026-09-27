@@ -1119,7 +1119,8 @@ impl DaemonHandle {
 
             // T-13a: pass repair_tx so ProcessorDropHandler can wake the repair worker
             // for immediate-drop DropNotice entries (deadline ≈ now).
-            let drop_handler = ProcessorDropHandler::new(db.clone(), repair_tx.clone());
+            let drop_handler = ProcessorDropHandler::new(db.clone(), repair_tx.clone())
+                .with_time_scale(time_scale);
 
             // T-13b-1: ProcessorDeleteHandler handles Delete/CancelDelete via mailbox.
             // Only requires db — same as SymbolDropHandler.
