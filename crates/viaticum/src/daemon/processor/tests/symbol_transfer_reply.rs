@@ -333,6 +333,7 @@ async fn marked_for_delete_holding_resent_chunk_goes_through_offer_and_reactivat
     assert_stored(&with_offer, blk, vec![(0, 2)]);
     let rec = db.get_holding(&blk, &owner).unwrap().unwrap();
     assert_eq!(rec.status, HoldingStatus::Active);
+    assert_eq!(rec.delete_requested_at, None);
     assert_eq!(rec.esi_ranges, vec![(0, 2)]);
     assert_eq!(rec.total_bytes, 2 * 64);
     assert_eq!(bins_on_disk(&dir, blk), vec![0, 1]);
@@ -363,4 +364,55 @@ async fn already_held_chunk_subtracts_from_existing_offer() {
     assert_stored(&rest, blk, vec![(2, 2)]);
     assert!(p.accepted_offers.lock().unwrap().is_empty());
     assert_eq!(bins_on_disk(&dir, blk), vec![0, 1, 2, 3]);
+}
+
+/// The block directory cannot be created (a plain file sits at its path): the write fails, the
+/// reply is `Ack`, nothing is recorded, and the offer stays for a later try.
+#[tokio::test]
+async fn transfer_write_error_replies_ack_not_stored() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let p = make_processor(db.clone(), &dir).await;
+    let owner = make_identity(0x1D);
+    let blk = make_block_id(0x1D);
+    insert_accepted_offer(&p, owner, blk, vec![(0, 2)], 0.5);
+    let block_hex: String = blk.0.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(dir.path().join(block_hex), b"not a directory").unwrap();
+
+    let reply = reply_to(&p, owner, chunk(blk, &[0, 1], 0xAA)).await;
+
+    assert_ack(&reply);
+    assert!(db.get_holding(&blk, &owner).unwrap().is_none());
+    assert_eq!(
+        p.accepted_offers.lock().unwrap()[&(sender_device(owner), blk)].esi_ranges,
+        vec![(0, 2)]
+    );
+}
+
+/// A held symbol whose file is shorter than the resent symbol is not "already held": without an
+/// offer the chunk is not stored; with an offer the file is rewritten in full.
+#[tokio::test]
+async fn truncated_held_file_is_not_already_held() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let p = make_processor(db.clone(), &dir).await;
+    let owner = make_identity(0x1E);
+    let blk = make_block_id(0x1E);
+    insert_accepted_offer(&p, owner, blk, vec![(0, 2)], 0.5);
+    let first = reply_to(&p, owner, chunk(blk, &[0, 1], 0xAA)).await;
+    assert_stored(&first, blk, vec![(0, 2)]);
+    let block_hex: String = blk.0.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(dir.path().join(block_hex).join("0.bin"), [0xAA; 10]).unwrap();
+
+    let no_offer = reply_to(&p, owner, chunk(blk, &[0, 1], 0xAA)).await;
+    assert_ack(&no_offer);
+    assert_eq!(read_bin(&dir, blk, 0).len(), 10);
+
+    insert_accepted_offer(&p, owner, blk, vec![(0, 2)], 0.5);
+    let with_offer = reply_to(&p, owner, chunk(blk, &[0, 1], 0xAA)).await;
+    assert_stored(&with_offer, blk, vec![(0, 2)]);
+    assert_eq!(read_bin(&dir, blk, 0), vec![0xAA; 64]);
+    let rec = db.get_holding(&blk, &owner).unwrap().unwrap();
+    assert_eq!(rec.esi_ranges, vec![(0, 2)]);
+    assert_eq!(rec.total_bytes, 2 * 64);
 }

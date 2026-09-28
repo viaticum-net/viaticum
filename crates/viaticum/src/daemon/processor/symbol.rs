@@ -910,8 +910,9 @@ impl Processor {
     /// File layout: `{holdings_dir}/{block_id_hex}/{esi}.bin`
     ///
     /// Returns `Stored` only if EVERY ESI of the chunk is on disk afterwards: written now, or
-    /// already held (in the owner's `HoldingRecord` for this block AND `{esi}.bin` exists) — a
-    /// resend of a chunk whose reply was lost is answered truthfully (backup-i19).
+    /// already held (in the owner's Active `HoldingRecord` for this block AND `{esi}.bin` exists
+    /// with the chunk symbol's length) — a resend of a chunk whose reply was lost is answered
+    /// truthfully (backup-i19).
     ///
     /// ESIs not already held require an accepted offer for `(from_device, block_id)`. The
     /// holding itself is per master (`owner_id`).
@@ -960,7 +961,8 @@ impl Processor {
         let block_hex = hex_encode(&block_id.0);
         let block_dir = self.holdings_dir.join(&block_hex);
 
-        // ── Already held: in the owner's ACTIVE record AND the file exists ───
+        // ── Already held: in the owner's ACTIVE record AND the file exists with the chunk's
+        // length (a truncated file is rewritten through the offer) ───────────────────────────
         // A record in any other status is on its way out (MarkedForDelete is swept after the
         // cooldown; Silent is never set by the daemon): its symbols are not "held", the chunk
         // goes through the offer path and the merge below makes the record Active again.
@@ -970,9 +972,16 @@ impl Processor {
         };
         let mut already_held: Vec<u32> = Vec::new();
         for symbol in &transfer.symbols {
-            if held_esis.contains(&symbol.esi)
-                && tokio::fs::try_exists(block_dir.join(format!("{}.bin", symbol.esi))).await?
-            {
+            if !held_esis.contains(&symbol.esi) {
+                continue;
+            }
+            let on_disk =
+                match tokio::fs::metadata(block_dir.join(format!("{}.bin", symbol.esi))).await {
+                    Ok(m) => m.len() == symbol.data.len() as u64,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(e) => return Err(e.into()),
+                };
+            if on_disk {
                 already_held.push(symbol.esi);
             }
         }
@@ -1089,6 +1098,7 @@ impl Processor {
                 existing.esi_ranges = esi_list_to_ranges(&all_esis);
                 existing.total_bytes += new_bytes;
                 existing.status = HoldingStatus::Active;
+                existing.delete_requested_at = None;
                 // importance: keep existing value (BR-7). New offer may have different
                 // importance, but the holding was already accepted at its original importance.
                 existing
