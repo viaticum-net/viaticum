@@ -4666,3 +4666,136 @@ mod four_r_shadow;
 mod four_r_shadow_wedge;
 // R1-u-H1 (backup-i19): the SymbolTransfer reply matches the holder's disk; offers per device.
 mod symbol_transfer_reply;
+
+// ─── pos-i5-a: a holder answers only a fresh challenge (replay guard) ───────────
+
+/// A held block with one symbol file; returns (db, holdings dir, owner key, block id).
+fn held_block_for_freshness() -> (Db, TempDir, ed25519_dalek::SigningKey, SourceBlockId) {
+    use viaticum_core::types::hex_encode;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let owner_key = ed25519_dalek::SigningKey::from_bytes(&[0x61u8; 32]);
+    let owner = IdentityPub(owner_key.verifying_key().to_bytes());
+    let block_id = make_block_id(0x62);
+    db.upsert_holding(&HoldingRecord {
+        source_block_id: block_id,
+        owner_id: owner,
+        esi_ranges: vec![(0, 1)],
+        importance: 0.5,
+        total_bytes: 8,
+        status: HoldingStatus::Active,
+        received_at: Timestamp::now(),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    })
+    .unwrap();
+    let block_dir = holdings_dir.path().join(hex_encode(&block_id.0));
+    std::fs::create_dir_all(&block_dir).unwrap();
+    std::fs::write(block_dir.join("0.bin"), b"symbol-0").unwrap();
+    (db, holdings_dir, owner_key, block_id)
+}
+
+/// Signed challenge for the held block, issued `age` seconds ago.
+fn challenge_aged(
+    owner_key: &ed25519_dalek::SigningKey,
+    block_id: SourceBlockId,
+    age: u64,
+) -> viaticum_core::messages::PosHashChallengeMsg {
+    viaticum_core::messages::build_pos_hash_challenge(
+        [0x63; 16],
+        block_id,
+        vec![(0, 1)],
+        Timestamp(Timestamp::now().0 - age),
+        None,
+        owner_key,
+    )
+}
+
+#[tokio::test]
+async fn challenge_older_than_ttl_plus_skew_is_dropped_before_the_disk() {
+    use super::pos::{PosResponder, challenge_max_age_secs};
+
+    let (db, dir, owner_key, block_id) = held_block_for_freshness();
+    let owner = IdentityPub(owner_key.verifying_key().to_bytes());
+    let responder = PosResponder::new(db, dir.path().to_path_buf(), make_signing_key(0xAA))
+        .with_time_scale(900);
+    let stale = challenge_aged(&owner_key, block_id, challenge_max_age_secs(900) + 1);
+    match responder.compute_response(owner, stale).await {
+        Err(crate::daemon::processor::ProcessorError::StaleChallenge { age_secs }) => {
+            assert!(age_secs > challenge_max_age_secs(900));
+        }
+        other => panic!("a replay must be dropped as stale, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn challenge_just_inside_ttl_plus_skew_is_answered() {
+    use super::pos::{PosResponder, challenge_max_age_secs};
+
+    let (db, dir, owner_key, block_id) = held_block_for_freshness();
+    let owner = IdentityPub(owner_key.verifying_key().to_bytes());
+    let responder = PosResponder::new(db, dir.path().to_path_buf(), make_signing_key(0xAA))
+        .with_time_scale(900);
+    let edge = challenge_aged(&owner_key, block_id, challenge_max_age_secs(900) - 1);
+    match responder.compute_response(owner, edge).await {
+        Ok(viaticum_core::messages::Message::PosHashResponse(r)) => {
+            assert_eq!(r.challenge_id, [0x63; 16]);
+        }
+        other => panic!("a challenge inside TTL + skew must be answered, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stale_challenge_through_the_mailbox_handler_is_no_answer() {
+    use super::pos::{PosResponder, challenge_max_age_secs};
+    use crate::daemon::mailbox::poll::PosMailboxChallengeHandler;
+    use crate::daemon::processor::ProcessorPosHandler;
+
+    let (db, dir, owner_key, block_id) = held_block_for_freshness();
+    let owner = IdentityPub(owner_key.verifying_key().to_bytes());
+    let handler = ProcessorPosHandler::new(
+        PosResponder::new(db, dir.path().to_path_buf(), make_signing_key(0xAA))
+            .with_time_scale(900),
+    );
+    let stale = challenge_aged(&owner_key, block_id, challenge_max_age_secs(900) + 60);
+    let payload = viaticum_core::messages::to_cbor(&stale).unwrap();
+    let result = handler
+        .handle_pos_challenge(owner, payload)
+        .await
+        .expect("a stale challenge is not a handler error");
+    assert!(result.is_none(), "a replay gets no answer");
+}
+
+#[test]
+fn max_age_is_the_scaled_ttl_plus_the_unscaled_skew() {
+    use super::pos::{POS_CHALLENGE_MAX_CLOCK_SKEW_SECS, challenge_max_age_secs};
+
+    assert_eq!(
+        challenge_max_age_secs(900),
+        672 + POS_CHALLENGE_MAX_CLOCK_SKEW_SECS
+    );
+    assert_eq!(
+        challenge_max_age_secs(1),
+        7 * 24 * 3600 + POS_CHALLENGE_MAX_CLOCK_SKEW_SECS
+    );
+}
+
+#[tokio::test]
+async fn undecodable_payload_through_the_mailbox_handler_is_no_answer() {
+    use super::pos::PosResponder;
+    use crate::daemon::mailbox::poll::PosMailboxChallengeHandler;
+    use crate::daemon::processor::ProcessorPosHandler;
+
+    let dir = TempDir::new().unwrap();
+    let handler = ProcessorPosHandler::new(PosResponder::new(
+        Db::open_in_memory().unwrap(),
+        dir.path().to_path_buf(),
+        make_signing_key(0xAA),
+    ));
+    let result = handler
+        .handle_pos_challenge(IdentityPub([0x42; 32]), vec![0xFF, 0x00, 0x13])
+        .await
+        .expect("junk is not a handler error");
+    assert!(result.is_none());
+}

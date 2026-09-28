@@ -13,54 +13,108 @@
 //! passed in.
 //!
 //! pos-i5-a: nothing a postman controls without a signature steers the memory. The key
-//! is the envelope digest (class, sender, payload), not the `msg_id`; an entry lives
-//! `ttl` from first sight, not until the envelope's `expires_at`; the number of entries
-//! is capped per kind (see `MAX_REMEMBERED_RESPONSES`, `MAX_REMEMBERED_NO_ANSWERS`).
+//! of a decodable challenge is its owner-signed content plus the signature
+//! (`ChallengeKey::signed`): not the `msg_id`, not the raw payload bytes (a postman can re-encode
+//! a signed challenge many ways without breaking the signature: another `v` or
+//! `device_id`, another key order, an extra field, a trailing byte). An entry lives `ttl`
+//! from first sight, not until the envelope's `expires_at`; the number of entries is capped
+//! per kind (see `MAX_REMEMBERED_RESPONSES`, `MAX_REMEMBERED_NO_ANSWERS`). The holder
+//! answers only a fresh challenge (`PosResponder`: age ≤ TTL + clock skew), so a postman
+//! can only replay challenges within that window, and each distinct signed challenge is
+//! computed at most once per TTL of memory.
 
 use std::collections::HashMap;
 
 use tracing::warn;
 use viaticum_core::mailbox::class_config::POS_CHALLENGE_TTL;
-use viaticum_core::mailbox::{MailboxEntry, scaled_ttl_secs};
+use viaticum_core::mailbox::{MailboxClass, MailboxEntry, scaled_ttl_secs};
+use viaticum_core::messages::PosHashChallengeMsg;
+use viaticum_core::types::IdentityPub;
 
 /// Cap on remembered responses (pos-i5-a).
 ///
-/// A response entry exists only for an owner-signed challenge over a block this holder
-/// really holds, so a postman cannot create one. Honest bound: one challenge is alive per
+/// A response entry is created only for a fresh challenge signed by the owner over a block
+/// this holder really holds. A postman cannot mint one; it can only replay challenges the
+/// owner issued within the last TTL + clock skew, and each distinct signed challenge is
+/// computed at most once per TTL of memory (the key is its signed content, not its
+/// encoding). So the responses are bounded by what the owners issued. Honest bound: one
+/// challenge is alive per
 /// interval, `challenges_per_week` is 1-2 for a placement below 1000 symbols (base 1 ×
 /// volume 1 × (2 − trust)), and the challenge TTL is one week, so live challenges ≤ 2 ×
 /// placements held. A friend with ~100 GB of others' data at ~1 MiB per placement holds
 /// ~100 000 placements → ≤ 200 000 live challenges; a friends-circle node holds thousands.
 /// RAM at the cap: ~450 B per entry (the signed response entry ~300 B + key + map
-/// overhead) ≈ 90 MB, reachable only by a malicious owner flooding signed challenges
+/// overhead) ≈ 90 MB, reachable only by an owner issuing that many signed challenges
 /// for its own blocks (each of which costs a real compute anyway). Above the cap a
 /// response is not remembered: that challenge is computed on every poll, as before pos-i5.
 pub const MAX_REMEMBERED_RESPONSES: usize = 200_000;
 
 /// Cap on remembered no-answers (pos-i5-a).
 ///
-/// A no-answer is what a postman's junk becomes (undecodable, unsigned, oversized), so this
-/// is the entry kind a hostile postman can mint without limit. Kept separate and small so
-/// junk never takes the responses' room (then the honest answers stay remembered and the
-/// disk is not re-read). Honest no-answers are Nacks (a block dropped, a volume not mounted
-/// yet, pos-i5-b), a small share of the live challenges. ~100 B per entry ≈ 1 MB at the cap.
-/// Above it junk is re-checked on every poll: a decode or a signature check, no disk read.
+/// A no-answer is what a postman's junk becomes (undecodable, a bad signature, a stale
+/// replay), so this is the entry kind a hostile postman can mint without limit. Kept
+/// separate and small so junk never takes the responses' room (then the honest answers
+/// stay remembered and the disk is not re-read). Honest no-answers are Nacks (a block
+/// dropped, a volume not mounted yet, pos-i5-b), a small share of the live challenges.
+/// ~100 B per entry ≈ 1 MB at the cap. Above it junk is re-checked on every poll: a decode,
+/// a signature check or a freshness check, all before any disk read.
 pub const MAX_REMEMBERED_NO_ANSWERS: usize = 10_000;
 
 /// A refusal to remember (cap reached) is logged on the 1st, then every this many.
 pub const MEMO_FULL_WARN_EVERY: u64 = 1_000;
 
-/// blake3 over what the handler's answer depends on: the class, the claimed sender (the
-/// owner whose signature the challenge is checked against) and the payload. It is the
-/// memory key (pos-i5-a): the `msg_id` is not in it, so a postman rotating the `msg_id`
-/// of the same challenge gets no second compute; a forgery (another payload, or the same
-/// payload under another sender) is another envelope and gets its own entry, so it can
-/// neither borrow nor lock out the honest challenge's answer.
-pub fn envelope_digest(entry: &MailboxEntry) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
-    h.update(b"viaticum-pos-memo-envelope-v1");
-    h.update(&[entry.class as u8]);
-    match &entry.sender {
+/// The memory key of one PoS challenge (pos-i5-a).
+///
+/// The poll decodes the challenge first and keys the memory by what the owner signed
+/// (`signed`); a payload that does not decode gets a key over its raw bytes
+/// (`undecodable`) and ends as a no-answer without a disk read. After mailbox encryption
+/// (C4, line B) the poll opens the entry before this step and passes the opened
+/// challenge: nothing here changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChallengeKey([u8; 32]);
+
+impl ChallengeKey {
+    /// blake3 over the class, the claimed sender (the owner whose key the signature is
+    /// checked against), the fields the owner signs (challenge_id, source_block_id,
+    /// esi_ranges, timestamp — decoded values in one fixed layout) and the signature.
+    ///
+    /// Every re-encoding a postman can make without breaking the signature (another key
+    /// order, an extra field, a trailing byte, another `v` or `device_id`) maps to the
+    /// same key: `v` and `device_id` are not signed and the chain hash does not depend on
+    /// them. The signature is in the key: a forgery with the honest `challenge_id` and a
+    /// junk signature is another key, so it cannot occupy the honest challenge's entry.
+    pub fn signed(sender: Option<&IdentityPub>, c: &PosHashChallengeMsg) -> Self {
+        let mut h = blake3::Hasher::new();
+        h.update(b"viaticum-pos-memo-signed-challenge-v1");
+        h.update(&[MailboxClass::PosChallenge as u8]);
+        update_sender(&mut h, sender);
+        h.update(&c.challenge_id);
+        h.update(&c.source_block_id.0);
+        h.update(&(c.esi_ranges.len() as u64).to_le_bytes());
+        for (start, count) in &c.esi_ranges {
+            h.update(&start.to_le_bytes());
+            h.update(&count.to_le_bytes());
+        }
+        h.update(&c.timestamp.0.to_le_bytes());
+        h.update(&c.sig);
+        ChallengeKey(*h.finalize().as_bytes())
+    }
+
+    /// blake3 over the class, the claimed sender and the raw payload bytes: the key of an
+    /// entry whose payload is not a decodable challenge.
+    pub fn undecodable(entry: &MailboxEntry) -> Self {
+        let mut h = blake3::Hasher::new();
+        h.update(b"viaticum-pos-memo-envelope-v1");
+        h.update(&[entry.class as u8]);
+        update_sender(&mut h, entry.sender.as_ref());
+        h.update(&(entry.payload.len() as u64).to_le_bytes());
+        h.update(&entry.payload);
+        ChallengeKey(*h.finalize().as_bytes())
+    }
+}
+
+fn update_sender(h: &mut blake3::Hasher, sender: Option<&IdentityPub>) {
+    match sender {
         Some(s) => {
             h.update(&[1]);
             h.update(&s.0);
@@ -69,9 +123,6 @@ pub fn envelope_digest(entry: &MailboxEntry) -> [u8; 32] {
             h.update(&[0]);
         }
     }
-    h.update(&(entry.payload.len() as u64).to_le_bytes());
-    h.update(&entry.payload);
-    *h.finalize().as_bytes()
 }
 
 /// What the poll does with one challenge entry this time.
@@ -117,14 +168,10 @@ struct Answered {
     outcome: Outcome,
 }
 
-fn key_of(challenge: &MailboxEntry) -> [u8; 32] {
-    envelope_digest(challenge)
-}
-
 /// The holder's memory of PoS challenges it already answered (pos-i5).
 #[derive(Debug)]
 pub struct AnsweredChallenges {
-    by_envelope: HashMap<[u8; 32], Answered>,
+    by_key: HashMap<ChallengeKey, Answered>,
     ttl_secs: u64,
     retry_secs: u64,
     max_responses: usize,
@@ -148,7 +195,7 @@ impl AnsweredChallenges {
     pub(crate) fn with_caps(time_scale: u64, max_responses: usize, max_no_answers: usize) -> Self {
         let ttl_secs = scaled_ttl_secs(POS_CHALLENGE_TTL.as_secs(), time_scale);
         AnsweredChallenges {
-            by_envelope: HashMap::new(),
+            by_key: HashMap::new(),
             ttl_secs,
             retry_secs: (ttl_secs / 4).max(1),
             max_responses,
@@ -172,8 +219,8 @@ impl AnsweredChallenges {
     /// A clock step backwards only delays the next re-publish or re-check (the elapsed
     /// time saturates at 0); a step forwards makes `forget_expired` drop the entry and
     /// the challenge is computed once more. Neither skips a live challenge.
-    pub fn step(&self, challenge: &MailboxEntry, now_secs: u64) -> ChallengeStep {
-        let Some(a) = self.by_envelope.get(&key_of(challenge)) else {
+    pub fn step(&self, key: ChallengeKey, now_secs: u64) -> ChallengeStep {
+        let Some(a) = self.by_key.get(&key) else {
             return ChallengeStep::Compute;
         };
         if now_secs >= a.forget_at {
@@ -210,14 +257,14 @@ impl AnsweredChallenges {
     /// Remember a computed response entry and how many acks its first publish got.
     pub fn remember_response(
         &mut self,
-        challenge: &MailboxEntry,
+        key: ChallengeKey,
         response: MailboxEntry,
         challenge_id: [u8; 16],
         acks: usize,
         now_secs: u64,
     ) {
         self.remember(
-            challenge,
+            key,
             Outcome::Response {
                 entry: response,
                 challenge_id,
@@ -228,13 +275,13 @@ impl AnsweredChallenges {
     }
 
     /// Remember that the handler gave no answer (Nack, unauthenticated, oversized).
-    pub fn remember_no_answer(&mut self, challenge: &MailboxEntry, now_secs: u64) {
-        self.remember(challenge, Outcome::NoAnswer, now_secs);
+    pub fn remember_no_answer(&mut self, key: ChallengeKey, now_secs: u64) {
+        self.remember(key, Outcome::NoAnswer, now_secs);
     }
 
     /// Record a re-publish of the remembered response and its acks.
-    pub fn record_republish(&mut self, challenge: &MailboxEntry, acks: usize, now_secs: u64) {
-        if let Some(a) = self.by_envelope.get_mut(&key_of(challenge)) {
+    pub fn record_republish(&mut self, key: ChallengeKey, acks: usize, now_secs: u64) {
+        if let Some(a) = self.by_key.get_mut(&key) {
             a.last_try_at = now_secs;
             if let Outcome::Response { last_acks, .. } = &mut a.outcome {
                 *last_acks = acks;
@@ -245,7 +292,7 @@ impl AnsweredChallenges {
     /// Drop entries whose `forget_at` passed; returns how many.
     pub fn forget_expired(&mut self, now_secs: u64) -> usize {
         let (mut responses, mut no_answers) = (0usize, 0usize);
-        self.by_envelope.retain(|_, a| {
+        self.by_key.retain(|_, a| {
             let keep = a.forget_at > now_secs;
             if !keep {
                 if a.outcome.is_response() {
@@ -262,11 +309,11 @@ impl AnsweredChallenges {
     }
 
     pub fn len(&self) -> usize {
-        self.by_envelope.len()
+        self.by_key.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_envelope.is_empty()
+        self.by_key.is_empty()
     }
 
     /// Remember refusals since start (a cap was reached).
@@ -279,10 +326,9 @@ impl AnsweredChallenges {
     /// not signed, pos-i5-a). A new entry of a kind whose cap is reached is not stored
     /// (and an entry that would change into that kind is dropped): the challenge is then
     /// computed on every poll, the pre-pos-i5 behaviour.
-    fn remember(&mut self, challenge: &MailboxEntry, outcome: Outcome, now_secs: u64) {
-        let key = key_of(challenge);
+    fn remember(&mut self, key: ChallengeKey, outcome: Outcome, now_secs: u64) {
         let is_response = outcome.is_response();
-        let was_response = self.by_envelope.get(&key).map(|a| a.outcome.is_response());
+        let was_response = self.by_key.get(&key).map(|a| a.outcome.is_response());
         if was_response != Some(is_response) {
             let full = if is_response {
                 self.responses >= self.max_responses
@@ -291,7 +337,7 @@ impl AnsweredChallenges {
             };
             if full {
                 if let Some(old) = was_response {
-                    self.by_envelope.remove(&key);
+                    self.by_key.remove(&key);
                     self.uncount(old);
                 }
                 self.refuse(is_response);
@@ -307,7 +353,7 @@ impl AnsweredChallenges {
             }
         }
         let forget_at = now_secs.saturating_add(self.ttl_secs);
-        self.by_envelope
+        self.by_key
             .entry(key)
             .and_modify(|a| {
                 // An entry past its life (not yet forgotten) starts a new one.

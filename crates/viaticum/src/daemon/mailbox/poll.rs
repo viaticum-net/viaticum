@@ -25,12 +25,14 @@ use tracing::{debug, error, info, warn};
 use viaticum_core::constants::MAILBOX_POLL_INTERVAL_SECS;
 use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
 use viaticum_core::messages::{
-    PosHashResponseMsg, SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, to_cbor,
+    PosHashChallengeMsg, PosHashResponseMsg, SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, to_cbor,
 };
 use viaticum_core::types::{IdentityPub, from_cbor_bytes, hex_encode};
 
 use super::routing::MailboxRouter;
-use crate::daemon::pos_memo::{AnsweredChallenges, ChallengeStep, PollCounts, PosPollState};
+use crate::daemon::pos_memo::{
+    AnsweredChallenges, ChallengeKey, ChallengeStep, PollCounts, PosPollState,
+};
 use crate::daemon::processor::{DeleteMailboxHandler, RevocationMailboxHandler};
 
 /// Mailbox poll cadence in seconds, scaled by `time_scale`.
@@ -323,7 +325,17 @@ async fn dispatch_pos_challenge(
         }
     };
 
-    match answered.step(&entry, now_secs) {
+    // pos-i5-a: decode first and key the memory by what the owner signed, so no
+    // re-encoding of the same signed challenge is computed twice. An undecodable payload
+    // is keyed by its raw bytes and ends as a no-answer here, without the handler (no
+    // disk read). After mailbox encryption (C4) the entry is opened before this point.
+    let decoded = from_cbor_bytes::<PosHashChallengeMsg>(&entry.payload).ok();
+    let key = match &decoded {
+        Some(c) => ChallengeKey::signed(Some(&owner_master), c),
+        None => ChallengeKey::undecodable(&entry),
+    };
+
+    match answered.step(key, now_secs) {
         ChallengeStep::Skip => {
             counts.skipped += 1;
             return;
@@ -338,10 +350,21 @@ async fn dispatch_pos_challenge(
             if acks == 0 {
                 counts.publish_zero_ack += 1;
             }
-            answered.record_republish(&entry, acks, now_secs);
+            answered.record_republish(key, acks, now_secs);
             return;
         }
         ChallengeStep::Compute => {}
+    }
+
+    if decoded.is_none() {
+        counts.no_answer += 1;
+        answered.remember_no_answer(key, now_secs);
+        warn!(
+            msg_id = %hex_encode(&entry.msg_id),
+            owner = %owner_master,
+            "mailbox_poll: undecodable PosChallenge — no answer (re-checked once per quarter TTL)"
+        );
+        return;
     }
 
     // Pass owner_master as the first arg — PosMailboxChallengeHandler uses it as owner_id
@@ -437,18 +460,12 @@ async fn dispatch_pos_challenge(
             if acks == 0 {
                 counts.publish_zero_ack += 1;
             }
-            answered.remember_response(
-                &entry,
-                response_entry,
-                response.challenge_id,
-                acks,
-                now_secs,
-            );
+            answered.remember_response(key, response_entry, response.challenge_id, acks, now_secs);
         }
         Ok(None) => {
             // Nack or CannotCompute — challenge_handler already logged
             counts.no_answer += 1;
-            answered.remember_no_answer(&entry, now_secs);
+            answered.remember_no_answer(key, now_secs);
             debug!(msg_id = %hex_encode(&entry.msg_id), "mailbox_poll: PosChallenge handler returned no response (nack)");
         }
         Err(e) => {

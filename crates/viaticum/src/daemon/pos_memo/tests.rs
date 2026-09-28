@@ -3,10 +3,22 @@
 use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
 use viaticum_core::types::IdentityPub;
 
+use viaticum_core::messages::{PosHashChallengeMsg, build_pos_hash_challenge, to_cbor};
+use viaticum_core::types::{SourceBlockId, Timestamp, from_cbor_bytes};
+
 use super::{
-    AnsweredChallenges, ChallengeStep, MAX_REMEMBERED_NO_ANSWERS, MAX_REMEMBERED_RESPONSES,
-    PollCounts, PosPollState, envelope_digest,
+    AnsweredChallenges, ChallengeKey, ChallengeStep, MAX_REMEMBERED_NO_ANSWERS,
+    MAX_REMEMBERED_RESPONSES, PollCounts, PosPollState,
 };
+
+/// The key the poll uses for `e`: signed content when the payload decodes as a
+/// challenge, the raw bytes otherwise (as `dispatch_pos_challenge` does).
+fn k(e: &MailboxEntry) -> ChallengeKey {
+    match from_cbor_bytes::<PosHashChallengeMsg>(&e.payload) {
+        Ok(c) => ChallengeKey::signed(e.sender.as_ref(), &c),
+        Err(_) => ChallengeKey::undecodable(e),
+    }
+}
 
 /// time_scale 900: TTL 672 s, retry 168 s (the scenario's scale).
 const TS: u64 = 900;
@@ -54,7 +66,7 @@ fn is_republish(step: &ChallengeStep) -> bool {
 fn new_challenge_is_computed() {
     let memo = AnsweredChallenges::new(TS);
     let c = challenge(1, vec![1, 2, 3], T0, memo.ttl_secs());
-    assert_eq!(memo.step(&c, T0), ChallengeStep::Compute);
+    assert_eq!(memo.step(k(&c), T0), ChallengeStep::Compute);
 }
 
 #[test]
@@ -74,10 +86,10 @@ fn answered_challenge_is_skipped_within_quarter_ttl() {
     let mut memo = AnsweredChallenges::new(TS);
     let ttl = memo.ttl_secs();
     let c = challenge(1, vec![1, 2, 3], T0, ttl);
-    memo.remember_response(&c, response(9, T0, ttl), [1; 16], 1, T0);
+    memo.remember_response(k(&c), response(9, T0, ttl), [1; 16], 1, T0);
     for dt in [0, 4, 100, memo.retry_secs() - 1] {
         assert_eq!(
-            memo.step(&c, T0 + dt),
+            memo.step(k(&c), T0 + dt),
             ChallengeStep::Skip,
             "an acked answer is neither recomputed nor re-published {dt} s later"
         );
@@ -90,8 +102,8 @@ fn answered_challenge_is_republished_from_cache_after_quarter_ttl() {
     let ttl = memo.ttl_secs();
     let c = challenge(1, vec![1, 2, 3], T0, ttl);
     let cached = response(9, T0, ttl);
-    memo.remember_response(&c, cached.clone(), [1; 16], 1, T0);
-    match memo.step(&c, T0 + memo.retry_secs()) {
+    memo.remember_response(k(&c), cached.clone(), [1; 16], 1, T0);
+    match memo.step(k(&c), T0 + memo.retry_secs()) {
         ChallengeStep::Republish {
             response,
             challenge_id,
@@ -109,15 +121,15 @@ fn zero_ack_answer_is_republished_on_next_poll() {
     let mut memo = AnsweredChallenges::new(TS);
     let ttl = memo.ttl_secs();
     let c = challenge(1, vec![1, 2, 3], T0, ttl);
-    memo.remember_response(&c, response(9, T0, ttl), [1; 16], 0, T0);
+    memo.remember_response(k(&c), response(9, T0, ttl), [1; 16], 0, T0);
     // Next poll (4 s later at TS 900): re-publish although TTL/4 has not passed.
-    assert!(is_republish(&memo.step(&c, T0 + 4)));
+    assert!(is_republish(&memo.step(k(&c), T0 + 4)));
     // Still 0 acks: keep trying on every poll.
-    memo.record_republish(&c, 0, T0 + 4);
-    assert!(is_republish(&memo.step(&c, T0 + 8)));
+    memo.record_republish(k(&c), 0, T0 + 4);
+    assert!(is_republish(&memo.step(k(&c), T0 + 8)));
     // Acked: back to the quarter-TTL rhythm.
-    memo.record_republish(&c, 1, T0 + 8);
-    assert_eq!(memo.step(&c, T0 + 12), ChallengeStep::Skip);
+    memo.record_republish(k(&c), 1, T0 + 8);
+    assert_eq!(memo.step(k(&c), T0 + 12), ChallengeStep::Skip);
 }
 
 #[test]
@@ -127,14 +139,17 @@ fn republish_stops_when_the_response_entry_expired() {
     // A challenge alive for 2 TTL (capped by first-seen + TTL anyway) whose response
     // entry lives only 100 s.
     let c = challenge(1, vec![1, 2, 3], T0, 2 * ttl);
-    memo.remember_response(&c, response(9, T0, 100), [1; 16], 0, T0);
-    assert!(is_republish(&memo.step(&c, T0 + 4)));
+    memo.remember_response(k(&c), response(9, T0, 100), [1; 16], 0, T0);
+    assert!(is_republish(&memo.step(k(&c), T0 + 4)));
     assert_eq!(
-        memo.step(&c, T0 + 100),
+        memo.step(k(&c), T0 + 100),
         ChallengeStep::Skip,
         "an expired response entry is never re-published"
     );
-    assert_eq!(memo.step(&c, T0 + memo.retry_secs()), ChallengeStep::Skip);
+    assert_eq!(
+        memo.step(k(&c), T0 + memo.retry_secs()),
+        ChallengeStep::Skip
+    );
 }
 
 #[test]
@@ -148,14 +163,14 @@ fn at_most_three_republishes_over_the_challenge_life() {
     let mut now = T0;
     while now < c.expires_at {
         memo.forget_expired(now);
-        match memo.step(&c, now) {
+        match memo.step(k(&c), now) {
             ChallengeStep::Compute => {
                 computed += 1;
-                memo.remember_response(&c, response(9, now, ttl), [1; 16], 1, now);
+                memo.remember_response(k(&c), response(9, now, ttl), [1; 16], 1, now);
             }
             ChallengeStep::Republish { .. } => {
                 republished += 1;
-                memo.record_republish(&c, 1, now);
+                memo.record_republish(k(&c), 1, now);
             }
             ChallengeStep::Skip => {}
         }
@@ -175,16 +190,16 @@ fn forged_payload_under_same_msg_id_is_computed_separately() {
     let honest = challenge(1, vec![1, 2, 3], T0, ttl);
     let forged = challenge(1, vec![6, 6, 6], T0, ttl);
     // The forgery is seen first and gives no answer (no owner signature).
-    memo.remember_no_answer(&forged, T0);
+    memo.remember_no_answer(k(&forged), T0);
     assert_eq!(
-        memo.step(&honest, T0 + 4),
+        memo.step(k(&honest), T0 + 4),
         ChallengeStep::Compute,
         "the honest challenge is not locked out by a forgery under its msg_id"
     );
-    memo.remember_response(&honest, response(9, T0 + 4, ttl), [1; 16], 1, T0 + 4);
+    memo.remember_response(k(&honest), response(9, T0 + 4, ttl), [1; 16], 1, T0 + 4);
     assert_eq!(memo.len(), 2, "two envelopes, two memory entries");
-    assert_eq!(memo.step(&forged, T0 + 8), ChallengeStep::Skip);
-    assert_eq!(memo.step(&honest, T0 + 8), ChallengeStep::Skip);
+    assert_eq!(memo.step(k(&forged), T0 + 8), ChallengeStep::Skip);
+    assert_eq!(memo.step(k(&honest), T0 + 8), ChallengeStep::Skip);
 }
 
 #[test]
@@ -196,20 +211,20 @@ fn forged_sender_under_same_msg_id_is_computed_separately() {
         sender: Some(IdentityPub([0x66; 32])),
         ..honest.clone()
     };
-    assert_ne!(envelope_digest(&honest), envelope_digest(&forged));
-    memo.remember_no_answer(&forged, T0);
-    assert_eq!(memo.step(&honest, T0 + 4), ChallengeStep::Compute);
+    assert_ne!(k(&honest), k(&forged));
+    memo.remember_no_answer(k(&forged), T0);
+    assert_eq!(memo.step(k(&honest), T0 + 4), ChallengeStep::Compute);
 }
 
 #[test]
-fn envelope_digest_ignores_times_and_target() {
+fn undecodable_key_ignores_times_and_target() {
     let a = challenge(1, vec![1, 2, 3], T0, 672);
     let b = MailboxEntry {
         stored_at: T0 + 50,
         expires_at: T0 + 999,
         ..a.clone()
     };
-    assert_eq!(envelope_digest(&a), envelope_digest(&b));
+    assert_eq!(k(&a), k(&b));
 }
 
 #[test]
@@ -217,14 +232,14 @@ fn no_answer_is_rechecked_only_after_quarter_ttl() {
     let mut memo = AnsweredChallenges::new(TS);
     let ttl = memo.ttl_secs();
     let c = challenge(1, vec![1, 2, 3], T0, ttl);
-    memo.remember_no_answer(&c, T0);
-    assert_eq!(memo.step(&c, T0 + 4), ChallengeStep::Skip);
+    memo.remember_no_answer(k(&c), T0);
+    assert_eq!(memo.step(k(&c), T0 + 4), ChallengeStep::Skip);
     assert_eq!(
-        memo.step(&c, T0 + memo.retry_secs() - 1),
+        memo.step(k(&c), T0 + memo.retry_secs() - 1),
         ChallengeStep::Skip
     );
     assert_eq!(
-        memo.step(&c, T0 + memo.retry_secs()),
+        memo.step(k(&c), T0 + memo.retry_secs()),
         ChallengeStep::Compute
     );
 }
@@ -235,9 +250,9 @@ fn recomputed_no_answer_keeps_the_challenge_forget_at() {
     let ttl = memo.ttl_secs();
     // The envelope claims a long life; the memory still counts from first sight.
     let c = challenge(1, vec![1, 2, 3], T0, 100 * ttl);
-    memo.remember_no_answer(&c, T0);
+    memo.remember_no_answer(k(&c), T0);
     let later = T0 + memo.retry_secs();
-    memo.remember_response(&c, response(9, later, ttl), [1; 16], 1, later);
+    memo.remember_response(k(&c), response(9, later, ttl), [1; 16], 1, later);
     assert_eq!(memo.len(), 1);
     assert_eq!(memo.forget_expired(T0 + ttl - 1), 0);
     assert_eq!(
@@ -253,8 +268,8 @@ fn expired_entries_are_forgotten() {
     let ttl = memo.ttl_secs();
     let first = challenge(1, vec![1], T0, ttl);
     let second = challenge(2, vec![2], T0 + 100, ttl);
-    memo.remember_response(&first, response(8, T0, ttl), [1; 16], 1, T0);
-    memo.remember_no_answer(&second, T0 + 100);
+    memo.remember_response(k(&first), response(8, T0, ttl), [1; 16], 1, T0);
+    memo.remember_no_answer(k(&second), T0 + 100);
     assert_eq!(memo.forget_expired(T0 + ttl - 1), 0);
     assert_eq!(memo.forget_expired(T0 + ttl), 1);
     assert_eq!(memo.len(), 1);
@@ -268,7 +283,7 @@ fn forget_at_is_first_seen_plus_ttl_even_for_a_long_envelope() {
     let ttl = memo.ttl_secs();
     // A challenge entry claiming a life far beyond the class TTL.
     let c = challenge(1, vec![1], T0, 100 * ttl);
-    memo.remember_no_answer(&c, T0);
+    memo.remember_no_answer(k(&c), T0);
     assert_eq!(memo.forget_expired(T0 + ttl - 1), 0);
     assert_eq!(memo.forget_expired(T0 + ttl), 1);
 }
@@ -278,30 +293,30 @@ fn memory_survives_clock_steps_without_skipping_a_live_challenge() {
     let mut memo = AnsweredChallenges::new(TS);
     let ttl = memo.ttl_secs();
     let c = challenge(1, vec![1, 2, 3], T0, ttl);
-    memo.remember_response(&c, response(9, T0, ttl), [1; 16], 1, T0);
+    memo.remember_response(k(&c), response(9, T0, ttl), [1; 16], 1, T0);
 
     // Clock steps back an hour: the answer stays remembered, nothing is re-published
     // on every poll (the elapsed time saturates at 0).
     let back = T0 - 3600;
     memo.forget_expired(back);
-    assert_eq!(memo.step(&c, back), ChallengeStep::Skip);
-    assert_eq!(memo.step(&c, back + 4), ChallengeStep::Skip);
+    assert_eq!(memo.step(k(&c), back), ChallengeStep::Skip);
+    assert_eq!(memo.step(k(&c), back + 4), ChallengeStep::Skip);
     // ...and once the clock is past the retry again, the re-publish comes.
-    assert!(is_republish(&memo.step(&c, T0 + memo.retry_secs())));
+    assert!(is_republish(&memo.step(k(&c), T0 + memo.retry_secs())));
 
     // Clock steps forward past the challenge's life: memory drops it, and a challenge
     // still shown by the postmen is computed once more, not skipped.
     let fwd = T0 + 10 * ttl;
     memo.forget_expired(fwd);
     assert!(memo.is_empty());
-    assert_eq!(memo.step(&c, fwd), ChallengeStep::Compute);
+    assert_eq!(memo.step(k(&c), fwd), ChallengeStep::Compute);
 }
 
 #[test]
 fn record_republish_of_unknown_challenge_is_a_no_op() {
     let mut memo = AnsweredChallenges::new(TS);
     let c = challenge(1, vec![1], T0, memo.ttl_secs());
-    memo.record_republish(&c, 1, T0);
+    memo.record_republish(k(&c), 1, T0);
     assert!(memo.is_empty());
 }
 
@@ -314,7 +329,7 @@ fn restart_memory_is_empty_and_every_live_challenge_is_computed_once() {
     assert!(state.answered.is_empty());
     for id in 0..5u8 {
         let c = challenge(id, vec![id], T0, ttl);
-        assert_eq!(state.answered.step(&c, T0), ChallengeStep::Compute);
+        assert_eq!(state.answered.step(k(&c), T0), ChallengeStep::Compute);
     }
     assert_eq!(PollCounts::default().computed, 0);
 }
@@ -326,14 +341,14 @@ fn rotated_msg_id_of_the_same_challenge_is_not_recomputed() {
     let mut memo = AnsweredChallenges::new(TS);
     let ttl = memo.ttl_secs();
     let c = challenge(1, vec![1, 2, 3], T0, ttl);
-    memo.remember_response(&c, response(9, T0, ttl), [1; 16], 1, T0);
+    memo.remember_response(k(&c), response(9, T0, ttl), [1; 16], 1, T0);
     for id in 2..20u8 {
         let rotated = MailboxEntry {
             msg_id: [id; 16],
             ..c.clone()
         };
         assert_eq!(
-            memo.step(&rotated, T0 + 4),
+            memo.step(k(&rotated), T0 + 4),
             ChallengeStep::Skip,
             "a postman renaming the same challenge gets no second compute"
         );
@@ -347,12 +362,12 @@ fn rotated_msg_id_republishes_under_the_response_own_msg_id() {
     let ttl = memo.ttl_secs();
     let c = challenge(1, vec![1, 2, 3], T0, ttl);
     let cached = response(9, T0, ttl);
-    memo.remember_response(&c, cached.clone(), [1; 16], 0, T0);
+    memo.remember_response(k(&c), cached.clone(), [1; 16], 0, T0);
     let rotated = MailboxEntry {
         msg_id: [0x77; 16],
         ..c
     };
-    match memo.step(&rotated, T0 + 4) {
+    match memo.step(k(&rotated), T0 + 4) {
         ChallengeStep::Republish { response, .. } => assert_eq!(response.msg_id, cached.msg_id),
         other => panic!("expected a re-publish, got {other:?}"),
     }
@@ -364,9 +379,9 @@ fn short_envelope_expires_at_does_not_shorten_the_memory() {
     let ttl = memo.ttl_secs();
     // The (unsigned) expires_at says 10 s; the memory keeps the entry a full TTL.
     let c = challenge(1, vec![1, 2, 3], T0, 10);
-    memo.remember_response(&c, response(9, T0, ttl), [1; 16], 1, T0);
+    memo.remember_response(k(&c), response(9, T0, ttl), [1; 16], 1, T0);
     assert_eq!(memo.forget_expired(T0 + 11), 0);
-    assert_eq!(memo.step(&c, T0 + 12), ChallengeStep::Skip);
+    assert_eq!(memo.step(k(&c), T0 + 12), ChallengeStep::Skip);
     assert_eq!(memo.forget_expired(T0 + ttl), 1);
 }
 
@@ -376,13 +391,13 @@ fn memory_does_not_grow_past_the_response_cap() {
     let ttl = memo.ttl_secs();
     for id in 0..10u8 {
         let c = challenge(id, vec![id], T0, ttl);
-        memo.remember_response(&c, response(id, T0, ttl), [id; 16], 1, T0);
+        memo.remember_response(k(&c), response(id, T0, ttl), [id; 16], 1, T0);
     }
     assert_eq!(memo.len(), 3, "above the cap nothing is stored");
     assert_eq!(memo.refused(), 7);
     // Not remembered = computed as before pos-i5, never silently skipped.
     let over = challenge(9, vec![9], T0, ttl);
-    assert_eq!(memo.step(&over, T0 + 4), ChallengeStep::Compute);
+    assert_eq!(memo.step(k(&over), T0 + 4), ChallengeStep::Compute);
 }
 
 #[test]
@@ -391,13 +406,13 @@ fn junk_no_answers_do_not_take_the_responses_room() {
     let ttl = memo.ttl_secs();
     // A postman floods junk: only the no-answer room fills.
     for id in 0..50u8 {
-        memo.remember_no_answer(&challenge(id, vec![0xEE, id], T0, ttl), T0);
+        memo.remember_no_answer(k(&challenge(id, vec![0xEE, id], T0, ttl)), T0);
     }
     assert_eq!(memo.len(), 2);
     // The honest answers are still remembered.
     let honest = challenge(200, vec![1, 2, 3], T0, ttl);
-    memo.remember_response(&honest, response(9, T0, ttl), [1; 16], 1, T0);
-    assert_eq!(memo.step(&honest, T0 + 4), ChallengeStep::Skip);
+    memo.remember_response(k(&honest), response(9, T0, ttl), [1; 16], 1, T0);
+    assert_eq!(memo.step(k(&honest), T0 + 4), ChallengeStep::Skip);
     assert_eq!(memo.len(), 3);
 }
 
@@ -407,13 +422,13 @@ fn forgetting_frees_room_under_the_cap() {
     let ttl = memo.ttl_secs();
     let a = challenge(1, vec![1], T0, ttl);
     let b = challenge(2, vec![2], T0, ttl);
-    memo.remember_response(&a, response(1, T0, ttl), [1; 16], 1, T0);
-    memo.remember_response(&b, response(2, T0, ttl), [2; 16], 1, T0);
+    memo.remember_response(k(&a), response(1, T0, ttl), [1; 16], 1, T0);
+    memo.remember_response(k(&b), response(2, T0, ttl), [2; 16], 1, T0);
     assert_eq!(memo.len(), 1);
     memo.forget_expired(T0 + ttl);
-    memo.remember_response(&b, response(2, T0 + ttl, ttl), [2; 16], 1, T0 + ttl);
+    memo.remember_response(k(&b), response(2, T0 + ttl, ttl), [2; 16], 1, T0 + ttl);
     assert_eq!(memo.len(), 1, "the room of the forgotten entry is reused");
-    assert_eq!(memo.step(&b, T0 + ttl + 4), ChallengeStep::Skip);
+    assert_eq!(memo.step(k(&b), T0 + ttl + 4), ChallengeStep::Skip);
 }
 
 #[test]
@@ -421,14 +436,14 @@ fn no_answer_turning_into_response_at_a_full_cap_is_dropped_not_kept_stale() {
     let mut memo = AnsweredChallenges::with_caps(TS, 1, 5);
     let ttl = memo.ttl_secs();
     let full = challenge(1, vec![1], T0, ttl);
-    memo.remember_response(&full, response(1, T0, ttl), [1; 16], 1, T0);
+    memo.remember_response(k(&full), response(1, T0, ttl), [1; 16], 1, T0);
     let c = challenge(2, vec![2], T0, ttl);
-    memo.remember_no_answer(&c, T0);
+    memo.remember_no_answer(k(&c), T0);
     let later = T0 + memo.retry_secs();
-    memo.remember_response(&c, response(2, later, ttl), [2; 16], 1, later);
+    memo.remember_response(k(&c), response(2, later, ttl), [2; 16], 1, later);
     // It cannot be stored as a response and must not stay a stale no-answer (that would
     // skip the challenge for another quarter TTL while its answer is never published).
-    assert_eq!(memo.step(&c, later + 4), ChallengeStep::Compute);
+    assert_eq!(memo.step(k(&c), later + 4), ChallengeStep::Compute);
     assert_eq!(memo.len(), 1);
 }
 
@@ -440,7 +455,7 @@ fn production_caps_are_the_documented_ones() {
     let ttl = memo.ttl_secs();
     for i in 0..(MAX_REMEMBERED_NO_ANSWERS as u32 + 100) {
         let c = challenge(0, i.to_le_bytes().to_vec(), T0, ttl);
-        memo.remember_no_answer(&c, T0);
+        memo.remember_no_answer(k(&c), T0);
     }
     assert_eq!(memo.len(), MAX_REMEMBERED_NO_ANSWERS);
     assert_eq!(memo.refused(), 100);
@@ -451,7 +466,7 @@ fn begin_poll_forgets_what_expired() {
     let mut state = PosPollState::new(TS);
     let ttl = state.answered.ttl_secs();
     let c = challenge(1, vec![1], T0, ttl);
-    state.answered.remember_no_answer(&c, T0);
+    state.answered.remember_no_answer(k(&c), T0);
     assert_eq!(state.begin_poll(T0 + ttl - 1), 0);
     assert_eq!(state.begin_poll(T0 + ttl), 1);
     assert!(state.answered.is_empty());
@@ -464,9 +479,167 @@ fn challenge_seen_after_its_memory_expired_is_computed_once_more_not_every_poll(
     let mut memo = AnsweredChallenges::new(TS);
     let ttl = memo.ttl_secs();
     let c = challenge(1, vec![1, 2, 3], T0, ttl);
-    memo.remember_response(&c, response(9, T0, ttl), [1; 16], 1, T0);
+    memo.remember_response(k(&c), response(9, T0, ttl), [1; 16], 1, T0);
     let late = T0 + ttl + 4;
-    assert_eq!(memo.step(&c, late), ChallengeStep::Compute);
-    memo.remember_response(&c, response(9, late, ttl), [1; 16], 1, late);
-    assert_eq!(memo.step(&c, late + 4), ChallengeStep::Skip);
+    assert_eq!(memo.step(k(&c), late), ChallengeStep::Compute);
+    memo.remember_response(k(&c), response(9, late, ttl), [1; 16], 1, late);
+    assert_eq!(memo.step(k(&c), late + 4), ChallengeStep::Skip);
+}
+
+// ─── pos-i5-a: the key is the owner-signed content, not its encoding ─────────────
+
+fn owner_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])
+}
+
+fn signed() -> PosHashChallengeMsg {
+    build_pos_hash_challenge(
+        [0x5A; 16],
+        SourceBlockId([8; 32]),
+        vec![(0, 3), (10, 2)],
+        Timestamp(1_700_000_000),
+        None,
+        &owner_key(),
+    )
+}
+
+fn entry_with(payload: Vec<u8>) -> MailboxEntry {
+    MailboxEntry {
+        sender: Some(IdentityPub(owner_key().verifying_key().to_bytes())),
+        ..challenge(1, payload, T0, 672)
+    }
+}
+
+/// Re-encode `c` through a generic CBOR value and let `f` edit it.
+fn reencoded(c: &PosHashChallengeMsg, f: impl FnOnce(&mut ciborium::Value)) -> Vec<u8> {
+    let bytes = to_cbor(c).unwrap();
+    let mut v: ciborium::Value = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+    f(&mut v);
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&v, &mut out).unwrap();
+    out
+}
+
+/// Every re-encoding a postman can make without breaking the signature: each decodes
+/// as the same signed challenge and gets the same key.
+fn postman_variants() -> Vec<(&'static str, Vec<u8>)> {
+    let c = signed();
+    let honest = to_cbor(&c).unwrap();
+    let mut with_tail = honest.clone();
+    with_tail.push(0x00);
+    vec![
+        (
+            "device_id",
+            to_cbor(&PosHashChallengeMsg {
+                device_id: Some(viaticum_core::types::DeviceId([7; 32])),
+                ..c.clone()
+            })
+            .unwrap(),
+        ),
+        (
+            "v",
+            to_cbor(&PosHashChallengeMsg { v: 9, ..c.clone() }).unwrap(),
+        ),
+        (
+            "extra field",
+            reencoded(&c, |v| {
+                if let ciborium::Value::Map(m) = v {
+                    m.push((
+                        ciborium::Value::Text("zz".into()),
+                        ciborium::Value::Integer(1.into()),
+                    ));
+                }
+            }),
+        ),
+        ("trailing byte", with_tail),
+        (
+            "key order",
+            reencoded(&c, |v| {
+                if let ciborium::Value::Map(m) = v {
+                    m.reverse();
+                }
+            }),
+        ),
+        ("honest", honest),
+    ]
+}
+
+#[test]
+fn every_reencoding_of_a_signed_challenge_has_the_same_key() {
+    let honest = k(&entry_with(to_cbor(&signed()).unwrap()));
+    for (name, payload) in postman_variants() {
+        let e = entry_with(payload);
+        assert!(
+            from_cbor_bytes::<PosHashChallengeMsg>(&e.payload).is_ok(),
+            "variant '{name}' must still decode (else it is not a door)"
+        );
+        assert_eq!(k(&e), honest, "variant '{name}' must map to the honest key");
+    }
+}
+
+#[test]
+fn reencoded_challenge_is_not_computed_again() {
+    let mut memo = AnsweredChallenges::new(TS);
+    let ttl = memo.ttl_secs();
+    let first = entry_with(to_cbor(&signed()).unwrap());
+    memo.remember_response(k(&first), response(9, T0, ttl), [0x5A; 16], 1, T0);
+    for (name, payload) in postman_variants() {
+        assert_eq!(
+            memo.step(k(&entry_with(payload)), T0 + 4),
+            ChallengeStep::Skip,
+            "variant '{name}' is the same challenge"
+        );
+    }
+    assert_eq!(memo.len(), 1);
+}
+
+#[test]
+fn junk_signature_under_the_honest_challenge_id_is_another_key() {
+    let honest = signed();
+    let forged = PosHashChallengeMsg {
+        sig: [0x13; 64],
+        ..honest.clone()
+    };
+    let hk = k(&entry_with(to_cbor(&honest).unwrap()));
+    let fk = k(&entry_with(to_cbor(&forged).unwrap()));
+    assert_ne!(
+        hk, fk,
+        "a forgery cannot occupy the honest challenge's entry"
+    );
+
+    let mut memo = AnsweredChallenges::new(TS);
+    memo.remember_no_answer(fk, T0);
+    assert_eq!(memo.step(hk, T0 + 4), ChallengeStep::Compute);
+}
+
+#[test]
+fn signed_fields_are_all_in_the_key() {
+    let c = signed();
+    let base = k(&entry_with(to_cbor(&c).unwrap()));
+    let edits: Vec<PosHashChallengeMsg> = vec![
+        PosHashChallengeMsg {
+            challenge_id: [1; 16],
+            ..c.clone()
+        },
+        PosHashChallengeMsg {
+            source_block_id: SourceBlockId([9; 32]),
+            ..c.clone()
+        },
+        PosHashChallengeMsg {
+            esi_ranges: vec![(0, 3)],
+            ..c.clone()
+        },
+        PosHashChallengeMsg {
+            timestamp: Timestamp(1),
+            ..c.clone()
+        },
+    ];
+    for e in edits {
+        assert_ne!(k(&entry_with(to_cbor(&e).unwrap())), base);
+    }
+    let other_sender = MailboxEntry {
+        sender: Some(IdentityPub([0x66; 32])),
+        ..entry_with(to_cbor(&c).unwrap())
+    };
+    assert_ne!(k(&other_sender), base);
 }

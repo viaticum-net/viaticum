@@ -42,6 +42,29 @@ fn make_entry(class: MailboxClass, target: IdentityPub, payload: Vec<u8>) -> Mai
     }
 }
 
+/// Owner key of the test challenges.
+fn owner_signing_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32])
+}
+
+/// A decodable PosHashChallengeMsg signed by `owner_signing_key` (issued now).
+fn signed_challenge() -> viaticum_core::messages::PosHashChallengeMsg {
+    viaticum_core::messages::build_pos_hash_challenge(
+        [0x5A; 16],
+        SourceBlockId([8u8; 32]),
+        vec![(0, 1)],
+        Timestamp::now(),
+        None,
+        &owner_signing_key(),
+    )
+}
+
+/// CBOR payload of `signed_challenge()`: the poll decodes a PosChallenge before its
+/// memory step (pos-i5-a), so test challenges must decode.
+fn signed_challenge_payload() -> Vec<u8> {
+    to_cbor(&signed_challenge()).expect("encode challenge")
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 /// PosResponse dispatch forwards the decoded message to pos_response_tx.
@@ -1391,7 +1414,11 @@ async fn pos_response_entry_ttl_is_scaled_by_time_scale() {
     let owner_master = make_identity(0x42);
     let my_master = make_identity(0xAA);
     // Payload is opaque to the stub handler; entry.sender = the challenging owner.
-    let base = make_entry(MailboxClass::PosChallenge, my_master, vec![0x00]);
+    let base = make_entry(
+        MailboxClass::PosChallenge,
+        my_master,
+        signed_challenge_payload(),
+    );
     let entry = MailboxEntry {
         sender: Some(owner_master),
         ..base
@@ -1462,7 +1489,11 @@ async fn pos_challenge_not_addressed_to_us_is_dropped() {
     let someone_else = make_identity(0xBB);
     // Entry addressed to `someone_else`, not us. sender is a valid owner so the only
     // thing stopping a publish is the target guard.
-    let base = make_entry(MailboxClass::PosChallenge, someone_else, vec![0x00]);
+    let base = make_entry(
+        MailboxClass::PosChallenge,
+        someone_else,
+        signed_challenge_payload(),
+    );
     let entry = MailboxEntry {
         sender: Some(owner_master),
         ..base
@@ -1668,7 +1699,11 @@ async fn pos_response_msg_id_is_derived_from_chain_hash_and_stable_across_redisp
 
     let owner_master = make_identity(0x42);
     let my_master = make_identity(0xAA);
-    let base = make_entry(MailboxClass::PosChallenge, my_master, vec![0x00]);
+    let base = make_entry(
+        MailboxClass::PosChallenge,
+        my_master,
+        signed_challenge_payload(),
+    );
     let entry = MailboxEntry {
         sender: Some(owner_master),
         ..base
@@ -1742,7 +1777,11 @@ async fn pos_response_msg_id_depends_on_chain_hash() {
         device_id: None,
         sig: [0u8; 64],
     };
-    let base = make_entry(MailboxClass::PosChallenge, my_master, vec![0x00]);
+    let base = make_entry(
+        MailboxClass::PosChallenge,
+        my_master,
+        signed_challenge_payload(),
+    );
     let entry = MailboxEntry {
         sender: Some(owner_master),
         ..base
@@ -1807,7 +1846,11 @@ async fn pos_response_zero_ack_is_recovered_by_redispatch() {
 
     let owner_master = make_identity(0x42);
     let my_master = make_identity(0xAA);
-    let base = make_entry(MailboxClass::PosChallenge, my_master, vec![0x00]);
+    let base = make_entry(
+        MailboxClass::PosChallenge,
+        my_master,
+        signed_challenge_payload(),
+    );
     let entry = MailboxEntry {
         sender: Some(owner_master),
         ..base
@@ -1935,7 +1978,11 @@ fn stub_response(challenge_id: [u8; 16]) -> PosHashResponseMsg {
 fn challenge_entry(my_master: IdentityPub, owner: IdentityPub) -> MailboxEntry {
     MailboxEntry {
         sender: Some(owner),
-        ..make_entry(MailboxClass::PosChallenge, my_master, vec![0x00])
+        ..make_entry(
+            MailboxClass::PosChallenge,
+            my_master,
+            signed_challenge_payload(),
+        )
     }
 }
 
@@ -2278,7 +2325,11 @@ async fn challenge_without_sender_is_not_remembered() {
     let my_master = make_identity(0xAA);
     let entry = MailboxEntry {
         sender: None,
-        ..make_entry(MailboxClass::PosChallenge, my_master, vec![0x00])
+        ..make_entry(
+            MailboxClass::PosChallenge,
+            my_master,
+            signed_challenge_payload(),
+        )
     };
     let mut memo = AnsweredChallenges::new(900);
     let mut counts = PollCounts::default();
@@ -2299,24 +2350,19 @@ async fn challenge_without_sender_is_not_remembered() {
     assert!(sender.stored.lock().await.is_empty());
 }
 
-/// B NOTE (4): a junk PosChallenge payload goes through the production handler as a
-/// no-answer: remembered, re-checked once per quarter TTL, not an error on every poll.
+/// B NOTE (4): a junk PosChallenge payload is a no-answer: the poll does not decode it,
+/// so the handler is never called (no disk read), it is remembered and re-checked once per
+/// quarter TTL, not an error on every poll.
 #[tokio::test]
 async fn junk_challenge_payload_is_remembered_as_no_answer() {
-    use crate::daemon::processor::{PosResponder, ProcessorPosHandler};
-
     let db = Db::open_in_memory().expect("db");
-    let holdings = tempfile::TempDir::new().expect("tempdir");
     let sender = Arc::new(RecordingSender {
         stored: tokio::sync::Mutex::new(vec![]),
     });
     let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
-    let handler: Arc<dyn super::PosMailboxChallengeHandler> =
-        Arc::new(ProcessorPosHandler::new(PosResponder::new(
-            db.clone(),
-            holdings.path().to_path_buf(),
-            ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]),
-        )));
+    let (handler, calls) = CountingChallengeHandler::wrap(Arc::new(StubChallengeHandler {
+        response: stub_response([0x55; 16]),
+    }));
     let my_master = make_identity(0xAA);
     let entry = MailboxEntry {
         sender: Some(make_identity(0x42)),
@@ -2342,8 +2388,174 @@ async fn junk_challenge_payload_is_remembered_as_no_answer() {
         )
         .await;
     }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "junk never reaches the handler"
+    );
     assert_eq!(counts.handler_error, 0, "junk is not a handler error");
     assert_eq!((counts.no_answer, counts.skipped), (1, 1));
     assert_eq!(memo.len(), 1);
     assert!(sender.stored.lock().await.is_empty());
+}
+
+// ─── Fix round 2: the memory key is the signed challenge, not its encoding ───────
+
+/// Re-encode `c` through a generic CBOR value and let `f` edit it.
+fn reencoded(
+    c: &viaticum_core::messages::PosHashChallengeMsg,
+    f: impl FnOnce(&mut ciborium::Value),
+) -> Vec<u8> {
+    let bytes = to_cbor(c).unwrap();
+    let mut v: ciborium::Value = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+    f(&mut v);
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&v, &mut out).unwrap();
+    out
+}
+
+/// pos-i5-a: a postman re-encodes one signed challenge five ways without breaking the
+/// signature. The poll computes it once and remembers one entry.
+#[tokio::test]
+async fn reencoded_signed_challenge_is_computed_once() {
+    use viaticum_core::messages::PosHashChallengeMsg;
+
+    let db = Db::open_in_memory().expect("db");
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let (handler, calls) = CountingChallengeHandler::wrap(Arc::new(StubChallengeHandler {
+        response: stub_response([0x5A; 16]),
+    }));
+    let my_master = make_identity(0xAA);
+    let owner = IdentityPub(owner_signing_key().verifying_key().to_bytes());
+    let c = signed_challenge();
+    let honest = to_cbor(&c).unwrap();
+    let mut with_tail = honest.clone();
+    with_tail.extend_from_slice(&[0x00, 0x01]);
+    let payloads = vec![
+        honest,
+        to_cbor(&PosHashChallengeMsg {
+            device_id: Some(DeviceId([7; 32])),
+            ..c.clone()
+        })
+        .unwrap(),
+        to_cbor(&PosHashChallengeMsg { v: 9, ..c.clone() }).unwrap(),
+        reencoded(&c, |v| {
+            if let ciborium::Value::Map(m) = v {
+                m.push((
+                    ciborium::Value::Text("zz".into()),
+                    ciborium::Value::Integer(1.into()),
+                ));
+            }
+        }),
+        with_tail,
+        reencoded(&c, |v| {
+            if let ciborium::Value::Map(m) = v {
+                m.reverse();
+            }
+        }),
+    ];
+    let mut memo = AnsweredChallenges::new(900);
+    let mut counts = PollCounts::default();
+    let now = Timestamp::now().0;
+    for (i, payload) in payloads.into_iter().enumerate() {
+        let entry = MailboxEntry {
+            msg_id: [i as u8; 16],
+            sender: Some(owner),
+            ..make_entry(MailboxClass::PosChallenge, my_master, payload)
+        };
+        super::dispatch_pos_challenge(
+            &router,
+            &handler,
+            &mut memo,
+            &mut counts,
+            &my_master,
+            entry,
+            900,
+            now + i as u64,
+        )
+        .await;
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the symbols are read once");
+    assert_eq!(memo.len(), 1, "one entry for one signed challenge");
+    assert_eq!(counts.skipped, 5);
+    assert_eq!(sender.stored.lock().await.len(), 1);
+}
+
+/// pos-i5-a: a forgery with the honest challenge_id and a junk signature arrives FIRST
+/// (a no-answer through the production handler); the honest challenge is still computed
+/// and answered on the next poll.
+#[tokio::test]
+async fn forgery_seen_first_does_not_block_the_honest_challenge() {
+    use crate::daemon::processor::{PosResponder, ProcessorPosHandler};
+    use viaticum_core::messages::PosHashChallengeMsg;
+    use viaticum_core::types::hex_encode;
+
+    let db = Db::open_in_memory().expect("db");
+    let holdings = tempfile::TempDir::new().expect("tempdir");
+    let owner = IdentityPub(owner_signing_key().verifying_key().to_bytes());
+    let c = signed_challenge();
+    db.upsert_holding(&HoldingRecord {
+        source_block_id: c.source_block_id,
+        owner_id: owner,
+        esi_ranges: vec![(0, 1)],
+        importance: 0.5,
+        total_bytes: 8,
+        status: HoldingStatus::Active,
+        received_at: Timestamp::now(),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    })
+    .expect("holding");
+    let block_dir = holdings.path().join(hex_encode(&c.source_block_id.0));
+    std::fs::create_dir_all(&block_dir).unwrap();
+    std::fs::write(block_dir.join("0.bin"), b"symbol-0").unwrap();
+
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let handler: Arc<dyn super::PosMailboxChallengeHandler> =
+        Arc::new(ProcessorPosHandler::new(PosResponder::new(
+            db.clone(),
+            holdings.path().to_path_buf(),
+            ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]),
+        )));
+    let my_master = make_identity(0xAA);
+    let entry_of = |payload: Vec<u8>| MailboxEntry {
+        sender: Some(owner),
+        ..make_entry(MailboxClass::PosChallenge, my_master, payload)
+    };
+    let forged = PosHashChallengeMsg {
+        sig: [0x13; 64],
+        ..c.clone()
+    };
+    let mut memo = AnsweredChallenges::new(900);
+    let mut counts = PollCounts::default();
+    let now = Timestamp::now().0;
+    for (at, payload) in [
+        (now, to_cbor(&forged).unwrap()),
+        (now + 4, to_cbor(&c).unwrap()),
+    ] {
+        super::dispatch_pos_challenge(
+            &router,
+            &handler,
+            &mut memo,
+            &mut counts,
+            &my_master,
+            entry_of(payload),
+            900,
+            at,
+        )
+        .await;
+    }
+    assert_eq!((counts.no_answer, counts.computed), (1, 1));
+    assert_eq!(memo.len(), 2);
+    assert_eq!(
+        sender.stored.lock().await.len(),
+        1,
+        "the honest challenge is answered"
+    );
 }

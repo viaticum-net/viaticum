@@ -108,6 +108,10 @@ pub enum ProcessorError {
         held: u32,
     },
 
+    /// pos-i5-a: a signed challenge older than the TTL + clock skew (a replay).
+    #[error("stale PoS challenge ({age_secs} s old)")]
+    StaleChallenge { age_secs: u64 },
+
     #[error("cluster sync error: {0}")]
     ClusterSync(#[from] crate::daemon::cluster_sync::ClusterSyncError),
 
