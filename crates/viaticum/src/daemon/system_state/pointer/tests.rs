@@ -603,7 +603,7 @@ async fn refusal_is_recorded_per_place_and_cleared_by_an_ack() {
     assert!(cur.acks.is_empty());
     assert_eq!(cur.last_refusal.map(|r| r.kind), Some(RefusalKind::NoAck));
     assert_eq!(
-        f.db.last_pointer_publication().unwrap(),
+        m.newest_accepted(),
         None,
         "dr-i9: a pointer nobody accepted is not a publication"
     );

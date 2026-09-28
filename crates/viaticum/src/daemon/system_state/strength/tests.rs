@@ -165,22 +165,67 @@ fn strength_counts_uncertain_but_not_lost_placements() {
     assert_eq!(block_strength(&db, &b, NOW, 1).unwrap(), 1.0);
 }
 
+/// dr-i41 / dr-i49: ready = the accepted pointer has the dr-i39 acks AND every block
+/// (base and diffs) is recoverable by the estimate; a holder not seen for W does not
+/// count; an unacked newer record does not make the node ready.
 #[test]
-fn pointer_strength_is_the_weakest_block() {
+fn readiness_needs_acks_and_every_block_recoverable() {
     let db = test_db();
+    for i in 0..6u8 {
+        db.upsert_peer(&PeerRecord {
+            device_id: DeviceId([0xA0 + i; 32]),
+            ..peer_template()
+        })
+        .unwrap();
+    }
+    assert_eq!(pointer_readiness(&db, 6, NOW, 1).unwrap().accepted, None);
     let base = block_of_strength(&db, 5, 3);
-    let d1 = block_of_strength(&db, 6, 2);
+    let d1 = block_of_strength(&db, 6, 1);
     let d2 = ss_record(&db, 7);
-    assert_eq!(pointer_strength(&db, &base, &[d1], NOW, 1).unwrap(), 2.0);
-    assert_eq!(
-        pointer_strength(&db, &base, &[d1, d2], NOW, 1).unwrap(),
-        0.0
+    hold(&db, d2, 0x70, 4, NOW - 8 * DAY); // gone for more than W
+    let mut m = meta(
+        Some(record(PointerPlace::A, base, vec![d1, d2], 100, 3)),
+        None,
     );
-    assert_eq!(
-        block_strength(&db, &SourceBlockId([0x77; 32]), NOW, 1).unwrap(),
-        0.0,
-        "a block without a record has no strength"
+    db.put_pointer_publications(&m).unwrap();
+    let r = pointer_readiness(&db, 6, NOW, 1).unwrap();
+    assert_eq!((r.blocks_placed, r.blocks_total, r.ready), (2, 3, false));
+    assert_eq!(r.accepted, Some((100, 1, 3)));
+    hold(&db, d2, 0x71, 4, NOW);
+    assert!(pointer_readiness(&db, 6, NOW, 1).unwrap().ready);
+    // Two acks < 3.
+    m.current.as_mut().unwrap().acks.truncate(2);
+    db.put_pointer_publications(&m).unwrap();
+    assert!(!pointer_readiness(&db, 6, NOW, 1).unwrap().ready);
+    // A newer, unacked record: the older accepted one is what is reported.
+    let newer = block_of_strength(&db, 8, 3);
+    let m2 = meta(
+        Some(record(PointerPlace::B, newer, vec![], 200, 0)),
+        Some(record(PointerPlace::A, base, vec![d1, d2], 100, 3)),
     );
+    db.put_pointer_publications(&m2).unwrap();
+    let r = pointer_readiness(&db, 6, NOW, 1).unwrap();
+    assert_eq!(r.accepted, Some((100, 1, 3)));
+    assert!(r.ready);
+}
+
+fn peer_template() -> PeerRecord {
+    PeerRecord {
+        device_id: DeviceId([0; 32]),
+        master_identity: IdentityPub([0; 32]),
+        trust_p: 0.5,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(1),
+        last_seen: Timestamp(NOW),
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma: 0.5,
+        last_avail_sample: 0,
+    }
 }
 
 #[test]

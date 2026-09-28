@@ -96,10 +96,6 @@ const META_KEY_HOLDINGS_OWNER_KEYED: &str = "holdings_owner_keyed_v1";
 /// never part of the SystemState snapshot (spec B2).
 const META_KEY_CATALOG_LINEAGE: &str = "catalog_lineage_v1";
 
-/// Meta key: this node's last pointer publication accepted by ≥ 1 postman
-/// (CBOR `PointerPublication`, dr-i9).
-const META_KEY_POINTER_PUBLICATION: &str = "pointer_publication_v1";
-
 /// Meta key: the two pointer places of this history (CBOR `PointerPublications`,
 /// CROWN-1 V.16.3). Not part of the SystemState snapshot.
 const META_KEY_POINTER_PUBLICATIONS: &str = "pointer_publication_v2";
@@ -516,32 +512,6 @@ impl Db {
         };
         tx.commit()?;
         Ok(id)
-    }
-
-    /// This node's last pointer publication accepted by ≥ 1 postman (dr-i9).
-    pub fn last_pointer_publication(
-        &self,
-    ) -> Result<Option<crate::system_state::catalog::PointerPublication>, DbError> {
-        let tx = self.inner.begin_read()?;
-        let table = tx.open_table(META)?;
-        match table.get(META_KEY_POINTER_PUBLICATION)? {
-            Some(v) => Ok(Some(from_cbor_bytes(v.value())?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Record a pointer publication accepted by ≥ 1 postman (replaces the previous one).
-    pub fn record_pointer_publication(
-        &self,
-        p: &crate::system_state::catalog::PointerPublication,
-    ) -> Result<(), DbError> {
-        let tx = self.inner.begin_write()?;
-        {
-            let mut table = tx.open_table(META)?;
-            table.insert(META_KEY_POINTER_PUBLICATION, to_cbor_bytes(p).as_slice())?;
-        }
-        tx.commit()?;
-        Ok(())
     }
 
     /// The pointer places of this history (CROWN-1 V.16.3), if any was ever written.

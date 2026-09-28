@@ -30,8 +30,8 @@ use viaticum_core::mailbox::seal::{PointerPlace, RendezvousKeys, seal_self_point
 use viaticum_core::mailbox::{MailboxEntry, class_config, scaled_ttl_secs};
 use viaticum_core::system_state::SelfPointer;
 use viaticum_core::system_state::catalog::{
-    PlacePublication, PointerPublication, PointerPublications, PointerRefusal, RefusalKind,
-    RetiredPointer, Waiting, WaitingReason,
+    PlacePublication, PointerPublications, PointerRefusal, RefusalKind, RetiredPointer, Waiting,
+    WaitingReason,
 };
 use viaticum_core::types::{SourceBlockId, Timestamp, from_cbor_bytes, hex_encode, to_cbor_bytes};
 
@@ -181,16 +181,16 @@ impl PointerPublisher<'_> {
         // 5. Waiting (mailbox-i54).
         update_waiting(&mut meta, &running, fresh_accepted, now_secs);
 
-        if self.put(&meta) {
-            if let Err(e) = sweep_ss_ledger(
+        // The sweep runs only once META (with every displaced base) is on disk.
+        if self.put(&meta)
+            && let Err(e) = sweep_ss_ledger(
                 self.db,
                 self.data_dir,
                 Some(&meta),
                 Some((running.base, running.diffs)),
-            ) {
-                error!(error = %e, "system_state push: SS ledger sweep failed");
-            }
-            self.record_summary(&meta);
+            )
+        {
+            error!(error = %e, "system_state push: SS ledger sweep failed");
         }
     }
 
@@ -333,24 +333,6 @@ impl PointerPublisher<'_> {
                 error!(error = %e, "system_state push: cannot write pointer META; nothing sent this tick");
                 false
             }
-        }
-    }
-
-    /// dr-i9 summary (read by `status` until it reads META directly): the newest
-    /// accepted record.
-    fn record_summary(&self, meta: &PointerPublications) {
-        let Some(r) = meta.newest_accepted() else {
-            return;
-        };
-        let summary = PointerPublication {
-            lineage: meta.lineage,
-            created_at: r.created_at,
-            generation: r.generation,
-            files: r.files,
-            acks: r.acks.len().try_into().unwrap_or(u32::MAX),
-        };
-        if let Err(e) = self.db.record_pointer_publication(&summary) {
-            warn!(error = %e, "system_state push: cannot record the pointer publication");
         }
     }
 }

@@ -66,24 +66,6 @@ pub(crate) fn block_strength(
     Ok(live as f64 / f64::from(k_eff))
 }
 
-/// Strength of a pointer: the weakest of its blocks (base and every diff). Used for DR
-/// readiness (dr-i41: every block of the accepted pointer must be recoverable).
-// `status` reads it from the next commit on ([cross:C] dispatch).
-#[allow(dead_code)]
-pub(crate) fn pointer_strength(
-    db: &Db,
-    base: &SourceBlockId,
-    diffs: &[SourceBlockId],
-    now_secs: u64,
-    time_scale: u64,
-) -> Result<f64, DbError> {
-    let mut min = block_strength(db, base, now_secs, time_scale)?;
-    for d in diffs {
-        min = min.min(block_strength(db, d, now_secs, time_scale)?);
-    }
-    Ok(min)
-}
-
 /// The place a NEW base goes to (mailbox-i56): an empty place first, then a place whose
 /// record no postman acked (it may never have left this machine), then the place whose
 /// BASE is weaker (diffs do not count, V.17.5); a tie → the older record. Never derived
@@ -172,4 +154,64 @@ pub(crate) fn sweep_ss_ledger(
         }
     }
     Ok(retired)
+}
+
+/// What `status` says about DR readiness (dr-i9, dr-i39, dr-i41, dr-i49; mailbox-i49,
+/// i54), read from META only.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct PointerReadiness {
+    /// The newest record at least one postman acked: its `created_at`, files, acks.
+    pub accepted: Option<(u64, u32, u32)>,
+    /// dr-i39 number of acks needed.
+    pub threshold: u32,
+    /// Blocks (base + diffs) of the accepted pointer, and how many of them are
+    /// recoverable by the owner's estimate (strength ≥ 1).
+    pub blocks_total: u32,
+    pub blocks_placed: u32,
+    /// acks ≥ threshold and every block recoverable.
+    pub ready: bool,
+    /// The last refusal of the place of the newest base.
+    pub refusal: Option<viaticum_core::system_state::catalog::RefusalKind>,
+    pub waiting: Option<viaticum_core::system_state::catalog::Waiting>,
+}
+
+/// DR readiness from META and the owner's placements. `known_peers` sets the dr-i39
+/// threshold. Read-only.
+pub(crate) fn pointer_readiness(
+    db: &Db,
+    known_peers: usize,
+    now_secs: u64,
+    time_scale: u64,
+) -> Result<PointerReadiness, DbError> {
+    let threshold = readiness_ack_threshold(known_peers);
+    let mut r = PointerReadiness {
+        threshold: u32::try_from(threshold).unwrap_or(u32::MAX),
+        ..PointerReadiness::default()
+    };
+    let Some(meta) = db.pointer_publications()? else {
+        return Ok(r);
+    };
+    r.waiting = meta.waiting;
+    r.refusal = meta
+        .current
+        .as_ref()
+        .and_then(|c| c.last_refusal)
+        .map(|x| x.kind);
+    if let Some(acc) = meta.newest_accepted() {
+        let acks = acc.acks.len();
+        r.accepted = Some((
+            acc.created_at.0,
+            acc.files,
+            u32::try_from(acks).unwrap_or(u32::MAX),
+        ));
+        let blocks: Vec<&SourceBlockId> = std::iter::once(&acc.base).chain(&acc.diffs).collect();
+        r.blocks_total = u32::try_from(blocks.len()).unwrap_or(u32::MAX);
+        for b in blocks {
+            if block_strength(db, b, now_secs, time_scale)? >= 1.0 {
+                r.blocks_placed += 1;
+            }
+        }
+        r.ready = acks >= threshold && r.blocks_placed == r.blocks_total;
+    }
+    Ok(r)
 }

@@ -4477,32 +4477,6 @@ fn every_fresh_db_mints_its_own_catalog_lineage() {
     assert_ne!(a, b);
 }
 
-#[test]
-fn record_pointer_publication_roundtrip() {
-    use crate::system_state::CatalogLineageId;
-    use crate::system_state::catalog::PointerPublication;
-    let db = test_db();
-    assert_eq!(db.last_pointer_publication().unwrap(), None);
-    let first = PointerPublication {
-        lineage: CatalogLineageId([1u8; 16]),
-        created_at: Timestamp(100),
-        generation: 1,
-        files: 3,
-        acks: 2,
-    };
-    db.record_pointer_publication(&first).unwrap();
-    assert_eq!(db.last_pointer_publication().unwrap(), Some(first));
-    let second = PointerPublication {
-        created_at: Timestamp(200),
-        generation: 2,
-        files: 2,
-        acks: 5,
-        ..first
-    };
-    db.record_pointer_publication(&second).unwrap();
-    assert_eq!(db.last_pointer_publication().unwrap(), Some(second));
-}
-
 /// CROWN-1 V.16.3: the two pointer places (with their envelopes) survive a write/read
 /// as one record; nothing before the first write.
 #[test]

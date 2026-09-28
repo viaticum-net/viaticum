@@ -36,6 +36,13 @@ fn make_status(peers: Vec<PeerSummary>) -> StatusData {
         dr_pointer_acks: 0,
         catalog_lineage: String::new(),
         files_without_source: 0,
+        dr_ready: false,
+        dr_pointer_ack_threshold: 0,
+        dr_ss_blocks_placed: 0,
+        dr_ss_blocks_total: 0,
+        dr_pointer_refusal: String::new(),
+        dr_waiting_since: 0,
+        dr_waiting: String::new(),
     }
 }
 

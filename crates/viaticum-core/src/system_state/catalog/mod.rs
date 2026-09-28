@@ -107,16 +107,6 @@ pub fn reassign_history_device(files: &mut [FileRecord], lost: DeviceId, new: De
     changed
 }
 
-/// This node's last pointer publication ACCEPTED by at least one postman (dr-i9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PointerPublication {
-    pub lineage: CatalogLineageId,
-    pub created_at: Timestamp,
-    pub generation: u32,
-    pub files: u32,
-    pub acks: u32,
-}
-
 /// One place of this history's pointer at the postmen, as the owner last sealed it
 /// (CROWN-1 V.16.3, mailbox-i50..i56). Written to META BEFORE the envelope is sent.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
