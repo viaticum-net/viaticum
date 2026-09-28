@@ -46,7 +46,7 @@ use tracing::{debug, error, info, warn};
 use viaticum_core::cluster::DeviceCertificate;
 use viaticum_core::constants::SYMBOL_OFFER_EXPIRY_SECS;
 use viaticum_core::db::Db;
-use viaticum_core::messages::{AckMsg, Message, SymbolStoredMsg};
+use viaticum_core::messages::{AckMsg, Message, SymbolStoredMsg, SymbolTransferMsg};
 use viaticum_core::pair_ledger::{LossCause, drop_event_for, ledger_master_for_device};
 use viaticum_core::types::{
     DeviceId, DropKind, IdentityPub, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
@@ -63,6 +63,7 @@ mod peer;
 mod pos;
 mod restore;
 mod symbol;
+use symbol::TransferResult;
 
 // Re-export for handle/mod.rs wiring (T-6: mailbox poll → PosResponder bridge).
 pub use pos::{PosResponder, ProcessorPosHandler};
@@ -117,20 +118,26 @@ pub enum ProcessorError {
 // ─── Offer / delivery state ───────────────────────────────────────────────────
 
 /// An accepted symbol offer awaiting transfer from the owner.
+///
+/// Keyed by the sending DEVICE: two devices of one master offering the same block keep
+/// separate offers (backup-i19). `owner_id` stays the master: the holding is per master.
 #[derive(Debug, Clone)]
 pub struct AcceptedOffer {
     pub owner_id: IdentityPub,
+    pub from_device: DeviceId,
     pub source_block_id: SourceBlockId,
     pub esi_ranges: Vec<(u32, u32)>,
     pub importance: f64,
     pub accepted_at: Timestamp,
 }
 
-/// Shared map of accepted offers: (owner_id, block_id) → AcceptedOffer.
+/// Shared map of accepted offers: (sending device, block_id) → AcceptedOffer. Keyed by DEVICE,
+/// not master: siblings of one master share block ids (deterministic nonce, shared epoch key) and
+/// would overwrite each other's offer mid-delivery (backup-i19).
 /// Written by handle_symbol_offer, read+removed by handle_symbol_transfer.
 /// Uses std::sync::Mutex (not tokio::sync::Mutex) because locks are never held
 /// across .await points — only brief insert/remove under the lock.
-pub type AcceptedOffers = Arc<Mutex<HashMap<(IdentityPub, SourceBlockId), AcceptedOffer>>>;
+pub type AcceptedOffers = Arc<Mutex<HashMap<(DeviceId, SourceBlockId), AcceptedOffer>>>;
 
 /// Construct an empty `AcceptedOffers` map (useful in tests and wiring).
 pub fn make_empty_accepted_offers() -> AcceptedOffers {
@@ -390,6 +397,40 @@ impl Processor {
         Ok(())
     }
 
+    /// The reply to a `SymbolTransfer`: `SymbolStored` with the chunk's ESIs only if every one of
+    /// them is on this holder's disk afterwards; `Ack` otherwise (backup-i19). Split from
+    /// `dispatch_libp2p` because a libp2p `ResponseChannel` cannot be built in a unit test.
+    pub(crate) async fn symbol_transfer_reply(
+        &self,
+        from_device: DeviceId,
+        from_master: IdentityPub,
+        transfer: SymbolTransferMsg,
+    ) -> Message {
+        let block_id = transfer.source_block_id;
+        let mut esi_list: Vec<u32> = transfer.symbols.iter().map(|s| s.esi).collect();
+        esi_list.sort_unstable();
+        match self
+            .handle_symbol_transfer(from_device, from_master, transfer)
+            .await
+        {
+            Ok(TransferResult::Stored) => Message::SymbolStored(SymbolStoredMsg {
+                v: 1,
+                source_block_id: block_id,
+                esi_ranges: esi_list_to_ranges(&esi_list),
+                timestamp: Timestamp::now(),
+            }),
+            Ok(TransferResult::NotStored(reason)) => {
+                warn!(device = %from_device, block_id = %block_id, reason = ?reason,
+                      "processor: SymbolTransfer not stored");
+                Message::Ack(AckMsg { v: 1 })
+            }
+            Err(e) => {
+                warn!(device = %from_device, err = %e, "processor: SymbolTransfer failed");
+                Message::Ack(AckMsg { v: 1 })
+            }
+        }
+    }
+
     /// Dispatch a libp2p InboundRequest to the correct handler.
     ///
     /// Every request must receive a response (libp2p request-response contract).
@@ -403,27 +444,10 @@ impl Processor {
     ) -> anyhow::Result<()> {
         match message {
             Message::SymbolTransfer(transfer) => {
-                let block_id = transfer.source_block_id;
-                // Extract ESI list before moving transfer into handle_symbol_transfer.
-                let mut esi_list: Vec<u32> = transfer.symbols.iter().map(|s| s.esi).collect();
-                esi_list.sort_unstable();
-                match self.handle_symbol_transfer(from_master, transfer).await {
-                    Ok(()) => {
-                        let stored_ranges = esi_list_to_ranges(&esi_list);
-                        let reply = Message::SymbolStored(SymbolStoredMsg {
-                            v: 1,
-                            source_block_id: block_id,
-                            esi_ranges: stored_ranges,
-                            timestamp: Timestamp::now(),
-                        });
-                        self.swarm.respond_logged(response_channel, reply);
-                    }
-                    Err(e) => {
-                        warn!(device = %from_device, err = %e, "processor: SymbolTransfer failed");
-                        let ack = Message::Ack(AckMsg { v: 1 });
-                        self.swarm.respond_logged(response_channel, ack);
-                    }
-                }
+                let reply = self
+                    .symbol_transfer_reply(from_device, from_master, transfer)
+                    .await;
+                self.swarm.respond_logged(response_channel, reply);
             }
             Message::PosHashChallenge(challenge) => {
                 match self
@@ -439,7 +463,7 @@ impl Processor {
                 }
             }
             Message::SymbolOffer(offer) => {
-                let reply = self.handle_symbol_offer_inner(from_master, offer);
+                let reply = self.handle_symbol_offer_inner(from_device, from_master, offer);
                 self.swarm.respond_logged(response_channel, reply);
             }
             Message::RestoreRequest(req) => {

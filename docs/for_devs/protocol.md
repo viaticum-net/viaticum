@@ -570,8 +570,17 @@ Owner                          Holder
   │── SymbolOffer ────────────>│   offer: source_block_id, esi_ranges, importance
   │<─ SymbolAccept ────────────│   or SymbolReject (quota_full, etc.)
   │── SymbolTransfer (×N) ────>│   push symbols in batches
-  │<─ SymbolStored ────────────│   acknowledgement of receipt
+  │<─ SymbolStored ────────────│   every ESI of this chunk is on the holder's disk, else Ack
 ```
+
+The holder answers each `SymbolTransfer` with `SymbolStored` (the chunk's ESIs) only when every
+ESI of the chunk is on its disk under an Active holding: written now, or already held (listed in
+the owner's Active holding record and the file has the symbol's length). Otherwise it answers
+`Ack`: no accepted offer, offer expired, an ESI neither held nor in the offer's remaining ranges,
+an oversized symbol, an empty chunk, or a write error. The owner reads `Ack` as "not stored".
+
+The holder keys accepted offers by the sending device and block, so two devices of one master
+offering the same block keep separate offers. The holding itself is kept per master.
 
 **SymbolOfferMsg**:
 ```rust
