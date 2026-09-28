@@ -1,17 +1,24 @@
 // Mailbox handlers: receiver-side for MailboxStoreRequest and MailboxFetchRequest
 // (postman role).
 //
-// CROWN-1 C2 rules (spec §7.5):
+// CROWN-1 rules (spec §7.5, C3a V.3 / V.5):
 //   store — one address (`req.entry.target`) for the candidate-set check, the write
 //           authorization and the storage key (AC-10, closes F3); SelfPointer needs a
-//           `target_sig` by the address key (AC-7); postman clock rule (AC-22); then
-//           MailboxEngine::store (size, quota / pointer budget, duplicate → Ack).
+//           `target_sig` by the address key (AC-7); postman clock rule (AC-22′); then
+//           MailboxEngine::store (size, directed quota, pointer slot: one entry per
+//           `(target, msg_id)`, newer replaces, older → Superseded, a new slot beyond
+//           the cap → QuotaExceeded, nothing evicted; duplicate → Ack).
 //   fetch — own master box by transport identity (all entries), any other box with a
 //           fetch proof bound to the requester's device (SelfPointer entries only,
 //           AC-9, AC-20); otherwise empty.
 //
-// The plaintext rule (§7.5 item 1, `payload_version < 2` → PlaintextPayload) is not
-// here yet: it lands with sealing (C3 for SelfPointer, C4 for all classes).
+// The plaintext rule (§7.5 п.1, `check_pointer_sealed`: SelfPointer with
+// `payload_version < 2` → PlaintextPayload) is NOT wired here yet: the C2 publisher
+// still sends plaintext pointers to the master box until C3a commit 3 seals them;
+// wiring it earlier would refuse every pointer the daemon publishes.
+//
+// `msg_id` is logged as hex everywhere (РС3.8): E2E oracles match it against the slot
+// derived offline from the phrase.
 //
 // Delivery-reward (T-5) is NOT implemented here — deferred from A2.
 // served_msg_ids field is populated and returned but nothing acts on it yet.
@@ -21,14 +28,14 @@ use tracing::{debug, info, warn};
 use viaticum_core::constants::MAILBOX_CANDIDATES_N;
 use viaticum_core::db::Db;
 use viaticum_core::mailbox::{
-    MailboxAddress, MailboxClass, MailboxEngine, MailboxError, MailboxRejectReason,
+    MailboxAddress, MailboxClass, MailboxEngine, MailboxError, MailboxRejectReason, Stored,
     check_entry_clock, verify_fetch_proof, verify_store_sig,
 };
 use viaticum_core::messages::{
     MAILBOX_WIRE_VERSION, MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest,
     MailboxStoreResponse,
 };
-use viaticum_core::types::{DeviceId, IdentityPub};
+use viaticum_core::types::{DeviceId, IdentityPub, hex_encode};
 
 use crate::daemon::mailbox::candidate::{KademliaRoutingView, should_store};
 
@@ -42,16 +49,20 @@ use crate::daemon::mailbox::candidate::{KademliaRoutingView, should_store};
 /// 2. `SelfPointer`: `req.target_sig` must verify against `req.entry.target`
 ///    (`verify_store_sig`, before the `expires_at` clamp) → else `Reject { Unauthorized }`.
 ///    Other classes: `target_sig` ignored (a sender never holds the recipient's key).
-/// 3. Clock: `expires_at <= now`, or a SelfPointer `stored_at` more than one rendezvous
-///    epoch from `now_secs` → `Reject { ClockSkew }`.
+/// 3. Clock: `expires_at <= now`, or a SelfPointer `stored_at` more than
+///    `SELF_POINTER_MAX_FUTURE_SKEW_SECS` ahead of `now_secs` → `Reject { ClockSkew }`.
 /// 4. MailboxEngine::store:
-///    - Ok / Err(Duplicate) → `Ack { msg_id }` (duplicate: idempotent, already present)
+///    - Ok / Err(Duplicate) → `Ack { msg_id }` (duplicate: idempotent, already present;
+///      for a SelfPointer: the same envelope already holds the slot)
+///    - Err(Superseded)     → `Reject { Superseded }` (the slot holds a newer pointer,
+///      or an equal-time one with another payload)
 ///    - Err(TooLarge)       → `Reject { EntryTooLarge }`
-///    - Err(QuotaExceeded)  → `Reject { QuotaExceeded }`
+///    - Err(QuotaExceeded)  → `Reject { QuotaExceeded }` (directed quota, or a new
+///      pointer slot beyond the cap)
 ///    - Err(other)          → `Reject { QuotaExceeded }` (DB error treated conservatively)
 ///
-/// The `Unauthorized` and `ClockSkew` refusals log at `warn!` with fixed text (N1): the
-/// E2E guards grep for them.
+/// The `Unauthorized`, `ClockSkew` and `Superseded` refusals log at `warn!` with fixed
+/// text (N1): the E2E guards grep for them.
 pub fn handle_mailbox_store(
     db: &Db,
     routing_view: &KademliaRoutingView,
@@ -89,7 +100,7 @@ pub fn handle_mailbox_store(
         if !authorized {
             warn!(
                 target = %target,
-                msg_id = ?msg_id,
+                msg_id = %hex_encode(&msg_id),
                 class = ?entry.class,
                 has_sig = req.target_sig.is_some(),
                 "mailbox: store rejected — unauthorized"
@@ -102,7 +113,7 @@ pub fn handle_mailbox_store(
     if let Err(e) = check_entry_clock(entry, now_secs) {
         warn!(
             target = %target,
-            msg_id = ?msg_id,
+            msg_id = %hex_encode(&msg_id),
             class = ?entry.class,
             err = %e,
             "mailbox: store rejected — clock skew"
@@ -113,26 +124,58 @@ pub fn handle_mailbox_store(
     // 4. Store.
     let engine = MailboxEngine::new(db.clone());
     match engine.store(entry, now_secs) {
-        Ok(()) => {
+        Ok(stored) => {
             // Spec B2 §2.8: a stored SelfPointer is the postman-side oracle of DR
             // readiness (dr-i9). No catalog fields: the postman does not decode payloads.
+            // The text prefix is an E2E anchor; `replaced` shows a slot update (i46).
             if entry.class == MailboxClass::SelfPointer {
-                info!(target = %target, msg_id = ?msg_id, "mailbox: stored SelfPointer entry");
+                let replaced = matches!(stored, Stored::Replaced { .. });
+                info!(
+                    target = %target,
+                    msg_id = %hex_encode(&msg_id),
+                    replaced,
+                    "mailbox: stored SelfPointer entry"
+                );
             } else {
-                debug!(target = %target, class = ?entry.class, "mailbox: stored entry");
+                debug!(
+                    target = %target,
+                    msg_id = %hex_encode(&msg_id),
+                    class = ?entry.class,
+                    "mailbox: stored entry"
+                );
             }
             MailboxStoreResponse::Ack { msg_id }
         }
         Err(MailboxError::Duplicate) => {
-            debug!(target = %target, "mailbox: duplicate entry — returning Ack (idempotent)");
+            debug!(
+                target = %target,
+                msg_id = %hex_encode(&msg_id),
+                class = ?entry.class,
+                "mailbox: duplicate entry — returning Ack (idempotent)"
+            );
             MailboxStoreResponse::Ack { msg_id }
+        }
+        Err(MailboxError::Superseded { held, incoming }) => {
+            warn!(
+                target = %target,
+                msg_id = %hex_encode(&msg_id),
+                held_stored_at = held,
+                incoming_stored_at = incoming,
+                "mailbox: store rejected — superseded (an equal-time or newer pointer is held for this slot)"
+            );
+            reject(MailboxRejectReason::Superseded)
         }
         Err(MailboxError::TooLarge { size, max }) => {
             warn!(target = %target, size, max, "mailbox: store rejected — entry too large");
             reject(MailboxRejectReason::EntryTooLarge)
         }
         Err(MailboxError::QuotaExceeded { .. }) => {
-            warn!(target = %target, class = ?entry.class, "mailbox: store rejected — quota exceeded");
+            warn!(
+                target = %target,
+                msg_id = %hex_encode(&msg_id),
+                class = ?entry.class,
+                "mailbox: store rejected — quota exceeded"
+            );
             reject(MailboxRejectReason::QuotaExceeded)
         }
         Err(e) => {

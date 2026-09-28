@@ -1,5 +1,5 @@
-// db/mailbox: pointer-budget counters, monotone pointer eviction (N5) and the
-// directed-mail addressing lookups (AC-21, F14). Real redb.
+// db/mailbox: byte counters, the SelfPointer slot rule (CROWN-1 C3a, AC-29,
+// mailbox-i50) and the directed-mail addressing lookups (AC-21, F14). Real redb.
 
 use crate::db::testutil::test_db;
 use crate::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
@@ -101,108 +101,6 @@ fn mailbox_contains_sees_expired_entries_too() {
     assert!(!db.mailbox_contains(&addr(4), e.msg_id, e.class).unwrap());
 }
 
-// ─── Monotone pointer eviction (N5) ──────────────────────────────────────────
-
-#[test]
-fn evict_oldest_self_pointers_removes_oldest_first_down_to_keep_bytes() {
-    let db = test_db();
-    let t = addr(6);
-    let sizes: Vec<u64> = (0..4)
-        .map(|i| {
-            let e = entry(t, i, MailboxClass::SelfPointer, 1000, 100 + i as u64);
-            db.mailbox_insert(&e, 0).unwrap();
-            e.serialized_size() as u64
-        })
-        .collect();
-    let total: u64 = sizes.iter().sum();
-    // Keep room for two pointers: the two oldest go.
-    let removed = db
-        .mailbox_evict_oldest_self_pointers(&t, total - sizes[0] - sizes[1], 1_000)
-        .unwrap();
-    assert_eq!(removed, 2);
-    let mut left: Vec<u64> = db
-        .mailbox_list_for_target(&t, 0)
-        .unwrap()
-        .into_iter()
-        .map(|e| e.stored_at)
-        .collect();
-    left.sort();
-    assert_eq!(left, vec![102, 103]);
-    assert_eq!(
-        db.mailbox_self_pointer_bytes_for_target(&t).unwrap(),
-        sizes[2] + sizes[3]
-    );
-}
-
-#[test]
-fn evict_oldest_self_pointers_never_touches_entries_at_or_after_older_than() {
-    let db = test_db();
-    let t = addr(7);
-    for i in 0..3u8 {
-        db.mailbox_insert(
-            &entry(t, i, MailboxClass::SelfPointer, 1000, 200 + i as u64),
-            0,
-        )
-        .unwrap();
-    }
-    // Incoming stored_at = 200: nothing is strictly older, so nothing may go even
-    // though keep_bytes = 0 asks for everything.
-    assert_eq!(
-        db.mailbox_evict_oldest_self_pointers(&t, 0, 200).unwrap(),
-        0
-    );
-    assert_eq!(db.mailbox_list_for_target(&t, 0).unwrap().len(), 3);
-}
-
-#[test]
-fn evict_oldest_self_pointers_is_all_or_nothing() {
-    let db = test_db();
-    let t = addr(8);
-    for i in 0..3u8 {
-        db.mailbox_insert(
-            &entry(t, i, MailboxClass::SelfPointer, 1000, 300 + i as u64),
-            0,
-        )
-        .unwrap();
-    }
-    // Only the oldest (300) is older than 301, but keep_bytes = 0 would need all
-    // three gone: evicting the one would not make room, so none is evicted.
-    assert_eq!(
-        db.mailbox_evict_oldest_self_pointers(&t, 0, 301).unwrap(),
-        0
-    );
-    assert_eq!(db.mailbox_list_for_target(&t, 0).unwrap().len(), 3);
-}
-
-#[test]
-fn evict_oldest_self_pointers_never_touches_directed_entries_or_other_targets() {
-    let db = test_db();
-    let t = addr(9);
-    let other = addr(10);
-    db.mailbox_insert(&entry(t, 1, MailboxClass::SelfPointer, 1000, 1), 0)
-        .unwrap();
-    db.mailbox_insert(&entry(t, 2, MailboxClass::DropNotice, 1000, 0), 0)
-        .unwrap();
-    db.mailbox_insert(&entry(other, 3, MailboxClass::SelfPointer, 1000, 0), 0)
-        .unwrap();
-
-    assert_eq!(
-        db.mailbox_evict_oldest_self_pointers(&t, 0, 1_000).unwrap(),
-        1
-    );
-    let left: Vec<MailboxClass> = db
-        .mailbox_list_for_target(&t, 0)
-        .unwrap()
-        .into_iter()
-        .map(|e| e.class)
-        .collect();
-    assert_eq!(left, vec![MailboxClass::DropNotice]);
-    assert_eq!(db.mailbox_list_for_target(&other, 0).unwrap().len(), 1);
-    assert!(db.mailbox_self_pointer_bytes_for_target(&other).unwrap() > 0);
-}
-
-// ─── Addressing (AC-21, F14) ─────────────────────────────────────────────────
-
 #[test]
 fn x25519_for_master_resolves_from_peers() {
     let db = test_db();
@@ -262,94 +160,233 @@ fn master_for_peer_device_resolves_from_peers() {
     assert_eq!(db.master_for_peer_device(&DeviceId([3; 32])).unwrap(), None);
 }
 
-// ─── Atomic pointer store (review WARN-1, mailbox-i31) ───────────────────────
+// ─── Pointer slots (CROWN-1 C3a, AC-29, mailbox-i40/i50) ─────────────────────
 
 use crate::db::{SelfPointerStore, read_only_mailbox_raw_entries};
 
+/// A SelfPointer in slot `slot` of `target`, with a payload that differs per
+/// `(slot, stored_at)` unless the caller overrides it.
+fn slot_pointer(target: MailboxAddress, slot: u8, stored_at: u64, len: usize) -> MailboxEntry {
+    let mut e = entry(target, slot, MailboxClass::SelfPointer, len, stored_at);
+    e.payload[..8].copy_from_slice(&stored_at.to_be_bytes());
+    e
+}
+
+fn held(db: &crate::db::Db, t: &MailboxAddress) -> Vec<MailboxEntry> {
+    db.mailbox_list_for_target(t, 0).unwrap()
+}
+
 #[test]
-fn insert_self_pointer_within_budget_evicts_older_in_one_step() {
+fn put_self_pointer_into_empty_slot_is_stored() {
+    let db = test_db();
+    let t = addr(19);
+    let p = slot_pointer(t, 1, 100, 64);
+    assert_eq!(
+        db.mailbox_put_self_pointer(&p, 128).unwrap(),
+        SelfPointerStore::Stored
+    );
+    assert_eq!(held(&db, &t), vec![p]);
+}
+
+#[test]
+fn put_self_pointer_newer_in_same_slot_replaces_and_keeps_one_entry() {
     let db = test_db();
     let t = addr(20);
-    let old = entry(t, 1, MailboxClass::SelfPointer, 1000, 100);
-    let budget = old.serialized_size() as u64;
+    db.mailbox_put_self_pointer(&slot_pointer(t, 1, 100, 64), 128)
+        .unwrap();
+    let newer = slot_pointer(t, 1, 200, 64);
     assert_eq!(
-        db.mailbox_insert_self_pointer_within_budget(&old, budget)
-            .unwrap(),
-        SelfPointerStore::Stored { evicted: 0 }
+        db.mailbox_put_self_pointer(&newer, 128).unwrap(),
+        SelfPointerStore::Replaced {
+            previous_stored_at: 100
+        }
     );
-    let new = entry(t, 2, MailboxClass::SelfPointer, 1000, 200);
     assert_eq!(
-        db.mailbox_insert_self_pointer_within_budget(&new, budget)
-            .unwrap(),
-        SelfPointerStore::Stored { evicted: 1 }
+        held(&db, &t),
+        vec![newer],
+        "one entry per slot, the newer one"
     );
-    let left: Vec<u64> = db
-        .mailbox_list_for_target(&t, 0)
-        .unwrap()
-        .iter()
-        .map(|e| e.stored_at)
-        .collect();
-    assert_eq!(left, vec![200]);
-    assert_eq!(
-        db.mailbox_self_pointer_bytes_for_target(&t).unwrap(),
-        budget
-    );
-    assert_eq!(db.mailbox_bytes_for_target(&t).unwrap(), budget);
+    assert_eq!(db.mailbox_self_pointer_slot_count(&t).unwrap(), 1);
 }
 
+/// Mutation guard (V.7, mailbox-i40): "replace without comparing stored_at" makes
+/// this red — a replayed older envelope of the same slot must change nothing.
 #[test]
-fn insert_self_pointer_within_budget_refuses_older_and_changes_nothing() {
+fn put_self_pointer_older_in_same_slot_is_superseded_and_changes_nothing() {
     let db = test_db();
     let t = addr(21);
-    let newer = entry(t, 1, MailboxClass::SelfPointer, 1000, 300);
-    let budget = newer.serialized_size() as u64;
-    db.mailbox_insert_self_pointer_within_budget(&newer, budget)
-        .unwrap();
-    let replay = entry(t, 2, MailboxClass::SelfPointer, 1000, 299);
-    assert_eq!(
-        db.mailbox_insert_self_pointer_within_budget(&replay, budget)
-            .unwrap(),
-        SelfPointerStore::OverBudget
-    );
-    let left: Vec<u64> = db
-        .mailbox_list_for_target(&t, 0)
-        .unwrap()
-        .iter()
-        .map(|e| e.stored_at)
-        .collect();
-    assert_eq!(left, vec![300]);
+    let newer = slot_pointer(t, 1, 300, 64);
+    db.mailbox_put_self_pointer(&newer, 128).unwrap();
+    let bytes_before = db.mailbox_bytes_for_target(&t).unwrap();
+    for older_at in [299, 1] {
+        let older = slot_pointer(t, 1, older_at, 64);
+        assert_eq!(
+            db.mailbox_put_self_pointer(&older, 128).unwrap(),
+            SelfPointerStore::Superseded {
+                held_stored_at: 300
+            }
+        );
+    }
+    assert_eq!(held(&db, &t), vec![newer]);
+    assert_eq!(db.mailbox_bytes_for_target(&t).unwrap(), bytes_before);
 }
 
 #[test]
-fn insert_self_pointer_within_budget_reports_duplicate_without_eviction() {
+fn put_self_pointer_same_time_same_payload_is_duplicate() {
     let db = test_db();
     let t = addr(22);
-    let a = entry(t, 1, MailboxClass::SelfPointer, 1000, 100);
-    let budget = a.serialized_size() as u64;
-    db.mailbox_insert_self_pointer_within_budget(&a, budget)
-        .unwrap();
-    // Same key, later stored_at: must be a duplicate, not "newer, evict the old".
-    let mut again = a.clone();
-    again.stored_at = 500;
+    let p = slot_pointer(t, 1, 100, 64);
+    db.mailbox_put_self_pointer(&p, 128).unwrap();
+    // The postman clamps expires_at: a re-offer of the same envelope may differ there
+    // and still be the same pointer.
+    let mut again = p.clone();
+    again.expires_at -= 7;
     assert_eq!(
-        db.mailbox_insert_self_pointer_within_budget(&again, budget)
-            .unwrap(),
+        db.mailbox_put_self_pointer(&again, 128).unwrap(),
         SelfPointerStore::Duplicate
     );
-    assert_eq!(db.mailbox_list_for_target(&t, 0).unwrap(), vec![a]);
+    assert_eq!(held(&db, &t), vec![p]);
 }
 
 #[test]
-fn insert_self_pointer_larger_than_budget_is_refused() {
+fn put_self_pointer_same_time_other_payload_is_superseded() {
     let db = test_db();
     let t = addr(23);
-    let big = entry(t, 1, MailboxClass::SelfPointer, 1000, 100);
+    let p = slot_pointer(t, 1, 100, 64);
+    db.mailbox_put_self_pointer(&p, 128).unwrap();
+    let mut other = p.clone();
+    other.payload[20] ^= 0xFF;
     assert_eq!(
-        db.mailbox_insert_self_pointer_within_budget(&big, 10)
-            .unwrap(),
-        SelfPointerStore::OverBudget
+        db.mailbox_put_self_pointer(&other, 128).unwrap(),
+        SelfPointerStore::Superseded {
+            held_stored_at: 100
+        }
     );
-    assert!(db.mailbox_list_for_target(&t, 0).unwrap().is_empty());
+    assert_eq!(held(&db, &t), vec![p]);
+}
+
+#[test]
+fn put_self_pointer_replacement_adjusts_both_counters_by_delta() {
+    let db = test_db();
+    let t = addr(24);
+    let junk = entry(t, 9, MailboxClass::DropNotice, 300, 10);
+    db.mailbox_insert(&junk, 10).unwrap();
+    let small = slot_pointer(t, 1, 100, 100);
+    db.mailbox_put_self_pointer(&small, 128).unwrap();
+    let big = slot_pointer(t, 1, 200, 5_000);
+    db.mailbox_put_self_pointer(&big, 128).unwrap();
+    let big_size = big.serialized_size() as u64;
+    assert_eq!(
+        db.mailbox_self_pointer_bytes_for_target(&t).unwrap(),
+        big_size
+    );
+    assert_eq!(
+        db.mailbox_bytes_for_target(&t).unwrap(),
+        big_size + junk.serialized_size() as u64
+    );
+    // And back down: a smaller newer pointer shrinks both counters.
+    let smaller = slot_pointer(t, 1, 300, 50);
+    db.mailbox_put_self_pointer(&smaller, 128).unwrap();
+    let smaller_size = smaller.serialized_size() as u64;
+    assert_eq!(
+        db.mailbox_self_pointer_bytes_for_target(&t).unwrap(),
+        smaller_size
+    );
+    assert_eq!(
+        db.mailbox_bytes_for_target(&t).unwrap(),
+        smaller_size + junk.serialized_size() as u64
+    );
+}
+
+/// Cap 128 (V.16.1 п.6): a new slot beyond the cap is refused, no older slot is
+/// evicted to make room — even one with the oldest stored_at — and the slots already
+/// held keep being replaceable.
+#[test]
+fn put_self_pointer_new_slot_beyond_cap_is_refused_and_evicts_nothing() {
+    let cap = crate::mailbox::class_config::MAX_POINTER_SLOTS_PER_ADDRESS;
+    assert_eq!(cap, 128);
+    let db = test_db();
+    let t = addr(25);
+    for slot in 0..cap {
+        let mut p = slot_pointer(t, 0, 1_000 + slot as u64, 32);
+        p.msg_id[..8].copy_from_slice(&(slot as u64).to_be_bytes());
+        assert_eq!(
+            db.mailbox_put_self_pointer(&p, cap).unwrap(),
+            SelfPointerStore::Stored
+        );
+    }
+    let before = held(&db, &t);
+    let bytes_before = db.mailbox_self_pointer_bytes_for_target(&t).unwrap();
+    let mut extra = slot_pointer(t, 0xEE, 1_000_000, 32);
+    extra.msg_id = [0xEE; 16];
+    assert_eq!(
+        db.mailbox_put_self_pointer(&extra, cap).unwrap(),
+        SelfPointerStore::SlotsFull
+    );
+    assert_eq!(held(&db, &t), before, "nothing evicted, nothing inserted");
+    assert_eq!(
+        db.mailbox_self_pointer_bytes_for_target(&t).unwrap(),
+        bytes_before
+    );
+    // A held slot (the oldest) still takes its own newer pointer at the cap.
+    let mut refresh = slot_pointer(t, 0, 2_000_000, 32);
+    refresh.msg_id = before.iter().min_by_key(|e| e.stored_at).unwrap().msg_id;
+    assert!(matches!(
+        db.mailbox_put_self_pointer(&refresh, cap).unwrap(),
+        SelfPointerStore::Replaced { .. }
+    ));
+    assert_eq!(db.mailbox_self_pointer_slot_count(&t).unwrap(), cap);
+}
+
+/// Directed junk planted in the pointer box neither occupies pointer slots nor
+/// blocks a pointer; slots of other addresses do not count.
+#[test]
+fn slot_count_ignores_directed_entries_in_same_address() {
+    let db = test_db();
+    let t = addr(26);
+    for i in 0..5u8 {
+        db.mailbox_insert(&entry(t, 100 + i, MailboxClass::DropNotice, 10, 10), 10)
+            .unwrap();
+    }
+    db.mailbox_put_self_pointer(&slot_pointer(addr(27), 1, 10, 10), 2)
+        .unwrap();
+    assert_eq!(db.mailbox_self_pointer_slot_count(&t).unwrap(), 0);
+    db.mailbox_put_self_pointer(&slot_pointer(t, 1, 10, 10), 2)
+        .unwrap();
+    assert_eq!(
+        db.mailbox_put_self_pointer(&slot_pointer(t, 2, 10, 10), 2)
+            .unwrap(),
+        SelfPointerStore::Stored,
+        "5 directed entries + 1 slot: the second slot still fits a cap of 2"
+    );
+    assert_eq!(db.mailbox_self_pointer_slot_count(&t).unwrap(), 2);
+    assert_eq!(
+        db.mailbox_put_self_pointer(&slot_pointer(t, 3, 10, 10), 2)
+            .unwrap(),
+        SelfPointerStore::SlotsFull
+    );
+}
+
+/// N3 boundary (mailbox-i49 note): an expired but not yet swept pointer still holds
+/// its slot until the sweep; after the sweep the slot is free.
+#[test]
+fn slot_count_includes_expired_unswept_pointers_until_sweep() {
+    let db = test_db();
+    let t = addr(28);
+    let mut p = slot_pointer(t, 1, 10, 10);
+    p.expires_at = 20;
+    db.mailbox_put_self_pointer(&p, 1).unwrap();
+    assert_eq!(
+        db.mailbox_put_self_pointer(&slot_pointer(t, 2, 30, 10), 1)
+            .unwrap(),
+        SelfPointerStore::SlotsFull
+    );
+    db.mailbox_sweep_expired(21).unwrap();
+    assert_eq!(
+        db.mailbox_put_self_pointer(&slot_pointer(t, 2, 30, 10), 1)
+            .unwrap(),
+        SelfPointerStore::Stored
+    );
 }
 
 /// mailbox-probe audit path: a stopped node's redb is read without writing to it

@@ -1,14 +1,15 @@
 // Mailbox tables: entries stored on behalf of other nodes (postman role) and the
-// per-address byte counters behind the quota / SelfPointer budget, plus the
-// addressing lookups directed mail needs (recipient master and x25519 key).
+// per-address byte counters behind the directed quota, the SelfPointer slots (one
+// per pointer place of a catalog history, CROWN-1 C3a), plus the addressing lookups
+// directed mail needs (recipient master and x25519 key).
 //
 // Two counters per address, both updated in the same write transaction as the entry
 // table so they never diverge from it:
 // - MAILBOX_BYTES_BY_TARGET: bytes of ALL entries of the address (also the set of
 //   addresses with mail, `mailbox_list_all_targets`);
 // - MAILBOX_SP_BYTES_BY_TARGET: bytes of the SelfPointer entries only. The directed
-//   quota is `total - pointers` and the pointer budget is `pointers` (CROWN-1 Q5,
-//   AC-8, mailbox-i23: junk cannot starve the crown, pointers cannot block mail).
+//   quota is `total - pointers` (AC-8: junk cannot starve the crown, pointers cannot
+//   block mail). Pointers are bounded by the slot cap, not by bytes (mailbox-i50).
 
 use redb::{ReadableDatabase, ReadableTable, WriteTransaction};
 
@@ -93,57 +94,39 @@ fn read_counter(
     }
 }
 
-/// SelfPointer byte counter of `target`, read inside a write transaction.
-fn sp_counter_in(tx: &WriteTransaction, target: &MailboxAddress) -> Result<u64, DbError> {
-    let counters = tx.open_table(MAILBOX_SP_BYTES_BY_TARGET)?;
-    Ok(match counters.get(&target.0)? {
-        Some(v) => from_cbor_bytes(v.value())?,
-        None => 0,
-    })
-}
-
-/// SelfPointers of `target` strictly older than `older_than`, oldest first, whose
-/// removal frees at least `to_free` bytes; `None` if all of them together are not
-/// enough (the caller then removes nothing).
-#[allow(clippy::type_complexity)]
-fn older_pointer_victims(
-    tx: &WriteTransaction,
+/// Number of SelfPointer keys of `target` (the class byte is `key[48]`; values are
+/// not decoded, so expired-but-unswept pointers count too).
+fn slot_count_in(
+    table: &impl ReadableTable<&'static [u8; 49], &'static [u8]>,
     target: &MailboxAddress,
-    to_free: u64,
-    older_than: u64,
-) -> Result<Option<Vec<([u8; 49], [u8; 32], u64, MailboxClass)>>, DbError> {
-    let table = tx.open_table(MAILBOX_ENTRIES)?;
+) -> Result<usize, DbError> {
     let (lo, hi) = target_range(target);
-    let mut eligible: Vec<([u8; 49], u64, u64)> = Vec::new();
+    let mut n = 0usize;
     for item in table.range::<&[u8; 49]>(&lo..=&hi)? {
-        let (k, v) = item?;
-        let entry: MailboxEntry = from_cbor_bytes(v.value())?;
-        if entry.class == MailboxClass::SelfPointer && entry.stored_at < older_than {
-            eligible.push((*k.value(), entry.stored_at, v.value().len() as u64));
+        let (k, _) = item?;
+        if k.value()[48] == MailboxClass::SelfPointer.as_u8() {
+            n += 1;
         }
     }
-    eligible.sort_by_key(|e| e.1);
-    let mut freed = 0u64;
-    let mut out = Vec::new();
-    for (key, _, size) in eligible {
-        if freed >= to_free {
-            break;
-        }
-        freed = freed.saturating_add(size);
-        out.push((key, target.0, size, MailboxClass::SelfPointer));
-    }
-    Ok((freed >= to_free).then_some(out))
+    Ok(n)
 }
 
-/// Outcome of [`Db::mailbox_insert_self_pointer_within_budget`].
+/// Outcome of [`Db::mailbox_put_self_pointer`] (CROWN-1 C3a, V.3 / V.5 п.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelfPointerStore {
-    /// Stored; `evicted` older pointers of the same address made room.
-    Stored { evicted: u64 },
-    /// Same (target, msg_id, class) already stored; nothing changed.
+    /// Empty slot, below the slot cap: inserted.
+    Stored,
+    /// The slot held an older pointer (`previous_stored_at` < incoming): replaced.
+    Replaced { previous_stored_at: u64 },
+    /// The slot holds a pointer with the same `stored_at` and the same `payload`:
+    /// nothing changed (a re-offer of the same envelope).
     Duplicate,
-    /// Does not fit even after evicting every strictly older pointer; nothing changed.
-    OverBudget,
+    /// The slot holds a pointer that is newer, or as new with another payload:
+    /// nothing changed.
+    Superseded { held_stored_at: u64 },
+    /// Empty slot, but the address already has `max_slots` slots: nothing changed,
+    /// nothing evicted.
+    SlotsFull,
 }
 
 /// Raw mailbox content read for the offline audit (mailbox-probe).
@@ -360,8 +343,8 @@ impl Db {
     ///
     /// Only non-high-trust entries (class.is_high_trust()==false) are candidates for
     /// eviction, ordered by stored_at ascending (oldest first). High-trust entries
-    /// (SelfPointer) are NEVER selected here: they leave only by TTL expiry or by the
-    /// monotone pointer-budget eviction (`mailbox_evict_oldest_self_pointers`). If after
+    /// (SelfPointer) are NEVER selected here: they leave only by TTL expiry or by a
+    /// newer pointer replacing them in their own slot (`mailbox_put_self_pointer`). If after
     /// dropping all non-high-trust entries the target is still over, the function
     /// returns without touching the pointers (Bug-D / AC-6).
     ///
@@ -415,42 +398,26 @@ impl Db {
         Ok(victims.len() as u64)
     }
 
-    /// Evict SelfPointer entries of `target` with `stored_at < older_than`, oldest
-    /// first, until their total size is at most `keep_bytes`. Entries at or after
-    /// `older_than` are never touched (N5: a replayed old owner-signed pointer cannot
-    /// evict a newer one). All-or-nothing: if evicting every eligible pointer would
-    /// still leave more than `keep_bytes`, nothing is removed. Returns the count removed.
-    pub fn mailbox_evict_oldest_self_pointers(
-        &self,
-        target: &MailboxAddress,
-        keep_bytes: u64,
-        older_than: u64,
-    ) -> Result<u64, DbError> {
-        let tx = self.inner.begin_write()?;
-        let current = sp_counter_in(&tx, target)?;
-        if current <= keep_bytes {
-            return Ok(0);
-        }
-        let Some(victims) = older_pointer_victims(&tx, target, current - keep_bytes, older_than)?
-        else {
-            return Ok(0);
-        };
-        remove_rows(&tx, &victims)?;
-        tx.commit()?;
-        Ok(victims.len() as u64)
-    }
-
-    /// Store a SelfPointer within the per-address pointer budget, atomically: the
-    /// duplicate check, the budget check, the monotone eviction of strictly OLDER
-    /// pointers of the same address (N5) and the insert happen in ONE redb write
-    /// transaction (write transactions are serialized), so concurrent stores can
-    /// neither overshoot the budget nor refuse the newest pointer because of a
-    /// half-applied eviction by another store (review WARN-1, mailbox-i31).
-    /// All-or-nothing: `OverBudget` leaves the table untouched.
-    pub fn mailbox_insert_self_pointer_within_budget(
+    /// Put a SelfPointer into its slot `(entry.target, entry.msg_id)` in ONE write
+    /// transaction (mailbox-i31, i40/i50): the check, the replacement and the insert
+    /// cannot interleave with another store (redb write transactions are serialized).
+    ///
+    /// Slot occupied:
+    /// - same `stored_at` and same `payload` → `Duplicate` (nothing changes). Compared by
+    ///   `payload`, not by the stored bytes: the postman clamps `expires_at`, so a re-offer
+    ///   of the same envelope may serialize differently;
+    /// - incoming `stored_at` > held → replaced, both byte counters move by (new − old)
+    ///   → `Replaced`;
+    /// - otherwise (older, or equal time with another payload) → `Superseded`.
+    ///
+    /// Slot empty: the SelfPointer keys of the target are counted (class byte, no value
+    /// decode); at `max_slots` → `SlotsFull` and nothing is evicted — a dormant history
+    /// must outlive any number of publications of other histories (dr-i6, dr-i42).
+    /// Otherwise → inserted, `Stored`.
+    pub fn mailbox_put_self_pointer(
         &self,
         entry: &MailboxEntry,
-        budget: u64,
+        max_slots: usize,
     ) -> Result<SelfPointerStore, DbError> {
         debug_assert_eq!(entry.class, MailboxClass::SelfPointer);
         let key = mailbox_entry_key(&entry.target, entry.msg_id, entry.class);
@@ -458,30 +425,64 @@ impl Db {
         let size = bytes.len() as u64;
 
         let tx = self.inner.begin_write()?;
-        if tx.open_table(MAILBOX_ENTRIES)?.get(&key)?.is_some() {
-            return Ok(SelfPointerStore::Duplicate);
-        }
-        let current = sp_counter_in(&tx, &entry.target)?;
-        let mut evicted = 0u64;
-        if current.saturating_add(size) > budget {
-            let to_free = current.saturating_add(size) - budget;
-            if size > budget {
-                return Ok(SelfPointerStore::OverBudget);
-            }
-            let Some(victims) =
-                older_pointer_victims(&tx, &entry.target, to_free, entry.stored_at)?
-            else {
-                return Ok(SelfPointerStore::OverBudget);
+        let (outcome, removed) = {
+            let mut table = tx.open_table(MAILBOX_ENTRIES)?;
+            let held = match table.get(&key)? {
+                Some(v) => {
+                    let held: MailboxEntry = from_cbor_bytes(v.value())?;
+                    Some((held, v.value().len() as u64))
+                }
+                None => None,
             };
-            evicted = victims.len() as u64;
-            remove_rows(&tx, &victims)?;
-        }
-        tx.open_table(MAILBOX_ENTRIES)?
-            .insert(&key, bytes.as_slice())?;
-        adjust_counter(&tx, MAILBOX_BYTES_BY_TARGET, &entry.target.0, size, 0)?;
-        adjust_counter(&tx, MAILBOX_SP_BYTES_BY_TARGET, &entry.target.0, size, 0)?;
+            match held {
+                Some((held, _))
+                    if held.stored_at == entry.stored_at && held.payload == entry.payload =>
+                {
+                    return Ok(SelfPointerStore::Duplicate);
+                }
+                Some((held, _)) if entry.stored_at <= held.stored_at => {
+                    return Ok(SelfPointerStore::Superseded {
+                        held_stored_at: held.stored_at,
+                    });
+                }
+                Some((held, held_size)) => {
+                    table.insert(&key, bytes.as_slice())?;
+                    (
+                        SelfPointerStore::Replaced {
+                            previous_stored_at: held.stored_at,
+                        },
+                        held_size,
+                    )
+                }
+                None => {
+                    if slot_count_in(&table, &entry.target)? >= max_slots {
+                        return Ok(SelfPointerStore::SlotsFull);
+                    }
+                    table.insert(&key, bytes.as_slice())?;
+                    (SelfPointerStore::Stored, 0)
+                }
+            }
+        };
+        adjust_counter(&tx, MAILBOX_BYTES_BY_TARGET, &entry.target.0, size, removed)?;
+        adjust_counter(
+            &tx,
+            MAILBOX_SP_BYTES_BY_TARGET,
+            &entry.target.0,
+            size,
+            removed,
+        )?;
         tx.commit()?;
-        Ok(SelfPointerStore::Stored { evicted })
+        Ok(outcome)
+    }
+
+    /// Number of SelfPointer slots stored for `target` (expired-unswept included).
+    pub fn mailbox_self_pointer_slot_count(
+        &self,
+        target: &MailboxAddress,
+    ) -> Result<usize, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(MAILBOX_ENTRIES)?;
+        slot_count_in(&table, target)
     }
 
     /// List all unique targets that have at least one mailbox entry.

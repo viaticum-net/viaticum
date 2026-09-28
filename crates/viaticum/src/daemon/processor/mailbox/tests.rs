@@ -19,15 +19,22 @@
 //         fetch_rendezvous_with_valid_proof_returns_entries
 //   AC-10 store_checks_candidate_set_against_entry_target
 //   AC-20 proof_fetch_returns_only_self_pointers
-//   AC-22 store_rejects_self_pointer_with_skewed_stored_at
+//   AC-22′ store_rejects_self_pointer_more_than_a_day_ahead
 //         store_rejects_already_expired_entry
+//         store_accepts_old_unexpired_self_pointer
+//
+// CROWN-1 C3a pointer slots (V.5 п.3, mailbox-i40/i46/i50, AC-29):
+//   store_superseded_pointer_is_rejected_with_superseded
+//   store_newer_pointer_in_same_slot_replaces_it
+//   store_same_pointer_again_is_acked_without_change
 
 use ed25519_dalek::SigningKey;
 use libp2p::PeerId;
 use viaticum_core::db::Db;
 use viaticum_core::db::testutil::test_db;
+use viaticum_core::mailbox::SELF_POINTER_MAX_FUTURE_SKEW_SECS;
 use viaticum_core::mailbox::class_config::{MAX_ENTRY_BYTES, MAX_MAILBOX_BYTES_PER_PEER};
-use viaticum_core::mailbox::seal::{RENDEZVOUS_EPOCH_SECS, RendezvousEpoch, RendezvousKeys};
+use viaticum_core::mailbox::seal::{RendezvousEpoch, RendezvousKeys};
 use viaticum_core::mailbox::{
     MailboxAddress, MailboxClass, MailboxEngine, MailboxEntry, MailboxRejectReason, sign_store,
 };
@@ -509,31 +516,114 @@ fn store_rejects_already_expired_entry() {
     assert!(stored(&db, &target).is_empty());
 }
 
+/// mailbox-i42: a pointer more than a day ahead of the postman's clock would freeze
+/// its slot; refused as ClockSkew. Up to a day ahead is accepted.
 #[test]
-fn store_rejects_self_pointer_with_skewed_stored_at() {
+fn store_rejects_self_pointer_more_than_a_day_ahead() {
     let db = test_db();
     let (sk, target) = box_key(20);
-    for stored_at in [
-        NOW + RENDEZVOUS_EPOCH_SECS + 1,
-        NOW - RENDEZVOUS_EPOCH_SECS - 1,
-    ] {
-        let mut entry = pointer_entry(target, 1, stored_at);
-        entry.expires_at = NOW + 3600;
-        let resp = store(&db, signed_store_request(&sk, entry), NOW);
-        assert!(
-            is_reject(&resp, MailboxRejectReason::ClockSkew),
-            "stored_at {stored_at}: {resp:?}"
-        );
-    }
+    let mut entry = pointer_entry(target, 1, NOW + SELF_POINTER_MAX_FUTURE_SKEW_SECS + 1);
+    entry.expires_at = entry.stored_at + 3600;
+    let resp = store(&db, signed_store_request(&sk, entry), NOW);
+    assert!(
+        is_reject(&resp, MailboxRejectReason::ClockSkew),
+        "got {resp:?}"
+    );
     assert!(stored(&db, &target).is_empty());
-    // Within one epoch either way: accepted.
-    let mut entry = pointer_entry(target, 2, NOW - RENDEZVOUS_EPOCH_SECS);
+    let mut entry = pointer_entry(target, 2, NOW + SELF_POINTER_MAX_FUTURE_SKEW_SECS);
+    entry.expires_at = entry.stored_at + 3600;
+    let resp = store(&db, signed_store_request(&sk, entry), NOW);
+    assert!(
+        matches!(resp, MailboxStoreResponse::Ack { .. }),
+        "got {resp:?}"
+    );
+}
+
+/// mailbox-i42: no past bound — an old unexpired pointer is accepted.
+#[test]
+fn store_accepts_old_unexpired_self_pointer() {
+    let db = test_db();
+    let (sk, target) = box_key(24);
+    let mut entry = pointer_entry(target, 1, NOW - 4 * 365 * 24 * 3600);
     entry.expires_at = NOW + 3600;
     let resp = store(&db, signed_store_request(&sk, entry), NOW);
     assert!(
         matches!(resp, MailboxStoreResponse::Ack { .. }),
         "got {resp:?}"
     );
+    assert_eq!(stored(&db, &target).len(), 1);
+}
+
+// ============================================================
+// AC-29: one pointer per slot (mailbox-i40/i46/i50)
+// ============================================================
+
+/// A signed pointer in slot `slot` whose payload differs per `stored_at`.
+fn slot_pointer(
+    sk: &SigningKey,
+    target: MailboxAddress,
+    slot: u8,
+    stored_at: u64,
+) -> MailboxStoreRequest {
+    let mut entry = pointer_entry(target, slot, stored_at);
+    entry.payload = format!("pointer@{stored_at}").into_bytes();
+    signed_store_request(sk, entry)
+}
+
+#[test]
+fn store_superseded_pointer_is_rejected_with_superseded() {
+    let db = test_db();
+    let (sk, target) = box_key(25);
+    let newer = slot_pointer(&sk, target, 1, NOW);
+    assert!(matches!(
+        store(&db, newer.clone(), NOW),
+        MailboxStoreResponse::Ack { .. }
+    ));
+    // Older in the same slot, and same time with another payload: both Superseded.
+    let older = slot_pointer(&sk, target, 1, NOW - 10);
+    let mut same_time_other = pointer_entry(target, 1, NOW);
+    same_time_other.payload = b"another pointer".to_vec();
+    for req in [older, signed_store_request(&sk, same_time_other)] {
+        let resp = store(&db, req, NOW);
+        assert!(
+            is_reject(&resp, MailboxRejectReason::Superseded),
+            "got {resp:?}"
+        );
+    }
+    assert_eq!(stored(&db, &target), vec![newer.entry]);
+}
+
+#[test]
+fn store_newer_pointer_in_same_slot_replaces_it() {
+    let db = test_db();
+    let (sk, target) = box_key(26);
+    store(&db, slot_pointer(&sk, target, 1, NOW - 100), NOW);
+    let newer = slot_pointer(&sk, target, 1, NOW);
+    assert!(matches!(
+        store(&db, newer.clone(), NOW),
+        MailboxStoreResponse::Ack { .. }
+    ));
+    assert_eq!(
+        stored(&db, &target),
+        vec![newer.entry],
+        "one entry per slot"
+    );
+}
+
+/// A re-offer of the same envelope is an idempotent Ack (i47: the publisher re-sends
+/// the same bytes until enough postmen hold it) and changes nothing.
+#[test]
+fn store_same_pointer_again_is_acked_without_change() {
+    let db = test_db();
+    let (sk, target) = box_key(27);
+    let req = slot_pointer(&sk, target, 1, NOW);
+    store(&db, req.clone(), NOW);
+    let resp = store(&db, req.clone(), NOW + 50);
+    assert!(
+        matches!(resp, MailboxStoreResponse::Ack { .. }),
+        "got {resp:?}"
+    );
+    assert_eq!(stored(&db, &target), vec![req.entry]);
 }
 
 // ============================================================
