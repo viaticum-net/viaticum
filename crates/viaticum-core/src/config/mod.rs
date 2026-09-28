@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use crate::constants::{
     DEFAULT_CLUSTER_SYNC_BATCH_SIZE, DEFAULT_COMPLETION_BONUS_COEFFICIENT,
     DEFAULT_DISK_RESERVE_BYTES, DEFAULT_MAX_VERSION_AGE_SECS, DEFAULT_MAX_VERSIONS,
-    DEFAULT_SOURCE_BLOCK_SIZE, MAX_COMPLETION_BONUS_COEFFICIENT,
+    DEFAULT_SOURCE_BLOCK_SIZE, FOUR_R_C_RECIP_DAYS_DEFAULT, FOUR_R_S_HARD_DEFAULT,
+    FOUR_R_S_SOFT_DEFAULT, FOUR_R_S_TARGET_DEFAULT, FOUR_R_TAU_REF_DAYS_DEFAULT,
+    FOUR_R_THETA_P_DEFAULT, FOUR_R_V_FREE_GB_DEFAULT, FOUR_R_V_MIN_GB_DEFAULT, FOUR_R_W_D_DEFAULT,
+    MAX_COMPLETION_BONUS_COEFFICIENT,
 };
 
 #[cfg(test)]
@@ -499,18 +502,14 @@ pub struct RestoreCfg {
     /// Warn in log when total size of data_dir/restore/ exceeds this threshold.
     /// Unit: gigabytes. Default: 50.
     pub staging_warn_gb: f64,
-
-    /// Timeout in seconds for fetching symbols from a holder over the network.
-    /// Applied to the entire fetch_from_holders() call (across all holders for one block).
-    /// Default: 60.
-    pub fetch_timeout_secs: u64,
+    // `fetch_timeout_secs` is gone (restore-i12): a restore has no deadline per
+    // block. A legacy `fetch_timeout_secs = …` line still loads (ignored).
 }
 
 impl Default for RestoreCfg {
     fn default() -> Self {
         Self {
             staging_warn_gb: 50.0,
-            fetch_timeout_secs: 60,
         }
     }
 }
@@ -544,6 +543,119 @@ impl Default for ReliabilityConfig {
 }
 
 // ============================================================
+// 4R config
+// ============================================================
+
+/// [four_r] — 4R v1 holder-side dials (В-0). The 4R path runs in SHADOW only: it logs what
+/// it would do and decides nothing; `enforce = true` is rejected by `validate()` until slice
+/// В-2 lands. Units: "gb" = bytes / 2^30, days are scaled days (the daemon's `time_scale`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct FourRCfg {
+    /// Apply 4R decisions (В-2+). Must be false in this build.
+    pub enforce: bool,
+    /// `V_free` [GB = 2^30 B]: free retention floor per owner.
+    pub v_free_gb: f64,
+    /// `c_recip` [days]: gb·days of κ_O per +1 GB of retention. 0 disables the cap.
+    pub c_recip_days: f64,
+    /// `w_d`: weight of the depth (loyalty) floor in κ_O.
+    pub w_d: f64,
+    /// `τ_ref` [days]: `d_ref = τ_ref · v_dem` per pair.
+    pub tau_ref_days: f64,
+    /// `θ_p`: preemption margin factor; margin = θ_p · max(V_offer, V_min) / λ [gb·days].
+    pub theta_p: f64,
+    /// `V_min` [GB]: margin floor.
+    pub v_min_gb: f64,
+    /// Relay threshold on φ = free share of the quota: evict below it.
+    pub s_hard: f64,
+    /// Relay threshold: evict down to it.
+    pub s_target: f64,
+    /// Relay threshold: accept new foreign data freely only above it.
+    pub s_soft: f64,
+}
+
+impl Default for FourRCfg {
+    fn default() -> Self {
+        Self {
+            enforce: false,
+            v_free_gb: FOUR_R_V_FREE_GB_DEFAULT,
+            c_recip_days: FOUR_R_C_RECIP_DAYS_DEFAULT,
+            w_d: FOUR_R_W_D_DEFAULT,
+            tau_ref_days: FOUR_R_TAU_REF_DAYS_DEFAULT,
+            theta_p: FOUR_R_THETA_P_DEFAULT,
+            v_min_gb: FOUR_R_V_MIN_GB_DEFAULT,
+            s_hard: FOUR_R_S_HARD_DEFAULT,
+            s_target: FOUR_R_S_TARGET_DEFAULT,
+            s_soft: FOUR_R_S_SOFT_DEFAULT,
+        }
+    }
+}
+
+impl FourRCfg {
+    /// Hard constraints of the `[four_r]` section (called from [`AppConfig::validate`]).
+    fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |name: &str, reason: &str| ConfigError::Validation {
+            field: format!("four_r.{name}"),
+            reason: reason.to_string(),
+        };
+        let values = [
+            ("v_free_gb", self.v_free_gb),
+            ("c_recip_days", self.c_recip_days),
+            ("w_d", self.w_d),
+            ("tau_ref_days", self.tau_ref_days),
+            ("theta_p", self.theta_p),
+            ("v_min_gb", self.v_min_gb),
+            ("s_hard", self.s_hard),
+            ("s_target", self.s_target),
+            ("s_soft", self.s_soft),
+        ];
+        for (name, v) in values {
+            if !v.is_finite() {
+                return Err(invalid(name, "must be a finite number"));
+            }
+        }
+        if !(0.0 < self.s_hard
+            && self.s_hard < self.s_target
+            && self.s_target < self.s_soft
+            && self.s_soft < 1.0)
+        {
+            return Err(invalid(
+                "s_hard",
+                "thresholds must satisfy 0 < s_hard < s_target < s_soft < 1",
+            ));
+        }
+        if self.v_free_gb < 0.0 {
+            return Err(invalid("v_free_gb", "must be >= 0.0"));
+        }
+        if self.c_recip_days < 0.0 {
+            return Err(invalid(
+                "c_recip_days",
+                "must be >= 0.0 (0 disables the cap)",
+            ));
+        }
+        if self.w_d < 0.0 {
+            return Err(invalid("w_d", "must be >= 0.0"));
+        }
+        if self.tau_ref_days <= 0.0 {
+            return Err(invalid("tau_ref_days", "must be > 0.0"));
+        }
+        if self.theta_p < 0.0 {
+            return Err(invalid("theta_p", "must be >= 0.0"));
+        }
+        if self.v_min_gb < 0.0 {
+            return Err(invalid("v_min_gb", "must be >= 0.0"));
+        }
+        if self.enforce {
+            return Err(invalid(
+                "enforce",
+                "4R runs in shadow until slice В-2; enforce is not available in this build",
+            ));
+        }
+        Ok(())
+    }
+}
+
+// ============================================================
 // Top-level config
 // ============================================================
 
@@ -563,6 +675,8 @@ pub struct AppConfig {
     pub web_api: WebApiCfg,
     pub restore: RestoreCfg,
     pub reliability: ReliabilityConfig,
+    /// 4R holder-side dials (В-0: shadow only, see [`FourRCfg`]).
+    pub four_r: FourRCfg,
     /// Per-directory watch configuration.
     /// Listed as [[watch]] array in config.toml.
     /// When empty, watch_dirs from CLI are used with DEFAULT_IMPORTANCE_MULTIPLIER.
@@ -714,12 +828,7 @@ impl AppConfig {
             });
         }
 
-        if self.restore.fetch_timeout_secs == 0 {
-            return Err(ConfigError::Validation {
-                field: "restore.fetch_timeout_secs".to_string(),
-                reason: "must be > 0".to_string(),
-            });
-        }
+        self.four_r.validate()?;
 
         Ok(())
     }

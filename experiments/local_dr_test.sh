@@ -45,8 +45,12 @@
 #               hashing); real NAT; real clock (pointer cadence is divided by time_scale); cluster
 #               siblings; "0 acks → not ready" (unit test publish_step_does_not_record_*);
 #               SIGKILL inside the DR commit (unit-tested per rename step); several catalog
-#               histories (local_dr_shadow_test). Runs WITHOUT any [escrow] section (B1.1:
-#               restore of one's own data has no escrow gate, dr-i34).
+#               histories (local_dr_shadow_test); restore-i3 (honest outcome) only on the
+#               success path: restore_from_network requires CLI exit 0, job outcome
+#               `complete`, the file in the job's restored_paths and staging ==
+#               restored_paths; partial / failed outcomes are local_restore_network_test
+#               (B1.4). Runs WITHOUT any [escrow] section (B1.1: restore of one's own data
+#               has no escrow gate, dr-i34).
 # Depends on:   line C R1-b1 (the post-DR daemon enrolls its new device into the restored
 #               cluster registry). STEPS 6+ ARE RED WITHOUT R1-b1: the recovered node has no
 #               network (step 6 names it "waits R1-b") and everything after fails for that

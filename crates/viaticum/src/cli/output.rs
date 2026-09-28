@@ -1,5 +1,6 @@
 use crate::cli::types::{
-    DeviceEntry, FileEntry, RestoreBlocker, RestoreData, StatusData, VersionEntry,
+    DeviceEntry, FileEntry, RestoreFailureKind, RestoreJob, RestoreJobState, RestoreOutcome,
+    RestoreRejection, StatusData, VersionEntry,
 };
 
 /// Format bytes as human-readable size string.
@@ -59,6 +60,29 @@ pub fn render_status(data: &StatusData) -> String {
         quota_str,
         format_bytes(data.used_bytes)
     ));
+    // restore-i8: restored files stay until the user moves them out.
+    let staging_size = match data.restore_staging_bytes {
+        Some(b) => format_bytes(b),
+        None => "size still counting".to_string(),
+    };
+    if data.restore_staging_jobs > 0 {
+        out.push_str(&format!(
+            "  restore staging: {} job dir(s), {} in {} — move files out, then delete the directories\n",
+            data.restore_staging_jobs, staging_size, data.restore_staging_path
+        ));
+    }
+    // restore-i18
+    if data.restore_staging_squeezes_holdings {
+        out.push_str(&format!(
+            "  WARNING: restore staging {staging_size} is taking space from your friends' data; move files out and delete it\n"
+        ));
+    }
+    // restore-i19
+    if data.restore_publish == "unavailable" {
+        out.push_str(
+            "  ERROR: restore cannot write files into staging on this filesystem (see the daemon log)\n",
+        );
+    }
     if data.peer_count == 0 {
         out.push_str("  no peers yet\n");
         out.push_str("  WARNING: backup requires >= 2 peers for erasure coding\n");
@@ -134,48 +158,236 @@ pub fn format_status(data: &StatusData) {
     print!("{}", render_status(data));
 }
 
-/// Render RestoreData to a String.
-pub fn render_restore(data: &RestoreData) -> String {
-    let mut out = String::new();
-    out.push_str("restore started\n");
-    out.push_str(&format!("  path:     {}\n", data.path));
-    out.push_str(&format!("  version:  {}\n", data.version_used));
-    let hash_display = if data.content_hash_hex.len() > 16 {
-        format!("{}...", &data.content_hash_hex[..16])
-    } else {
-        data.content_hash_hex.clone()
+// ─── restore (restore-i3, i4, i15) ───────────────────────────────────────────
+
+/// Right after the daemon accepted the job (printed before any waiting).
+pub fn render_restore_submitted(job: &RestoreJob) -> String {
+    let mut out = format!(
+        "restore job {} submitted: {} file(s) under {}\n",
+        job.job_id, job.files_total, job.path
+    );
+    out.push_str(&format!("  staging: {}\n", job.staging_path));
+    out.push_str(
+        "  This is a cold backup: restore can take hours. Ctrl-C stops watching, not the restore.\n",
+    );
+    out.push_str(&format!(
+        "  Check later with: viaticum restore --status {}\n",
+        job.job_id
+    ));
+    out
+}
+
+/// A progress line while the job is queued or running. `now_unix` (seconds) turns a
+/// wait for holders into "retry in …".
+pub fn render_restore_progress(job: &RestoreJob, now_unix: u64) -> String {
+    match job.state {
+        RestoreJobState::Queued => format!(
+            "queued: waiting for an earlier restore job to finish ({} file(s))\n",
+            job.files_total
+        ),
+        _ => {
+            let mut line = format!(
+                "running: {}/{} restored, {} failed",
+                job.files_restored,
+                job.files_total,
+                job.failures.len()
+            );
+            // restore-i26: holders did not answer; redialed, retried after a pause.
+            if let Some(until) = &job.waiting_for_holders_until {
+                line.push_str(&format!(
+                    "; holders did not answer, reconnecting, {}",
+                    retry_in(until, now_unix)
+                ));
+            }
+            line.push('\n');
+            line
+        }
+    }
+}
+
+/// "retry in 4 min" for an ISO-8601 UTC time (`YYYY-MM-DDTHH:MM:SSZ`) relative to
+/// `now_unix`; "retry at <raw>" if it does not parse.
+pub(crate) fn retry_in(until_iso: &str, now_unix: u64) -> String {
+    let Some(until) = parse_iso_utc(until_iso) else {
+        return format!("retry at {until_iso}");
     };
-    out.push_str(&format!("  hash:     {}\n", hash_display));
-    out.push_str(&format!("  status:   {}\n", data.status));
-    if !data.staging_path.is_empty() {
-        out.push_str(&format!("  staging:  {}\n", data.staging_path));
+    let left = until.saturating_sub(now_unix);
+    match left {
+        0 => "retrying now".to_string(),
+        1..60 => format!("retry in {left} s"),
+        60..3600 => format!("retry in {} min", left.div_ceil(60)),
+        _ => format!(
+            "retry in {} h {} min",
+            left / 3600,
+            (left % 3600).div_ceil(60)
+        ),
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` → Unix seconds (days_from_civil, Hinnant). `None` on
+/// any other shape.
+fn parse_iso_utc(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, min, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + h * 3600 + min * 60 + sec).ok()
+}
+
+/// Why a file was not restored, in words.
+pub fn restore_failure_reason(kind: RestoreFailureKind) -> &'static str {
+    match kind {
+        RestoreFailureKind::HoldersUnavailable => "not enough holders answered; retry later",
+        RestoreFailureKind::NotBackedUp => "no backed-up version",
+        RestoreFailureKind::BlockMissing => "its block record is missing from the catalog",
+        RestoreFailureKind::Corrupt => "the data did not decode",
+        RestoreFailureKind::PathUnsafe => "unsafe path in the catalog",
+        RestoreFailureKind::WriteFailed => "could not write it into staging",
+        RestoreFailureKind::Interrupted => "the daemon stopped before it was restored",
+        RestoreFailureKind::Internal => "internal error",
+    }
+}
+
+/// The final report of a finished job. Never says "started": the job is over.
+pub fn render_restore_finished(job: &RestoreJob) -> String {
+    let (restored, total) = (job.files_restored, job.files_total);
+    let mut out = match job.outcome {
+        Some(RestoreOutcome::Complete) => {
+            format!("restore complete: {restored} of {total} file(s) restored\n")
+        }
+        Some(RestoreOutcome::Partial) => {
+            format!("restore partial: {restored} of {total} file(s) restored\n")
+        }
+        Some(RestoreOutcome::NothingRestored) => {
+            format!("restore failed: nothing restored (0 of {total} file(s))\n")
+        }
+        Some(RestoreOutcome::Interrupted) => format!(
+            "restore interrupted: the daemon stopped before the job finished; {restored} of {total} file(s) restored\n"
+        ),
+        None => format!("restore job state unknown: {restored} of {total} file(s) restored\n"),
+    };
+    out.push_str(&format!("  staging: {}\n", job.staging_path));
+    if !job.failures.is_empty() {
+        out.push_str(&format!("  not restored ({}):\n", job.failures.len()));
+        for f in &job.failures {
+            out.push_str(&format!(
+                "    {} — {} ({})\n",
+                f.path,
+                restore_failure_reason(f.kind),
+                f.detail
+            ));
+        }
+    }
+    let retry = job.failures.iter().any(|f| {
+        matches!(
+            f.kind,
+            RestoreFailureKind::HoldersUnavailable | RestoreFailureKind::Interrupted
+        )
+    });
+    if retry {
+        out.push_str(&format!(
+            "  Retry: viaticum restore {}   (restored files are downloaded again)\n",
+            job.path
+        ));
+    }
+    if restored > 0 {
+        out.push_str(
+            "  The files are in staging and NOT protected there. Move them into a watched folder \
+             (the original one or any other) within ~4 weeks of the deletion to protect them again.\n",
+        );
     }
     out
 }
 
-/// Format and print RestoreData to stdout.
-pub fn format_restore(data: &RestoreData) {
-    print!("{}", render_restore(data));
+/// A refused request (nothing was started) or an unknown job id.
+pub fn render_restore_rejection(r: &RestoreRejection) -> String {
+    let line = match r {
+        RestoreRejection::NotInCatalog { path } => {
+            format!("{path} is not in the backup catalog (no file there and none under it)")
+        }
+        RestoreRejection::NotBackedUp { path } => {
+            format!("nothing under {path} has a backed-up version yet")
+        }
+        RestoreRejection::VersionNotFound {
+            path,
+            version,
+            available,
+        } => {
+            let list: Vec<String> = available.iter().map(u32::to_string).collect();
+            format!(
+                "version {version} not found for {path} (available: {})",
+                list.join(", ")
+            )
+        }
+        RestoreRejection::DestNotSupported => {
+            "--dest is not supported: restored files go to the staging directory".to_string()
+        }
+        RestoreRejection::InvalidDate { date } => {
+            format!("invalid date {date} (expected YYYY-MM-DD)")
+        }
+        RestoreRejection::Busy { active } => {
+            format!(
+                "the restore queue is full ({active} job(s) queued or running); try again later"
+            )
+        }
+        RestoreRejection::Unavailable => {
+            "the daemon is not taking restore jobs (shutting down?)".to_string()
+        }
+        RestoreRejection::UnknownJob { job_id } => format!(
+            "unknown restore job {job_id} (its staging directory does not exist, or the id is wrong)"
+        ),
+    };
+    format!("restore: {line}\n")
 }
 
-/// Render a structured RestoreBlocker to stderr-suitable text.
-pub fn format_restore_blocked(b: &RestoreBlocker) {
-    eprintln!("restore blocked:");
-    match b {
-        RestoreBlocker::InsufficientPlacements {
-            have,
-            need,
-            holders_offline,
-        } => {
-            eprintln!(
-                "  reason: not enough live holders ({have}/{need} symbols, ~{holders_offline} offline)"
-            );
-            eprintln!("  hint:   wait for offline peers to come back, or trigger repair");
-        }
-        RestoreBlocker::AllHoldersOffline { last_seen_secs_ago } => {
-            eprintln!("  reason: all holders offline (last seen {last_seen_secs_ago}s ago)");
-        }
+/// `viaticum restore --status`: recent jobs, newest first.
+pub fn render_restore_jobs(jobs: &[RestoreJob]) -> String {
+    if jobs.is_empty() {
+        return "no restore jobs\n".to_string();
     }
+    let mut out = format!("restore jobs ({}), newest first:\n", jobs.len());
+    for j in jobs {
+        let state = match (j.state, j.outcome) {
+            (RestoreJobState::Finished, Some(o)) => o.as_str(),
+            (RestoreJobState::Queued, _) => "queued",
+            (RestoreJobState::Running, _) => "running",
+            (RestoreJobState::Finished, None) => "finished",
+        };
+        out.push_str(&format!(
+            "  {}  {:<16} {}/{}  {}\n",
+            j.job_id, state, j.files_restored, j.files_total, j.path
+        ));
+    }
+    out
+}
+
+/// The CLI could not reach the daemon for too long, or the daemon no longer knows
+/// the job.
+pub fn render_restore_lost_contact(job_id: &str, staging_path: &str) -> String {
+    format!(
+        "restore: lost contact with the daemon; the restore may have been interrupted. \
+         Files restored so far: {staging_path}. Check `viaticum restore --status {job_id}` \
+         after the daemon is back, or run the restore again.\n"
+    )
 }
 
 /// Render a list of DeviceEntry to a String.

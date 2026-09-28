@@ -1129,6 +1129,23 @@ fn an_absurd_scale_saturates_the_age_instead_of_wrapping() {
     assert!(p.confirmed_at(Timestamp(12), 0, window));
 }
 
+#[test]
+fn may_hold_symbols_is_true_only_for_alive_uncertain_presumed_lost() {
+    // repair-i2: exactly the statuses only a PoS verdict may leave.
+    let cases = [
+        (PlacementStatus::Offered, false),
+        (PlacementStatus::Accepted, false),
+        (PlacementStatus::Alive, true),
+        (PlacementStatus::Uncertain, true),
+        (PlacementStatus::PresumedLost, true),
+        (PlacementStatus::Lost, false),
+        (PlacementStatus::Deleting, false),
+    ];
+    for (status, expected) in cases {
+        assert_eq!(status.may_hold_symbols(), expected, "{status:?}");
+    }
+}
+
 // ── DN-1: SeenSignedLetter (applied signed letters by signature) ─────────────
 
 #[test]

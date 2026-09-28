@@ -2,7 +2,8 @@ use clap::Parser;
 
 use super::output;
 use super::types::{
-    CliRequest, CliResponse, DeviceEntry, FileEntry, PeerSummary, RestoreData, StatusData,
+    CliRequest, CliResponse, DeviceEntry, FileEntry, PeerSummary, RestoreFailure,
+    RestoreFailureKind, RestoreJob, RestoreJobState, RestoreOutcome, RestoreRejection, StatusData,
     VersionEntry,
 };
 use super::{Cli, CliError, Command, DeviceAction};
@@ -31,11 +32,16 @@ fn command_restore_parses_path() {
         version,
         date,
         dest,
+        no_wait,
+        status,
+        json,
     } = cmd
     else {
         panic!("expected Restore");
     };
-    assert_eq!(path, "photos/img.jpg");
+    assert_eq!(path.as_deref(), Some("photos/img.jpg"));
+    assert!(!no_wait && !json);
+    assert_eq!(status, None);
     assert_eq!(version, None);
     assert_eq!(date, None);
     assert_eq!(dest, None);
@@ -149,7 +155,7 @@ fn command_device_revoke() {
 // run_command validation tests (daemon not reachable — validation happens first)
 // ============================================================
 
-fn run(cmd: &Command) -> Result<(), CliError> {
+fn run(cmd: &Command) -> Result<i32, CliError> {
     // 127.0.0.1:1 is effectively unreachable (port 1 reserved, no listener)
     let conn = super::Connection {
         url: "http://127.0.0.1:1".into(),
@@ -160,24 +166,22 @@ fn run(cmd: &Command) -> Result<(), CliError> {
 
 #[test]
 fn run_command_restore_rejects_version_zero() {
-    let cmd = Command::Restore {
-        path: "f".into(),
-        version: Some(0),
-        date: None,
-        dest: None,
-    };
+    let cmd = parse(&["viaticum", "restore", "f", "--version", "0"]);
     let err = run(&cmd).unwrap_err();
     assert!(matches!(err, CliError::InvalidArgument(_)));
 }
 
 #[test]
 fn run_command_restore_rejects_version_and_date_both() {
-    let cmd = Command::Restore {
-        path: "f".into(),
-        version: Some(1),
-        date: Some("2026-01-01".into()),
-        dest: None,
-    };
+    let cmd = parse(&[
+        "viaticum",
+        "restore",
+        "f",
+        "--version",
+        "1",
+        "--date",
+        "2026-01-01",
+    ]);
     let err = run(&cmd).unwrap_err();
     assert!(matches!(err, CliError::InvalidArgument(_)));
 }
@@ -273,12 +277,96 @@ fn make_status_zero_peers() -> StatusData {
         blocks_at_risk: 0,
         table_stats: None,
         by_importance: vec![],
+        restore_staging_jobs: 0,
+        restore_staging_bytes: Some(0),
+        restore_staging_path: String::new(),
+        restore_publish: String::new(),
+        restore_staging_squeezes_holdings: false,
         dr_pointer_published_at: 0,
         dr_pointer_files: 0,
         dr_pointer_acks: 0,
         catalog_lineage: String::new(),
         files_without_source: 0,
     }
+}
+
+/// restore-i8: `status` reminds the user that restored files wait in staging.
+#[test]
+fn render_status_shows_restore_staging_when_job_dirs_exist() {
+    let mut data = make_status_zero_peers();
+    data.restore_staging_jobs = 2;
+    data.restore_staging_bytes = Some(3 * 1024 * 1024);
+    data.restore_staging_path = "/home/kolya/.viaticum/restore".into();
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("restore staging: 2 job dir(s)"),
+        "got: {rendered}"
+    );
+    assert!(
+        rendered.contains("/home/kolya/.viaticum/restore"),
+        "got: {rendered}"
+    );
+    assert!(rendered.contains("move files out, then delete the directories"));
+}
+
+#[test]
+fn render_status_hides_restore_staging_when_empty() {
+    let rendered = output::render_status(&make_status_zero_peers());
+    assert!(!rendered.contains("restore staging"), "got: {rendered}");
+}
+
+/// Old daemons do not send the staging fields; the CLI still parses the status.
+#[test]
+fn status_data_without_staging_fields_deserializes_with_zero() {
+    let mut v = serde_json::to_value(make_status_zero_peers()).unwrap();
+    let obj = v.as_object_mut().unwrap();
+    obj.remove("restore_staging_jobs");
+    obj.remove("restore_staging_bytes");
+    obj.remove("restore_staging_path");
+    obj.remove("restore_publish");
+    obj.remove("restore_staging_squeezes_holdings");
+    let back: StatusData = serde_json::from_value(v).unwrap();
+    assert_eq!(back.restore_staging_jobs, 0);
+    assert_eq!(back.restore_staging_bytes, None);
+    assert!(!back.restore_staging_squeezes_holdings);
+}
+
+/// W3: right after start the byte count is not known yet: say so, never "0 B".
+#[test]
+fn render_status_says_counting_before_bytes_are_known() {
+    let mut data = make_status_zero_peers();
+    data.restore_staging_jobs = 1;
+    data.restore_staging_bytes = None;
+    let rendered = output::render_status(&data);
+    assert!(rendered.contains("size still counting"), "got: {rendered}");
+}
+
+/// restore-i18: the squeeze warning names the staging size and asks to move out.
+#[test]
+fn render_status_warns_when_staging_takes_space_from_friends() {
+    let mut data = make_status_zero_peers();
+    data.restore_staging_jobs = 1;
+    data.restore_staging_bytes = Some(2 * 1024 * 1024 * 1024);
+    data.restore_staging_squeezes_holdings = true;
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("is taking space from your friends' data; move files out and delete it"),
+        "got: {rendered}"
+    );
+}
+
+/// restore-i19: no atomic publish path → an explicit error line in status.
+#[test]
+fn render_status_reports_unavailable_publish() {
+    let mut data = make_status_zero_peers();
+    data.restore_publish = "unavailable".into();
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("restore cannot write files into staging"),
+        "got: {rendered}"
+    );
+    data.restore_publish = "hard_link".into();
+    assert!(!output::render_status(&data).contains("cannot write"));
 }
 
 #[test]
@@ -357,6 +445,11 @@ fn format_status_top_peers_printed() {
         blocks_at_risk: 1,
         table_stats: None,
         by_importance: vec![],
+        restore_staging_jobs: 0,
+        restore_staging_bytes: Some(0),
+        restore_staging_path: String::new(),
+        restore_publish: String::new(),
+        restore_staging_squeezes_holdings: false,
         dr_pointer_published_at: 0,
         dr_pointer_files: 0,
         dr_pointer_acks: 0,
@@ -536,57 +629,6 @@ fn format_device_list_device_id_truncated_to_16_chars() {
     assert!(
         !rendered.contains(&full_id),
         "full id should be truncated: {rendered}"
-    );
-}
-
-// ============================================================
-// render_restore tests
-// ============================================================
-
-#[test]
-fn format_restore_includes_path_version_status() {
-    let data = RestoreData {
-        path: "/home/user/doc.pdf".into(),
-        version_used: 3,
-        content_hash_hex: "aabbccdd11223344556677889900aabb".into(),
-        status: "started".into(),
-        staging_path: "".into(),
-    };
-    let rendered = output::render_restore(&data);
-    assert!(rendered.contains("restore started"), "got: {rendered}");
-    assert!(rendered.contains("/home/user/doc.pdf"), "got: {rendered}");
-    assert!(rendered.contains("version:  3"), "got: {rendered}");
-    assert!(rendered.contains("status:   started"), "got: {rendered}");
-}
-
-#[test]
-fn format_restore_hash_truncated_to_16_chars() {
-    let data = RestoreData {
-        path: "f".into(),
-        version_used: 1,
-        content_hash_hex: "aabbccdd11223344556677889900aabb".into(),
-        status: "queued".into(),
-        staging_path: "".into(),
-    };
-    let rendered = output::render_restore(&data);
-    // First 16 chars + "..."
-    assert!(rendered.contains("aabbccdd11223344..."), "got: {rendered}");
-}
-
-#[test]
-fn format_restore_short_hash_not_truncated() {
-    let data = RestoreData {
-        path: "f".into(),
-        version_used: 1,
-        content_hash_hex: "aabb".into(),
-        status: "queued".into(),
-        staging_path: "".into(),
-    };
-    let rendered = output::render_restore(&data);
-    assert!(rendered.contains("aabb"), "got: {rendered}");
-    assert!(
-        !rendered.contains("..."),
-        "short hash should not have ellipsis: {rendered}"
     );
 }
 
@@ -806,6 +848,8 @@ fn cli_request_roundtrips_cbor() {
             date: None,
             dest: None,
         },
+        CliRequest::RestoreJobStatus { job_id: "j".into() },
+        CliRequest::RestoreJobList,
         CliRequest::DeviceList,
         CliRequest::DeviceAdd {
             label: "phone".into(),
@@ -823,10 +867,10 @@ fn cli_request_roundtrips_cbor() {
 
 #[test]
 fn cli_response_roundtrips_cbor() {
-    use super::types::{RestoreData, StatusData};
+    use super::types::StatusData;
 
     let responses = vec![
-        CliResponse::Status(StatusData {
+        CliResponse::Status(Box::new(StatusData {
             node_identity: "aabbccdd11223344".into(),
             device_id: "aabbccdd11223344".into(),
             node_addr: String::new(),
@@ -850,21 +894,22 @@ fn cli_response_roundtrips_cbor() {
             blocks_at_risk: 0,
             table_stats: None,
             by_importance: vec![],
+            restore_staging_jobs: 0,
+            restore_staging_bytes: Some(0),
+            restore_staging_path: String::new(),
+            restore_publish: String::new(),
+            restore_staging_squeezes_holdings: false,
             dr_pointer_published_at: 0,
             dr_pointer_files: 0,
             dr_pointer_acks: 0,
             catalog_lineage: String::new(),
             files_without_source: 0,
-        }),
+        })),
         CliResponse::DeviceList(vec![]),
         CliResponse::Error("oops".into()),
-        CliResponse::Restore(RestoreData {
-            path: "test.txt".into(),
-            version_used: 2,
-            content_hash_hex: "aa".repeat(32),
-            status: "queued".into(),
-            staging_path: "".into(),
-        }),
+        CliResponse::RestoreJob(finished_job(RestoreOutcome::Partial)),
+        CliResponse::RestoreJobs(vec![finished_job(RestoreOutcome::Complete)]),
+        CliResponse::RestoreRejected(RestoreRejection::Busy { active: 3 }),
         CliResponse::DeviceRevoked {
             device_id_hex: "01".repeat(16),
         },
@@ -876,6 +921,615 @@ fn cli_response_roundtrips_cbor() {
         let decoded: CliResponse = cbor_decode(&bytes);
         assert_eq!(&decoded, resp);
     }
+}
+
+// ============================================================
+// B1.3: restore as a job — CLI contract (restore-i3, i4, i15)
+// ============================================================
+
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::rc::Rc;
+use std::time::Duration;
+
+use super::restore::{
+    RestoreApi, RestoreArgs, WaitError, WaitPolicy, run_restore_with, wait_for_job,
+};
+
+fn job(state: RestoreJobState, restored: u32, total: u32) -> RestoreJob {
+    RestoreJob {
+        job_id: "3f2a0000-0000-4000-8000-000000000001".into(),
+        path: "/home/kolya/photos/".into(),
+        state,
+        files_total: total,
+        files_restored: restored,
+        restored_paths: (0..restored)
+            .map(|i| format!("/home/kolya/photos/{i}.jpg"))
+            .collect(),
+        failures: vec![],
+        outcome: None,
+        staging_path: "/home/kolya/.local/share/viaticum/restore/3f2a".into(),
+        submitted_at: "2026-09-27T10:00:00Z".into(),
+        finished_at: None,
+        waiting_for_holders_until: None,
+    }
+}
+
+fn finished_job(outcome: RestoreOutcome) -> RestoreJob {
+    let (restored, failures) = match outcome {
+        RestoreOutcome::Complete => (3, vec![]),
+        RestoreOutcome::Partial => (2, vec![holders_failure("/home/kolya/photos/c.jpg")]),
+        RestoreOutcome::NothingRestored => (
+            0,
+            vec![
+                holders_failure("/home/kolya/photos/a.jpg"),
+                holders_failure("/home/kolya/photos/b.jpg"),
+                holders_failure("/home/kolya/photos/c.jpg"),
+            ],
+        ),
+        RestoreOutcome::Interrupted => (
+            1,
+            vec![RestoreFailure {
+                path: "/home/kolya/photos/".into(),
+                kind: RestoreFailureKind::Interrupted,
+                detail: "daemon stopped during restore".into(),
+            }],
+        ),
+    };
+    RestoreJob {
+        failures,
+        outcome: Some(outcome),
+        finished_at: Some("2026-09-27T11:00:00Z".into()),
+        ..job(RestoreJobState::Finished, restored, 3)
+    }
+}
+
+fn holders_failure(path: &str) -> RestoreFailure {
+    RestoreFailure {
+        path: path.into(),
+        kind: RestoreFailureKind::HoldersUnavailable,
+        detail: "not enough holders answered: collected 3 of 5 symbols".into(),
+    }
+}
+
+#[test]
+fn restore_outcome_exit_codes_complete_0_partial_2_nothing_1_interrupted_1() {
+    assert_eq!(RestoreOutcome::Complete.exit_code(), 0);
+    assert_eq!(RestoreOutcome::Partial.exit_code(), 2);
+    assert_eq!(RestoreOutcome::NothingRestored.exit_code(), 1);
+    assert_eq!(RestoreOutcome::Interrupted.exit_code(), 1);
+}
+
+#[test]
+fn outcome_from_counts_zero_total_is_nothing_restored() {
+    assert_eq!(
+        RestoreOutcome::from_counts(0, 0, 0, false),
+        RestoreOutcome::NothingRestored
+    );
+    assert_eq!(
+        RestoreOutcome::from_counts(0, 0, 1, false),
+        RestoreOutcome::NothingRestored
+    );
+}
+
+#[test]
+fn render_restore_finished_lists_each_failed_path_with_reason_and_retry_hint() {
+    let mut j = finished_job(RestoreOutcome::Partial);
+    j.failures.push(RestoreFailure {
+        path: "/home/kolya/photos/d.jpg".into(),
+        kind: RestoreFailureKind::WriteFailed,
+        detail: "file already exists in staging".into(),
+    });
+    let out = output::render_restore_finished(&j);
+    assert!(out.contains("2 of 3 file(s) restored"), "{out}");
+    assert!(out.contains("not restored (2)"), "{out}");
+    assert!(
+        out.contains("/home/kolya/photos/c.jpg — not enough holders answered; retry later"),
+        "{out}"
+    );
+    assert!(out.contains("collected 3 of 5 symbols"), "{out}");
+    assert!(
+        out.contains("/home/kolya/photos/d.jpg — could not write it into staging"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Retry: viaticum restore /home/kolya/photos/"),
+        "{out}"
+    );
+    assert!(out.contains(&j.staging_path), "{out}");
+}
+
+#[test]
+fn render_restore_finished_never_says_started() {
+    for o in [
+        RestoreOutcome::Complete,
+        RestoreOutcome::Partial,
+        RestoreOutcome::NothingRestored,
+        RestoreOutcome::Interrupted,
+    ] {
+        let out = output::render_restore_finished(&finished_job(o));
+        assert!(!out.contains("started"), "{o:?}: {out}");
+    }
+    let nothing = output::render_restore_finished(&finished_job(RestoreOutcome::NothingRestored));
+    assert!(
+        nothing.starts_with("restore failed: nothing restored"),
+        "{nothing}"
+    );
+}
+
+#[test]
+fn render_restore_finished_says_staging_is_not_protected() {
+    let out = output::render_restore_finished(&finished_job(RestoreOutcome::Complete));
+    assert!(out.contains("NOT protected"), "{out}");
+    assert!(out.contains("within ~4 weeks of the deletion"), "{out}");
+    assert!(!out.contains("Retry:"), "nothing to retry: {out}");
+    let nothing = output::render_restore_finished(&finished_job(RestoreOutcome::NothingRestored));
+    assert!(
+        !nothing.contains("NOT protected"),
+        "no files, no note: {nothing}"
+    );
+}
+
+#[test]
+fn render_restore_rejection_not_in_catalog_names_path() {
+    let out = output::render_restore_rejection(&RestoreRejection::NotInCatalog {
+        path: "/home/kolya/files/nope.bin".into(),
+    });
+    assert!(out.contains("/home/kolya/files/nope.bin"), "{out}");
+    assert!(out.contains("not in the backup catalog"), "{out}");
+}
+
+#[test]
+fn render_restore_rejection_version_not_found_names_version_and_available() {
+    let out = output::render_restore_rejection(&RestoreRejection::VersionNotFound {
+        path: "/home/kolya/a.txt".into(),
+        version: 7,
+        available: vec![1, 3],
+    });
+    assert!(
+        out.contains("version 7 not found for /home/kolya/a.txt (available: 1, 3)"),
+        "{out}"
+    );
+    assert!(!out.contains("nothing under"), "{out}");
+}
+
+const FAST: WaitPolicy = WaitPolicy {
+    poll_every: Duration::from_secs(2),
+    max_silence: Duration::from_secs(60),
+    progress_every: Duration::from_secs(10),
+};
+
+type Poll = Result<Option<RestoreJob>, CliError>;
+
+fn polls(items: Vec<Poll>) -> impl FnMut() -> Poll {
+    let mut q: VecDeque<Poll> = items.into();
+    move || q.pop_front().expect("polled past the script")
+}
+
+fn unreachable_err() -> CliError {
+    CliError::DaemonNotReachable {
+        reason: "connection refused".into(),
+    }
+}
+
+#[test]
+fn wait_for_job_polls_until_finished() {
+    let mut slept = Duration::ZERO;
+    let done = wait_for_job(
+        polls(vec![
+            Ok(Some(job(RestoreJobState::Queued, 0, 3))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(finished_job(RestoreOutcome::Complete))),
+        ]),
+        |d| slept += d,
+        |_| {},
+        FAST,
+    )
+    .unwrap();
+    assert_eq!(done.outcome, Some(RestoreOutcome::Complete));
+    assert_eq!(slept, Duration::from_secs(4), "polled every 2 s");
+}
+
+/// restore-i4: no overall deadline — a job that runs for hours is waited for.
+#[test]
+fn wait_for_job_has_no_overall_deadline() {
+    let mut script: Vec<Poll> = (0..5000)
+        .map(|_| Ok(Some(job(RestoreJobState::Running, 1, 3))))
+        .collect();
+    script.push(Ok(Some(finished_job(RestoreOutcome::Complete))));
+    let done = wait_for_job(polls(script), |_| {}, |_| {}, FAST).unwrap();
+    assert_eq!(done.outcome, Some(RestoreOutcome::Complete));
+}
+
+#[test]
+fn wait_for_job_reports_progress_only_on_change() {
+    let running = |n| Ok(Some(job(RestoreJobState::Running, n, 9)));
+    let mut seen: Vec<(RestoreJobState, u32)> = Vec::new();
+    wait_for_job(
+        polls(vec![
+            Ok(Some(job(RestoreJobState::Queued, 0, 9))),
+            running(0),
+            running(0),
+            running(0),
+            running(0),
+            running(0),
+            running(0),
+            running(1),
+            running(1),
+            running(1),
+            running(1),
+            running(1),
+            Ok(Some(finished_job(RestoreOutcome::Complete))),
+        ]),
+        |_| {},
+        |j| seen.push((j.state, j.files_restored)),
+        FAST,
+    )
+    .unwrap();
+    // queued at once; running 0/9 once 10 s later; 1/9 once, never repeated.
+    assert_eq!(
+        seen,
+        vec![
+            (RestoreJobState::Queued, 0),
+            (RestoreJobState::Running, 0),
+            (RestoreJobState::Running, 1),
+        ]
+    );
+}
+
+#[test]
+fn wait_for_job_gives_up_after_max_silence_with_last_known_job() {
+    let mut script: Vec<Poll> = vec![Ok(Some(job(RestoreJobState::Running, 2, 3)))];
+    script.extend((0..40).map(|_| Err(unreachable_err())));
+    let polled_after = std::cell::Cell::new(0u32);
+    let err = wait_for_job(
+        {
+            let mut inner = polls(script);
+            let polled_after = &polled_after;
+            move || {
+                polled_after.set(polled_after.get() + 1);
+                inner()
+            }
+        },
+        |_| {},
+        |_| {},
+        FAST,
+    )
+    .unwrap_err();
+    let WaitError::LostContact { last_known } = err;
+    assert_eq!(last_known.unwrap().files_restored, 2);
+    // 1 good poll + 31 failures: 31 × 2 s > 60 s.
+    assert_eq!(polled_after.get(), 32);
+}
+
+#[test]
+fn wait_for_job_tolerates_short_daemon_silence() {
+    let mut script: Vec<Poll> = vec![Ok(Some(job(RestoreJobState::Running, 0, 3)))];
+    script.extend((0..20).map(|_| Err(unreachable_err())));
+    script.push(Ok(Some(finished_job(RestoreOutcome::Complete))));
+    let done = wait_for_job(polls(script), |_| {}, |_| {}, FAST).unwrap();
+    assert_eq!(done.outcome, Some(RestoreOutcome::Complete));
+}
+
+#[test]
+fn wait_for_job_treats_unknown_job_as_lost_contact() {
+    let err = wait_for_job(
+        polls(vec![
+            Ok(Some(job(RestoreJobState::Running, 0, 3))),
+            Ok(None),
+        ]),
+        |_| {},
+        |_| {},
+        FAST,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        WaitError::LostContact {
+            last_known: Some(_)
+        }
+    ));
+}
+
+#[test]
+fn command_restore_status_without_id_lists_jobs() {
+    let Command::Restore { status, path, .. } = parse(&["viaticum", "restore", "--status"]) else {
+        panic!("expected Restore");
+    };
+    assert_eq!(status.as_deref(), Some(""));
+    assert_eq!(path, None);
+}
+
+#[test]
+fn command_restore_status_with_id() {
+    let Command::Restore { status, json, .. } =
+        parse(&["viaticum", "restore", "--status", "3f2a", "--json"])
+    else {
+        panic!("expected Restore");
+    };
+    assert_eq!(status.as_deref(), Some("3f2a"));
+    assert!(json);
+    assert!(
+        Cli::try_parse_from(["viaticum", "restore", "--status", "3f2a", "--no-wait"]).is_err(),
+        "--status conflicts with --no-wait"
+    );
+}
+
+#[test]
+fn command_restore_without_path_or_status_is_invalid() {
+    let cmd = parse(&["viaticum", "restore"]);
+    let err = run(&cmd).unwrap_err();
+    assert!(matches!(err, CliError::InvalidArgument(_)), "{err:?}");
+}
+
+#[test]
+fn command_restore_parses_no_wait_and_json() {
+    let Command::Restore {
+        path,
+        no_wait,
+        json,
+        ..
+    } = parse(&["viaticum", "restore", "/a/b", "--no-wait", "--json"])
+    else {
+        panic!("expected Restore");
+    };
+    assert_eq!(path.as_deref(), Some("/a/b"));
+    assert!(no_wait && json);
+}
+
+// ─── run_restore over a scripted daemon ───────────────────────────────────────
+
+#[derive(Clone, Default)]
+struct SharedBuf(Rc<RefCell<Vec<u8>>>);
+
+impl SharedBuf {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.borrow().clone()).unwrap()
+    }
+}
+
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The daemon's restore endpoints, scripted. Records every call and what stdout
+/// held at the first poll.
+struct FakeApi {
+    submit: RefCell<Option<Result<RestoreJob, RestoreRejection>>>,
+    polls: RefCell<VecDeque<Poll>>,
+    out: SharedBuf,
+    out_at_first_poll: RefCell<Option<String>>,
+    calls: RefCell<Vec<&'static str>>,
+}
+
+impl FakeApi {
+    fn new(
+        submit: Result<RestoreJob, RestoreRejection>,
+        polls: Vec<Poll>,
+        out: &SharedBuf,
+    ) -> Self {
+        FakeApi {
+            submit: RefCell::new(Some(submit)),
+            polls: RefCell::new(polls.into()),
+            out: out.clone(),
+            out_at_first_poll: RefCell::new(None),
+            calls: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl RestoreApi for FakeApi {
+    fn submit(&self, _body: String) -> Result<Result<RestoreJob, RestoreRejection>, CliError> {
+        self.calls.borrow_mut().push("submit");
+        Ok(self.submit.borrow_mut().take().expect("one submit"))
+    }
+    fn get_job(&self, _job_id: &str) -> Result<Option<RestoreJob>, CliError> {
+        self.calls.borrow_mut().push("get_job");
+        self.out_at_first_poll
+            .borrow_mut()
+            .get_or_insert_with(|| self.out.text());
+        self.polls
+            .borrow_mut()
+            .pop_front()
+            .expect("polled past the script")
+    }
+    fn list_jobs(&self) -> Result<Vec<RestoreJob>, CliError> {
+        self.calls.borrow_mut().push("list_jobs");
+        Ok(vec![finished_job(RestoreOutcome::Complete)])
+    }
+}
+
+fn args(json: bool) -> RestoreArgs<'static> {
+    RestoreArgs {
+        path: Some("/home/kolya/photos/"),
+        version: None,
+        date: None,
+        dest: None,
+        no_wait: false,
+        status: None,
+        json,
+    }
+}
+
+/// Run over the fake; (exit code, stdout, stderr).
+fn run_fake(api: &FakeApi, a: RestoreArgs<'_>) -> (i32, String, String) {
+    let err = SharedBuf::default();
+    let code = run_restore_with(
+        a,
+        api,
+        &mut api.out.clone(),
+        &mut err.clone(),
+        &mut |_| {},
+        FAST,
+    )
+    .unwrap();
+    (code, api.out.text(), err.text())
+}
+
+/// restore-i3: the exit code is the job's outcome — a job that restored nothing is
+/// a failure (1), partial is 2, complete 0; never "success" for nothing restored.
+#[test]
+fn run_restore_exits_by_the_finished_job_outcome() {
+    for (outcome, code) in [
+        (RestoreOutcome::Complete, 0),
+        (RestoreOutcome::Partial, 2),
+        (RestoreOutcome::NothingRestored, 1),
+        (RestoreOutcome::Interrupted, 1),
+    ] {
+        let out = SharedBuf::default();
+        let api = FakeApi::new(
+            Ok(job(RestoreJobState::Queued, 0, 3)),
+            vec![
+                Ok(Some(job(RestoreJobState::Running, 0, 3))),
+                Ok(Some(finished_job(outcome))),
+            ],
+            &out,
+        );
+        let (got, stdout, _) = run_fake(&api, args(false));
+        assert_eq!(got, code, "{outcome:?}: {stdout}");
+    }
+}
+
+/// restore-i15: the job id reaches stdout before any waiting, so Ctrl-C during the
+/// wait loses nothing; the JSON first line is the submitted job, the last the
+/// finished one.
+#[test]
+fn json_mode_prints_submitted_job_before_waiting() {
+    let out = SharedBuf::default();
+    let api = FakeApi::new(
+        Ok(job(RestoreJobState::Queued, 0, 3)),
+        vec![
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(finished_job(RestoreOutcome::Partial))),
+        ],
+        &out,
+    );
+    let (code, stdout, _) = run_fake(&api, args(true));
+    assert_eq!(code, 2);
+
+    let first_poll = api.out_at_first_poll.borrow().clone().unwrap();
+    let submitted: RestoreJob = serde_json::from_str(first_poll.trim()).unwrap();
+    assert_eq!(submitted.state, RestoreJobState::Queued);
+
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "NDJSON: submitted + final, no progress lines: {stdout}"
+    );
+    let last: RestoreJob = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(last.outcome, Some(RestoreOutcome::Partial));
+}
+
+/// restore-i15: the CLI only ever submits and reads; it has no way to stop a job.
+#[test]
+fn run_restore_only_submits_and_reads_the_job() {
+    let out = SharedBuf::default();
+    let api = FakeApi::new(
+        Ok(job(RestoreJobState::Queued, 0, 3)),
+        vec![Ok(Some(finished_job(RestoreOutcome::Complete)))],
+        &out,
+    );
+    let (_, stdout, _) = run_fake(&api, args(false));
+    assert_eq!(*api.calls.borrow(), vec!["submit", "get_job"]);
+    assert!(
+        stdout.contains("Ctrl-C stops watching, not the restore"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("viaticum restore --status 3f2a"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn run_restore_rejected_submit_exits_1_without_polling() {
+    let out = SharedBuf::default();
+    let api = FakeApi::new(
+        Err(RestoreRejection::NotInCatalog {
+            path: "/home/kolya/photos/".into(),
+        }),
+        vec![],
+        &out,
+    );
+    let (code, stdout, stderr) = run_fake(&api, args(false));
+    assert_eq!(code, 1);
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("not in the backup catalog"), "{stderr}");
+    assert_eq!(*api.calls.borrow(), vec!["submit"]);
+}
+
+#[test]
+fn run_restore_no_wait_exits_0_after_printing_the_job() {
+    let out = SharedBuf::default();
+    let api = FakeApi::new(Ok(job(RestoreJobState::Queued, 0, 3)), vec![], &out);
+    let (code, stdout, _) = run_fake(
+        &api,
+        RestoreArgs {
+            no_wait: true,
+            ..args(false)
+        },
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains("submitted"), "{stdout}");
+    assert_eq!(*api.calls.borrow(), vec!["submit"]);
+}
+
+#[test]
+fn run_restore_lost_contact_exits_1_and_names_staging() {
+    let out = SharedBuf::default();
+    let mut script: Vec<Poll> = vec![Ok(Some(job(RestoreJobState::Running, 1, 3)))];
+    script.extend((0..40).map(|_| Err(unreachable_err())));
+    let api = FakeApi::new(Ok(job(RestoreJobState::Queued, 0, 3)), script, &out);
+    let (code, _, stderr) = run_fake(&api, args(false));
+    assert_eq!(code, 1);
+    assert!(stderr.contains("lost contact with the daemon"), "{stderr}");
+    assert!(stderr.contains("/restore/3f2a"), "{stderr}");
+    assert!(
+        stderr.contains("viaticum restore --status 3f2a"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn run_restore_status_unknown_id_exits_1_and_known_exits_0() {
+    let out = SharedBuf::default();
+    let api = FakeApi::new(Ok(job(RestoreJobState::Queued, 0, 3)), vec![Ok(None)], &out);
+    let (code, _, stderr) = run_fake(
+        &api,
+        RestoreArgs {
+            path: None,
+            status: Some("nope"),
+            ..args(false)
+        },
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("unknown restore job nope"), "{stderr}");
+
+    let out = SharedBuf::default();
+    let api = FakeApi::new(
+        Ok(job(RestoreJobState::Queued, 0, 3)),
+        vec![Ok(Some(finished_job(RestoreOutcome::Interrupted)))],
+        &out,
+    );
+    let (code, stdout, _) = run_fake(
+        &api,
+        RestoreArgs {
+            path: None,
+            status: Some("3f2a"),
+            json: true,
+            ..args(false)
+        },
+    );
+    assert_eq!(code, 0, "found");
+    let j: RestoreJob = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(j.outcome, Some(RestoreOutcome::Interrupted));
 }
 
 // ── DR readiness and missing sources in `status` (dr-i9, dr-i11) ──────────────
@@ -920,4 +1574,83 @@ fn status_render_counts_files_without_local_source_when_positive() {
         rendered.contains("files without local source: 3 (not re-protected"),
         "got: {rendered}"
     );
+}
+
+// ─── restore-i26: a job waiting for holders does not look hung ───────────────
+
+fn waiting_job(until: &str) -> RestoreJob {
+    RestoreJob {
+        waiting_for_holders_until: Some(until.into()),
+        ..job(RestoreJobState::Running, 1, 3)
+    }
+}
+
+#[test]
+fn render_restore_progress_when_waiting_for_holders_shows_retry_in_relative_time() {
+    // 2026-09-27T10:05:00Z = 1790503500; now = 4 min before.
+    let now = 1_790_503_500 - 240;
+    let line = output::render_restore_progress(&waiting_job("2026-09-27T10:05:00Z"), now);
+    assert!(
+        line.starts_with("running: 1/3 restored, 0 failed"),
+        "{line}"
+    );
+    assert!(
+        line.contains("holders did not answer") && line.contains("retry in 4 min"),
+        "{line}"
+    );
+    let plain = output::render_restore_progress(&job(RestoreJobState::Running, 1, 3), now);
+    assert!(!plain.contains("did not answer"), "{plain}");
+}
+
+#[test]
+fn retry_in_counts_down_from_the_wire_time() {
+    let until = "2026-09-27T10:05:00Z";
+    let t = 1_790_503_500u64;
+    assert_eq!(
+        crate::daemon::dispatch::unix_secs_to_iso(t, true),
+        until,
+        "test anchor matches the daemon's formatter"
+    );
+    assert_eq!(output::retry_in(until, t - 30), "retry in 30 s");
+    assert_eq!(output::retry_in(until, t - 61), "retry in 2 min");
+    assert_eq!(output::retry_in(until, t - 3_720), "retry in 1 h 2 min");
+    assert_eq!(output::retry_in(until, t), "retrying now");
+    assert_eq!(output::retry_in(until, t + 5), "retrying now");
+    assert_eq!(output::retry_in("soon", t), "retry at soon");
+}
+
+#[test]
+fn wait_for_job_reports_when_job_starts_and_stops_waiting_for_holders() {
+    let mut seen: Vec<bool> = Vec::new();
+    wait_for_job(
+        polls(vec![
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(waiting_job("2026-09-27T10:05:00Z"))),
+            Ok(Some(waiting_job("2026-09-27T10:05:00Z"))),
+            Ok(Some(waiting_job("2026-09-27T10:05:00Z"))),
+            Ok(Some(waiting_job("2026-09-27T10:05:00Z"))),
+            Ok(Some(waiting_job("2026-09-27T10:05:00Z"))),
+            Ok(Some(job(RestoreJobState::Running, 1, 3))),
+            Ok(Some(finished_job(RestoreOutcome::Complete))),
+        ]),
+        |_| {},
+        |j| seen.push(j.waiting_for_holders_until.is_some()),
+        FAST,
+    )
+    .unwrap();
+    assert_eq!(seen, vec![false, true, false]);
+}
+
+#[test]
+fn restore_job_wire_omits_waiting_field_unless_waiting() {
+    let plain = serde_json::to_value(job(RestoreJobState::Running, 1, 3)).unwrap();
+    assert!(plain.get("waiting_for_holders_until").is_none(), "{plain}");
+    let waiting = serde_json::to_value(waiting_job("2026-09-27T10:05:00Z")).unwrap();
+    assert_eq!(waiting["waiting_for_holders_until"], "2026-09-27T10:05:00Z");
+    let back: RestoreJob = serde_json::from_value(plain).unwrap();
+    assert_eq!(back.waiting_for_holders_until, None);
 }

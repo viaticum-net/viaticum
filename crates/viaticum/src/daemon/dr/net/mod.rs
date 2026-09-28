@@ -509,11 +509,12 @@ pub(super) async fn fetch_ss_block(
         .collect();
 
     let symbols = crate::daemon::symbol_fetch::fetch_unbound_symbols(
-        swarm,
+        swarm.as_ref(),
         encoder,
         &bref.block_id,
         &placements,
         &params,
+        None,
     )
     .await
     .map_err(|e| anyhow::anyhow!("fetch_unbound_symbols: {e}"))?;

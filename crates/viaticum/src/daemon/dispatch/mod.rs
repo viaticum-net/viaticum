@@ -11,11 +11,11 @@ use viaticum_core::types::{
 
 use crate::cli::types::{
     CliRequest, CliResponse, DeviceEntry, EffectiveStatus, FileEntry, PeerSummary, RestoreBlocker,
-    RestoreData, StatusData, VersionEntry,
+    RestoreRejection, StatusData, VersionEntry,
 };
 use crate::daemon::handle::DaemonState;
 use crate::daemon::restore::staging::JobId;
-use crate::daemon::restore::{RestoreError, RestoreRequest, VersionSelector};
+use crate::daemon::restore::{RestoreCoordinator, RestoreRequest, VersionSelector};
 
 pub mod missing_sources;
 
@@ -41,6 +41,10 @@ pub(crate) async fn dispatch(request: CliRequest, state: &DaemonState) -> CliRes
             date,
             dest,
         } => dispatch_restore(state, path, version, date, dest).await,
+
+        CliRequest::RestoreJobStatus { job_id } => dispatch_restore_job(state, &job_id).await,
+
+        CliRequest::RestoreJobList => CliResponse::RestoreJobs(state.restore_jobs.list()),
 
         CliRequest::DeviceList => dispatch_device_list(state),
 
@@ -250,10 +254,33 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
     };
 
     let by_importance = compute_importance_buckets(&source_blocks);
+    // restore-i8/i18/i19: cached staging status (set before the web API started,
+    // refreshed hourly and by the restore coordinator after each job); no disk walk.
+    let staging = *state
+        .restore_staging
+        .lock()
+        .expect("restore staging status lock poisoned");
+    let effective_quota_bytes = {
+        let disk_free = crate::daemon::handle::disk_available_bytes(&state.data_dir);
+        viaticum_core::budget::compute_effective_quota(
+            state.soft_quota_bytes,
+            disk_free,
+            state.disk_reserve_bytes,
+        )
+    };
+    let staging_squeezes_holdings = crate::daemon::restore::cleanup::staging_squeezes_holdings(
+        crate::daemon::restore::cleanup::holder_stops_taking_data(
+            state.soft_quota_bytes,
+            crate::daemon::restore::cleanup::disk_free_bytes(&state.data_dir),
+            state.disk_reserve_bytes,
+            holdings_bytes,
+        ),
+        staging.bytes,
+    );
     let mut dr = dr_readiness(&state.db);
     dr.files_without_source = state.missing_sources.get(&state.db).await;
 
-    CliResponse::Status(StatusData {
+    CliResponse::Status(Box::new(StatusData {
         node_identity,
         device_id,
         node_addr,
@@ -266,14 +293,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         backed_up_bytes,
         blocks_needing_repair,
         peers: peer_summaries,
-        effective_quota_bytes: {
-            let disk_free = crate::daemon::handle::disk_available_bytes(&state.data_dir);
-            viaticum_core::budget::compute_effective_quota(
-                state.soft_quota_bytes,
-                disk_free,
-                state.disk_reserve_bytes,
-            )
-        },
+        effective_quota_bytes,
         used_bytes: holdings_bytes,
         pos_total_challenges,
         pos_total_passes,
@@ -284,12 +304,21 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         blocks_at_risk,
         table_stats: state.db.table_stats().ok(),
         by_importance,
+        restore_staging_jobs: staging.job_dirs,
+        restore_staging_bytes: staging.bytes,
+        restore_staging_path: state
+            .data_dir
+            .join("restore")
+            .to_string_lossy()
+            .into_owned(),
+        restore_publish: staging.publish.as_str().to_string(),
+        restore_staging_squeezes_holdings: staging_squeezes_holdings,
         dr_pointer_published_at: dr.published_at,
         dr_pointer_files: dr.files,
         dr_pointer_acks: dr.acks,
         catalog_lineage: dr.lineage,
         files_without_source: dr.files_without_source,
-    })
+    }))
 }
 
 /// Status fields about DR readiness (dr-i9) and missing sources (dr-i11).
@@ -337,6 +366,8 @@ pub(crate) fn dr_readiness(db: &viaticum_core::db::Db) -> DrReadiness {
 /// reconstruct it without the local source. Conservative — returns false when the
 /// version is not backed up, the block record is missing, or it is below target
 /// (a target of 0.0 is the pre-migration sentinel and never counts as safe).
+/// "At target" is `reliability::meets_target` — the one tolerance-aware definition
+/// (repair-i3).
 fn compute_is_safe_to_delete(state: &DaemonState, file: &FileRecord) -> bool {
     let Some(version) = file.versions.last() else {
         return false;
@@ -346,7 +377,11 @@ fn compute_is_safe_to_delete(state: &DaemonState, file: &FileRecord) -> bool {
     }
     match state.db.get_source_block(&version.source_block_id) {
         Ok(Some(block)) => {
-            block.target_reliability > 0.0 && block.current_reliability >= block.target_reliability
+            block.target_reliability > 0.0
+                && viaticum_core::reliability::meets_target(
+                    block.current_reliability,
+                    block.target_reliability,
+                )
         }
         _ => false,
     }
@@ -472,8 +507,8 @@ fn dispatch_versions(state: &DaemonState, path: &str) -> CliResponse {
             let content_hash_hex = hex_encode(&v.content_hash);
             let source_block_id_hex = hex_encode(&v.source_block_id.0);
             let effective_status = compute_effective_status(state, v);
-            // restore_blocker is the count-side of effective_status; the precise
-            // blocker (symbols actually fetched) is computed on click in dispatch_restore.
+            // restore_blocker is the count-side of effective_status (owner's estimate);
+            // what a restore actually got is in its job's failures (restore-i3).
             let restore_blocker = match &effective_status {
                 EffectiveStatus::Replicating { live, target }
                 | EffectiveStatus::Degraded { live, target, .. } => {
@@ -506,6 +541,10 @@ fn dispatch_versions(state: &DaemonState, path: &str) -> CliResponse {
 
 // ── Restore ───────────────────────────────────────────────────────────────────
 
+/// Submit a restore job (restore-i3, i4). Answers at once: the job (`queued`), or a
+/// rejection when no job can do anything — the path is not in the catalog, nothing
+/// under it has a backed-up version, a bad argument, or the queue is full / closed.
+/// A rejected request creates no job and no staging dir.
 async fn dispatch_restore(
     state: &DaemonState,
     path: String,
@@ -513,106 +552,107 @@ async fn dispatch_restore(
     date: Option<String>,
     dest: Option<String>,
 ) -> CliResponse {
-    // Alpha: dest is not supported. Reject immediately with a structured error.
     if dest.is_some() {
-        return CliResponse::Error("dest_not_supported_in_alpha".to_string());
+        return CliResponse::RestoreRejected(RestoreRejection::DestNotSupported);
     }
 
-    // Resolve version selector.
+    // version is 1-based from the CLI; the selector index is 0-based.
     let version_selector = if let Some(v) = version {
-        // version is 1-based from CLI; convert to 0-based index.
-        let idx = v.saturating_sub(1) as usize;
-        VersionSelector::Index(idx)
+        VersionSelector::Index(v.saturating_sub(1) as usize)
     } else if let Some(ref d) = date {
-        // Parse ISO-8601 date "YYYY-MM-DD" as a Timestamp (start of day UTC).
         match parse_iso_date(d) {
             Some(ts) => VersionSelector::BeforeDate(ts),
             None => {
-                return CliResponse::Error(format!(
-                    "invalid date format: {d} (expected YYYY-MM-DD)"
-                ));
+                return CliResponse::RestoreRejected(RestoreRejection::InvalidDate {
+                    date: d.clone(),
+                });
             }
         }
     } else {
         VersionSelector::Latest
     };
 
-    let job_id = JobId::new();
+    // A range scan of the catalog (A12): cheap enough for the request path.
+    let records = match crate::daemon::restore::resolve_path(&state.db, &path) {
+        Ok(r) => r,
+        Err(e) => return CliResponse::Error(format!("db error resolving {path}: {e}")),
+    };
+    if records.is_empty() {
+        return CliResponse::RestoreRejected(RestoreRejection::NotInCatalog { path });
+    }
+    // `--version 0` names nothing (versions are 1-based), not version 1.
+    let selectable = version != Some(0)
+        && records
+            .iter()
+            .any(|r| RestoreCoordinator::select_version(r, &version_selector).is_some());
+    if !selectable {
+        let available = backed_up_version_numbers(&records);
+        return CliResponse::RestoreRejected(match version {
+            Some(version) if !available.is_empty() => RestoreRejection::VersionNotFound {
+                path,
+                version,
+                available,
+            },
+            _ => RestoreRejection::NotBackedUp { path },
+        });
+    }
 
+    let job_id = JobId::new();
+    let job = state
+        .restore_jobs
+        .submit(job_id, &path, records.len() as u32);
     let request = RestoreRequest {
-        path: path.clone(),
+        path,
         version_selector,
         job_id,
     };
-
-    // Look up the file record to find the version that will be used.
-    // This lets us populate RestoreData accurately without waiting for the full restore.
-    let (version_used, content_hash_hex) = match state.db.get_file(&path) {
-        Ok(Some(record)) => {
-            let v_idx = match &request.version_selector {
-                VersionSelector::Latest => record.versions.len().saturating_sub(1),
-                VersionSelector::Index(i) => *i,
-                VersionSelector::BeforeDate(ts) => {
-                    // Find rightmost version with backed_up_at <= ts.
-                    record
-                        .versions
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, v)| v.backed_up_at.map(|t| (i, t)))
-                        .filter(|(_, t)| t.0 <= ts.0)
-                        .map(|(i, _)| i)
-                        .next_back()
-                        .unwrap_or(0)
-                }
-            };
-            let hash_hex = record
-                .versions
-                .get(v_idx)
-                .map(|v| hex_encode(&v.content_hash))
-                .unwrap_or_else(|| "0".repeat(64));
-            ((v_idx + 1) as u32, hash_hex)
+    match state.restore_tx.try_send(request) {
+        Ok(()) => CliResponse::RestoreJob(job),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            state.restore_jobs.remove(job_id);
+            CliResponse::RestoreRejected(RestoreRejection::Busy {
+                active: state.restore_jobs.active_count(),
+            })
         }
-        Ok(None) => (1, "0".repeat(64)),
-        Err(e) => return CliResponse::Error(format!("db error looking up file: {e}")),
-    };
-
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if state.restore_tx.send((request, reply_tx)).await.is_err() {
-        return CliResponse::Error("restore coordinator not running".to_string());
-    }
-
-    match reply_rx.await {
-        Ok(Ok(result)) => CliResponse::Restore(RestoreData {
-            path,
-            version_used,
-            content_hash_hex,
-            status: "started".to_string(),
-            staging_path: result.staging_path.to_string_lossy().into_owned(),
-        }),
-        Ok(Err(e)) => match restore_error_to_blocker(&e) {
-            Some(blocker) => CliResponse::RestoreBlocked(blocker),
-            None => CliResponse::Error(format!("restore failed: {e}")),
-        },
-        Err(_) => CliResponse::Error("restore coordinator dropped response".to_string()),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            state.restore_jobs.remove(job_id);
+            CliResponse::RestoreRejected(RestoreRejection::Unavailable)
+        }
     }
 }
 
-/// Map RestoreError to a structured RestoreBlocker for UI consumption. Returns
-/// None for genuine internal errors (decode failures, IO, DB) — those stay as
-/// 500-class errors. Only "you can't restore yet because..." cases convert.
-fn restore_error_to_blocker(e: &RestoreError) -> Option<RestoreBlocker> {
-    match e {
-        RestoreError::InsufficientSymbols { got, need, .. } => {
-            Some(RestoreBlocker::InsufficientPlacements {
-                have: *got as u32,
-                need: *need as u32,
-                holders_offline: (*need as u32).saturating_sub(*got as u32),
-            })
-        }
-        // NOTE-1: `RestoreError::NoHolders` was removed (A4 removed its only constructor;
-        // the empty-placement case now surfaces as InsufficientPlacements/InsufficientSymbols).
-        RestoreError::Timeout { .. } => None,
-        _ => None,
+/// The 1-based version numbers backed up in any of `records`, ascending.
+fn backed_up_version_numbers(records: &[FileRecord]) -> Vec<u32> {
+    let numbers: std::collections::BTreeSet<u32> = records
+        .iter()
+        .flat_map(|r| {
+            r.versions
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.backed_up_at.is_some())
+                .map(|(i, _)| i as u32 + 1)
+        })
+        .collect();
+    numbers.into_iter().collect()
+}
+
+/// One restore job by id: from memory, else from its job dir (never "unknown" for
+/// an existing job dir, restore-i14).
+async fn dispatch_restore_job(state: &DaemonState, job_id: &str) -> CliResponse {
+    let unknown = || {
+        CliResponse::RestoreRejected(RestoreRejection::UnknownJob {
+            job_id: job_id.to_string(),
+        })
+    };
+    let Some(id) = JobId::parse(job_id) else {
+        return unknown();
+    };
+    // The disk fallback may walk a job dir: off the async workers.
+    let jobs = state.restore_jobs.clone();
+    match tokio::task::spawn_blocking(move || jobs.get(id)).await {
+        Ok(Some(job)) => CliResponse::RestoreJob(job),
+        Ok(None) => unknown(),
+        Err(e) => CliResponse::Error(format!("restore job lookup failed: {e}")),
     }
 }
 
@@ -1033,7 +1073,7 @@ const BUCKET_DEFS: [BucketDef; 5] = [
 pub(crate) fn compute_importance_buckets(
     source_blocks: &[viaticum_core::types::SourceBlockRecord],
 ) -> Vec<viaticum_core::types::ImportanceBucketStats> {
-    use viaticum_core::reliability::target_reliability;
+    use viaticum_core::reliability::{meets_target, target_reliability};
     use viaticum_core::types::{ImportanceBucketStats, SourceBlockStatus};
 
     // Accumulators: (count, sum_of_current_reliability)
@@ -1076,7 +1116,7 @@ pub(crate) fn compute_importance_buckets(
                     block_count: count,
                     mean_p_recoverable: mean,
                     target_p,
-                    status: if mean >= target_p {
+                    status: if meets_target(mean, target_p) {
                         "healthy".to_string()
                     } else {
                         "degraded".to_string()

@@ -6,14 +6,26 @@ use viaticum_core::db::Db;
 use viaticum_core::types::{DeviceId, IdentityPub};
 
 use crate::cli::types::{CliRequest, CliResponse};
+use crate::cli::types::{
+    RestoreFailure, RestoreFailureKind, RestoreJobState, RestoreOutcome, RestoreRejection,
+};
 use crate::daemon::handle::DaemonState;
-use crate::daemon::restore::{RestoreError, RestoreRequest, RestoreResult};
+use crate::daemon::restore::RestoreRequest;
+use crate::daemon::restore::jobs::RestoreJobs;
+use crate::daemon::restore::staging::JobId;
 
 use super::dispatch;
 
 // ============================================================
 // Test helper: build a minimal DaemonState backed by in-memory DB
 // ============================================================
+
+/// A registry over a staging root that does not exist (no job dirs).
+fn test_jobs() -> RestoreJobs {
+    RestoreJobs::new(std::path::PathBuf::from(
+        "/nonexistent/viaticum-test/restore",
+    ))
+}
 
 async fn make_test_state() -> Arc<DaemonState> {
     let db = Db::open_in_memory().expect("in-memory db");
@@ -22,16 +34,15 @@ async fn make_test_state() -> Arc<DaemonState> {
     let master_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
     let identity_pub = IdentityPub(master_key.verifying_key().to_bytes());
 
-    let (restore_tx, _restore_rx) = mpsc::channel::<(
-        RestoreRequest,
-        tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
-    )>(4);
+    let (restore_tx, _restore_rx) = mpsc::channel::<crate::daemon::restore::RestoreRequest>(4);
 
     Arc::new(DaemonState {
         db,
         identity_pub,
         device_id,
         restore_tx,
+        restore_jobs: test_jobs(),
+        restore_staging: Default::default(),
         cluster_state: None,
         master_key,
         seed: vec![0u8; 64],
@@ -209,30 +220,6 @@ async fn dispatch_versions_unknown_path_returns_empty_list() {
 }
 
 #[tokio::test]
-async fn dispatch_restore_coordinator_not_running_returns_error() {
-    let state = make_test_state().await;
-    // Drop the receiver so the send fails immediately.
-    // (The make_test_state already drops _restore_rx; channel is bounded=4,
-    // but since receiver is dropped, any send will fail.)
-    let request = CliRequest::Restore {
-        path: "some/file.txt".into(),
-        version: None,
-        date: None,
-        dest: None,
-    };
-    // The file doesn't exist in DB, so get_file returns None → version_used=1.
-    // Then send on a dropped-receiver channel → Error response.
-    let response = dispatch(request, &state).await;
-    // Either coordinator not running or db lookup returns empty:
-    // both map to an error or valid Restore stub.
-    match response {
-        CliResponse::Error(_) => {}   // expected: coordinator not running
-        CliResponse::Restore(_) => {} // also acceptable if db returned empty
-        other => panic!("unexpected response: {other:?}"),
-    }
-}
-
-#[tokio::test]
 async fn dispatch_device_revoke_no_cluster_returns_error() {
     let state = make_test_state().await;
     let id = "aa".repeat(16);
@@ -277,18 +264,15 @@ async fn dispatch_device_revoke_returns_device_revoked_with_no_router() {
     cs.add_device(cert_b.clone(), now).unwrap();
     let cluster_state = Arc::new(Mutex::new(cs));
 
-    let (restore_tx, _restore_rx) = mpsc::channel::<(
-        crate::daemon::restore::RestoreRequest,
-        tokio::sync::oneshot::Sender<
-            Result<crate::daemon::restore::RestoreResult, crate::daemon::restore::RestoreError>,
-        >,
-    )>(4);
+    let (restore_tx, _restore_rx) = mpsc::channel::<crate::daemon::restore::RestoreRequest>(4);
 
     let state = Arc::new(DaemonState {
         db,
         identity_pub,
         device_id: device_id_a,
         restore_tx,
+        restore_jobs: test_jobs(),
+        restore_staging: Default::default(),
         cluster_state: Some(cluster_state),
         master_key,
         seed: seed_a.to_vec(),
@@ -401,24 +385,6 @@ async fn dispatch_connect_valid_addr_but_unreachable_returns_error() {
 
 // dispatch_connect_two_daemons_registers_peer removed in ε.5 (iroh removal).
 // The libp2p equivalent test should be in swarm_tests.rs.
-
-/// C3: Restore with dest returns "dest_not_supported_in_alpha" error.
-#[tokio::test]
-async fn restore_with_dest_returns_error() {
-    let state = make_test_state().await;
-    let request = CliRequest::Restore {
-        path: "/some/file.txt".into(),
-        version: None,
-        date: None,
-        dest: Some("/tmp/custom_dest".to_string()),
-    };
-    let response = dispatch(request, &state).await;
-    assert_eq!(
-        response,
-        CliResponse::Error("dest_not_supported_in_alpha".to_string()),
-        "dest must be rejected with dest_not_supported_in_alpha, got: {response:?}"
-    );
-}
 
 // ============================================================
 // Wave 12 ATDD: importance bucket tests
@@ -925,12 +891,7 @@ async fn revocation_published_only_to_storage_relationship_peers() {
         db.set_master_for_device(&u1_device, &u1_master).unwrap();
     }
 
-    let (restore_tx, _restore_rx) = mpsc::channel::<(
-        crate::daemon::restore::RestoreRequest,
-        tokio::sync::oneshot::Sender<
-            Result<crate::daemon::restore::RestoreResult, crate::daemon::restore::RestoreError>,
-        >,
-    )>(4);
+    let (restore_tx, _restore_rx) = mpsc::channel::<crate::daemon::restore::RestoreRequest>(4);
 
     let (router, sender) = make_router_for_revocation(&db);
 
@@ -939,6 +900,8 @@ async fn revocation_published_only_to_storage_relationship_peers() {
         identity_pub: our_master,
         device_id: our_device_id,
         restore_tx,
+        restore_jobs: test_jobs(),
+        restore_staging: Default::default(),
         cluster_state: Some(cluster_state),
         master_key,
         seed: seed.to_vec(),
@@ -1086,12 +1049,7 @@ async fn revocation_dedup_peer_is_holder_and_owner() {
     };
     db.upsert_holding(&holding).unwrap();
 
-    let (restore_tx, _restore_rx) = mpsc::channel::<(
-        crate::daemon::restore::RestoreRequest,
-        tokio::sync::oneshot::Sender<
-            Result<crate::daemon::restore::RestoreResult, crate::daemon::restore::RestoreError>,
-        >,
-    )>(4);
+    let (restore_tx, _restore_rx) = mpsc::channel::<crate::daemon::restore::RestoreRequest>(4);
 
     let (router, sender) = make_router_for_revocation(&db);
 
@@ -1100,6 +1058,8 @@ async fn revocation_dedup_peer_is_holder_and_owner() {
         identity_pub: our_master,
         device_id: our_device_id,
         restore_tx,
+        restore_jobs: test_jobs(),
+        restore_staging: Default::default(),
         cluster_state: Some(cluster_state),
         master_key,
         seed: seed.to_vec(),
@@ -1240,16 +1200,15 @@ async fn _removed_dispatch_connect_two_daemons_registers_peer() {
         .await
         .expect("handle_a"),
     );
-    let (restore_tx, _restore_rx) = mpsc::channel::<(
-        RestoreRequest,
-        tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
-    )>(4);
+    let (restore_tx, _restore_rx) = mpsc::channel::<crate::daemon::restore::RestoreRequest>(4);
     let state_a = Arc::new(DaemonState {
         db: db_a.clone(),
         identity_pub: pk_a,
         device_id: did_a,
         network: handle_a.clone(),
         restore_tx,
+        restore_jobs: test_jobs(),
+        restore_staging: Default::default(),
         cluster_state: None,
         incoming_tx: tx_a_for_state,
         master_key: master_a,
@@ -1293,10 +1252,458 @@ async fn _removed_dispatch_connect_two_daemons_registers_peer() {
 }
 
 // ============================================================
+// R1-e1 (repair-i3): one tolerance-aware "at target"
+// ============================================================
+
+#[tokio::test]
+async fn dispatch_files_is_safe_to_delete_at_float_boundary_of_target() {
+    // Five full copies at p = 0.9 compute to 0.9999899999999999 in f64, one ulp under
+    // target_reliability(1.0): mathematically at target, and shown as such.
+    let state = make_test_state().await;
+    let target = viaticum_core::reliability::target_reliability(1.0);
+    insert_file_with_block(&state, "notes.txt", 0.9999899999999999, target, true);
+    assert!(safe_to_delete_flag(&state, "notes.txt").await);
+}
+
+#[test]
+fn importance_bucket_is_healthy_at_float_boundary() {
+    // The spec's example (importance 1.0 at 0.9999899999999999) is healthy even with a
+    // raw `>=`: the critical bucket's target is target(0.95) ≈ 0.999982. The float
+    // boundary of a bucket is its own target: one ulp below it must read "healthy".
+    for (importance, bucket) in [(1.0, "critical"), (0.55, "medium")] {
+        let midpoint = if bucket == "critical" { 0.95 } else { 0.55 };
+        let target = viaticum_core::reliability::target_reliability(midpoint);
+        let one_ulp_below = f64::from_bits(target.to_bits() - 1);
+        let block = make_block(1, importance, one_ulp_below, SourceBlockStatus::Active);
+        let buckets = compute_importance_buckets(&[block]);
+        let b = buckets.iter().find(|b| b.bucket == bucket).unwrap();
+        assert_eq!(b.status, "healthy", "{bucket}");
+    }
+}
+
+// ============================================================
+// restore-i8 / i18 / i19: cached restore staging status in status
+// ============================================================
+
+fn staging_test_state(
+    data_dir: &std::path::Path,
+    restore_tx: mpsc::Sender<RestoreRequest>,
+    soft_quota_bytes: u64,
+) -> Arc<DaemonState> {
+    let master_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    Arc::new(DaemonState {
+        db: Db::open_in_memory().unwrap(),
+        identity_pub: IdentityPub(master_key.verifying_key().to_bytes()),
+        device_id: DeviceId([0u8; 32]),
+        restore_tx,
+        restore_jobs: test_jobs(),
+        restore_staging: Default::default(),
+        cluster_state: None,
+        master_key,
+        seed: vec![0u8; 64],
+        data_dir: data_dir.to_path_buf(),
+        soft_quota_bytes,
+        disk_reserve_bytes: 0,
+        hard_quota_bytes: 0,
+        time_scale: 1,
+        swarm_handle: None,
+        watch_admin: None,
+        config_admin: None,
+        restart_gate: None,
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
+        peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
+        mailbox_router: None,
+        missing_sources: Default::default(),
+    })
+}
+
+fn held(total_bytes: u64) -> viaticum_core::types::HoldingRecord {
+    viaticum_core::types::HoldingRecord {
+        source_block_id: viaticum_core::types::SourceBlockId([9u8; 32]),
+        owner_id: IdentityPub([8u8; 32]),
+        esi_ranges: vec![(0, 10)],
+        importance: 0.5,
+        total_bytes,
+        status: viaticum_core::types::HoldingStatus::Active,
+        received_at: viaticum_core::types::Timestamp(100),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    }
+}
+
+/// `status` reports the cached staging status (no disk walk on the request path).
+#[tokio::test]
+async fn dispatch_status_reports_cached_restore_staging_summary() {
+    use crate::daemon::restore::cleanup::{PublishCheck, StagingStatus};
+    use crate::daemon::restore::staging::publish::PublishMethod;
+    let state = make_test_state().await;
+    *state.restore_staging.lock().unwrap() = StagingStatus {
+        job_dirs: 3,
+        bytes: Some(1234),
+        publish: PublishCheck::Works(PublishMethod::RenameNoReplace),
+    };
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert_eq!(data.restore_staging_jobs, 3);
+    assert_eq!(data.restore_staging_bytes, Some(1234));
+    assert_eq!(data.restore_staging_path, "/tmp/restore");
+    assert_eq!(data.restore_publish, "rename_noreplace");
+}
+
+/// W3: before the byte walk finished, `status` says "counting" (None), not 0.
+#[tokio::test]
+async fn dispatch_status_reports_counting_before_first_byte_walk() {
+    use crate::daemon::restore::cleanup::StagingStatus;
+    let state = make_test_state().await;
+    *state.restore_staging.lock().unwrap() = StagingStatus {
+        job_dirs: 2,
+        bytes: None,
+        ..Default::default()
+    };
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert_eq!(data.restore_staging_jobs, 2);
+    assert_eq!(data.restore_staging_bytes, None);
+}
+
+/// restore-i18: holder under disk pressure + non-empty staging → the status flag;
+/// no pressure or empty staging → no flag.
+#[tokio::test]
+async fn dispatch_status_flags_staging_squeezing_holdings_under_pressure() {
+    use crate::daemon::restore::cleanup::StagingStatus;
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let (restore_tx, _rx) = mpsc::channel(1);
+    // Quota 1000 bytes, 950 held: free ratio 5 % < 15 % → pressure.
+    let state = staging_test_state(data_dir.path(), restore_tx, 1000);
+    state.db.upsert_holding(&held(950)).unwrap();
+
+    let status = |bytes: u64| StagingStatus {
+        job_dirs: 1,
+        bytes: Some(bytes),
+        ..Default::default()
+    };
+    *state.restore_staging.lock().unwrap() = status(5 * 1024 * 1024);
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert!(data.restore_staging_squeezes_holdings);
+
+    *state.restore_staging.lock().unwrap() = status(0);
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert!(
+        !data.restore_staging_squeezes_holdings,
+        "empty staging squeezes nothing"
+    );
+
+    let (restore_tx, _rx) = mpsc::channel(1);
+    let relaxed = staging_test_state(data_dir.path(), restore_tx, 1_000_000);
+    relaxed.db.upsert_holding(&held(950)).unwrap();
+    *relaxed.restore_staging.lock().unwrap() = status(5 * 1024 * 1024);
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &relaxed).await else {
+        panic!("expected Status");
+    };
+    assert!(
+        !data.restore_staging_squeezes_holdings,
+        "no pressure, no warning"
+    );
+}
+
+// ============================================================
+// B1.3: restore as a job — submit answers at once (restore-i3, i4)
+// ============================================================
+
+/// A catalog record at `path` (one version, backed up or not).
+fn catalog_file(path: &str, id: u64, backed_up: bool) -> viaticum_core::types::FileRecord {
+    viaticum_core::types::FileRecord {
+        file_id: viaticum_core::types::FileId(id),
+        path: path.to_string(),
+        importance: 0.5,
+        devices: vec![],
+        versions: vec![viaticum_core::types::FileVersion {
+            content_hash: [1u8; 32],
+            source_block_id: viaticum_core::types::SourceBlockId([2u8; 32]),
+            k: 1,
+            t: 64,
+            created_at: Ts(10),
+            backed_up_at: backed_up.then_some(Ts(20)),
+        }],
+        first_seen: Ts(0),
+    }
+}
+
+fn restore_req(path: &str) -> CliRequest {
+    CliRequest::Restore {
+        path: path.into(),
+        version: None,
+        date: None,
+        dest: None,
+    }
+}
+
+/// State whose restore queue is `rx` (capacity `cap`) and whose registry is `jobs`.
+fn job_state(cap: usize) -> (Arc<DaemonState>, mpsc::Receiver<RestoreRequest>) {
+    let (tx, rx) = mpsc::channel::<RestoreRequest>(cap);
+    let state = staging_test_state(std::path::Path::new("/tmp"), tx, 0);
+    (state, rx)
+}
+
+#[tokio::test]
+async fn dispatch_restore_unknown_path_is_rejected_not_in_catalog_and_creates_no_job() {
+    let (state, mut rx) = job_state(4);
+    state
+        .db
+        .upsert_file(&catalog_file("/home/kolya/files/part/b.bin", 1, true))
+        .unwrap();
+    for path in ["/home/kolya/files/nope.bin", "/home/kolya/files/par"] {
+        let response = dispatch(restore_req(path), &state).await;
+        assert_eq!(
+            response,
+            CliResponse::RestoreRejected(RestoreRejection::NotInCatalog { path: path.into() })
+        );
+    }
+    assert!(state.restore_jobs.list().is_empty(), "no job was created");
+    assert!(rx.try_recv().is_err(), "nothing was enqueued");
+}
+
+#[tokio::test]
+async fn dispatch_restore_path_without_backed_up_version_is_rejected_not_backed_up() {
+    let (state, mut rx) = job_state(4);
+    state
+        .db
+        .upsert_file(&catalog_file("/home/kolya/new.txt", 1, false))
+        .unwrap();
+    let response = dispatch(restore_req("/home/kolya/new.txt"), &state).await;
+    assert_eq!(
+        response,
+        CliResponse::RestoreRejected(RestoreRejection::NotBackedUp {
+            path: "/home/kolya/new.txt".into()
+        })
+    );
+    assert!(state.restore_jobs.list().is_empty());
+    assert!(rx.try_recv().is_err());
+}
+
+/// `--version N` outside the backed-up versions is its own refusal naming the
+/// versions that are there — never "nothing has a backed-up version yet".
+#[tokio::test]
+async fn dispatch_restore_unknown_version_is_rejected_version_not_found_with_available() {
+    let (state, mut rx) = job_state(4);
+    let mut record = catalog_file("/home/kolya/a.txt", 1, true);
+    let mut second = record.versions[0].clone();
+    second.backed_up_at = None; // version 2 exists but is not backed up
+    record.versions.push(second);
+    state.db.upsert_file(&record).unwrap();
+
+    for version in [0, 2, 7] {
+        let response = dispatch(
+            CliRequest::Restore {
+                path: "/home/kolya/a.txt".into(),
+                version: Some(version),
+                date: None,
+                dest: None,
+            },
+            &state,
+        )
+        .await;
+        assert_eq!(
+            response,
+            CliResponse::RestoreRejected(RestoreRejection::VersionNotFound {
+                path: "/home/kolya/a.txt".into(),
+                version,
+                available: vec![1],
+            }),
+            "--version {version}"
+        );
+    }
+    assert!(state.restore_jobs.list().is_empty(), "no job was created");
+    assert!(rx.try_recv().is_err(), "nothing was enqueued");
+}
+
+#[tokio::test]
+async fn dispatch_restore_version_when_nothing_backed_up_is_rejected_not_backed_up() {
+    let (state, _rx) = job_state(4);
+    state
+        .db
+        .upsert_file(&catalog_file("/home/kolya/new.txt", 1, false))
+        .unwrap();
+    let response = dispatch(
+        CliRequest::Restore {
+            path: "/home/kolya/new.txt".into(),
+            version: Some(1),
+            date: None,
+            dest: None,
+        },
+        &state,
+    )
+    .await;
+    assert_eq!(
+        response,
+        CliResponse::RestoreRejected(RestoreRejection::NotBackedUp {
+            path: "/home/kolya/new.txt".into()
+        })
+    );
+}
+
+/// restore-i4: the answer is the queued job, at once — the request is in the
+/// coordinator's queue, nobody waits for the restore itself.
+#[tokio::test]
+async fn dispatch_restore_known_path_returns_queued_job_and_enqueues_request() {
+    let (state, mut rx) = job_state(4);
+    state
+        .db
+        .upsert_file(&catalog_file("/home/kolya/photos/a.jpg", 1, true))
+        .unwrap();
+    state
+        .db
+        .upsert_file(&catalog_file("/home/kolya/photos/b.jpg", 2, true))
+        .unwrap();
+
+    let response = dispatch(restore_req("/home/kolya/photos"), &state).await;
+    let CliResponse::RestoreJob(job) = response else {
+        panic!("expected RestoreJob, got {response:?}");
+    };
+    assert_eq!(job.state, RestoreJobState::Queued);
+    assert_eq!(job.files_total, 2);
+    assert_eq!(job.path, "/home/kolya/photos");
+    let queued = rx.try_recv().expect("request enqueued");
+    assert_eq!(queued.job_id.to_string(), job.job_id);
+    assert_eq!(queued.path, "/home/kolya/photos");
+    assert_eq!(state.restore_jobs.get(queued.job_id), Some(job));
+}
+
+#[tokio::test]
+async fn dispatch_restore_queue_full_returns_busy_and_rolls_back_job() {
+    let (state, _rx) = job_state(1);
+    state
+        .db
+        .upsert_file(&catalog_file("/a.txt", 1, true))
+        .unwrap();
+    assert!(matches!(
+        dispatch(restore_req("/a.txt"), &state).await,
+        CliResponse::RestoreJob(_)
+    ));
+    let response = dispatch(restore_req("/a.txt"), &state).await;
+    assert_eq!(
+        response,
+        CliResponse::RestoreRejected(RestoreRejection::Busy { active: 1 })
+    );
+    assert_eq!(
+        state.restore_jobs.list().len(),
+        1,
+        "the refused job is rolled back"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_restore_closed_channel_returns_unavailable_and_rolls_back_job() {
+    let (state, rx) = job_state(4);
+    drop(rx);
+    state
+        .db
+        .upsert_file(&catalog_file("/a.txt", 1, true))
+        .unwrap();
+    let response = dispatch(restore_req("/a.txt"), &state).await;
+    assert_eq!(
+        response,
+        CliResponse::RestoreRejected(RestoreRejection::Unavailable)
+    );
+    assert!(state.restore_jobs.list().is_empty());
+}
+
+#[tokio::test]
+async fn dispatch_restore_with_dest_or_bad_date_is_rejected() {
+    let (state, _rx) = job_state(4);
+    let response = dispatch(
+        CliRequest::Restore {
+            path: "/a.txt".into(),
+            version: None,
+            date: None,
+            dest: Some("/tmp/out".into()),
+        },
+        &state,
+    )
+    .await;
+    assert_eq!(
+        response,
+        CliResponse::RestoreRejected(RestoreRejection::DestNotSupported)
+    );
+    let response = dispatch(
+        CliRequest::Restore {
+            path: "/a.txt".into(),
+            version: None,
+            date: Some("yesterday".into()),
+            dest: None,
+        },
+        &state,
+    )
+    .await;
+    assert_eq!(
+        response,
+        CliResponse::RestoreRejected(RestoreRejection::InvalidDate {
+            date: "yesterday".into()
+        })
+    );
+}
+
+#[tokio::test]
+async fn dispatch_restore_job_status_unknown_id_returns_unknown_job() {
+    let (state, _rx) = job_state(4);
+    for id in [JobId::new().to_string(), "not-a-job-id".to_string()] {
+        let response = dispatch(CliRequest::RestoreJobStatus { job_id: id.clone() }, &state).await;
+        assert_eq!(
+            response,
+            CliResponse::RestoreRejected(RestoreRejection::UnknownJob { job_id: id })
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispatch_restore_job_status_returns_finished_job_with_failures() {
+    let (state, _rx) = job_state(4);
+    let id = JobId::new();
+    state.restore_jobs.submit(id, "/p/", 2);
+    state.restore_jobs.mark_running(id, "/p/", 2);
+    state.restore_jobs.record_restored(id, "/p/a");
+    state.restore_jobs.record_failure(
+        id,
+        RestoreFailure {
+            path: "/p/b".into(),
+            kind: RestoreFailureKind::HoldersUnavailable,
+            detail: "collected 1 of 3 symbols".into(),
+        },
+    );
+    state.restore_jobs.finish(id, false);
+
+    let response = dispatch(
+        CliRequest::RestoreJobStatus {
+            job_id: id.to_string(),
+        },
+        &state,
+    )
+    .await;
+    let CliResponse::RestoreJob(job) = response else {
+        panic!("expected RestoreJob, got {response:?}");
+    };
+    assert_eq!(job.state, RestoreJobState::Finished);
+    assert_eq!(job.outcome, Some(RestoreOutcome::Partial));
+    assert_eq!(job.restored_paths, vec!["/p/a".to_string()]);
+    assert_eq!(job.failures[0].kind, RestoreFailureKind::HoldersUnavailable);
+
+    let CliResponse::RestoreJobs(list) = dispatch(CliRequest::RestoreJobList, &state).await else {
+        panic!("expected RestoreJobs");
+    };
+    assert_eq!(list, vec![job]);
+}
+
+// ============================================================
 // DR readiness (dr-i9) and files without a local source (dr-i11)
 // ============================================================
 
-fn catalog_file(
+fn catalog_file_with_states(
     path: &std::path::Path,
     states: Vec<viaticum_core::types::LocalState>,
 ) -> viaticum_core::types::FileRecord {
@@ -1322,9 +1729,9 @@ async fn status_counts_files_without_source() {
     std::fs::write(&here, b"x").unwrap();
     let state = make_test_state().await;
     let files = [
-        catalog_file(&here, vec![LocalState::Present]),
-        catalog_file(&dir.path().join("gone-1.txt"), vec![LocalState::Present]),
-        catalog_file(&dir.path().join("gone-2.txt"), vec![LocalState::Present]),
+        catalog_file_with_states(&here, vec![LocalState::Present]),
+        catalog_file_with_states(&dir.path().join("gone-1.txt"), vec![LocalState::Present]),
+        catalog_file_with_states(&dir.path().join("gone-2.txt"), vec![LocalState::Present]),
     ];
     for (i, mut f) in files.into_iter().enumerate() {
         f.file_id = viaticum_core::types::FileId(i as u64 + 1);
@@ -1343,12 +1750,12 @@ fn status_ignores_files_deleted_everywhere() {
     let dir = tempfile::tempdir().unwrap();
     let files = vec![
         // Deleted on every device: not live, not "missing".
-        catalog_file(
+        catalog_file_with_states(
             &dir.path().join("deleted.txt"),
             vec![LocalState::Deleted(Timestamp(5))],
         ),
         // Deleted on one device, present on another: live, missing here.
-        catalog_file(
+        catalog_file_with_states(
             &dir.path().join("half.txt"),
             vec![LocalState::Deleted(Timestamp(5)), LocalState::Present],
         ),

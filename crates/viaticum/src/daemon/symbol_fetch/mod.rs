@@ -1,12 +1,20 @@
 // Shared helper for fetching unbound erasure symbols from holders over libp2p.
 //
 // Used by:
-//   - `restore`: normal restore flow.
-//   - `repair`:  fallback when local `block.bin` and source-file rebuild both fail
-//                (holder-disk-dies scenario).
+//   - `restore`: normal restore flow (with the daemon's cancel token), through a
+//     `RestoreSource` (`SwarmSymbols`: requests + redial of holders).
+//   - `dr`:      the SystemState block during disaster recovery (no cancel), through
+//     the bare `SwarmHandle` (a `SymbolSource`: requests only).
 //
-// Fetches sequentially from Alive placements, unbinds returned symbols, returns
-// at least `k_eff` unbound symbols or `InsufficientSymbols`.
+// restore-i12: a slow home link is not "holders unavailable". Each request asks one
+// holder for at most `RESTORE_FETCH_CHUNK_BYTES` of symbols; there is no deadline on
+// a block. The fetch goes in rounds over the holders (`rounds::BlockFetch`) and gives
+// up only after a full round that accepted no new ESI. A holder whose request fails
+// (the 30 s request timeout, a dial failure) is skipped for the rest of the round and
+// asked again in the next one. A round with nothing new where some holder did not
+// answer is a separate outcome (`RoundEnd::NoAnswer`, restore-i33): restore retries
+// it after a redial and a pause (restore-i26); `fetch_in_rounds` (DR) stops there as
+// before.
 //
 // There is no restore gate on the holder (restore-i6): a holder either serves the
 // owner's symbols or answers empty (no active holding for this owner).
@@ -14,39 +22,35 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tracing::{debug, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+use viaticum_core::db::Db;
 use viaticum_core::erasure::{ErasureEncoder, Symbol};
 use viaticum_core::messages::{Message, RestoreRequestMsg};
-use viaticum_core::types::{
-    DeviceId, ErasureParams, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
-    ranges_to_esi_list,
-};
+use viaticum_core::types::{DeviceId, ErasureParams, SourceBlockId, SymbolPlacement};
 
 use crate::daemon::network::swarm::SwarmHandle;
+
+mod rounds;
+
+pub(crate) use rounds::{BlockFetch, Round, RoundEnd};
 
 /// Maximum ESI value the raptorq decoder accepts: ESI is a 24-bit field, so any
 /// value `>= 2^24` makes `PayloadId::new(0, esi)` assert-panic inside raptorq.
 /// We reject such symbols at the wire boundary before they ever reach `decode`.
 const MAX_VALID_ESI: u32 = 1 << 24;
 
-// The network round-trip (fetch_unbound_symbols) requires a live SwarmHandle and
-// is covered end-to-end via restore/tests.rs integration tests and
-// local_e2e_test.sh. The pure wire-validation / dedup / cap boundary logic
-// (CS-DR-2 / CS-DR-5) is split into `accept_holder_symbols` and unit-tested in
-// `tests.rs` with real symbols + a real encoder, no swarm needed.
+/// Upper bound on symbol bytes asked from one holder in one `RestoreRequest`. At the
+/// fixed 30 s request timeout (`network/swarm.rs`) this tolerates ≈ 1.1 Mbit/s per
+/// holder (restore-i12).
+pub const RESTORE_FETCH_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests;
 
 /// Errors from fetching unbound symbols from holders.
-///
-/// `pub(crate)` because only callers inside this crate ever observe a
-/// `FetchError` — `fetch_unbound_symbols` itself consumes `Swarm` internally
-/// (logs WARN, skips holder) and only ever surfaces `InsufficientSymbols` to its
-/// caller. `Swarm` exists to carry information *between*
-/// `fetch_symbols_from_holder` and the loop in `fetch_unbound_symbols`; it is not
-/// part of the public API surface.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum FetchError {
+pub enum FetchError {
     #[error("insufficient symbols: collected {got}, need {need} for block {block}")]
     InsufficientSymbols {
         block: SourceBlockId,
@@ -54,136 +58,143 @@ pub(crate) enum FetchError {
         need: usize,
     },
 
+    /// One request to one holder failed (timeout, dial, unexpected reply). Never
+    /// returned by `fetch_unbound_symbols`: it skips the holder for the round.
     #[error("swarm error: {0}")]
     Swarm(String),
+
+    /// The daemon is stopping; the fetch was abandoned.
+    #[error("fetch cancelled: the daemon is stopping")]
+    Cancelled,
 }
 
-/// Fetch unbound symbols for a source block from Alive holders over libp2p.
+/// One `RestoreRequest` to one holder. The bare `SwarmHandle` (DR); tests use
+/// scripted fakes.
+#[async_trait::async_trait]
+pub trait SymbolSource: Send + Sync {
+    /// Ask `holder` for the ESIs in `req`; returns the bound symbols it sent.
+    async fn request(
+        &self,
+        holder: DeviceId,
+        req: RestoreRequestMsg,
+    ) -> Result<Vec<Symbol>, FetchError>;
+}
+
+/// What restore needs on top of requests: a redial of holders that did not answer
+/// before a retry (restore-i26). `SwarmSymbols` in the daemon; tests use fakes.
+#[async_trait::async_trait]
+pub trait RestoreSource: SymbolSource {
+    /// Try to (re)connect to `holders`. Only starts the dials; failures are
+    /// logged, never returned (the retry itself tells).
+    async fn reconnect(&self, holders: &[DeviceId]);
+}
+
+#[async_trait::async_trait]
+impl SymbolSource for SwarmHandle {
+    async fn request(
+        &self,
+        holder: DeviceId,
+        req: RestoreRequestMsg,
+    ) -> Result<Vec<Symbol>, FetchError> {
+        fetch_symbols_from_holder(self, &holder, req).await
+    }
+}
+
+/// The daemon's symbol source for restore: requests over the swarm, redial of
+/// holders from their stored addresses (the auto-dial mechanism, network-i2).
+pub struct SwarmSymbols {
+    swarm: Arc<SwarmHandle>,
+    db: Db,
+}
+
+impl SwarmSymbols {
+    pub fn new(swarm: Arc<SwarmHandle>, db: Db) -> Self {
+        SwarmSymbols { swarm, db }
+    }
+}
+
+#[async_trait::async_trait]
+impl SymbolSource for SwarmSymbols {
+    async fn request(
+        &self,
+        holder: DeviceId,
+        req: RestoreRequestMsg,
+    ) -> Result<Vec<Symbol>, FetchError> {
+        fetch_symbols_from_holder(&self.swarm, &holder, req).await
+    }
+}
+
+#[async_trait::async_trait]
+impl RestoreSource for SwarmSymbols {
+    async fn reconnect(&self, holders: &[DeviceId]) {
+        match crate::daemon::handle::redial::redial_devices(&self.db, &self.swarm, holders).await {
+            Ok(stats) => info!(
+                holders = holders.len(),
+                dialed = stats.dialed,
+                already_connected = stats.already_connected,
+                no_addrs = stats.no_addrs,
+                "fetch: redialed holders before a retry"
+            ),
+            Err(e) => warn!(err = %e, "fetch: redial of holders failed"),
+        }
+    }
+}
+
+/// ESIs per request for symbol size `t`: `max(1, chunk_bytes / t)`.
+pub(crate) fn chunk_esis(chunk_bytes: u64, t: u16) -> usize {
+    (chunk_bytes / u64::from(t.max(1))).max(1) as usize
+}
+
+/// Collect `k_eff` distinct unbound symbols for `block_id` (restore-i12).
 ///
-/// - Iterates holders sequentially, collecting up to `k_eff` *distinct-ESI*
-///   unbound symbols.
-/// - Swarm errors per holder are logged WARN and skipped.
-/// - Returns `InsufficientSymbols` if total collected < `k_eff`.
+/// Rounds over the candidate placements (Alive | Uncertain | PresumedLost). Within a
+/// round each holder is asked in chunks of at most
+/// `max(1, RESTORE_FETCH_CHUNK_BYTES / params.t)` ESIs from its assigned ranges that
+/// are not yet accepted and not yet asked-and-not-returned by it. A holder whose
+/// request errors is skipped for the rest of the round and asked again next round. A
+/// holder that answers a chunk with zero accepted symbols is exhausted. No deadline:
+/// the fetch gives up only after a full round that accepted zero new ESIs
+/// (→ `InsufficientSymbols`), or on cancel (→ `Cancelled`; a request in flight is
+/// abandoned). Every accepted symbol passes the CS-DR-2 / CS-DR-5 checks
+/// (`accept_holder_symbols`).
 ///
-/// Input validation (CS-DR-2 / CS-DR-5): symbols arrive over the wire from a
-/// holder that may be malformed or Byzantine. Before a received symbol is
-/// accepted it must pass three boundary checks, all attributable to the holder:
-///   1. **Form (CS-DR-2):** `esi < 2^24` and `data.len() == params.t`. A symbol
-///      that fails either would otherwise panic inside `RaptorQEncoder::decode`
-///      (`PayloadId::new` assert / decoder slice copy). Invalid → skip + WARN.
-///   2. **Membership (CS-DR-5):** the symbol's `esi` must be one this holder was
-///      actually asked for. A holder cannot smuggle ESIs it was never assigned.
-///   3. **Dedup + cap (CS-DR-5):** each ESI is counted once globally, and no more
-///      symbols are accepted from one holder than were requested from it. This
-///      keeps a single Byzantine holder (early in placement order, returning
-///      `k_eff` dupes/junk for ESIs it was never assigned) from filling the quota
-///      and starving honest holders.
-///
-/// Scope: this closes the *flood / dupe / unrequested-ESI* starvation vector
-/// (threshold back to ≥1 honest holder reachable). It does NOT close the residual
-/// SM-6 case — a holder returning *well-formed* symbols for its *own* assigned ESIs
-/// that are silently wrong (AEAD/decode catches it only after the fact, and an
-/// erasure decode failure is not attributable to a specific holder). That bound is
-/// still 1 and is tracked separately as SM-6 (per-symbol content attribution).
+/// Termination: every round that does not stop the loop accepts at least one new
+/// ESI, and a holder can only contribute ESIs of its own finite ranges, each once.
 pub(crate) async fn fetch_unbound_symbols(
-    swarm: &Arc<SwarmHandle>,
+    source: &dyn SymbolSource,
     encoder: &Arc<dyn ErasureEncoder>,
     block_id: &SourceBlockId,
     placements: &[SymbolPlacement],
     params: &ErasureParams,
+    cancel: Option<&CancellationToken>,
 ) -> Result<Vec<Symbol>, FetchError> {
-    let k_eff = params.k_eff as usize;
-    let symbol_len = params.t as usize;
-    let mut unbound_symbols: Vec<Symbol> = Vec::new();
-    // Every ESI we have already accepted, so a later (or the same) holder cannot
-    // pad our quota with duplicates. Progress toward k_eff is measured by the
-    // size of this set, never by raw symbol count.
-    let mut accepted_esis: HashSet<u32> = HashSet::new();
+    let chunk = chunk_esis(RESTORE_FETCH_CHUNK_BYTES, params.t);
+    fetch_in_rounds(source, encoder, block_id, placements, params, cancel, chunk).await
+}
 
-    for placement in placements {
-        if !matches!(
-            placement.status,
-            PlacementStatus::Alive | PlacementStatus::Uncertain | PlacementStatus::PresumedLost
-        ) {
-            continue;
-        }
-        if accepted_esis.len() >= k_eff {
-            break;
-        }
-
-        let still_needed = k_eff - accepted_esis.len();
-        // Exclude ESIs we already hold so an overlap across holders (e.g. after a
-        // repair re-placement) doesn't make us request ESIs we'd only discard,
-        // under-collecting from a holder that had other useful ESIs. No-op under
-        // the current disjoint-ranges invariant.
-        let wanted_esis: Vec<u32> = ranges_to_esi_list(&placement.esi_ranges)
-            .into_iter()
-            .filter(|e| !accepted_esis.contains(e))
-            .take(still_needed)
-            .collect();
-
-        if wanted_esis.is_empty() {
-            continue;
-        }
-
-        // The set of ESIs this holder is allowed to answer with, and the cap on
-        // how many symbols we will accept from it (CS-DR-5).
-        let wanted_set: HashSet<u32> = wanted_esis.iter().copied().collect();
-        let holder_cap = wanted_esis.len();
-
-        let request = RestoreRequestMsg {
-            v: 1,
-            source_block_id: *block_id,
-            esi_list: wanted_esis,
-            timestamp: Timestamp::now(),
-        };
-
-        match fetch_symbols_from_holder(swarm, &placement.holder_id, request).await {
-            Ok(symbols) => {
-                debug!(
-                    holder = %placement.holder_id,
-                    block = %block_id,
-                    count = symbols.len(),
-                    "fetch: received bound symbols from holder"
-                );
-                accept_holder_symbols(
-                    encoder,
-                    block_id,
-                    &placement.holder_id,
-                    symbols,
-                    &wanted_set,
-                    holder_cap,
-                    symbol_len,
-                    k_eff,
-                    &mut accepted_esis,
-                    &mut unbound_symbols,
-                );
-            }
-            Err(e) => {
-                warn!(
-                    holder = %placement.holder_id,
-                    block = %block_id,
-                    err = %e,
-                    "fetch: holder failed, skipping"
-                );
-            }
-        }
-    }
-
-    if accepted_esis.len() < k_eff {
-        Err(FetchError::InsufficientSymbols {
-            block: *block_id,
-            got: accepted_esis.len(),
-            need: k_eff,
-        })
-    } else {
-        Ok(unbound_symbols)
-    }
+/// `fetch_unbound_symbols` with the chunk size given (seam for tests).
+///
+/// Stops at the first round that accepted nothing, whatever the reason: a round
+/// nobody answered is not retried here (DR; restore retries it with a pause,
+/// restore-i26).
+pub(crate) async fn fetch_in_rounds(
+    source: &dyn SymbolSource,
+    encoder: &Arc<dyn ErasureEncoder>,
+    block_id: &SourceBlockId,
+    placements: &[SymbolPlacement],
+    params: &ErasureParams,
+    cancel: Option<&CancellationToken>,
+    chunk: usize,
+) -> Result<Vec<Symbol>, FetchError> {
+    let mut fetch = BlockFetch::new(encoder, block_id, placements, params, chunk);
+    while fetch.round(source, cancel).await?.end == RoundEnd::Progress {}
+    fetch.finish()
 }
 
 /// Apply the wire-boundary checks to one holder's reply and append the accepted,
 /// unbound symbols to `unbound_symbols`, recording newly-accepted ESIs in
-/// `accepted_esis`. Pure (no network) so it can be unit-tested directly.
+/// `accepted_esis`; returns how many were accepted. Pure (no network) so it can be
+/// unit-tested directly.
 ///
 /// Enforces, in order, for each received symbol:
 ///   - per-holder cap and global `k_eff` ceiling (stop early once reached),
@@ -204,7 +215,7 @@ fn accept_holder_symbols(
     k_eff: usize,
     accepted_esis: &mut HashSet<u32>,
     unbound_symbols: &mut Vec<Symbol>,
-) {
+) -> usize {
     let mut accepted_from_holder = 0usize;
     for sym in symbols {
         if accepted_from_holder >= holder_cap || accepted_esis.len() >= k_eff {
@@ -240,13 +251,14 @@ fn accept_holder_symbols(
         unbound_symbols.push(unbound);
         accepted_from_holder += 1;
     }
+    accepted_from_holder
 }
 
 /// Contact one holder, send a RestoreRequest, receive a RestoreResponse via libp2p.
 ///
 /// Returns the raw bound symbols (caller unbinds).
 async fn fetch_symbols_from_holder(
-    swarm: &Arc<SwarmHandle>,
+    swarm: &SwarmHandle,
     holder_device: &DeviceId,
     request: RestoreRequestMsg,
 ) -> Result<Vec<Symbol>, FetchError> {

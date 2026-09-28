@@ -6,7 +6,7 @@
 //
 // Module layout:
 //   mod.rs      -- WorkPipeline struct, public API, run_loop, reset_all_cooldowns
-//   worker.rs   -- run_block_iteration: encode → deliver → cooldown update
+//   worker.rs   -- run_block_iteration: exclude → allocate → encode → deliver
 //   pool.rs     -- pool snapshot + pool_signature computation
 //   tests.rs    -- all ATDD unit tests
 
@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use viaticum_core::cluster::ClusterState;
 use viaticum_core::db::Db;
 use viaticum_core::erasure::ErasureEncoder;
-use viaticum_core::types::{DeviceId, SourceBlockRecord, Timestamp};
+use viaticum_core::types::{DeviceId, SourceBlockId, SourceBlockRecord, Timestamp};
 
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
@@ -65,7 +65,7 @@ pub struct WorkPipelineConfig {
     /// file; their encoded blob is retained under `<data_dir>/system_state/` and
     /// loaded directly for the encode step instead of rebuilding from source files.
     pub data_dir: std::path::PathBuf,
-    /// Minimum pool size to attempt delivery. Below this, apply cooldown without encoding.
+    /// Minimum pool size to attempt delivery. Below this, park the block without encoding.
     /// Default: 2.
     pub min_pool_size: usize,
 }
@@ -83,6 +83,49 @@ impl Default for WorkPipelineConfig {
             min_pool_size: 2,
         }
     }
+}
+
+/// Why a block was parked (nobody could take its symbols).
+#[derive(Debug, Clone, Copy)]
+enum ParkReason {
+    PoolTooSmall,
+    NoSwarm,
+    NoCandidates,
+    IterationError,
+}
+
+impl ParkReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            ParkReason::PoolTooSmall => "pool too small",
+            ParkReason::NoSwarm => "no swarm",
+            ParkReason::NoCandidates => "no candidates",
+            ParkReason::IterationError => "iteration error",
+        }
+    }
+}
+
+/// A parked block waits this many ordinary cooldowns before it is retried with an
+/// unchanged pool (production: 120 × 30 s = 1 h). Earlier release: pool change,
+/// placement-status change of the block, `PeerAuthenticated` (repair-i4).
+const PARKED_COOLDOWN_FACTOR: u32 = 120;
+
+/// At most this many blocks are tried per iteration when the picked ones turn out
+/// to have nobody to take symbols (cheap: the source is not read). Bounds the cost
+/// of one iteration: each `next_work_item` call scans all source blocks.
+const MAX_BLOCKS_PER_ITERATION: usize = 16;
+
+/// What one attempt on one block came to (decides whether the iteration goes on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockAttempt {
+    /// Offers were sent (whatever the holders answered).
+    Offered,
+    /// Nobody to offer to for THIS block; parked; the next block may do better.
+    NoCandidates,
+    /// Pool too small / no swarm: parked; no other block would do better.
+    PoolUnusable,
+    /// The iteration failed (e.g. unreadable source); parked.
+    Error,
 }
 
 // ─── WorkPipeline ─────────────────────────────────────────────────────────────
@@ -186,7 +229,13 @@ impl WorkPipeline {
 
     /// Execute one work iteration: pick item, encode, deliver, update cooldown.
     ///
-    /// Returns `Ok(true)` if a block was picked and work was attempted.
+    /// If the picked block's outcome is "nobody to take symbols" (no candidate after
+    /// exclusions / empty allocation — cheap, the source is not read), the block is
+    /// parked and the iteration moves on to the next eligible block, at most
+    /// `MAX_BLOCKS_PER_ITERATION` blocks (repair-i4, backup-i12): one stuck block must
+    /// not hold the queue for a whole tick.
+    ///
+    /// Returns `Ok(true)` if at least one block was picked and work was attempted.
     /// Returns `Ok(false)` if no block needed work (queue empty or all on cooldown).
     ///
     /// `pub` for testability — called from `run()` and from tests directly.
@@ -194,6 +243,7 @@ impl WorkPipeline {
         let now = Timestamp::now();
         // cooldown is already pre-scaled by handle/mod.rs. See note in `run()`.
         let cooldown = self.config.cooldown;
+        let parked_cooldown = cooldown.saturating_mul(PARKED_COOLDOWN_FACTOR);
 
         // Snapshot pool first (needed for pool_sig).
         let pool = pool::snapshot_pool(
@@ -206,19 +256,49 @@ impl WorkPipeline {
         )
         .await;
 
-        let block = match self.db.next_work_item(
-            self.config.completion_bonus_coef,
-            cooldown,
-            now,
-            pool.signature,
-        )? {
-            Some(b) => b,
-            None => {
-                tracing::debug!("work_pipeline: no work item (queue empty or all on cooldown)");
-                return Ok(false);
+        let mut picked_any = false;
+        let mut tried: std::collections::HashSet<SourceBlockId> = std::collections::HashSet::new();
+        for _ in 0..MAX_BLOCKS_PER_ITERATION {
+            let block = match self.db.next_work_item(
+                self.config.completion_bonus_coef,
+                cooldown,
+                parked_cooldown,
+                now,
+                pool.signature,
+            )? {
+                Some(b) => b,
+                None => {
+                    if !picked_any {
+                        tracing::debug!(
+                            "work_pipeline: no work item (queue empty or all on cooldown)"
+                        );
+                    }
+                    break;
+                }
+            };
+            // With pool signature 0 `next_work_item` ignores cooldowns and would hand the
+            // same block back; never work one block twice in an iteration.
+            if !tried.insert(block.block_id) {
+                break;
             }
-        };
+            picked_any = true;
 
+            let attempt = self.work_on_block(&block, &pool, now).await?;
+            if attempt != BlockAttempt::NoCandidates {
+                break;
+            }
+        }
+        Ok(picked_any)
+    }
+
+    /// One attempt on one block: log the pick, run the encode+deliver cycle, record
+    /// the cooldown (parked when nobody could take symbols).
+    async fn work_on_block(
+        &self,
+        block: &SourceBlockRecord,
+        pool: &PoolSnapshot,
+        now: Timestamp,
+    ) -> anyhow::Result<BlockAttempt> {
         tracing::info!(
             block_id = %block.block_id,
             importance = block.importance,
@@ -229,24 +309,25 @@ impl WorkPipeline {
             "work_pipeline: picked block for work"
         );
 
-        // Pool too small to make progress — apply cooldown and skip encode.
+        // Pool too small to make progress — park and skip encode. A pool-wide
+        // condition: the iteration stops (every other block would get the same answer).
         if pool.candidates.len() < self.config.min_pool_size {
             tracing::info!(
                 pool = pool.candidates.len(),
                 min = self.config.min_pool_size,
-                "work_pipeline: pool_too_small — applying cooldown, no encode"
+                "work_pipeline: pool_too_small — parking block, no encode"
             );
-            self.update_block_cooldown(&block, &pool, now)?;
-            return Ok(true);
+            self.update_block_cooldown(block, pool, now, Some(ParkReason::PoolTooSmall));
+            return Ok(BlockAttempt::PoolUnusable);
         }
 
         // Run the actual encode + deliver.
         let swarm = match self.swarm.as_ref() {
             Some(s) => s,
             None => {
-                tracing::debug!("work_pipeline: no swarm, applying cooldown");
-                self.update_block_cooldown(&block, &pool, now)?;
-                return Ok(true);
+                tracing::debug!("work_pipeline: no swarm, parking block");
+                self.update_block_cooldown(block, pool, now, Some(ParkReason::NoSwarm));
+                return Ok(BlockAttempt::PoolUnusable);
             }
         };
 
@@ -258,11 +339,12 @@ impl WorkPipeline {
             self.master_signing_key.as_ref(),
             self.peer_backoff.as_deref(),
             self.cluster_state.as_ref(),
-            &block,
-            &pool,
+            block,
+            pool,
         )
         .await;
 
+        // Cooldown is always updated (even on error) to prevent tight retry loops.
         match outcome {
             Ok(wo) => {
                 tracing::info!(
@@ -270,21 +352,31 @@ impl WorkPipeline {
                     acked = wo.acked,
                     failed = wo.failed,
                     encoded = wo.encoded,
+                    offered = wo.offered,
                     "work_pipeline: iteration complete"
                 );
+                if wo.offered > 0 {
+                    // Offers went out (accepted or not): retry after the normal
+                    // cooldown — a network failure is not "nobody can take it".
+                    self.update_block_cooldown(block, pool, now, None);
+                    Ok(BlockAttempt::Offered)
+                } else {
+                    self.update_block_cooldown(block, pool, now, Some(ParkReason::NoCandidates));
+                    Ok(BlockAttempt::NoCandidates)
+                }
             }
             Err(e) => {
+                // E.g. the source is unreadable (unplugged external disk): retrying
+                // every cooldown only burns CPU and log lines — park it (W3).
                 tracing::error!(
                     block_id = %block.block_id,
                     error = %e,
-                    "work_pipeline: iteration error — applying cooldown"
+                    "work_pipeline: iteration error — parking block"
                 );
+                self.update_block_cooldown(block, pool, now, Some(ParkReason::IterationError));
+                Ok(BlockAttempt::Error)
             }
         }
-
-        // Cooldown is always updated (even on error) to prevent tight retry loops.
-        self.update_block_cooldown(&block, &pool, now)?;
-        Ok(true)
     }
 
     /// Reset cooldowns on all blocks. Called on `PeerAuthenticated` to force
@@ -299,15 +391,37 @@ impl WorkPipeline {
     ///
     /// Sets `last_attempted_at = now` and `last_pool_signature = pool.signature`.
     /// This prevents re-encoding the same block with the same pool immediately.
+    /// `park_reason = Some(..)` parks the block (nobody could take its symbols):
+    /// it stays out of the queue until the pool or a placement status of the block
+    /// changes, cooldowns are reset (`PeerAuthenticated`), or `PARKED_COOLDOWN_FACTOR`
+    /// cooldowns elapse (repair-i4).
     fn update_block_cooldown(
         &self,
         block: &SourceBlockRecord,
         pool: &PoolSnapshot,
         now: Timestamp,
-    ) -> anyhow::Result<()> {
+        park_reason: Option<ParkReason>,
+    ) {
+        match park_reason {
+            // Pool-wide: a lone node would log this every tick.
+            Some(reason @ (ParkReason::PoolTooSmall | ParkReason::NoSwarm)) => tracing::debug!(
+                block_id = %block.block_id,
+                reason = reason.as_str(),
+                "work_pipeline: block parked (nobody can take symbols)"
+            ),
+            Some(reason) => tracing::info!(
+                block_id = %block.block_id,
+                reason = reason.as_str(),
+                "work_pipeline: block parked (nobody can take symbols)"
+            ),
+            None => {}
+        }
         // B-4: cooldown is RAM-only — no disk write per attempt.
-        self.db
-            .set_block_cooldown(&block.block_id, Some(now), pool.signature);
-        Ok(())
+        self.db.set_block_cooldown(
+            &block.block_id,
+            Some(now),
+            pool.signature,
+            park_reason.is_some(),
+        );
     }
 }

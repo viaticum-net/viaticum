@@ -1,6 +1,6 @@
-// Web API handler tests.
-// F1: POST /api/restore (no dest) → 200 OK, JSON contains "staging_path".
-// F2: POST /api/restore with dest → 400 Bad Request.
+// Web API handler tests: the real `/api/*` routes behind `require_auth`
+// (`authed_router`), a real in-memory DB and a real job registry; the restore
+// queue is a plain channel (no coordinator runs).
 
 use std::sync::Arc;
 
@@ -11,45 +11,54 @@ use tower::ServiceExt; // for oneshot
 
 use tokio_util::sync::CancellationToken;
 use viaticum_core::db::Db;
-use viaticum_core::types::{DeviceId, IdentityPub};
+use viaticum_core::types::{
+    DeviceId, FileId, FileRecord, FileVersion, IdentityPub, SourceBlockId, Timestamp,
+};
 
-use crate::cli::types::CliRequest;
 use crate::daemon::handle::DaemonState;
-use crate::daemon::restore::{RestoreError, RestoreRequest, RestoreResult};
+use crate::daemon::restore::RestoreRequest;
+use crate::daemon::restore::jobs::RestoreJobs;
+use crate::daemon::restore::staging::JobId;
+use crate::daemon::web_auth::AuthState;
+
+const TOKEN: &str = "test-token";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Build a minimal DaemonState for web API tests.
-/// The restore channel is set up so it immediately returns a synthetic result.
-async fn make_test_state_with_restore(staging_path: std::path::PathBuf) -> Arc<DaemonState> {
+/// DaemonState with one backed-up catalog file (`/home/alice/docs/report.docx`);
+/// restore requests land in the returned receiver.
+fn test_state() -> (Arc<DaemonState>, mpsc::Receiver<RestoreRequest>) {
     let db = Db::open_in_memory().expect("in-memory db");
+    let jobs = RestoreJobs::new("/nonexistent/viaticum-web-test/restore".into());
+    db.upsert_file(&FileRecord {
+        file_id: FileId(1),
+        path: "/home/alice/docs/report.docx".into(),
+        importance: 0.5,
+        devices: vec![],
+        versions: vec![FileVersion {
+            content_hash: [1u8; 32],
+            source_block_id: SourceBlockId([2u8; 32]),
+            k: 1,
+            t: 64,
+            created_at: Timestamp(10),
+            backed_up_at: Some(Timestamp(20)),
+        }],
+        first_seen: Timestamp(0),
+    })
+    .unwrap();
+    state_with(db, jobs)
+}
+
+fn state_with(db: Db, jobs: RestoreJobs) -> (Arc<DaemonState>, mpsc::Receiver<RestoreRequest>) {
     let master_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let identity_pub = IdentityPub(master_key.verifying_key().to_bytes());
-    let device_id = DeviceId([0u8; 32]);
-
-    let (restore_tx, mut restore_rx) = mpsc::channel::<(
-        RestoreRequest,
-        tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
-    )>(4);
-
-    // Spawn a task that auto-responds with a synthetic RestoreResult.
-    let sp = staging_path.clone();
-    tokio::spawn(async move {
-        while let Some((_req, reply)) = restore_rx.recv().await {
-            let _ = reply.send(Ok(RestoreResult {
-                files_restored: 1,
-                blocks_fetched: 1,
-                failures: vec![],
-                staging_path: sp.clone(),
-            }));
-        }
-    });
-
-    Arc::new(DaemonState {
+    let (restore_tx, restore_rx) = mpsc::channel::<RestoreRequest>(4);
+    let state = Arc::new(DaemonState {
         db,
-        identity_pub,
-        device_id,
+        identity_pub: IdentityPub(master_key.verifying_key().to_bytes()),
+        device_id: DeviceId([0u8; 32]),
         restore_tx,
+        restore_jobs: jobs,
+        restore_staging: Default::default(),
         cluster_state: None,
         master_key,
         seed: vec![0u8; 64],
@@ -66,91 +75,210 @@ async fn make_test_state_with_restore(staging_path: std::path::PathBuf) -> Arc<D
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: None,
         missing_sources: Default::default(),
-    })
+    });
+    (state, restore_rx)
 }
 
-/// Build a test router with auth bypass (no token check for unit tests).
-fn build_test_router(state: Arc<DaemonState>) -> axum::Router {
-    use crate::cli::types::CliResponse;
-    use crate::daemon::dispatch::dispatch;
-    use axum::extract::{Json, State};
-    use axum::http::StatusCode;
-    use axum::routing::post;
-
-    // Inline a minimal router that mirrors the real handle_restore handler,
-    // bypassing auth middleware.
-    #[derive(serde::Deserialize)]
-    struct RestoreBody {
-        path: String,
-        version: Option<u32>,
-        date: Option<String>,
-        dest: Option<String>,
-    }
-
-    async fn handle_restore_test(
-        State(state): State<Arc<DaemonState>>,
-        Json(body): Json<RestoreBody>,
-    ) -> axum::response::Response {
-        use axum::response::IntoResponse;
-        let req = CliRequest::Restore {
-            path: body.path,
-            version: body.version,
-            date: body.date,
-            dest: body.dest,
-        };
-        match dispatch(req, &state).await {
-            CliResponse::Restore(data) => (StatusCode::OK, Json(data)).into_response(),
-            CliResponse::RestoreBlocked(blocker) => {
-                (StatusCode::CONFLICT, Json(blocker)).into_response()
-            }
-            CliResponse::Error(ref e) if e == "dest_not_supported_in_alpha" => {
-                let body = serde_json::json!({ "error": "dest_not_supported_in_alpha" });
-                (StatusCode::BAD_REQUEST, Json(body)).into_response()
-            }
-            CliResponse::Error(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, "unexpected response").into_response(),
-        }
-    }
-
-    axum::Router::new()
-        .route("/api/restore", post(handle_restore_test))
-        .with_state(state)
+fn app(state: Arc<DaemonState>) -> axum::Router {
+    super::authed_router(state, AuthState::new(TOKEN.to_string()))
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
+fn get(uri: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .unwrap()
+}
 
-/// F1: POST /api/restore with no dest → 200 OK, body contains "staging_path".
-#[tokio::test]
-async fn restore_api_returns_staging_path() {
-    let staging_path = std::path::PathBuf::from("/tmp/test_staging/job-abc123");
-    let state = make_test_state_with_restore(staging_path.clone()).await;
-    let app = build_test_router(state);
-
-    let body = serde_json::json!({ "path": "/home/alice/docs/report.docx" });
-    let request = Request::builder()
+fn post_restore(body: serde_json::Value) -> Request<Body> {
+    Request::builder()
         .method("POST")
         .uri("/api/restore")
+        .header("authorization", format!("Bearer {TOKEN}"))
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
 
-    let response = app.oneshot(request).await.unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK, "expected 200 OK");
-
-    let bytes = axum::body::to_bytes(response.into_body(), 65536)
+async fn json_of(response: axum::response::Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
         .await
         .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
 
+// ─── Restore job API (restore-i3, i4) ─────────────────────────────────────────
+
+/// POST /api/restore answers 202 at once with the queued job; the request is in
+/// the coordinator's queue.
+#[tokio::test]
+async fn restore_api_returns_202_with_job() {
+    let (state, mut rx) = test_state();
+    let response = app(state)
+        .oneshot(post_restore(
+            serde_json::json!({ "path": "/home/alice/docs/report.docx" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let job = json_of(response).await;
+    assert_eq!(job["state"], "queued");
+    assert_eq!(job["files_total"], 1);
     assert!(
-        json.get("staging_path").is_some(),
-        "response body must contain 'staging_path' field, got: {json}"
+        job["staging_path"]
+            .as_str()
+            .unwrap()
+            .ends_with(job["job_id"].as_str().unwrap()),
+        "{job}"
     );
-    let sp = json["staging_path"].as_str().unwrap_or("");
+    let queued = rx.try_recv().expect("enqueued");
+    assert_eq!(queued.job_id.to_string(), job["job_id"].as_str().unwrap());
+}
+
+#[tokio::test]
+async fn restore_api_unknown_path_returns_404_not_in_catalog() {
+    let (state, mut rx) = test_state();
+    let response = app(state)
+        .oneshot(post_restore(
+            serde_json::json!({ "path": "/home/alice/nope" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = json_of(response).await;
+    assert_eq!(body["error"], "not_in_catalog");
+    assert_eq!(body["path"], "/home/alice/nope");
+    assert!(rx.try_recv().is_err());
+}
+
+/// restore-i29: a version not backed up under the path — including 0 (versions are
+/// 1-based; 0 is not a synonym for version 1) — is refused with the available ones.
+#[tokio::test]
+async fn restore_api_unknown_version_returns_404_version_not_found() {
+    for version in [5u32, 0] {
+        let (state, mut rx) = test_state();
+        let response = app(state)
+            .oneshot(post_restore(serde_json::json!({
+                "path": "/home/alice/docs/report.docx",
+                "version": version,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "version {version}"
+        );
+        let body = json_of(response).await;
+        assert_eq!(body["error"], "version_not_found", "version {version}");
+        assert_eq!(body["version"], version);
+        assert_eq!(body["available"], serde_json::json!([1]));
+        assert!(
+            rx.try_recv().is_err(),
+            "version {version}: nothing enqueued"
+        );
+    }
+}
+
+#[tokio::test]
+async fn restore_job_api_returns_job_state() {
+    let (state, _rx) = test_state();
+    let id = JobId::new();
+    state.restore_jobs.submit(id, "/home/alice/docs/", 3);
+    state.restore_jobs.mark_running(id, "/home/alice/docs/", 3);
+    state
+        .restore_jobs
+        .record_restored(id, "/home/alice/docs/report.docx");
+
+    let response = app(state)
+        .oneshot(get(&format!("/api/restore/jobs/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let job = json_of(response).await;
+    assert_eq!(job["state"], "running");
+    assert_eq!(job["files_restored"], 1);
+    assert_eq!(job["restored_paths"][0], "/home/alice/docs/report.docx");
+}
+
+#[tokio::test]
+async fn restore_job_api_unknown_id_returns_404() {
+    let (state, _rx) = test_state();
+    let id = JobId::new();
+    let response = app(state)
+        .oneshot(get(&format!("/api/restore/jobs/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = json_of(response).await;
+    assert_eq!(body["error"], "unknown_job");
+    assert_eq!(body["job_id"], id.to_string());
+}
+
+#[tokio::test]
+async fn restore_jobs_api_lists_newest_first() {
+    let (state, _rx) = test_state();
+    let older = JobId::new();
+    let newer = JobId::new();
+    state.restore_jobs.submit(older, "/a", 1);
+    state.restore_jobs.submit(newer, "/b", 1);
+    let response = app(state).oneshot(get("/api/restore/jobs")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let list = json_of(response).await;
+    let ids: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j["job_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![newer.to_string(), older.to_string()]);
+}
+
+#[tokio::test]
+async fn restore_api_with_dest_returns_400() {
+    let (state, _rx) = test_state();
+    let response = app(state)
+        .oneshot(post_restore(serde_json::json!({
+            "path": "/home/alice/docs/report.docx",
+            "dest": "/tmp/custom_dest"
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_of(response).await["error"], "dest_not_supported");
+}
+
+#[tokio::test]
+async fn restore_routes_require_auth() {
+    let (state, mut rx) = test_state();
+    let app = app(state);
+    let id = JobId::new();
+    for request in [
+        Request::builder()
+            .method("POST")
+            .uri("/api/restore")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"path":"/home/alice/docs/report.docx"}"#))
+            .unwrap(),
+        Request::builder()
+            .uri("/api/restore/jobs")
+            .body(Body::empty())
+            .unwrap(),
+        Request::builder()
+            .uri(format!("/api/restore/jobs/{id}"))
+            .header("authorization", "Bearer wrong")
+            .body(Body::empty())
+            .unwrap(),
+    ] {
+        let uri = request.uri().to_string();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
     assert!(
-        !sp.is_empty(),
-        "staging_path must be non-empty, got: {json}"
+        rx.try_recv().is_err(),
+        "an unauthenticated POST enqueued nothing"
     );
 }
 
@@ -226,40 +354,87 @@ async fn security_headers_present_on_401_response() {
     );
 }
 
-/// F2: POST /api/restore with dest → 400 Bad Request with dest_not_supported_in_alpha.
-#[tokio::test]
-async fn restore_api_with_dest_returns_400() {
-    let staging_path = std::path::PathBuf::from("/tmp/staging");
-    let state = make_test_state_with_restore(staging_path).await;
-    let app = build_test_router(state);
+// ─── restore-i15: the job does not belong to the client ──────────────────────
 
-    let body = serde_json::json!({
-        "path": "/home/alice/file.txt",
-        "dest": "/tmp/custom_dest"
-    });
-    let request = Request::builder()
-        .method("POST")
-        .uri("/api/restore")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
+/// restore-i15: a submitted job does not depend on the client that submitted it.
+/// The POST is abandoned (Ctrl-C, closed terminal) before the coordinator even
+/// starts; the coordinator then runs the job to `complete`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_job_outlives_the_client_that_submitted_it() {
+    use crate::cli::types::{RestoreJobState, RestoreOutcome};
+    use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
+    use crate::daemon::restore::{RestoreConfig, RestoreCoordinator};
+    use viaticum_core::erasure::RaptorQEncoder;
 
-    let response = app.oneshot(request).await.unwrap();
+    const KEY: [u8; 32] = [42u8; 32];
+    let files = tempfile::TempDir::new().unwrap();
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let staging_root = data_dir.path().join("restore");
+    std::fs::create_dir_all(&staging_root).unwrap();
+    let path = files.path().join("kept.txt");
+    std::fs::write(&path, b"the job is not the client's").unwrap();
+    let path = path.to_string_lossy().into_owned();
 
-    assert_eq!(
-        response.status(),
-        StatusCode::BAD_REQUEST,
-        "expected 400 Bad Request"
+    let db = Db::open_in_memory().unwrap();
+    let mut backup = BackupCoordinator::new(
+        db.clone(),
+        BackupConfig {
+            source_block_size: 65_535 * 2,
+            symbols_dir: data_dir.path().join("symbols"),
+            epoch_key: KEY,
+            device_id: DeviceId([1u8; 32]),
+            mock_holders: vec![],
+            cluster_state: None,
+            watch_configs: vec![],
+            time_scale: 1,
+            mock_offer_budget_gb: None,
+            master_signing_key: None,
+            swarm: None,
+            live_watch_configs: None,
+            peer_backoff: None,
+            work_event_tx: None,
+        },
+        Arc::new(RaptorQEncoder::new()),
     );
-
-    let bytes = axum::body::to_bytes(response.into_body(), 65536)
-        .await
+    backup
+        .process_event(DirtyEvent {
+            path: path.clone(),
+            kind: DirtyKind::Added,
+            device_id: DeviceId([1u8; 32]),
+        })
         .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    backup.flush_all(true, &Default::default()).unwrap();
 
-    let error_msg = json["error"].as_str().unwrap_or("");
+    let jobs = RestoreJobs::new(staging_root.clone());
+    let (state, rx) = state_with(db.clone(), jobs.clone());
+    let client =
+        tokio::spawn(app(state).oneshot(post_restore(serde_json::json!({ "path": path }))));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    client.abort();
+
+    let mut config = RestoreConfig::new(KEY, staging_root, data_dir.path().to_path_buf());
+    config.jobs = jobs.clone();
+    let cancel = config.cancel.clone();
+    let coordinator =
+        tokio::spawn(RestoreCoordinator::new(db, config, Arc::new(RaptorQEncoder::new())).run(rx));
+    let mut finished = None;
+    for _ in 0..100 {
+        if let Some(j) = jobs.list().into_iter().next()
+            && j.state == RestoreJobState::Finished
+        {
+            finished = Some(j);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    cancel.cancel();
+    coordinator.await.unwrap().unwrap();
+
+    let job = finished.expect("the job ran to the end without its client");
+    assert_eq!(job.outcome, Some(RestoreOutcome::Complete), "{job:?}");
+    let staged = std::path::Path::new(&job.staging_path).join(path.trim_start_matches('/'));
     assert_eq!(
-        error_msg, "dest_not_supported_in_alpha",
-        "error must be dest_not_supported_in_alpha, got: {json}"
+        std::fs::read(staged).unwrap(),
+        b"the job is not the client's"
     );
 }

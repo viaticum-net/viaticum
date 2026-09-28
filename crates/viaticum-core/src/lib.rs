@@ -11,6 +11,7 @@ pub mod db;
 pub mod deletion;
 pub mod erasure;
 pub mod four_r;
+pub mod four_r_holder;
 pub mod importance;
 pub mod mailbox;
 pub mod messages;

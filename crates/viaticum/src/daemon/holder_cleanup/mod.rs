@@ -18,6 +18,7 @@ use viaticum_core::budget::{DiskPressure, evaluate_pressure};
 use viaticum_core::cluster::master_identity;
 use viaticum_core::constants::{KI, KP, S_CLAMP_MAX, S_CLAMP_MIN};
 use viaticum_core::db::Db;
+use viaticum_core::four_r_holder::FourRParams;
 use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry, class_config};
 use viaticum_core::messages::{
     SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, build_signed_symbol_drop_notice, to_cbor,
@@ -25,6 +26,8 @@ use viaticum_core::messages::{
 use viaticum_core::types::{IdentityPub, Timestamp, hex_encode};
 
 use crate::daemon::mailbox::routing::MailboxRouter;
+
+mod shadow;
 
 #[cfg(test)]
 mod tests;
@@ -40,6 +43,9 @@ mod tests;
 ///
 /// T-7: advance DropNotice (before physical delete) via mailbox, batched per owner.
 /// T-13a: immediate-drop DropNotice (deadline=now) via mailbox.
+///
+/// В-0: every pressure tick also runs the 4R SHADOW (`four_r`: the `[four_r]` dials) — logs
+/// only, see `shadow.rs`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     db: Db,
@@ -53,6 +59,7 @@ pub async fn run(
     pressure_interval_secs: u64,
     time_scale: u64,
     master_signing_key: ed25519_dalek::SigningKey,
+    four_r: FourRParams,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut cleanup_timer =
@@ -91,6 +98,7 @@ pub async fn run(
                     &data_dir, disk_reserve_bytes,
                     time_scale,
                     &master_signing_key,
+                    &four_r,
                 ).await {
                     error!("holder_cleanup: check_pressure error: {e}");
                 }
@@ -279,6 +287,9 @@ async fn cleanup_drop_notices(
 ///
 /// T-7: advance DropNotice entries via mailbox, batched per owner.
 /// T-13a: immediate-drop DropNotice (deadline=now) via mailbox (replaces SymbolDropped-via-relay).
+///
+/// В-0: between `evaluate_pressure` and the old path's actions the 4R shadow runs over the
+/// same snapshot (`shadow::shadow_pressure`); its failure is a `warn!`, never an early return.
 #[allow(clippy::too_many_arguments)]
 async fn check_pressure(
     db: &Db,
@@ -291,6 +302,7 @@ async fn check_pressure(
     disk_reserve_bytes: u64,
     time_scale: u64,
     master_signing_key: &ed25519_dalek::SigningKey,
+    four_r: &FourRParams,
 ) -> anyhow::Result<()> {
     let now = Timestamp::now();
     let holdings = db.list_all_holdings()?;
@@ -327,6 +339,29 @@ async fn check_pressure(
         trust_fn,
         now.0,
     );
+
+    // В-0: the 4R shadow — same snapshot, before the old path acts; logs only.
+    if let Err(e) = shadow::shadow_pressure(
+        db,
+        &holdings,
+        shadow::ShadowQuota {
+            disk_free,
+            soft: soft_quota_bytes,
+            reserve: disk_reserve_bytes,
+            hard: hard_quota_bytes,
+        },
+        holder_master_pub,
+        &trust_fn,
+        now,
+        &result,
+        four_r,
+    ) {
+        warn!(
+            target: "viaticum::four_r",
+            err = %e,
+            "four_r: shadow tick failed — old path unaffected"
+        );
+    }
 
     match result.pressure {
         DiskPressure::Normal => {}

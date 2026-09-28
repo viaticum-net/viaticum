@@ -265,10 +265,49 @@ fn preflight_second_dr_cannot_claim_staging_while_first_holds_it() {
     let err = preflight(dir.path(), PHRASE_A).expect_err("second DR must stop");
     assert!(matches!(err, DrError::DrInProgress { .. }), "got {err:?}");
     assert!(
-        path_is(&first.paths.db_staging, first.staging.id),
+        path_is(&first.paths.db_staging, first.staging.id.as_ref()),
         "the first DR's staging file is untouched"
     );
     crate::daemon::dr::commit::abort(&mut first);
+}
+
+/// The reason a reused inode number cannot fool `path_is`: after our draft is
+/// unlinked, `OwnedFile` still holds that very inode (link count 0, still readable),
+/// so the filesystem cannot give its number to another file. Deterministic on any
+/// filesystem — no inode allocator involved.
+#[cfg(unix)]
+#[test]
+fn owned_file_keeps_its_unlinked_inode_allocated() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("draft");
+    std::fs::write(&path, b"ours").unwrap();
+    let ino = std::fs::metadata(&path).unwrap().ino();
+    let owned = super::OwnedFile::pin(&path).expect("unix has file identity");
+
+    std::fs::remove_file(&path).unwrap();
+
+    let held = owned.handle.metadata().unwrap();
+    assert_eq!(held.ino(), ino, "the handle is on our file");
+    assert_eq!(held.nlink(), 0, "unlinked, yet held open");
+    assert!(!path_is(&path, Some(&owned)), "no file at the path is ours");
+}
+
+/// An `OwnedFile` holds its file open, so a file created at its path after it was
+/// unlinked never has its identity — on a filesystem checked to hand the freed
+/// inode number to the next file (`inode_reusing_tempdir`).
+#[cfg(unix)]
+#[test]
+fn owned_file_never_matches_a_file_recreated_at_its_path() {
+    let dir = super::test_disk::inode_reusing_tempdir();
+    let path = dir.path().join("draft");
+    std::fs::write(&path, b"ours").unwrap();
+    let owned = super::OwnedFile::pin(&path).expect("unix has file identity");
+    assert!(path_is(&path, Some(&owned)));
+
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, b"theirs").unwrap();
+    assert!(!path_is(&path, Some(&owned)));
 }
 
 #[test]

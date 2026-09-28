@@ -20,7 +20,7 @@ use std::time::Duration;
 use libp2p::Multiaddr;
 use tokio_util::sync::CancellationToken;
 use viaticum_core::db::{Db, DbError};
-use viaticum_core::types::DeviceId;
+use viaticum_core::types::{DeviceId, PeerRecord};
 
 use crate::daemon::network::swarm::{
     SwarmError, SwarmHandle, device_id_to_peer_id, strip_peer_suffix,
@@ -70,17 +70,7 @@ pub(crate) async fn redial_known_peers(
             continue;
         }
         stats.known_peers += 1;
-        if authenticated.contains(&record.device_id) {
-            stats.already_connected += 1;
-            continue;
-        }
-        let Some((peer_id, addrs)) = dialable_addrs(&record.device_id, &record.addrs, &mut stats)
-        else {
-            stats.no_addrs += 1;
-            continue;
-        };
-        swarm.dial_addrs(peer_id, addrs).await?;
-        stats.dialed += 1;
+        redial_one(swarm, record, &authenticated, &mut stats).await?;
     }
 
     if stats.known_peers > 0 {
@@ -94,6 +84,51 @@ pub(crate) async fn redial_known_peers(
         );
     }
     Ok(stats)
+}
+
+/// The same pass limited to `devices` (restore-i26: the holders of a block before
+/// a retry). A device without a PeerRecord has nothing to dial (`no_addrs`); each
+/// device is dialed at most once per call.
+pub(crate) async fn redial_devices(
+    db: &Db,
+    swarm: &SwarmHandle,
+    devices: &[DeviceId],
+) -> Result<RedialStats, RedialError> {
+    let (authenticated, _) = swarm.peer_sets().await?;
+    let mut stats = RedialStats::default();
+    let mut seen: HashSet<DeviceId> = HashSet::new();
+    for device in devices {
+        if *device == swarm.device_id || !seen.insert(*device) {
+            continue;
+        }
+        stats.known_peers += 1;
+        match db.get_peer(device)? {
+            Some(record) => redial_one(swarm, &record, &authenticated, &mut stats).await?,
+            None => stats.no_addrs += 1,
+        }
+    }
+    Ok(stats)
+}
+
+/// One peer of a pass: skip if authenticated, else one dial over all its usable
+/// stored addresses.
+async fn redial_one(
+    swarm: &SwarmHandle,
+    record: &PeerRecord,
+    authenticated: &HashSet<DeviceId>,
+    stats: &mut RedialStats,
+) -> Result<(), SwarmError> {
+    if authenticated.contains(&record.device_id) {
+        stats.already_connected += 1;
+        return Ok(());
+    }
+    let Some((peer_id, addrs)) = dialable_addrs(&record.device_id, &record.addrs, stats) else {
+        stats.no_addrs += 1;
+        return Ok(());
+    };
+    swarm.dial_addrs(peer_id, addrs).await?;
+    stats.dialed += 1;
+    Ok(())
 }
 
 /// PeerId of `device` and the transport addresses to dial it on (terminal

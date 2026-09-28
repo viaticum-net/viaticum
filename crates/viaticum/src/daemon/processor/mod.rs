@@ -58,6 +58,7 @@ use crate::daemon::network::swarm::{ProtocolEvent, SwarmHandle, device_id_to_pee
 
 mod cluster;
 pub mod mailbox;
+mod offer_shadow;
 mod peer;
 mod pos;
 mod restore;
@@ -193,6 +194,13 @@ pub struct Processor {
     /// When Some: `on_peer_authenticated` sends `WorkEvent::PeerAuthenticated`.
     /// None in tests that do not wire the work pipeline.
     pub(crate) work_event_tx: Option<mpsc::Sender<crate::daemon::work_pipeline::WorkEvent>>,
+    /// В-0b: the `[four_r]` dials of the offer SHADOW (logs only; defaults until
+    /// [`Processor::set_four_r`]).
+    pub(crate) four_r: viaticum_core::four_r_holder::FourRParams,
+    /// В-0b (4r-i50): ONE offer shadow at a time, off the reply path; a busy slot skips.
+    pub(crate) shadow_offer_slot: Arc<tokio::sync::Semaphore>,
+    /// Offers whose shadow was skipped since the last logged offer shadow.
+    pub(crate) shadow_offers_skipped: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Processor {
@@ -229,6 +237,9 @@ impl Processor {
             peer_cert_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
             master_signing_key,
             work_event_tx: None,
+            four_r: viaticum_core::four_r_holder::FourRParams::default(),
+            shadow_offer_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            shadow_offers_skipped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -237,6 +248,12 @@ impl Processor {
     /// Called from `handle/mod.rs::start()` after constructing both Processor and WorkPipeline.
     pub fn set_work_event_tx(&mut self, tx: mpsc::Sender<crate::daemon::work_pipeline::WorkEvent>) {
         self.work_event_tx = Some(tx);
+    }
+
+    /// В-0b: the `[four_r]` dials for the offer shadow (logs only; the reply never reads them).
+    /// Called from `handle/mod.rs::start()` next to [`Processor::set_work_event_tx`].
+    pub fn set_four_r(&mut self, p: viaticum_core::four_r_holder::FourRParams) {
+        self.four_r = p;
     }
 
     /// Build a KademliaRoutingView from known peers in the DB.
@@ -858,6 +875,27 @@ pub(crate) fn recompute_and_persist_block_cached_fields(db: &Db, block_id: &Sour
             block_id = %block_id,
             err = %e,
             "placement hook: update_block_cached_fields failed"
+        );
+        return;
+    }
+
+    // 6. Log only when the "at target" verdict flips (low volume): the owner's own
+    // judgement "this block is at its target" becomes observable (repair-i3), with the
+    // raw numbers that decided it.
+    let at_target = |current: f64| {
+        block.target_reliability > 0.0
+            && viaticum_core::reliability::meets_target(current, block.target_reliability)
+    };
+    let was_at_target = at_target(block.current_reliability);
+    let now_at_target = at_target(new_reliability);
+    if was_at_target != now_at_target {
+        info!(
+            block_id = %block_id,
+            current_alive = new_current_alive,
+            current_reliability = new_reliability,
+            target_reliability = block.target_reliability,
+            at_target = now_at_target,
+            "placement hook: block target status changed"
         );
     }
 }

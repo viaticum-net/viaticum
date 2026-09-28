@@ -366,7 +366,7 @@ pub struct ImportanceBucketStats {
     /// Constant per bucket; computed at call time, not hardcoded.
     pub target_p: f64,
 
-    /// "healthy" if mean_p_recoverable >= target_p, "degraded" if below,
+    /// "healthy" if `reliability::meets_target(mean_p_recoverable, target_p)`, "degraded" if below,
     /// "empty" if block_count == 0.
     pub status: String,
 }
@@ -443,6 +443,19 @@ pub enum PlacementStatus {
     Lost,
     /// Delete in progress.
     Deleting,
+}
+
+impl PlacementStatus {
+    /// The owner believes the holder may still have these symbols, and only a PoS
+    /// verdict may change that belief (Pass → Alive, Fail/NotHeld → Lost).
+    /// The worker must not offer this block to such a holder again, and must not
+    /// overwrite its placement record (repair-i2).
+    pub fn may_hold_symbols(self) -> bool {
+        matches!(
+            self,
+            PlacementStatus::Alive | PlacementStatus::Uncertain | PlacementStatus::PresumedLost
+        )
+    }
 }
 
 /// Kind of a pair-ledger drop event (У-4, Д-I). One event = one placement of ours at one
@@ -551,6 +564,23 @@ pub struct SeenSignedLetter {
     pub forget_after: Timestamp,
 }
 
+/// 4R relay latch of this holder (T5): whether the holder is in the evicting state of the
+/// two-gap hysteresis, and since when. Singleton row of the `four_r_state` table.
+///
+/// В-0: written by the SHADOW pressure tick only (on a change of `evicting`) and read only by
+/// the shadow (pressure tick and offer shadow); В-1a makes it authoritative. NOT in the
+/// SystemState snapshot — node-local like HOLDINGS: after a holder DR the row is absent
+/// (`evicting = false` until the first pressure tick) and the holdings are gone too.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FourRPhaseRecord {
+    /// True iff the relay is latched in the evicting state.
+    #[serde(default)]
+    pub evicting: bool,
+    /// Wall clock of the last change of `evicting` (`None` = never changed).
+    #[serde(default)]
+    pub since: Option<Timestamp>,
+}
+
 /// 4R pair-ledger accumulators for ONE economic pair: this node and one **master
 /// identity**. Key: [`IdentityPub`], in its own redb table — NOT a field of
 /// [`PeerRecord`].
@@ -559,12 +589,14 @@ pub struct SeenSignedLetter {
 /// placement, eviction, offer admission and PoS cadence all still run on the legacy
 /// `trust` axes. That is *not* enforced structurally — [`crate::db::Db`] is reachable
 /// from every module and `get_pair_ledger` is an ordinary `pub` method. The honest
-/// guarantee is weaker: **the only readers are the recorder itself
-/// ([`crate::pair_ledger`], which accrues these values on a scheduler tick) and the
-/// SystemState snapshot/restore pair that carries them through disaster recovery — no
-/// decision site.** The ledger exists so that when the 4R decision kernel
-/// ([`crate::four_r`]) is wired into the daemon, it starts on *warm history* instead of
-/// zeros.
+/// guarantee is weaker: **the readers are the recorder itself ([`crate::pair_ledger`],
+/// which accrues these values on a scheduler tick), the SystemState snapshot/restore pair
+/// that carries them through disaster recovery, and — since В-0 — the 4R SHADOW
+/// ([`crate::four_r_holder`], called from the daemon's pressure tick and, off the reply
+/// path, after each symbol offer), whose only outputs are log lines and its own latch row
+/// ([`FourRPhaseRecord`]) — no decision site.** The ledger exists so that when the 4R
+/// decision kernel ([`crate::four_r`]) is wired into the daemon, it starts on *warm
+/// history* instead of zeros.
 ///
 /// The reason it cannot wait for that wiring: `G` is a *leaky* integral — a decaying
 /// weighted history, not a running total, and nothing recorded today can produce one

@@ -287,7 +287,7 @@ async fn worker_resets_cooldowns_on_peer_authenticated() {
     let mut record = make_block_record(bid, 1.0, 0.99);
     record.current_reliability = 0.0; // below target
     db.upsert_source_block(&record).unwrap();
-    db.set_block_cooldown(&bid, None, 42); // some non-zero value
+    db.set_block_cooldown(&bid, None, 42, false); // some non-zero value
 
     let encoder =
         Arc::new(RaptorQEncoder::new()) as Arc<dyn viaticum_core::erasure::ErasureEncoder>;
@@ -328,7 +328,7 @@ async fn reset_all_cooldowns_clears_cooldown_even_for_completed_blocks() {
     let mut record = make_block_record(bid, 1.0, 0.99);
     record.current_reliability = 0.999; // at target
     db.upsert_source_block(&record).unwrap();
-    db.set_block_cooldown(&bid, None, 99);
+    db.set_block_cooldown(&bid, None, 99, false);
 
     let encoder =
         Arc::new(RaptorQEncoder::new()) as Arc<dyn viaticum_core::erasure::ErasureEncoder>;
@@ -399,7 +399,7 @@ async fn worker_with_empty_pool_picks_block_because_sig_zero_bypasses_cooldown()
     // Set last_attempted_at = now - 10s (well within 30s cooldown).
     let last_at = Timestamp(Timestamp::now().0 - 10);
     // last_pool_signature is non-zero (block was previously attempted).
-    db.set_block_cooldown(&bid, Some(last_at), 12345); // some non-zero value
+    db.set_block_cooldown(&bid, Some(last_at), 12345, false); // some non-zero value
 
     // swarm=None → pool is always empty → pool_signature() of [] == 0 (sentinel).
     // pool_sig=0 bypasses the cooldown check in next_work_item (per spec Part 11).
@@ -682,7 +682,13 @@ async fn worker_pos_lost_triggers_block_reappearing_in_queue() {
 
     // next_work_item should return None (at target).
     let item = db
-        .next_work_item(1.5, Duration::from_secs(30), Timestamp::now(), 0)
+        .next_work_item(
+            1.5,
+            Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            Timestamp::now(),
+            0,
+        )
         .unwrap();
     assert!(
         item.is_none(),
@@ -697,7 +703,13 @@ async fn worker_pos_lost_triggers_block_reappearing_in_queue() {
 
     // Now next_work_item should return Some.
     let item = db
-        .next_work_item(1.5, Duration::from_secs(30), Timestamp::now(), 0)
+        .next_work_item(
+            1.5,
+            Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            Timestamp::now(),
+            0,
+        )
         .unwrap();
     assert!(
         item.is_some(),
@@ -726,7 +738,13 @@ fn worker_picks_highest_priority_item() {
     db.upsert_source_block(&record_b).unwrap();
 
     let item = db
-        .next_work_item(1.5, Duration::from_secs(30), Timestamp::now(), 0)
+        .next_work_item(
+            1.5,
+            Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            Timestamp::now(),
+            0,
+        )
         .unwrap();
     assert!(item.is_some());
     let picked = item.unwrap();
@@ -751,11 +769,17 @@ fn worker_includes_item_after_cooldown_expires() {
     db.upsert_source_block(&record).unwrap();
     // last_attempted = 60s ago, cooldown = 30s → cooldown expired.
     let old_time = Timestamp(Timestamp::now().0.saturating_sub(60));
-    db.set_block_cooldown(&bid, Some(old_time), 99999); // non-zero pool sig
+    db.set_block_cooldown(&bid, Some(old_time), 99999, false); // non-zero pool sig
 
     // With current_pool_sig = 99999 and elapsed=60 > cooldown=30 → eligible.
     let item = db
-        .next_work_item(1.5, Duration::from_secs(30), Timestamp::now(), 99999)
+        .next_work_item(
+            1.5,
+            Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            Timestamp::now(),
+            99999,
+        )
         .unwrap();
     assert!(
         item.is_some(),
@@ -773,11 +797,17 @@ fn worker_includes_item_when_pool_signature_changes() {
     db.upsert_source_block(&record).unwrap();
     // last_attempted = 5s ago (within cooldown), pool_sig = X.
     let recent = Timestamp(Timestamp::now().0.saturating_sub(5));
-    db.set_block_cooldown(&bid, Some(recent), 11111); // X
+    db.set_block_cooldown(&bid, Some(recent), 11111, false); // X
 
     // Different pool sig Y → cooldown bypassed.
     let item = db
-        .next_work_item(1.5, Duration::from_secs(30), Timestamp::now(), 22222)
+        .next_work_item(
+            1.5,
+            Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            Timestamp::now(),
+            22222,
+        )
         .unwrap();
     assert!(
         item.is_some(),
@@ -820,11 +850,17 @@ async fn worker_skips_item_when_same_pool_sig_within_cooldown() {
     // Arrange: last_attempted_at = now - 5s (within 30s cooldown), pool_sig = S.
     let recent = Timestamp(Timestamp::now().0.saturating_sub(5));
     let sig_s: u64 = 0xdeadbeef_cafebabe; // non-zero signature
-    db.set_block_cooldown(&bid, Some(recent), sig_s);
+    db.set_block_cooldown(&bid, Some(recent), sig_s, false);
 
     // First run with same signature S: next_work_item must return None (on cooldown).
     let item_first = db
-        .next_work_item(1.5, Duration::from_secs(30), Timestamp::now(), sig_s)
+        .next_work_item(
+            1.5,
+            Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            Timestamp::now(),
+            sig_s,
+        )
         .unwrap();
     assert!(
         item_first.is_none(),
@@ -833,7 +869,13 @@ async fn worker_skips_item_when_same_pool_sig_within_cooldown() {
 
     // Run with a DIFFERENT signature: cooldown bypassed → item is returned.
     let item_diff_sig = db
-        .next_work_item(1.5, Duration::from_secs(30), Timestamp::now(), sig_s + 1)
+        .next_work_item(
+            1.5,
+            Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            Timestamp::now(),
+            sig_s + 1,
+        )
         .unwrap();
     assert!(
         item_diff_sig.is_some(),
@@ -1095,7 +1137,7 @@ async fn after_peer_authenticated_event_cooldowns_are_reset() {
     let mut record = make_block_record(bid, 1.0, 0.99);
     record.current_reliability = 0.0; // below target → eligible for reset
     db.upsert_source_block(&record).unwrap();
-    db.set_block_cooldown(&bid, None, 0xfeedf00d);
+    db.set_block_cooldown(&bid, None, 0xfeedf00d, false);
 
     // Create pipeline and call reset_all_cooldowns (simulates PeerAuthenticated handler).
     let encoder =
@@ -1122,7 +1164,13 @@ async fn after_peer_authenticated_event_cooldowns_are_reset() {
 
     // Verify the block is now eligible in next_work_item (sig=0 bypasses cooldown).
     let item = db
-        .next_work_item(1.5, Duration::from_secs(30), Timestamp::now(), 0xfeedf00d)
+        .next_work_item(
+            1.5,
+            Duration::from_secs(30),
+            std::time::Duration::from_secs(3600),
+            Timestamp::now(),
+            0xfeedf00d,
+        )
         .unwrap();
     assert!(
         item.is_some(),
@@ -1226,7 +1274,7 @@ fn worker_retries_delivery_for_offered_placement() {
     // Assert: get_existing_holder_ids returns an empty set.
     // peer-A has an Offered placement, which must NOT be excluded.
     // An empty result means peer-A remains in candidates → delivery will be retried.
-    let holders = get_existing_holder_ids(&db, &bid).unwrap();
+    let holders = get_existing_holder_ids(&db, &bid).unwrap().ids;
     assert!(
         holders.is_empty(),
         "with only an Offered placement, get_existing_holder_ids must return empty \
@@ -1239,67 +1287,44 @@ fn worker_retries_delivery_for_offered_placement() {
     );
 }
 
-// ─── W11b bugfix: get_existing_holder_ids excludes only Alive ─────────────────
+// ─── R1-e1: get_existing_holder_ids excludes every may-hold status ──────────────
 
 #[test]
-fn worker_excludes_only_alive_peers_from_candidates() {
-    // Unit test for get_existing_holder_ids:
-    //   peer-A = Alive   → excluded (already fully delivered)
-    //   peer-B = Offered → NOT excluded (retry candidate)
-    //   peer-C = Lost    → NOT excluded (needs fresh delivery)
-    //
-    // Only peer-A must be in the returned set.
+fn get_existing_holder_ids_excludes_alive_uncertain_presumed_lost() {
+    // repair-i2: Alive (holds), Uncertain / PresumedLost (awaiting a PoS verdict) are
+    // excluded; Offered (retry), Lost (holds nothing), Deleting stay candidates.
+    // Replaces `worker_excludes_only_alive_peers_from_candidates` (pre-R1-e behaviour).
     use crate::daemon::work_pipeline::worker::get_existing_holder_ids;
-    use viaticum_core::types::{FileId, PlacementStatus, SymbolPlacement};
+    use viaticum_core::types::PlacementStatus;
 
     let db = make_db();
     let bid = block_id(0xCC);
-    let peer_a = device_id(0xA0); // Alive
-    let peer_b = device_id(0xB0); // Offered
-    let peer_c = device_id(0xC0); // Lost
-
-    let record = make_block_record(bid, 1.0, 0.99);
-    db.upsert_source_block(&record).unwrap();
-
-    for (holder, status, esi_start) in [
-        (peer_a, PlacementStatus::Alive, 0u32),
-        (peer_b, PlacementStatus::Offered, 1u32),
-        (peer_c, PlacementStatus::Lost, 2u32),
-    ] {
-        db.upsert_placement(&SymbolPlacement {
-            source_block_id: bid,
-            holder_id: holder,
-            file_id: FileId(0),
-            esi_ranges: vec![(esi_start, 1)],
-            binding_seed: [0u8; 32],
-            status,
-            last_verified: None,
-            placed_at: Timestamp::now(),
-            consecutive_misses: 0,
-        })
+    db.upsert_source_block(&make_block_record(bid, 1.0, 0.99))
         .unwrap();
+    let cases = [
+        (device_id(0xA0), PlacementStatus::Alive, true),
+        (device_id(0xA1), PlacementStatus::Uncertain, true),
+        (device_id(0xA2), PlacementStatus::PresumedLost, true),
+        (device_id(0xB0), PlacementStatus::Offered, false),
+        (device_id(0xB1), PlacementStatus::Lost, false),
+        (device_id(0xB2), PlacementStatus::Deleting, false),
+    ];
+    for (i, (holder, status, _)) in cases.iter().enumerate() {
+        db.upsert_placement(&placement(bid, *holder, *status, i as u32))
+            .unwrap();
     }
 
-    let holders = get_existing_holder_ids(&db, &bid).unwrap();
+    let excluded = get_existing_holder_ids(&db, &bid).unwrap();
 
-    assert_eq!(
-        holders.len(),
-        1,
-        "only 1 holder (Alive) must be excluded; got {:?}",
-        holders
-    );
-    assert!(
-        holders.contains(&peer_a),
-        "peer-A (Alive) must be in the excluded set"
-    );
-    assert!(
-        !holders.contains(&peer_b),
-        "peer-B (Offered) must NOT be in the excluded set — worker retries delivery"
-    );
-    assert!(
-        !holders.contains(&peer_c),
-        "peer-C (Lost) must NOT be in the excluded set — worker retries delivery"
-    );
+    for (holder, status, want_excluded) in cases {
+        assert_eq!(
+            excluded.ids.contains(&holder),
+            want_excluded,
+            "{status:?}: excluded must be {want_excluded}"
+        );
+    }
+    assert_eq!(excluded.alive, 1);
+    assert_eq!(excluded.awaiting_verdict, 2);
 }
 
 // ─── snapshot_pool: sibling exclusion tests ───────────────────────────────────
@@ -1620,3 +1645,311 @@ fn resolve_primary_file_id_single_block_without_placements_reverse_looks_up_file
 // corrupt SOURCE_BLOCKS, and redb holds a single exclusive file lock so a second
 // faulty handle cannot be opened. The change is log-only on a corruption-only
 // path — verified by inspection, not by a test.
+
+// ─── R1-e: harness for worker tests that need a (peerless) swarm ───────────────
+
+fn placement(
+    bid: SourceBlockId,
+    holder: DeviceId,
+    status: viaticum_core::types::PlacementStatus,
+    esi_start: u32,
+) -> viaticum_core::types::SymbolPlacement {
+    viaticum_core::types::SymbolPlacement {
+        source_block_id: bid,
+        holder_id: holder,
+        file_id: viaticum_core::types::FileId(0),
+        esi_ranges: vec![(esi_start, 1)],
+        binding_seed: [0u8; 32],
+        status,
+        last_verified: None,
+        placed_at: Timestamp::now(),
+        consecutive_misses: 0,
+    }
+}
+
+/// A started swarm with no peers: `send_to_device` fails at once (peer not
+/// authenticated), `peer_sets` is empty so `snapshot_pool` falls back to the DB peers.
+async fn lonely_swarm(seed: u8) -> Arc<crate::daemon::network::swarm::SwarmHandle> {
+    let cfg = crate::daemon::network::swarm_test_helpers::make_swarm_config(seed);
+    let (handle, events) = crate::daemon::network::swarm::SwarmHandle::start(cfg)
+        .await
+        .unwrap();
+    // Keep the event channel open for the life of the test process: a dropped
+    // receiver must not be what makes a send fail.
+    std::mem::forget(events);
+    Arc::new(handle)
+}
+
+fn add_pool_peers(db: &Db, peers: &[DeviceId]) {
+    for (i, &p) in peers.iter().enumerate() {
+        db.upsert_peer(&make_peer_with_master(p, master_pub(0x40 + i as u8)))
+            .unwrap();
+    }
+}
+
+fn pipeline_with(
+    db: &Db,
+    config: WorkPipelineConfig,
+    swarm: Option<Arc<crate::daemon::network::swarm::SwarmHandle>>,
+) -> WorkPipeline {
+    let encoder =
+        Arc::new(RaptorQEncoder::new()) as Arc<dyn viaticum_core::erasure::ErasureEncoder>;
+    let (_tx, rx) = tokio::sync::mpsc::channel(4);
+    WorkPipeline::new(db.clone(), config, encoder, swarm, None, None, None, rx)
+}
+
+/// A below-target block whose blob is retained under `data_dir/system_state` (the
+/// SystemState path), so the worker can encode it without source files.
+fn retained_block(data_dir: &std::path::Path, seed: u8, importance: f64) -> SourceBlockRecord {
+    let blob: Vec<u8> = (0..3000u32).map(|i| (i as u8) ^ seed).collect();
+    let bid = SourceBlockId(*blake3::hash(&blob).as_bytes());
+    crate::daemon::system_state::block::store_retained_block(data_dir, &bid, &blob).unwrap();
+    let mut rec = make_block_record(bid, importance, 0.99999);
+    rec.k = 3;
+    rec.t = 1024;
+    rec.encrypted_size = Some(blob.len() as u64);
+    rec
+}
+
+#[tokio::test]
+async fn worker_iteration_does_not_overwrite_uncertain_placement() {
+    // repair-i2 / INV-1: the only pool peer awaits a PoS verdict for this block —
+    // nobody to offer to; its record (status, misses, ESI ranges, last_verified) is
+    // byte-for-byte untouched.
+    use viaticum_core::types::{PlacementStatus, to_cbor_bytes};
+
+    let db = make_db();
+    let bid = block_id(0x71);
+    let x = device_id(0x72);
+    let mut rec = make_block_record(bid, 1.0, 0.99999);
+    rec.current_alive = 1;
+    rec.current_reliability = 0.9;
+    db.upsert_source_block(&rec).unwrap();
+    let mut before = placement(bid, x, PlacementStatus::Uncertain, 0);
+    before.esi_ranges = vec![(0, 7)];
+    before.consecutive_misses = 2;
+    before.last_verified = Some(Timestamp(1_000));
+    db.upsert_placement(&before).unwrap();
+
+    let pool = super::PoolSnapshot {
+        candidates: vec![HolderCandidate {
+            device_id: x,
+            trust: 0.9,
+        }],
+        signature: 7,
+    };
+    let swarm = lonely_swarm(0x31).await;
+    let encoder =
+        Arc::new(RaptorQEncoder::new()) as Arc<dyn viaticum_core::erasure::ErasureEncoder>;
+    let outcome = super::worker::run_block_iteration(
+        &db,
+        &make_config(),
+        &encoder,
+        &swarm,
+        None,
+        None,
+        None,
+        &rec,
+        &pool,
+    )
+    .await
+    .unwrap();
+
+    assert!(!outcome.encoded);
+    assert_eq!(outcome.offered, 0);
+    let after = db.get_placement(&bid, &x).unwrap().unwrap();
+    assert_eq!(to_cbor_bytes(&after), to_cbor_bytes(&before));
+}
+
+#[tokio::test]
+async fn worker_does_not_read_source_when_no_candidates() {
+    // repair-i4 cost: with nobody to offer to, the (missing) source is never read —
+    // Ok(encoded=false), not Err(rebuild_source_blob).
+    use viaticum_core::types::PlacementStatus;
+
+    let db = make_db();
+    let bid = block_id(0x73);
+    let peers = [device_id(0x74), device_id(0x75)];
+    let mut rec = make_block_record(bid, 1.0, 0.99999);
+    rec.current_reliability = 0.99;
+    db.upsert_source_block(&rec).unwrap();
+    for (i, &p) in peers.iter().enumerate() {
+        db.upsert_placement(&placement(bid, p, PlacementStatus::Alive, i as u32))
+            .unwrap();
+    }
+    let pool = super::PoolSnapshot {
+        candidates: peers
+            .iter()
+            .map(|&device_id| HolderCandidate {
+                device_id,
+                trust: 0.9,
+            })
+            .collect(),
+        signature: 7,
+    };
+    let swarm = lonely_swarm(0x32).await;
+    let encoder =
+        Arc::new(RaptorQEncoder::new()) as Arc<dyn viaticum_core::erasure::ErasureEncoder>;
+
+    let outcome = super::worker::run_block_iteration(
+        &db,
+        &make_config(),
+        &encoder,
+        &swarm,
+        None,
+        None,
+        None,
+        &rec,
+        &pool,
+    )
+    .await
+    .expect("no candidates must not touch the source");
+
+    assert!(!outcome.encoded);
+    assert_eq!(outcome.offered, 0);
+}
+
+#[tokio::test]
+async fn worker_parks_block_when_no_candidates() {
+    use viaticum_core::types::PlacementStatus;
+
+    let db = make_db();
+    let peers = [device_id(0x76), device_id(0x77)];
+    add_pool_peers(&db, &peers);
+    let bid = block_id(0x78);
+    let mut rec = make_block_record(bid, 1.0, 0.99999);
+    rec.current_reliability = 0.99;
+    db.upsert_source_block(&rec).unwrap();
+    for (i, &p) in peers.iter().enumerate() {
+        db.upsert_placement(&placement(bid, p, PlacementStatus::Alive, i as u32))
+            .unwrap();
+    }
+
+    let mut pipeline = pipeline_with(&db, make_config(), Some(lonely_swarm(0x33).await));
+    assert!(pipeline.run_iteration().await.unwrap());
+
+    let cd = db.block_cooldown(&bid);
+    assert!(cd.parked, "nobody could take symbols → parked");
+    assert!(cd.last_attempted_at.is_some());
+}
+
+#[tokio::test]
+async fn worker_parks_block_when_source_is_unreadable() {
+    // W3: a free candidate exists, but the source cannot be rebuilt (no file behind
+    // the block — an unplugged disk). Retrying every cooldown only burns CPU: park.
+    let db = make_db();
+    let peers = [device_id(0x79), device_id(0x7A)];
+    add_pool_peers(&db, &peers);
+    let bid = block_id(0x7B);
+    let mut rec = make_block_record(bid, 1.0, 0.99999);
+    rec.current_reliability = 0.0;
+    db.upsert_source_block(&rec).unwrap();
+
+    let mut pipeline = pipeline_with(&db, make_config(), Some(lonely_swarm(0x34).await));
+    assert!(pipeline.run_iteration().await.unwrap());
+
+    assert!(db.block_cooldown(&bid).parked);
+    assert!(
+        db.list_placements_for_block(&bid).unwrap().is_empty(),
+        "no Offered record without symbols to send"
+    );
+}
+
+#[tokio::test]
+async fn worker_does_not_park_when_offers_were_attempted() {
+    // Offers went out (and failed: the peers are not connected) — a network failure
+    // is not "nobody can take it": retry after the normal cooldown.
+    let data_dir = tempdir().unwrap();
+    let db = make_db();
+    let peers = [device_id(0x7C), device_id(0x7D)];
+    add_pool_peers(&db, &peers);
+    let rec = retained_block(data_dir.path(), 0x7E, 1.0);
+    db.upsert_source_block(&rec).unwrap();
+
+    let mut config = make_config();
+    config.data_dir = data_dir.path().to_path_buf();
+    let mut pipeline = pipeline_with(&db, config, Some(lonely_swarm(0x35).await));
+    assert!(pipeline.run_iteration().await.unwrap());
+
+    let cd = db.block_cooldown(&rec.block_id);
+    assert!(cd.last_attempted_at.is_some(), "the block was worked");
+    assert!(!cd.parked, "offers were attempted → not parked");
+    assert!(
+        !db.list_placements_for_block(&rec.block_id)
+            .unwrap()
+            .is_empty(),
+        "offers were recorded"
+    );
+}
+
+#[tokio::test]
+async fn stuck_high_priority_block_does_not_starve_lower_block() {
+    // repair-i4 / backup-i12. A: importance 1.0, every pool peer already holds it
+    // (can never grow). B: importance 0.65, one free peer. A outranks B.
+    use viaticum_core::types::PlacementStatus;
+
+    let data_dir = tempdir().unwrap();
+    let db = make_db();
+    let peers = [device_id(0x81), device_id(0x82), device_id(0x83)];
+    add_pool_peers(&db, &peers);
+
+    let a = block_id(0x84);
+    let mut rec_a = make_block_record(a, 1.0, 0.99999);
+    rec_a.current_reliability = 0.999;
+    rec_a.current_alive = 3;
+    db.upsert_source_block(&rec_a).unwrap();
+    for (i, &p) in peers.iter().enumerate() {
+        db.upsert_placement(&placement(a, p, PlacementStatus::Alive, i as u32))
+            .unwrap();
+    }
+    let rec_b = retained_block(data_dir.path(), 0x85, 0.65);
+    db.upsert_source_block(&rec_b).unwrap();
+    for (i, &p) in peers[..2].iter().enumerate() {
+        db.upsert_placement(&placement(
+            rec_b.block_id,
+            p,
+            PlacementStatus::Alive,
+            i as u32,
+        ))
+        .unwrap();
+    }
+
+    let mut config = make_config();
+    config.data_dir = data_dir.path().to_path_buf();
+    let mut pipeline = pipeline_with(&db, config, Some(lonely_swarm(0x36).await));
+
+    // One iteration: A has nobody to offer to → parked, and the SAME iteration goes on
+    // to B, which gets an offer to the free peer.
+    assert!(pipeline.run_iteration().await.unwrap());
+    assert!(db.block_cooldown(&a).parked);
+    let cd_b = db.block_cooldown(&rec_b.block_id);
+    assert!(
+        cd_b.last_attempted_at.is_some(),
+        "B worked in the same iteration"
+    );
+    assert!(!cd_b.parked);
+    assert!(
+        db.get_placement(&rec_b.block_id, &peers[2])
+            .unwrap()
+            .is_some(),
+        "B was offered to the free peer"
+    );
+
+    // A later tick, past the normal cooldown (both attempts re-stamped 60 s back):
+    // parked A is skipped, B is picked first.
+    let earlier = Timestamp(Timestamp::now().0 - 60);
+    let sig = db.block_cooldown(&a).last_pool_signature;
+    db.set_block_cooldown(&a, Some(earlier), sig, true);
+    db.set_block_cooldown(&rec_b.block_id, Some(earlier), sig, false);
+    assert!(pipeline.run_iteration().await.unwrap());
+    assert_eq!(
+        db.block_cooldown(&a).last_attempted_at,
+        Some(earlier),
+        "parked A was not picked again"
+    );
+    assert_ne!(
+        db.block_cooldown(&rec_b.block_id).last_attempted_at,
+        Some(earlier),
+        "B was picked"
+    );
+}

@@ -7,7 +7,12 @@
 //   I1: encode_raw called once per block per iteration (not per holder).
 //   I2: No disk writes — raw symbols held in RAM, dropped after iteration.
 //   I3: CPU-bound encode_raw wrapped in spawn_blocking.
-//   I4: Cooldown updated unconditionally at end of iteration.
+//   I4: Every attempt ends with a cooldown record written by the caller: an ordinary
+//       cooldown when offers went out, parking when `offered == 0` or on error
+//       (repair-i4).
+//   I5: Never overwrite a placement whose status `may_hold_symbols()` (Alive /
+//       Uncertain / PresumedLost): only PoS moves those (repair-i2, INV-1).
+//   I6: The source is read only when the allocation is non-empty (repair-i4).
 //
 // TODO: this function duplicates deliver_to_holder from BackupCoordinator.
 // See spec R6: duplication is intentional — worker context differs from coordinator.
@@ -36,24 +41,45 @@ pub(crate) struct WorkOutcome {
     pub acked: usize,
     /// Number of holders that failed or timed out.
     pub failed: usize,
-    /// Whether encoding was actually run.
+    /// Whether encoding was actually run. `false` means nobody could be offered
+    /// symbols (no candidate after exclusions, or an empty allocation); the source
+    /// was not read.
     pub encoded: bool,
+    /// Number of holders an offer was actually sent to (Offered records written).
+    /// `0` = nobody to take symbols (always with `encoded = false`) — the caller
+    /// parks the block (repair-i4).
+    pub offered: usize,
+}
+
+/// Holders excluded from a new offer of one block (repair-i2).
+#[derive(Debug, Default)]
+pub(crate) struct ExcludedHolders {
+    /// Every excluded holder.
+    pub ids: std::collections::HashSet<DeviceId>,
+    /// Of which `Alive`: already hold the block.
+    pub alive: usize,
+    /// Of which `Uncertain` / `PresumedLost`: may still hold it, awaiting a PoS verdict.
+    pub awaiting_verdict: usize,
 }
 
 /// Execute one encode+deliver cycle for the given block.
 ///
 /// Steps:
-///  1. Load source blob via `rebuild_source_blob` (re-encodes from source files).
-///  2. Compute ErasureParams from block record.
-///  3. Compute esi_offset = sum of alive/offered symbol counts (non-overlapping namespace).
-///  4. Compute allocations via `compute_allocation_with_importance`.
+///  1. Compute ErasureParams from block record.
+///  2. Compute esi_offset = sum of alive/offered symbol counts (non-overlapping namespace).
+///  3. Exclude holders that hold or may hold the block (`may_hold_symbols`, repair-i2);
+///     compute allocations via `compute_allocation_with_importance`. Nobody to offer to
+///     → return `encoded = false` WITHOUT reading the source (repair-i4: cheap outcome).
+///  4. Load source blob via `rebuild_source_blob` (re-encodes from source files).
+///     The allocation never depends on the blob (sizes come from `encrypted_size`).
 ///  5. `encode_raw` once (spawn_blocking — CPU-bound ~30s for 128MB).
 ///  6. For each allocation: bind symbols inline, send SymbolOffer → SymbolAccept → SymbolTransfer.
 ///     On `SymbolStored`: transition Offered→Alive + recompute cached fields.
 ///  7. Drop raw symbols (no disk spill).
 ///
-/// Cooldown (`last_attempted_at`, `last_pool_signature`) is updated by the caller
-/// (in `run_iteration`) unconditionally after this function returns.
+/// The caller records the attempt after this returns (`last_attempted_at`,
+/// `last_pool_signature`): an ordinary cooldown when `offered > 0`, otherwise (or on
+/// error) the block is parked (repair-i4).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_block_iteration(
     db: &Db,
@@ -66,20 +92,7 @@ pub(crate) async fn run_block_iteration(
     block: &SourceBlockRecord,
     pool: &PoolSnapshot,
 ) -> anyhow::Result<WorkOutcome> {
-    // 1. Obtain the source blob. SystemState blocks have no backing watch-dir file:
-    //    their encoded blob is retained on disk (blake3 == block_id), so load it
-    //    directly. All other blocks rebuild from source files (deterministic).
-    let source_data = match crate::daemon::system_state::block::try_load_retained_block(
-        &config.data_dir,
-        &block.block_id,
-    )? {
-        Some(blob) => blob,
-        None => crate::daemon::backup::pipeline::rebuild_source_blob(db, block, &config.epoch_key)
-            .await
-            .map_err(|e| anyhow::anyhow!("rebuild_source_blob: {e}"))?,
-    };
-
-    // 2. Compute ErasureParams.
+    // 1. Compute ErasureParams.
     let k = block.k;
     let t = block.t;
     let overhead = block.overhead.unwrap_or(1.5);
@@ -92,29 +105,35 @@ pub(crate) async fn run_block_iteration(
         n,
     };
 
-    // 3. Compute esi_offset: sum of all alive/offered symbol counts for this block.
+    // 2. Compute esi_offset: sum of all alive/offered symbol counts for this block.
     //    This ensures new ESIs don't overlap with existing placements.
     let esi_offset = compute_esi_offset(db, &block.block_id, cluster_state, &config.device_id)?;
 
-    // 4. Compute allocations for available candidates.
-    //    Filter out candidates that already hold symbols for this block.
-    let existing_holders = get_existing_holder_ids(db, &block.block_id)?;
+    // 3. Compute allocations for available candidates. Exclude holders that hold the
+    //    block (Alive) or may still hold it pending a PoS verdict (Uncertain /
+    //    PresumedLost): re-offering to them would overwrite their placement and make a
+    //    silent holder "Alive" without a proof (repair-i2).
+    let excluded = get_existing_holder_ids(db, &block.block_id)?;
     let candidates: Vec<HolderCandidate> = pool
         .candidates
         .iter()
-        .filter(|c| !existing_holders.contains(&c.device_id))
+        .filter(|c| !excluded.ids.contains(&c.device_id))
         .cloned()
         .collect();
 
     if candidates.is_empty() {
         tracing::info!(
             block_id = %block.block_id,
-            "work_pipeline: no new candidates (all pool peers already holding)"
+            excluded_alive = excluded.alive,
+            excluded_awaiting_verdict = excluded.awaiting_verdict,
+            pool = pool.candidates.len(),
+            "work_pipeline: no new candidates (every pool peer holds the block or awaits a PoS verdict)"
         );
         return Ok(WorkOutcome {
             acked: 0,
             failed: 0,
             encoded: false,
+            offered: 0,
         });
     }
 
@@ -134,6 +153,7 @@ pub(crate) async fn run_block_iteration(
                 acked: 0,
                 failed: 0,
                 encoded: false,
+                offered: 0,
             });
         }
         Err(e) => {
@@ -145,8 +165,23 @@ pub(crate) async fn run_block_iteration(
                 acked: 0,
                 failed: 0,
                 encoded: false,
+                offered: 0,
             });
         }
+    };
+
+    // 4. Obtain the source blob — only now that someone can take symbols. SystemState
+    //    blocks have no backing watch-dir file: their encoded blob is retained on disk
+    //    (blake3 == block_id), so load it directly. All other blocks rebuild from
+    //    source files (deterministic).
+    let source_data = match crate::daemon::system_state::block::try_load_retained_block(
+        &config.data_dir,
+        &block.block_id,
+    )? {
+        Some(blob) => blob,
+        None => crate::daemon::backup::pipeline::rebuild_source_blob(db, block, &config.epoch_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("rebuild_source_blob: {e}"))?,
     };
 
     // 5. Encode once for all allocations combined.
@@ -207,6 +242,7 @@ pub(crate) async fn run_block_iteration(
         txn.append_event(&entry)?;
     }
     txn.commit()?;
+    let offered = allocations.len();
 
     // 7. Deliver to each holder (binding applied inline at send time).
     let mut acked = 0usize;
@@ -275,6 +311,7 @@ pub(crate) async fn run_block_iteration(
         acked,
         failed,
         encoded: true,
+        offered,
     })
 }
 
@@ -663,18 +700,26 @@ pub(crate) fn resolve_primary_file_id(
     })
 }
 
-/// Get the set of DeviceIds with Alive symbols for this block.
-/// Offered placements are NOT excluded — the worker retries delivery to peers
-/// whose placement is Offered. See W11b spec Step 5:
-/// `n_attempt = n_target - current_alive`.
+/// Holders excluded from a new offer for this block: Alive (already hold) and
+/// Uncertain/PresumedLost (awaiting a PoS verdict — repair-i2), i.e. every placement
+/// whose status `may_hold_symbols()`. The worker never overwrites such a placement
+/// (INV-1). Offered/Accepted/Lost/Deleting stay candidates: Offered is an unfinished
+/// delivery the worker retries (W11b), Lost holds no data.
 pub(crate) fn get_existing_holder_ids(
     db: &Db,
     block_id: &SourceBlockId,
-) -> anyhow::Result<std::collections::HashSet<DeviceId>> {
-    let placements = db.list_placements_for_block(block_id)?;
-    Ok(placements
-        .into_iter()
-        .filter(|p| matches!(p.status, PlacementStatus::Alive))
-        .map(|p| p.holder_id)
-        .collect())
+) -> anyhow::Result<ExcludedHolders> {
+    let mut excluded = ExcludedHolders::default();
+    for p in db.list_placements_for_block(block_id)? {
+        if !p.status.may_hold_symbols() {
+            continue;
+        }
+        if p.status == PlacementStatus::Alive {
+            excluded.alive += 1;
+        } else {
+            excluded.awaiting_verdict += 1;
+        }
+        excluded.ids.insert(p.holder_id);
+    }
+    Ok(excluded)
 }

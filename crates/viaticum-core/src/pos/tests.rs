@@ -674,3 +674,32 @@ fn trust_factor_clamped_above_two() {
         "trust=-1.0 (clamped to 0.0) should produce >= challenges of trust=1.0"
     );
 }
+
+// ─── pos-i3: a stale verdict does not revive a placement without symbols ─────
+
+fn assert_every_outcome_is_noop(status: PlacementStatus) {
+    let placement = make_placement_with_status(block_id(1), holder(2), vec![(0, 5)], status, 2);
+    let outcomes = [
+        VerifyOutcome::Pass,
+        VerifyOutcome::Timeout,
+        VerifyOutcome::Fail { esi: 0 },
+        VerifyOutcome::NotHeld { esi: 0 },
+        VerifyOutcome::CannotVerify,
+    ];
+    for outcome in &outcomes {
+        let result = apply_pos_outcome(&placement, outcome);
+        assert_eq!(result.new_status, status, "outcome: {outcome:?}");
+        assert_eq!(result.new_consecutive_misses, 2, "outcome: {outcome:?}");
+        assert!(!result.trigger_repair, "outcome: {outcome:?}");
+    }
+}
+
+#[test]
+fn apply_pos_outcome_ignores_offered_placement() {
+    assert_every_outcome_is_noop(PlacementStatus::Offered);
+}
+
+#[test]
+fn apply_pos_outcome_ignores_accepted_placement() {
+    assert_every_outcome_is_noop(PlacementStatus::Accepted);
+}

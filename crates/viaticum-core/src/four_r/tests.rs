@@ -3518,3 +3518,9 @@ fn retained_depth_counts_announced_drops_in_drop_frac() {
     };
     assert_eq!(retained_depth(&zeroed, &r).to_bits(), phi_clean.to_bits());
 }
+
+// В-0a: `eviction_order` by-key refactor (K-0..K-2).
+mod by_key;
+
+// В-0b: `admit_offer` (K-3..K-11).
+mod admit;
