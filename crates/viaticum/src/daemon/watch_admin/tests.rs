@@ -1174,3 +1174,93 @@ fn watch_defaults_json_key_is_importance_multiplier() {
         "legacy 'importance' must not appear in output"
     );
 }
+
+// ─── backup-i13: Viaticum's own storage is never a watch folder ──────────────
+
+/// A fake data dir: both marker files, as the daemon leaves them after its first start.
+fn fake_data_dir(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join(crate::daemon::identity::KEYFILE_NAME), b"key").unwrap();
+    std::fs::write(dir.join(crate::daemon::identity::DB_FILE_NAME), b"db").unwrap();
+}
+
+#[tokio::test]
+async fn add_watch_rejects_viaticum_data_dir() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("vdata");
+    fake_data_dir(&data_dir);
+    let (admin, mut rx) =
+        make_watch_admin_with_config(tmp.path().join("config.toml"), vec![], test_db());
+
+    let result = admin
+        .add_watch(AddWatchRequest {
+            path: data_dir.to_string_lossy().into_owned(),
+            importance_multiplier: None,
+            importance_legacy: None,
+        })
+        .await;
+
+    match result {
+        Err(e @ WatchAdminError::DaemonStorage { .. }) => {
+            assert!(
+                e.to_string().contains("Viaticum data directory"),
+                "reason names the data directory: {e}"
+            );
+        }
+        other => panic!("expected DaemonStorage, got {other:?}"),
+    }
+    assert!(admin.list_watches().is_empty(), "nothing was added");
+    assert!(
+        rx.try_recv().is_err(),
+        "the watcher was not told to watch it"
+    );
+}
+
+#[tokio::test]
+async fn add_watch_rejects_folder_inside_holdings() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("vdata");
+    fake_data_dir(&data_dir);
+    let inside = data_dir.join(crate::daemon::identity::HOLDINGS_DIR_NAME);
+    std::fs::create_dir_all(&inside).unwrap();
+    let (admin, _rx) =
+        make_watch_admin_with_config(tmp.path().join("config.toml"), vec![], test_db());
+
+    let result = admin
+        .add_watch(AddWatchRequest {
+            path: inside.to_string_lossy().into_owned(),
+            importance_multiplier: None,
+            importance_legacy: None,
+        })
+        .await;
+
+    match result {
+        Err(e @ WatchAdminError::DaemonStorage { .. }) => {
+            assert!(e.to_string().contains("own storage"), "{e}");
+        }
+        other => panic!("expected DaemonStorage, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn add_watch_allows_user_folder_inside_data_dir() {
+    // Every E2E watches `<data-dir>/files`: a folder in a data dir but outside
+    // holdings/symbols/restore/system_state is a normal folder.
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("vdata");
+    fake_data_dir(&data_dir);
+    let files = data_dir.join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    let (admin, _rx) =
+        make_watch_admin_with_config(tmp.path().join("config.toml"), vec![], test_db());
+
+    let result = admin
+        .add_watch(AddWatchRequest {
+            path: files.to_string_lossy().into_owned(),
+            importance_multiplier: None,
+            importance_legacy: None,
+        })
+        .await;
+
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}

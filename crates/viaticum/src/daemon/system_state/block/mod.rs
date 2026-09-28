@@ -26,7 +26,7 @@ mod tests;
 
 /// Directory holding retained SystemState block blobs.
 pub fn retention_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("system_state")
+    data_dir.join(crate::daemon::identity::SYSTEM_STATE_DIR_NAME)
 }
 
 /// On-disk path for one retained SystemState block blob.

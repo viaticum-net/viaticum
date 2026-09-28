@@ -967,3 +967,35 @@ fn describe_watch_error_names_missing_folder_and_inotify_limit() {
     let limit = describe_watch_error(&notify::Error::new(notify::ErrorKind::MaxFilesWatch));
     assert!(limit.contains("fs.inotify.max_user_watches"), "{limit}");
 }
+
+/// An event already waiting out its debounce window when its folder is removed
+/// is dropped at flush time (N3): the folder is no root any more.
+#[tokio::test]
+async fn watcher_drops_pending_event_of_removed_folder() {
+    const DEBOUNCE: u64 = 1000;
+    let dir = TempDir::new().unwrap();
+    let (dirty_tx, mut dirty_rx) = mpsc::channel(32);
+    let cancel = CancellationToken::new();
+    let (ctrl_tx, ctrl_rx) = mpsc::channel::<WatcherCommand>(8);
+    let mut config = config_for(&dir);
+    config.debounce_ms = DEBOUNCE;
+    tokio::spawn(start_watcher(config, dirty_tx, ctrl_rx, cancel.clone()));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    std::fs::write(dir.path().join("pending.txt"), b"data").unwrap();
+    // Poll runs every DEBOUNCE/4: the event is in the debounce map, not yet flushed.
+    tokio::time::sleep(Duration::from_millis(DEBOUNCE / 2)).await;
+    ctrl_tx
+        .send(WatcherCommand::Remove {
+            path: dir.path().to_path_buf(),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(3 * DEBOUNCE)).await;
+    let got: Vec<String> = std::iter::from_fn(|| dirty_rx.try_recv().ok())
+        .map(|e| e.path)
+        .collect();
+    assert!(got.is_empty(), "event of a removed folder flushed: {got:?}");
+    cancel.cancel();
+}

@@ -593,8 +593,18 @@ fs event → notify::Event → std channel → tokio task → debounce (30 min)
   → mpsc → BackupCoordinator
 ```
 
-Filters: hidden files (dotfiles), temporary files.
-Only detects changes AFTER daemon start — pre-existing files not scanned.
+Filters (the same for the scan and for live events): hidden files and folders
+(any component below the watch root starting with `.`), Viaticum data directories
+(a directory holding `db.redb`, or an `identity.key` that parses as a Viaticum key,
+found at or below the watch root, is skipped whole), `.viaticumignore` rules and
+built-in ignores. Symlinks to directories are not followed; a symlink to a file whose
+canonical target lies inside a data directory is skipped. A watch folder that is a
+data directory, or lies in its `holdings/`, `symbols/`, `restore/` or
+`system_state/`, is refused. A folder whose watch could not be set up (permission
+denied on a subfolder, inotify limit) stays in Error but is still scanned, and live
+events from the part that is watched are kept.
+A full scan at start (when the last one is older than the rescan interval) and a
+weekly rescan emit every file; live events cover changes in between.
 
 ---
 

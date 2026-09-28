@@ -48,7 +48,8 @@
 #               not daemon-i3 — the step prints both counters.
 # Steps:        0. init 4 nodes; node-00 by hand, node-01 as a service; star
 #                  → node-00 sees 1 authenticated peer — check: wait_auth_peers
-#               1. python blocker holds 0.0.0.0:P (no SO_REUSEPORT); node-02 with
+#               1. python blocker holds 0.0.0.0:P (no SO_REUSEPORT; it binds P itself at
+#                  setup, below the ephemeral range; bind failure = setup FAIL); node-02 with
 #                  listen_port=P → exit 75 within 100 s; its log: `daemon failed
 #                  to start` naming `listen port P`, and none of `daemon
 #                  started` / `libp2p swarm started` / `web API server started`;
@@ -241,8 +242,47 @@ cleanup() {
 trap cleanup EXIT
 
 # A free TCP port (bound and released at once).
-free_port() {
-    python3 -c 'import socket; s=socket.socket(); s.bind(("0.0.0.0",0)); print(s.getsockname()[1]); s.close()'
+# Start the step-1 port blocker and set PORT_P to the port it holds. The blocker binds the
+# port itself (no free-then-rebind window) and picks it below the kernel's ephemeral range,
+# so no outgoing connection on the server can take P while the blocker is gone (step 1b).
+# A blocker that cannot bind is a setup FAIL, never a silent pass.
+start_port_blocker() {
+    local port_file="$TEST_DIR/blocker.port"
+    rm -f "$port_file"
+    python3 - "$port_file" <<'PYEOF' &
+import os, random, socket, sys, time
+low = int(open("/proc/sys/net/ipv4/ip_local_port_range").read().split()[0])
+s = None
+for _ in range(500):
+    p = random.randint(10000, low - 1)
+    c = socket.socket()          # no SO_REUSEPORT, no SO_REUSEADDR
+    try:
+        c.bind(("0.0.0.0", p))
+    except OSError:
+        c.close()
+        continue
+    s = c
+    break
+if s is None:
+    sys.exit("port blocker: no free port below the ephemeral range")
+s.listen()
+with open(sys.argv[1] + ".tmp", "w") as f:
+    f.write(str(p))
+os.rename(sys.argv[1] + ".tmp", sys.argv[1])
+time.sleep(3600)
+PYEOF
+    BLOCKER_PID=$!
+    for _ in $(seq 1 50); do
+        [ -s "$port_file" ] && break
+        kill -0 "$BLOCKER_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [ ! -s "$port_file" ]; then
+        fail "setup: the port blocker could not bind a port (see stderr above)"
+        echo "RESULT: FAIL (setup)"
+        exit 1
+    fi
+    PORT_P=$(cat "$port_file")
 }
 
 # Checks on the lines node IDX wrote since line N: a refused start.
@@ -282,8 +322,8 @@ echo "============================================================"
 echo ""
 echo "=== Phase 0: Setup ==="
 mkdir -p "$TEST_DIR"
-PORT_P=$(free_port)
-echo "  Fixed listen port for node-02/node-03: $PORT_P"
+start_port_blocker
+echo "  Fixed listen port for node-02/node-03: $PORT_P (held by the blocker until step 1b)"
 
 for i in $(seq 0 $((NUM_NODES-1))); do
     mkdir -p "$(node_dir "$i")"
@@ -319,14 +359,7 @@ fi
 # ── STEP 1: PORT HELD BY A FOREIGN PROCESS ───────────────────────
 echo ""
 echo "=== Step 1: listen port held by another process → exit 75 (daemon-i1) ==="
-python3 - "$PORT_P" <<'PYEOF' &
-import socket, sys, time
-s = socket.socket()          # no SO_REUSEPORT, no SO_REUSEADDR
-s.bind(("0.0.0.0", int(sys.argv[1])))
-s.listen()
-time.sleep(3600)
-PYEOF
-BLOCKER_PID=$!
+kill -0 "$BLOCKER_PID" 2>/dev/null || fail "step 1 setup: the port blocker is gone"
 HELD=0
 for _ in $(seq 1 25); do
     if (exec 3<>"/dev/tcp/127.0.0.1/$PORT_P") 2>/dev/null; then HELD=1; break; fi

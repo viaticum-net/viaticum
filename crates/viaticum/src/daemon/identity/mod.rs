@@ -17,6 +17,30 @@ use viaticum_core::cluster::{
 mod tests;
 
 // ============================================================
+// Data-directory layout
+// ============================================================
+//
+// The one place these names are spelled. The watcher recognizes a Viaticum data
+// directory (its own, a sibling's, one left behind by a move or a DR) by these
+// names and keeps it out of the backup (backup-i13): a name changed here changes
+// what the watcher looks for.
+
+/// The node's identity (mnemonic, seed, device seed) — `IdentityKeyFile`, CBOR.
+pub const KEYFILE_NAME: &str = "identity.key";
+/// The catalog database (redb).
+pub const DB_FILE_NAME: &str = "db.redb";
+/// Daemon configuration.
+pub const CONFIG_FILE_NAME: &str = "config.toml";
+/// Symbols this node holds for other owners: `holdings/{block_hex}/{esi}.bin`.
+pub const HOLDINGS_DIR_NAME: &str = "holdings";
+/// Owner-side symbol cache (transitional, W11b).
+pub const SYMBOLS_DIR_NAME: &str = "symbols";
+/// Restore staging: `restore/<job>/…`.
+pub const RESTORE_STAGING_DIR_NAME: &str = "restore";
+/// Retained SystemState block blobs.
+pub const SYSTEM_STATE_DIR_NAME: &str = "system_state";
+
+// ============================================================
 // Public types
 // ============================================================
 
@@ -265,7 +289,7 @@ pub fn write_keyfile_at(path: &Path, kf: &IdentityKeyFile) -> Result<(), Identit
 
 /// Write the default `config.toml` into `data_dir` unless one exists.
 pub fn write_default_config_if_absent(data_dir: &Path) -> Result<(), IdentityError> {
-    let config_path = data_dir.join("config.toml");
+    let config_path = data_dir.join(CONFIG_FILE_NAME);
     if !config_path.exists() {
         std::fs::write(&config_path, DEFAULT_CONFIG_TOML)?;
     }
@@ -305,7 +329,7 @@ pub fn corrupt_key_hint(path: &Path, reason: &str) -> String {
 /// What the daemon says when `data_dir` has no `identity.key`. A folder that still
 /// holds a catalog (`db.redb`) lost its key: recovery (`dr`) comes first there.
 pub fn not_initialized_hint(data_dir: &Path) -> String {
-    if data_dir.join("db.redb").exists() {
+    if data_dir.join(DB_FILE_NAME).exists() {
         format!(
             "identity not initialized, but {} already holds a catalog (db.redb): run \
              'viaticum dr' with your recovery phrase to recover it. 'viaticum init' would \
@@ -350,7 +374,7 @@ pub fn derive_keys(
 // ============================================================
 
 fn keyfile_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("identity.key")
+    data_dir.join(KEYFILE_NAME)
 }
 
 /// Shared logic of the three `init_identity*`: refuse an existing keyfile (telling a
@@ -377,7 +401,7 @@ fn install_keyfile(
 
     // A catalog without its key is a node that lost identity.key: a new identity
     // here would silently start a new, empty history over it (dr-i30).
-    if data_dir.join("db.redb").exists() {
+    if data_dir.join(DB_FILE_NAME).exists() {
         return Err(IdentityError::CatalogWithoutKey(data_dir.to_path_buf()));
     }
 
