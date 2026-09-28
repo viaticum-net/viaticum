@@ -1,6 +1,6 @@
 // How well an SS block is stored, which pointer place a new base takes, and which SS
-// blocks the owner keeps (CROWN-1 V.16.3-V.16.4, V.17.1-V.17.5; mailbox-i50, i56;
-// dr-i41, dr-i48, dr-i49).
+// blocks the owner keeps (CROWN-1 V.16.3-V.16.4, V.17.1-V.17.5; mailbox-i50, i56,
+// i58; dr-i41, dr-i48, dr-i49).
 //
 // Strength of a block = live symbols / k_eff. A placement is live when its status may
 // hold symbols AND its holder was seen within `W = 7 days / time_scale`. SS blocks get
@@ -12,10 +12,10 @@ use std::collections::HashSet;
 
 use viaticum_core::constants::DECODE_OVERHEAD;
 use viaticum_core::db::{Db, DbError};
-use viaticum_core::mailbox::scaled_ttl_secs;
 use viaticum_core::mailbox::seal::PointerPlace;
+use viaticum_core::mailbox::{MailboxEntry, scaled_ttl_secs};
 use viaticum_core::system_state::catalog::{PlacePublication, PointerPublications};
-use viaticum_core::types::SourceBlockId;
+use viaticum_core::types::{SourceBlockId, from_cbor_bytes};
 
 #[cfg(test)]
 mod tests;
@@ -66,10 +66,11 @@ pub(crate) fn block_strength(
     Ok(live as f64 / f64::from(k_eff))
 }
 
-/// The place a NEW base goes to (mailbox-i56): an empty place first, then a place whose
-/// record no postman acked (it may never have left this machine), then the place whose
-/// BASE is weaker (diffs do not count, V.17.5); a tie → the older record. Never derived
-/// from `generation`.
+/// The place a NEW base goes to (mailbox-i56): an empty place first — a record whose
+/// envelope has expired counts as empty, the postmen no longer hold it (mailbox-i58) —
+/// then a place whose record no postman acked (it may never have left this machine),
+/// then the place whose BASE is weaker (diffs do not count, V.17.5); a tie → the older
+/// record. Never derived from `generation`.
 pub(crate) fn place_for_new_base(
     db: &Db,
     meta: &PointerPublications,
@@ -81,6 +82,7 @@ pub(crate) fn place_for_new_base(
     let rank = |r: Option<&PlacePublication>| -> Result<(u8, f64, u64), DbError> {
         Ok(match r {
             None => (0, 0.0, 0),
+            Some(r) if envelope_expired(r, now_secs) => (0, 0.0, r.created_at.0),
             Some(r) if r.acks.is_empty() => (1, 0.0, r.created_at.0),
             Some(r) => (
                 2,
@@ -107,6 +109,12 @@ pub(crate) fn place_for_new_base(
     } else {
         PointerPlace::A
     })
+}
+
+/// The record's envelope is past its `expires_at`. A record whose envelope does not
+/// decode (never expected: META holds what was sealed) is not called expired.
+pub(crate) fn envelope_expired(r: &PlacePublication, now_secs: u64) -> bool {
+    from_cbor_bytes::<MailboxEntry>(&r.entry_cbor).is_ok_and(|e| e.expires_at <= now_secs)
 }
 
 /// SS blocks the owner keeps (V.16.3): bases + diffs of both places, of everything

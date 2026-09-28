@@ -430,6 +430,7 @@ async fn recover_into_staging(
         rv.pointer_slot(&source_lineage.0, PointerPlace::B),
     ];
     let attempts = order_attempts(choice.selected, choice.fallbacks, &slot_of, place_slots);
+    log_attempt_plan(&attempts, &slot_of, place_slots);
 
     // ── 8. Holders, blocks, state ─────────────────────────────────────────────
     let dr_key = crate::daemon::system_state::identity_key_bytes_from_seed(&keyfile.seed)
@@ -513,6 +514,39 @@ async fn recover_into_staging(
         source_lineage,
     })
     // Everything holding the staging DB (router, db) and the swarm drops here.
+}
+
+/// The place (`A`, `B`, or `-` for an unknown `msg_id`) whose slot `p` was opened from.
+pub(crate) fn attempt_place(
+    p: &SelfPointer,
+    slot_of: &HashMap<[u8; 64], [u8; 16]>,
+    place_slots: [[u8; 16]; 2],
+) -> &'static str {
+    match slot_of.get(&p.signature) {
+        Some(s) if *s == place_slots[0] => "A",
+        Some(s) if *s == place_slots[1] => "B",
+        _ => "-",
+    }
+}
+
+/// One line per planned attempt, in order (dr-i48 observable in E2E):
+/// `dr: attempt i/N place=A|B|- created_at=… base=…`.
+fn log_attempt_plan(
+    attempts: &[SelfPointer],
+    slot_of: &HashMap<[u8; 64], [u8; 16]>,
+    place_slots: [[u8; 16]; 2],
+) {
+    let n = attempts.len();
+    for (i, p) in attempts.iter().enumerate() {
+        tracing::info!(
+            "dr: attempt {}/{} place={} created_at={} base={}",
+            i + 1,
+            n,
+            attempt_place(p, slot_of, place_slots),
+            p.created_at.0,
+            hex_encode(&p.base.block_id.0[..8])
+        );
+    }
 }
 
 /// dr-i35: at most this many pointers of the chosen history are tried (each costs a

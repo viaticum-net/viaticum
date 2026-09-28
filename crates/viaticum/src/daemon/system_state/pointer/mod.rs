@@ -1,5 +1,5 @@
 // The pointer publisher: two places per catalog history (CROWN-1 C3a, V.16.3-V.16.4,
-// V.17; mailbox-i46, i47, i50..i56; dr-i48).
+// V.17; mailbox-i46, i47, i50..i56, i58, i59; dr-i48).
 //
 // State lives in META (`PointerPublications`), not in RAM: one record per place, each
 // with the sealed envelope as sent. One tick:
@@ -13,6 +13,9 @@
 //        by generation); the record it displaces goes to the new record's `to_retire`;
 //      the record is written to META BEFORE the envelope is sent (a crash after the
 //      send leaves it known, never retired by the startup sweep);
+//   2b. every other record whose envelope was stored a refresh interval ago gets the
+//      SAME signed pointer re-sealed with a new expiry (mailbox-i58); META is written
+//      before any send and a failed write skips the whole tick (mailbox-i59);
 //   3. every other record with fewer than the dr-i39 number of acks re-offers its
 //      envelope byte-identical (acks accumulate as distinct postmen); an expired
 //      envelope is not re-offered;
@@ -26,7 +29,9 @@ use std::path::Path;
 
 use tracing::{debug, error, info, warn};
 use viaticum_core::db::Db;
-use viaticum_core::mailbox::seal::{PointerPlace, RendezvousKeys, seal_self_pointer};
+use viaticum_core::mailbox::seal::{
+    PointerPlace, RendezvousKeys, open_self_pointer, seal_self_pointer,
+};
 use viaticum_core::mailbox::{MailboxEntry, class_config, scaled_ttl_secs};
 use viaticum_core::system_state::SelfPointer;
 use viaticum_core::system_state::catalog::{
@@ -111,8 +116,7 @@ impl PointerPublisher<'_> {
         };
 
         // 1-2. A new envelope for the running base, when due.
-        let mut fresh_place: Option<PointerPlace> = None;
-        let mut fresh_accepted = false;
+        let mut fresh: Option<SelfPointer> = None;
         if let Some(pointer) = self.build(&running, now_secs)
             && self.new_envelope_due(&meta, &pointer, running.base, now_secs)
         {
@@ -128,15 +132,30 @@ impl PointerPublisher<'_> {
             };
             if let Some(record) = self.seal_record(&pointer, running.base, place, now_secs) {
                 install(&mut meta, record, running.base);
-                if self.put(&meta) {
-                    let outcome = self.send(meta.current.as_ref().expect("installed")).await;
-                    let current = meta.current.as_mut().expect("installed");
-                    fresh_accepted = !outcome.acks.is_empty();
-                    self.log_fresh(current, &pointer, &outcome);
-                    absorb(current, &outcome, now_secs);
-                    fresh_place = Some(place);
-                }
+                fresh = Some(pointer);
             }
+        }
+        let fresh_place = fresh
+            .as_ref()
+            .and_then(|_| meta.current.as_ref().map(|c| c.place));
+
+        // 2b. mailbox-i58: every other record keeps a live envelope — the SAME signed
+        // pointer re-sealed with a new stored_at / expires_at before it expires.
+        let resealed = self.reseal_due(&mut meta, fresh_place, now_secs);
+
+        // mailbox-i52, i59: META is on disk before anything leaves this tick; when it
+        // cannot be written nothing is sent (no new envelope, no re-offer).
+        if (fresh.is_some() || resealed) && !self.put(&meta) {
+            return;
+        }
+
+        let mut fresh_accepted = false;
+        if let Some(pointer) = fresh.as_ref() {
+            let outcome = self.send(meta.current.as_ref().expect("installed")).await;
+            let current = meta.current.as_mut().expect("installed");
+            fresh_accepted = !outcome.acks.is_empty();
+            self.log_fresh(current, pointer, &outcome);
+            absorb(current, &outcome, now_secs);
         }
 
         // 3. Re-offer the other envelopes that lack the dr-i39 number of acks.
@@ -243,6 +262,76 @@ impl PointerPublisher<'_> {
                 })
             );
         changed || refresh_due || clock_refused
+    }
+
+    /// mailbox-i58: a record whose envelope was stored `pointer_refresh_interval` ago
+    /// (or earlier) gets a new envelope with the SAME signed pointer — opened from its
+    /// `entry_cbor`, sealed again with new `stored_at` / `expires_at`. The pointer is
+    /// never rebuilt: a newer `created_at` would make an old state the head of the
+    /// history for DR. Acks restart (they count holders of the newest envelope); the
+    /// re-offer step sends it this tick. `skip` = the place sealed fresh this tick.
+    fn reseal_due(
+        &self,
+        meta: &mut PointerPublications,
+        skip: Option<PointerPlace>,
+        now_secs: u64,
+    ) -> bool {
+        let lineage = meta.lineage.0;
+        let interval = pointer_refresh_interval_secs(self.time_scale);
+        let mut any = false;
+        for slot in [&mut meta.current, &mut meta.other] {
+            let Some(record) = slot.as_mut() else {
+                continue;
+            };
+            if Some(record.place) == skip {
+                continue;
+            }
+            let Some((entry, _)) = envelope(record) else {
+                continue;
+            };
+            if now_secs.saturating_sub(entry.stored_at) < interval {
+                continue;
+            }
+            let pointer_cbor = match open_self_pointer(self.rv, &entry) {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(place = ?record.place, error = %e, "system_state push: cannot open the stored pointer envelope; not re-sealed");
+                    continue;
+                }
+            };
+            let expires_at = now_secs
+                + scaled_ttl_secs(class_config::SELF_POINTER_TTL.as_secs(), self.time_scale);
+            let sealed = match seal_self_pointer(
+                self.rv,
+                &lineage,
+                record.place,
+                &pointer_cbor,
+                expires_at,
+                now_secs,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(place = ?record.place, error = %e, "system_state push: cannot re-seal the stored pointer");
+                    continue;
+                }
+            };
+            record.entry_cbor = to_cbor_bytes(sealed.entry());
+            record.target_sig = sealed
+                .target_sig()
+                .expect("a sealed pointer carries its store signature");
+            record.acks.clear();
+            record.last_refusal = None;
+            info!(
+                place = ?record.place,
+                base = %record.base,
+                created_at = record.created_at.0,
+                previous_stored_at = entry.stored_at,
+                expires_at,
+                "system_state push: pointer envelope re-sealed (same pointer, new expiry)"
+            );
+            any = true;
+        }
+        any
     }
 
     /// Seal `pointer` into `place`; the record starts with no acks.

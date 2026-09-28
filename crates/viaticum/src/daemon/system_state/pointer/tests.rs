@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use viaticum_core::db::Db;
-use viaticum_core::db::testutil::test_db;
+use viaticum_core::db::testutil::{test_db, test_db_with_write_switch};
 use viaticum_core::mailbox::MailboxEntry;
 use viaticum_core::mailbox::seal::{PointerPlace, RendezvousKeys, open_self_pointer};
 use viaticum_core::messages::{
@@ -26,6 +26,7 @@ use viaticum_core::types::{
 use super::{PointerPublisher, RunningState};
 use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter};
 use crate::daemon::mailbox::test_postman::InProcessPostmanNet;
+use crate::daemon::system_state::pointer_refresh_interval_secs;
 use crate::daemon::system_state::publish::PointerCatalog;
 
 const SEED: [u8; 64] = [0x5E; 64];
@@ -119,7 +120,10 @@ fn peer(device: DeviceId, seen: u64) -> PeerRecord {
 
 /// `n` postmen (also the holders of SS blocks), all known peers of the owner.
 fn fx(n: usize) -> Fx {
-    let db = test_db();
+    fx_on(test_db(), n)
+}
+
+fn fx_on(db: Db, n: usize) -> Fx {
     let master = viaticum_core::cluster::derive_master_key(&SEED).unwrap();
     let me = viaticum_core::cluster::master_identity(&master);
     let devices: Vec<DeviceId> = (0..n).map(|_| gen_device_id()).collect();
@@ -399,6 +403,93 @@ async fn meta_place_recorded_before_publish() {
         seen.iter().all(|x| *x),
         "every send found its envelope in META first"
     );
+}
+
+/// mailbox-i59: META that cannot be written means nothing leaves the tick — neither the
+/// new envelope nor a re-offer of the one waiting for acks.
+#[tokio::test]
+async fn meta_write_failure_skips_the_whole_tick() {
+    let (db, fail) = test_db_with_write_switch();
+    let f = fx_on(db, 6); // threshold 3
+    let b1 = f.block(1, 6);
+    f.answering(Some(1));
+    let t = now();
+    f.tick(1, &b1, &[], t).await;
+    let b2 = f.block(2, 6); // a compaction; written while the disk still works
+    assert_eq!(
+        f.meta().current.as_ref().unwrap().acks.len(),
+        1,
+        "b1 waits for re-offers"
+    );
+    let before = f.meta();
+    let sent = f.sent().len();
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    f.answering(None);
+    f.tick(2, &b2, &[], t + 1).await;
+    assert_eq!(
+        f.sent().len(),
+        sent,
+        "META not written: no new envelope, no re-offer"
+    );
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(f.meta(), before, "META on disk is what it was");
+}
+
+/// mailbox-i58: the record of the other place is not refreshed by new catalog states;
+/// before its envelope expires the SAME signed pointer (same created_at) is sealed
+/// again with a new stored_at / expires_at and sent to the postmen.
+#[tokio::test]
+async fn other_place_is_resealed_with_the_same_pointer_before_expiry() {
+    use viaticum_core::mailbox::MailboxEntry;
+    let f = fx(3);
+    let ts = 100_000;
+    let p = PointerPublisher {
+        time_scale: ts,
+        ..f.publisher()
+    };
+    let refresh = pointer_refresh_interval_secs(ts);
+    let b1 = f.block(1, 3);
+    let t = now();
+    f.tick_with(&p, 1, &b1, &[], t).await; // A
+    let b2 = f.block(2, 3);
+    f.tick_with(&p, 2, &b2, &[], t + 1).await; // B; b1 stays in A as `other`
+    let before = f.meta().other.expect("b1 in the other place");
+    assert_eq!((before.place, before.base), (PointerPlace::A, b1));
+    let old: MailboxEntry = from_cbor_bytes(&before.entry_cbor).unwrap();
+    let old_pointer = to_cbor_bytes(&f.opened(&old));
+
+    f.tick_with(&p, 2, &b2, &[], t + refresh - 1).await;
+    assert_eq!(
+        f.meta().other.unwrap().entry_cbor,
+        before.entry_cbor,
+        "not due yet: the envelope is untouched"
+    );
+
+    f.tick_with(&p, 2, &b2, &[], t + refresh).await;
+    let other = f.meta().other.expect("still in META");
+    assert_eq!((other.place, other.base), (PointerPlace::A, b1));
+    assert_eq!(
+        other.created_at, before.created_at,
+        "the pointer is not rebuilt"
+    );
+    let new: MailboxEntry = from_cbor_bytes(&other.entry_cbor).unwrap();
+    assert_eq!(new.stored_at, t + refresh);
+    assert!(new.expires_at > old.expires_at, "a later expiry");
+    assert_eq!(new.msg_id, f.slot(PointerPlace::A));
+    assert_eq!(
+        to_cbor_bytes(&f.opened(&new)),
+        old_pointer,
+        "the same signed pointer inside"
+    );
+    assert_eq!(other.acks.len(), 3, "the new envelope was sent this tick");
+    let held: Vec<MailboxEntry> = f
+        .held_at(2)
+        .into_iter()
+        .filter(|e| e.msg_id == f.slot(PointerPlace::A))
+        .collect();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].stored_at, t + refresh, "the postman replaced it");
+    assert_eq!(to_cbor_bytes(&f.opened(&held[0])), old_pointer);
 }
 
 // ─── Retirement (V.17.2, V.16.4 п.5-6) ────────────────────────────────────────

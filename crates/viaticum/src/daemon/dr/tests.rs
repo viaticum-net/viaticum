@@ -277,6 +277,31 @@ fn dr_tries_both_place_heads_before_stale_bases_from_lagging_postmen() {
     );
 }
 
+/// The per-attempt DR log names the place each pointer was opened from (`-` when its
+/// `msg_id` is neither slot of the history).
+#[test]
+fn attempt_place_names_the_slot_each_pointer_came_from() {
+    use std::collections::HashMap;
+    let slot_a = [0xA0u8; 16];
+    let slot_b = [0xB0u8; 16];
+    let (a, b, moved, unknown) = (
+        test_pointer(900),
+        test_pointer(800),
+        test_pointer(700),
+        test_pointer(600),
+    );
+    let slot_of: HashMap<[u8; 64], [u8; 16]> = HashMap::from([
+        (a.signature, slot_a),
+        (b.signature, slot_b),
+        (moved.signature, [0xCC; 16]),
+    ]);
+    let slots = [slot_a, slot_b];
+    assert_eq!(super::attempt_place(&a, &slot_of, slots), "A");
+    assert_eq!(super::attempt_place(&b, &slot_of, slots), "B");
+    assert_eq!(super::attempt_place(&moved, &slot_of, slots), "-");
+    assert_eq!(super::attempt_place(&unknown, &slot_of, slots), "-");
+}
+
 /// A pointer under a `msg_id` that is neither place (a postman moved it) is never a
 /// head; with one place only, the order is plain freshness.
 #[test]

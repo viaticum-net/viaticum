@@ -3263,6 +3263,8 @@ pub use mailbox::{MailboxRawDump, SelfPointerStore, read_only_mailbox_raw_entrie
 
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil {
+    use redb::StorageBackend;
+
     use crate::db::Db;
     use crate::types::{DeviceId, IdentityPub, Timestamp};
 
@@ -3287,6 +3289,67 @@ pub mod testutil {
 
     pub fn week(n: u32) -> Timestamp {
         Timestamp(n as u64 * crate::constants::SECS_PER_WEEK)
+    }
+
+    /// An in-memory storage whose writes fail while `fail` is set: a full disk or a
+    /// redb I/O error on demand. Reads keep working.
+    #[derive(Debug)]
+    struct WriteSwitchBackend {
+        inner: redb::backends::InMemoryBackend,
+        fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl WriteSwitchBackend {
+        fn check(&self) -> std::io::Result<()> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(std::io::Error::other("test: storage writes switched off"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl StorageBackend for WriteSwitchBackend {
+        fn len(&self) -> std::io::Result<u64> {
+            self.inner.len()
+        }
+        fn read(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+            self.inner.read(offset, out)
+        }
+        fn set_len(&self, len: u64) -> std::io::Result<()> {
+            self.check()?;
+            self.inner.set_len(len)
+        }
+        fn sync_data(&self) -> std::io::Result<()> {
+            self.check()?;
+            self.inner.sync_data()
+        }
+        fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+            self.check()?;
+            self.inner.write(offset, data)
+        }
+    }
+
+    /// A test db whose writes fail while the returned switch is `true` (mailbox-i59:
+    /// "META not written → nothing sent").
+    pub fn test_db_with_write_switch() -> (Db, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backend = WriteSwitchBackend {
+            inner: redb::backends::InMemoryBackend::new(),
+            fail: std::sync::Arc::clone(&fail),
+        };
+        let db = redb::Database::builder()
+            .create_with_backend(backend)
+            .expect("test db");
+        Db::create_tables(&db).expect("test db tables");
+        let hot = super::HotCache::build_from_db(&db).expect("test db hot cache");
+        (
+            Db {
+                inner: std::sync::Arc::new(db),
+                hot: std::sync::Arc::new(std::sync::RwLock::new(hot)),
+            },
+            fail,
+        )
     }
 }
 

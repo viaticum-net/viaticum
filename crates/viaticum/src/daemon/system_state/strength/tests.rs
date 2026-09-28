@@ -284,6 +284,62 @@ fn new_base_replaces_the_weaker_place() {
     );
 }
 
+/// `r` with a real sealed envelope that expires at `expires_at`.
+fn with_envelope(mut r: PlacePublication, expires_at: u64) -> PlacePublication {
+    use viaticum_core::mailbox::seal::{RendezvousKeys, seal_self_pointer};
+    let rv = RendezvousKeys::derive(&[7; 64]);
+    let sealed = seal_self_pointer(
+        &rv,
+        &[1; 16],
+        r.place,
+        b"pointer",
+        expires_at,
+        expires_at - 10,
+    )
+    .unwrap();
+    r.entry_cbor = viaticum_core::types::to_cbor_bytes(sealed.entry());
+    r
+}
+
+/// mailbox-i58: the postmen dropped an expired envelope, so its place is empty in the
+/// network — a new base takes it even over a weaker live place.
+#[test]
+fn place_with_expired_envelope_counts_as_empty() {
+    let db = test_db();
+    let strong = block_of_strength(&db, 1, 5);
+    let weak = block_of_strength(&db, 2, 1);
+    let live_strong = meta(
+        Some(with_envelope(
+            record(PointerPlace::B, weak, vec![], 200, 3),
+            NOW + DAY,
+        )),
+        Some(with_envelope(
+            record(PointerPlace::A, strong, vec![], 100, 3),
+            NOW + DAY,
+        )),
+    );
+    assert_eq!(
+        place_for_new_base(&db, &live_strong, NOW, 1).unwrap(),
+        PointerPlace::B,
+        "control: the weaker live place is displaced"
+    );
+    let expired_strong = meta(
+        Some(with_envelope(
+            record(PointerPlace::B, weak, vec![], 200, 3),
+            NOW + DAY,
+        )),
+        Some(with_envelope(
+            record(PointerPlace::A, strong, vec![], 100, 3),
+            NOW,
+        )),
+    );
+    assert_eq!(
+        place_for_new_base(&db, &expired_strong, NOW, 1).unwrap(),
+        PointerPlace::A,
+        "the strong base's envelope expired: its place is empty"
+    );
+}
+
 #[test]
 fn equal_strength_displaces_the_older_record() {
     let db = test_db();
