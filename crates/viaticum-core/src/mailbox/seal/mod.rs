@@ -3,11 +3,16 @@
 // A postman stores envelopes, never contents. Two schemes, one envelope layout:
 //
 // - self (class SelfPointer only): the owner seals its DR pointer to itself with
-//   `self_seal_e = HKDF(seed, salt=e, "viaticum-mailbox-self-seal-v1")` and puts it
-//   into the rendezvous box `address_e = pub(Ed25519(HKDF(seed, salt=e,
-//   "viaticum-mailbox-rendezvous-sign-v1")))`. Both keys come from the seed and the
-//   wall-clock epoch only, so DR on a clean machine derives them from the mnemonic.
-//   payload = nonce (12, random) ‖ ChaCha20Poly1305(self_seal_e, nonce, AAD, SealedBody)
+//   `self_seal = HKDF(seed, "viaticum-mailbox-self-seal-v2")` and puts it into the
+//   permanent rendezvous box `address = pub(Ed25519(HKDF(seed,
+//   "viaticum-mailbox-rendezvous-sign-v2")))` (CROWN-1 C3a: no epochs, no rotation in
+//   v1). The keys come from the seed only — no time, nothing computable from
+//   `master_pub` — so DR on a clean machine with any clock derives them from the
+//   mnemonic. Each catalog history owns two slots (pointer places A and B) in that
+//   box: the entry's `msg_id` is `HKDF(slot_key, lineage ‖ place)[..16]`, set by
+//   `seal_self_pointer` itself, and the postman keeps one entry per slot (newer
+//   replaces, nothing is evicted — `Db::mailbox_put_self_pointer`).
+//   payload = nonce (12, random) ‖ ChaCha20Poly1305(self_seal, nonce, AAD, SealedBody)
 //
 // - directed (every other class): the "X25519 stanza" of age v1 with our own info
 //   string and AAD. Ephemeral-static X25519 to the recipient master's x25519 key,
@@ -28,7 +33,8 @@
 // plant its own openable envelope under an honest `msg_id` — so receivers must never
 // dedup distinct envelopes by `msg_id` alone (C1 review W1, mailbox-i26).
 //
-// Spec: private/beta-planning/tasks/crown1_mailbox_encryption.md §7.2-§7.4.2.
+// Spec: private/beta-planning/tasks/crown1_mailbox_encryption.md §7.2-§7.4.2, V.3,
+// V.16.3.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -50,10 +56,6 @@ mod tests;
 
 /// `payload_version` of a sealed entry. Version 1 = legacy plaintext CBOR.
 pub const SEALED_PAYLOAD_VERSION: u8 = 2;
-
-/// Length of one rendezvous epoch: 30 days. Deliberately NOT scaled by
-/// `time_scale`: DR is a separate process without a time scale.
-pub const RENDEZVOUS_EPOCH_SECS: u64 = 30 * 24 * 3600;
 
 /// Worst-case number of bytes a sealed entry adds on top of its body, measured
 /// exactly as the postman measures it (`MailboxEntry::serialized_size`, the CBOR of
@@ -86,8 +88,10 @@ pub const SEAL_OVERHEAD_BYTES: usize = 343;
 /// Largest body `seal_*` accepts.
 pub const MAX_SEALED_BODY_BYTES: usize = class_config::MAX_ENTRY_BYTES - SEAL_OVERHEAD_BYTES;
 
-const RENDEZVOUS_SIGN_INFO: &[u8] = b"viaticum-mailbox-rendezvous-sign-v1";
-const SELF_SEAL_INFO: &[u8] = b"viaticum-mailbox-self-seal-v1";
+const RENDEZVOUS_SIGN_INFO: &[u8] = b"viaticum-mailbox-rendezvous-sign-v2";
+const SELF_SEAL_INFO: &[u8] = b"viaticum-mailbox-self-seal-v2";
+const POINTER_SLOT_KEY_INFO: &[u8] = b"viaticum-mailbox-pointer-slot-key-v1";
+const POINTER_SLOT_INFO: &[u8] = b"viaticum-mailbox-pointer-slot-v1";
 const DIRECTED_INFO: &[u8] = b"viaticum-mailbox-directed-v1";
 const AAD_DOMAIN: &[u8] = b"viaticum-mailbox-aad-v1";
 
@@ -96,55 +100,72 @@ const TAG_LEN: usize = 16;
 const EPK_LEN: usize = 32;
 
 // ============================================================
-// Rendezvous epoch + keys
+// Rendezvous keys + pointer places
 // ============================================================
 
-/// Time bucket for the DR pointer rendezvous address. NOT the cluster EpochCounter:
-/// DR must compute it before any state is restored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RendezvousEpoch(pub u64);
+/// Which of a catalog history's two pointer places (V.16.3). The owner records it
+/// with each publication; it is never derived from `generation` (which restarts at 1
+/// on every daemon start).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PointerPlace {
+    A,
+    B,
+}
 
-impl RendezvousEpoch {
-    /// The epoch containing `unix_secs`.
-    pub fn at(unix_secs: u64) -> Self {
-        RendezvousEpoch(unix_secs / RENDEZVOUS_EPOCH_SECS)
+impl PointerPlace {
+    /// The other place of the same history.
+    pub fn other(self) -> Self {
+        match self {
+            PointerPlace::A => PointerPlace::B,
+            PointerPlace::B => PointerPlace::A,
+        }
     }
 
-    /// The previous epoch; `None` for epoch 0.
-    pub fn prev(self) -> Option<Self> {
-        self.0.checked_sub(1).map(RendezvousEpoch)
-    }
-
-    /// The next epoch.
-    pub fn next(self) -> Self {
-        RendezvousEpoch(self.0.saturating_add(1))
+    fn as_u8(self) -> u8 {
+        match self {
+            PointerPlace::A => 0,
+            PointerPlace::B => 1,
+        }
     }
 }
 
-/// Seed-derived keys for one rendezvous epoch. The only secret input is the seed:
-/// nothing here is computable from `master_pub`. Identical on every device that
-/// shares the mnemonic (master-scoped, P6).
+/// Seed-derived keys of the DR pointer box. The box address is permanent (no rotation
+/// in v1): nothing here depends on time, and nothing is computable from `master_pub`.
+/// Identical on every device sharing the mnemonic (P6).
 pub struct RendezvousKeys {
-    pub epoch: RendezvousEpoch,
     pub address: MailboxAddress,
     signing_key: ed25519_dalek::SigningKey,
     seal_key: Zeroizing<[u8; 32]>,
+    slot_key: Zeroizing<[u8; 32]>,
 }
 
 impl RendezvousKeys {
-    /// `rv_sign_e = HKDF(seed, salt=e_be8, RENDEZVOUS_SIGN_INFO)` → Ed25519 secret;
-    /// `address_e = pub(rv_sign_e)`; `self_seal_e = HKDF(seed, salt=e_be8, SELF_SEAL_INFO)`.
-    pub fn derive(seed: &[u8], epoch: RendezvousEpoch) -> Self {
-        let salt = epoch.0.to_be_bytes();
-        let sign_bytes = hkdf32(seed, &salt, RENDEZVOUS_SIGN_INFO);
+    /// All three keys: HKDF-SHA256(ikm = seed, salt = b"", info = *_INFO);
+    /// `address = pub(Ed25519(rendezvous-sign key))`.
+    pub fn derive(seed: &[u8]) -> Self {
+        let sign_bytes = hkdf32(seed, b"", RENDEZVOUS_SIGN_INFO);
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&sign_bytes);
         let address = MailboxAddress(signing_key.verifying_key().to_bytes());
         RendezvousKeys {
-            epoch,
             address,
             signing_key,
-            seal_key: hkdf32(seed, &salt, SELF_SEAL_INFO),
+            seal_key: hkdf32(seed, b"", SELF_SEAL_INFO),
+            slot_key: hkdf32(seed, b"", POINTER_SLOT_KEY_INFO),
         }
+    }
+
+    /// The box slot (= `msg_id`) of one place of one catalog history:
+    /// `HKDF(ikm = slot_key, salt = lineage ‖ place, info = POINTER_SLOT_INFO)[..16]`.
+    /// Deterministic per (seed, lineage, place); unlinkable to the lineage without the
+    /// seed.
+    pub fn pointer_slot(&self, lineage: &[u8; 16], place: PointerPlace) -> [u8; 16] {
+        let mut salt = [0u8; 17];
+        salt[..16].copy_from_slice(lineage);
+        salt[16] = place.as_u8();
+        let okm = hkdf32(&self.slot_key[..], &salt, POINTER_SLOT_INFO);
+        let mut slot = [0u8; 16];
+        slot.copy_from_slice(&okm[..16]);
+        slot
     }
 
     /// Store signature (`target_sig`) of an entry addressed to this rendezvous box.
@@ -161,7 +182,6 @@ impl RendezvousKeys {
 impl std::fmt::Debug for RendezvousKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RendezvousKeys")
-            .field("epoch", &self.epoch)
             .field("address", &self.address)
             .finish_non_exhaustive()
     }
@@ -244,29 +264,44 @@ struct SealedBody {
 // Self scheme (SelfPointer)
 // ============================================================
 
-/// Seal a CBOR(SelfPointer) into the rendezvous box of `keys.epoch`, with the
-/// store signature of the box key attached.
+/// Seal a CBOR(SelfPointer) of catalog history `lineage` into place `place` of the
+/// rendezvous box, with the store signature of the box key attached.
+///
+/// `msg_id` is ALWAYS `keys.pointer_slot(lineage, place)` — callers cannot pick it, so
+/// one history occupies at most two slots (its places A and B) at every postman.
 pub fn seal_self_pointer(
     keys: &RendezvousKeys,
-    msg_id: [u8; 16],
+    lineage: &[u8; 16],
+    place: PointerPlace,
     pointer_cbor: &[u8],
     expires_at: u64,
     stored_at: u64,
 ) -> Result<SealedMailboxEntry, SealError> {
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
-    seal_self_pointer_with_nonce(keys, msg_id, pointer_cbor, expires_at, stored_at, nonce)
+    seal_self_pointer_with_nonce(
+        keys,
+        lineage,
+        place,
+        pointer_cbor,
+        expires_at,
+        stored_at,
+        nonce,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn seal_self_pointer_with_nonce(
     keys: &RendezvousKeys,
-    msg_id: [u8; 16],
+    lineage: &[u8; 16],
+    place: PointerPlace,
     pointer_cbor: &[u8],
     expires_at: u64,
     stored_at: u64,
     nonce: [u8; NONCE_LEN],
 ) -> Result<SealedMailboxEntry, SealError> {
     check_body_len(pointer_cbor)?;
+    let msg_id = keys.pointer_slot(lineage, place);
     let class = MailboxClass::SelfPointer;
     let plaintext = encode_sealed_body(None, pointer_cbor);
     let aad = aad(SEALED_PAYLOAD_VERSION, class, &keys.address.0);

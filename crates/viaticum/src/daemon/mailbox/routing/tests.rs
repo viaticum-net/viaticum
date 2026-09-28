@@ -887,7 +887,7 @@ async fn dr_walk_expands_to_next_batch_when_first_misses() {
 // checked against the actual postman rules rather than a mock that acks anything.
 
 use crate::daemon::mailbox::test_postman::InProcessPostmanNet;
-use viaticum_core::mailbox::seal::{RendezvousEpoch, RendezvousKeys};
+use viaticum_core::mailbox::seal::RendezvousKeys;
 use viaticum_core::mailbox::sign_store;
 
 /// A router whose DB knows `n` postmen, all reachable through one in-process net.
@@ -1008,7 +1008,7 @@ async fn rendezvous_poll_through_real_postmen_needs_proof_and_returns_only_point
     let requester_device = gen_device_id();
     let (router, _net, _devices) =
         router_over_postmen(3, IdentityPub([0x31; 32]), requester_device);
-    let rv = RendezvousKeys::derive(&[0x24u8; 64], RendezvousEpoch::at(Timestamp::now().0));
+    let rv = RendezvousKeys::derive(&[0x24u8; 64]);
 
     let now = Timestamp::now().0;
     let pointer = MailboxEntry {

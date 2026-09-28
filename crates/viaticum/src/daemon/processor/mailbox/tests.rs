@@ -34,7 +34,7 @@ use viaticum_core::db::Db;
 use viaticum_core::db::testutil::test_db;
 use viaticum_core::mailbox::SELF_POINTER_MAX_FUTURE_SKEW_SECS;
 use viaticum_core::mailbox::class_config::{MAX_ENTRY_BYTES, MAX_MAILBOX_BYTES_PER_PEER};
-use viaticum_core::mailbox::seal::{RendezvousEpoch, RendezvousKeys};
+use viaticum_core::mailbox::seal::RendezvousKeys;
 use viaticum_core::mailbox::{
     MailboxAddress, MailboxClass, MailboxEngine, MailboxEntry, MailboxRejectReason, sign_store,
 };
@@ -371,7 +371,7 @@ fn store_self_pointer_with_valid_target_sig_is_accepted() {
     );
     assert_eq!(stored(&db, &master_box).len(), 1);
 
-    let rv = RendezvousKeys::derive(&[7u8; 64], RendezvousEpoch::at(NOW));
+    let rv = RendezvousKeys::derive(&[7u8; 64]);
     let entry = pointer_entry(rv.address, 2, NOW);
     let req = MailboxStoreRequest {
         v: MAILBOX_WIRE_VERSION,
@@ -626,13 +626,55 @@ fn store_same_pointer_again_is_acked_without_change() {
     assert_eq!(stored(&db, &target), vec![req.entry]);
 }
 
+/// Seal + postman together (V.16.3, mailbox-i50): the two places of one history are
+/// two slots in the permanent rendezvous box; republishing a place replaces its own
+/// entry and never touches the other place or another history's slot.
+#[test]
+fn sealed_pointer_places_hold_one_entry_each_at_the_postman() {
+    use viaticum_core::mailbox::seal::{PointerPlace, seal_self_pointer};
+    let db = test_db();
+    let rv = RendezvousKeys::derive(&[9u8; 64]);
+    let publish = |lineage: &[u8; 16], place, stored_at: u64, body: &[u8]| {
+        let sealed =
+            seal_self_pointer(&rv, lineage, place, body, stored_at + 3600, stored_at).unwrap();
+        let req = MailboxStoreRequest {
+            v: MAILBOX_WIRE_VERSION,
+            entry: sealed.entry().clone(),
+            target_sig: sealed.target_sig(),
+        };
+        store(&db, req, NOW)
+    };
+    let mine = [0x4Cu8; 16];
+    let dormant = [0xD0u8; 16];
+    for (lineage, place, at) in [
+        (&dormant, PointerPlace::A, NOW - 100),
+        (&mine, PointerPlace::A, NOW - 50),
+        (&mine, PointerPlace::B, NOW - 40),
+        (&mine, PointerPlace::A, NOW - 30),
+        (&mine, PointerPlace::A, NOW),
+    ] {
+        let resp = publish(lineage, place, at, format!("{at}").as_bytes());
+        assert!(matches!(resp, MailboxStoreResponse::Ack { .. }), "{resp:?}");
+    }
+    let held = stored(&db, &rv.address);
+    let slots: std::collections::HashMap<[u8; 16], u64> =
+        held.iter().map(|e| (e.msg_id, e.stored_at)).collect();
+    assert_eq!(held.len(), 3, "dormant A + mine A + mine B");
+    assert_eq!(slots[&rv.pointer_slot(&mine, PointerPlace::A)], NOW);
+    assert_eq!(slots[&rv.pointer_slot(&mine, PointerPlace::B)], NOW - 40);
+    assert_eq!(
+        slots[&rv.pointer_slot(&dormant, PointerPlace::A)],
+        NOW - 100
+    );
+}
+
 // ============================================================
 // AC-9 / AC-20: proof-gated reads (mailbox-i11, i20)
 // ============================================================
 
 /// A rendezvous box holding 2 pointers and 50 directed-junk entries.
 fn rendezvous_box_with_junk(db: &Db) -> RendezvousKeys {
-    let rv = RendezvousKeys::derive(&[3u8; 64], RendezvousEpoch::at(NOW));
+    let rv = RendezvousKeys::derive(&[3u8; 64]);
     for i in 0..2u8 {
         let entry = pointer_entry(rv.address, i, NOW + i as u64);
         let req = MailboxStoreRequest {
