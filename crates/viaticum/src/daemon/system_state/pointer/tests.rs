@@ -508,6 +508,7 @@ fn two_places(f: &Fx, a: SourceBlockId, b0: SourceBlockId) {
         target_sig: [0; 64],
         last_refusal: None,
         to_retire: vec![],
+        reached: None,
     };
     let mut m = PointerPublications::new(LINEAGE);
     m.current = Some(rec(PointerPlace::A, a, 20));
@@ -776,5 +777,83 @@ async fn published_pointer_ttl_scales_with_time_scale() {
     assert_eq!(
         e.expires_at - e.stored_at,
         class_config::SELF_POINTER_TTL.as_secs() / 60
+    );
+}
+
+// ─── Readiness does not blink (dr-i52) ─────────────────────────────────────────
+
+/// A new envelope of the same place and base starts with no acks; readiness stands on
+/// the last envelope of the place that reached the threshold until the new one does.
+#[tokio::test]
+async fn readiness_does_not_flicker_while_a_new_envelope_collects_acks() {
+    use crate::daemon::system_state::strength::pointer_readiness;
+    let f = fx(6); // threshold 3
+    let b1 = f.block(1, 6);
+    let t = now();
+    let readiness = |at| pointer_readiness(&f.db, 6, at, 1).unwrap();
+    f.tick(1, &b1, &[], t).await;
+    let first = f.meta().current.unwrap();
+    assert!(first.acks.len() >= 3);
+    assert!(readiness(t).ready);
+
+    // A diff: a new envelope in place A; nobody answers.
+    let d1 = f.block(2, 6);
+    f.answering(Some(0));
+    f.tick(1, &b1, &[d1], t + 1).await;
+    let cur = f.meta().current.unwrap();
+    assert!(cur.acks.is_empty(), "the new envelope has no acks yet");
+    let r = readiness(t + 1);
+    assert!(
+        r.ready,
+        "no blink: the earlier envelope still has the threshold"
+    );
+    assert_eq!(r.accepted.unwrap().0, first.created_at.0);
+
+    // Two postmen accept the new one: still short of 3, still ready on the earlier.
+    f.answering(Some(2));
+    f.tick(1, &b1, &[d1], t + 2).await;
+    assert_eq!(f.meta().current.unwrap().acks.len(), 2);
+    let r = readiness(t + 2);
+    assert!(r.ready);
+    assert_eq!(r.accepted.unwrap().0, first.created_at.0);
+
+    // The new envelope reaches the threshold: readiness moves to it.
+    f.answering(None);
+    f.tick(1, &b1, &[d1], t + 3).await;
+    let cur = f.meta().current.unwrap();
+    assert!(cur.acks.len() >= 3);
+    assert_eq!(cur.reached, None, "no longer needed");
+    let r = readiness(t + 3);
+    assert!(r.ready);
+    assert_eq!(r.accepted.unwrap().0, cur.created_at.0);
+    assert_eq!(r.blocks_total, 2, "base + the new diff");
+}
+
+/// A new base displacing a place does not inherit the readiness of the base it
+/// displaced: readiness stands on the other place (or on nothing).
+#[tokio::test]
+async fn new_base_in_a_place_does_not_keep_the_displaced_base_ready() {
+    use crate::daemon::system_state::strength::pointer_readiness;
+    let f = fx(6);
+    let t = now();
+    let b1 = f.block(1, 6);
+    f.tick(1, &b1, &[], t).await; // A
+    let b2 = f.block(2, 6);
+    f.tick(2, &b2, &[], t + 1).await; // B
+    let b3 = f.block(3, 1);
+    f.answering(Some(0));
+    f.tick(3, &b3, &[], t + 2).await; // displaces the weaker (older on a tie) place: A
+    let m = f.meta();
+    let cur = m.current.as_ref().unwrap();
+    assert_eq!((cur.place, cur.base), (PointerPlace::A, b3));
+    assert_eq!(
+        cur.reached, None,
+        "a new base starts without a kept envelope"
+    );
+    let r = pointer_readiness(&f.db, 6, t + 2, 1).unwrap();
+    assert_eq!(
+        r.accepted.unwrap().0,
+        m.other.as_ref().unwrap().created_at.0,
+        "readiness stands on the other place (b2), not on the displaced b1"
     );
 }

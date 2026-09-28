@@ -4483,7 +4483,8 @@ fn every_fresh_db_mints_its_own_catalog_lineage() {
 fn pointer_publications_roundtrip() {
     use crate::mailbox::seal::PointerPlace;
     use crate::system_state::catalog::{
-        PlacePublication, PointerPublications, PointerRefusal, RefusalKind, RetiredPointer,
+        PlacePublication, PointerPublications, PointerRefusal, ReachedEnvelope, RefusalKind,
+        RetiredPointer,
     };
     let db = test_db();
     assert_eq!(db.pointer_publications().unwrap(), None);
@@ -4510,6 +4511,14 @@ fn pointer_publications_roundtrip() {
             base: SourceBlockId([4; 32]),
             diffs: vec![],
         }],
+        reached: Some(ReachedEnvelope {
+            diffs: vec![],
+            generation: 2,
+            created_at: Timestamp(60),
+            files: 4,
+            acks: 3,
+            expires_at: 900,
+        }),
     };
     let mut meta = PointerPublications::new(crate::system_state::CatalogLineageId([6; 16]));
     meta.current = Some(record.clone());

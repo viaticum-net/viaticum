@@ -5,7 +5,9 @@ use viaticum_core::db::Db;
 use viaticum_core::db::testutil::test_db;
 use viaticum_core::mailbox::seal::PointerPlace;
 use viaticum_core::system_state::CatalogLineageId;
-use viaticum_core::system_state::catalog::{PlacePublication, PointerPublications, RetiredPointer};
+use viaticum_core::system_state::catalog::{
+    PlacePublication, PointerPublications, ReachedEnvelope, RetiredPointer,
+};
 use viaticum_core::types::{
     DeviceId, FileId, IdentityPub, PeerRecord, PlacementStatus, SourceBlockId, SourceBlockRecord,
     SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
@@ -101,6 +103,7 @@ fn record(
         target_sig: [0; 64],
         last_refusal: None,
         to_retire: vec![],
+        reached: None,
     }
 }
 
@@ -207,6 +210,32 @@ fn readiness_needs_acks_and_every_block_recoverable() {
     let r = pointer_readiness(&db, 6, NOW, 1).unwrap();
     assert_eq!(r.accepted, Some((100, 1, 3)));
     assert!(r.ready);
+}
+
+/// dr-i52: a place whose new envelope is short of the threshold stands on the kept
+/// earlier one (its diffs, its acks) while that one is unexpired; once it expires the
+/// place stands on its own envelope again.
+#[test]
+fn readiness_stands_on_the_kept_envelope_until_it_expires() {
+    let db = test_db();
+    let base = block_of_strength(&db, 5, 3);
+    let d1 = block_of_strength(&db, 6, 1);
+    let mut cur = record(PointerPlace::A, base, vec![d1], 200, 1);
+    cur.reached = Some(ReachedEnvelope {
+        diffs: vec![],
+        generation: 1,
+        created_at: Timestamp(100),
+        files: 7,
+        acks: 3,
+        expires_at: NOW + 1,
+    });
+    db.put_pointer_publications(&meta(Some(cur), None)).unwrap();
+    let r = pointer_readiness(&db, 6, NOW, 1).unwrap();
+    assert_eq!(r.accepted, Some((100, 7, 3)));
+    assert_eq!((r.blocks_total, r.ready), (1, true));
+    let r = pointer_readiness(&db, 6, NOW + 1, 1).unwrap();
+    assert_eq!(r.accepted, Some((200, 1, 1)), "the kept envelope expired");
+    assert!(!r.ready);
 }
 
 fn peer_template() -> PeerRecord {
@@ -417,12 +446,21 @@ fn keep_set_holds_both_places_their_retire_lists_and_the_candidate() {
         base: b(3),
         diffs: vec![b(4)],
     }];
+    // dr-i52: the diffs of the earlier envelope readiness stands on are kept too.
+    cur.reached = Some(ReachedEnvelope {
+        diffs: vec![b(9)],
+        generation: 1,
+        created_at: Timestamp(9),
+        files: 1,
+        acks: 3,
+        expires_at: NOW,
+    });
     let m = meta(
         Some(cur),
         Some(record(PointerPlace::B, b(5), vec![b(6)], 5, 1)),
     );
     let keep = ss_blocks_to_keep(Some(&m), Some((&b(7), &[b(8)])));
-    let want: HashSet<SourceBlockId> = (1..=8).map(b).collect();
+    let want: HashSet<SourceBlockId> = (1..=9).map(b).collect();
     assert_eq!(keep, want);
     assert!(ss_blocks_to_keep(None, None).is_empty());
 }

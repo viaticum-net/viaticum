@@ -117,9 +117,10 @@ pub(crate) fn envelope_expired(r: &PlacePublication, now_secs: u64) -> bool {
     from_cbor_bytes::<MailboxEntry>(&r.entry_cbor).is_ok_and(|e| e.expires_at <= now_secs)
 }
 
-/// SS blocks the owner keeps (V.16.3): bases + diffs of both places, of everything
-/// waiting to be retired, and of the running candidate (base + all its diffs, placed or
-/// not). Everything else in the SS ledger is retired.
+/// SS blocks the owner keeps (V.16.3): bases + diffs of both places, of the earlier
+/// envelope a place keeps for readiness (dr-i52), of everything waiting to be retired,
+/// and of the running candidate (base + all its diffs, placed or not). Everything else
+/// in the SS ledger is retired.
 pub(crate) fn ss_blocks_to_keep(
     meta: Option<&PointerPublications>,
     candidate: Option<(&SourceBlockId, &[SourceBlockId])>,
@@ -132,6 +133,9 @@ pub(crate) fn ss_blocks_to_keep(
         {
             keep.insert(r.base);
             keep.extend(r.diffs.iter().copied());
+            if let Some(reached) = &r.reached {
+                keep.extend(reached.diffs.iter().copied());
+            }
             for t in &r.to_retire {
                 keep.insert(t.base);
                 keep.extend(t.diffs.iter().copied());
@@ -168,7 +172,8 @@ pub(crate) fn sweep_ss_ledger(
 /// i54), read from META only.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct PointerReadiness {
-    /// The newest record at least one postman acked: its `created_at`, files, acks.
+    /// The newest place at least one postman acked, by its standing envelope
+    /// (dr-i52): its `created_at`, files, acks.
     pub accepted: Option<(u64, u32, u32)>,
     /// dr-i39 number of acks needed.
     pub threshold: u32,
@@ -205,21 +210,56 @@ pub(crate) fn pointer_readiness(
         .as_ref()
         .and_then(|c| c.last_refusal)
         .map(|x| x.kind);
-    if let Some(acc) = meta.newest_accepted() {
-        let acks = acc.acks.len();
+    let accepted = [meta.current.as_ref(), meta.other.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|rec| standing(rec, threshold, now_secs))
+        .find(|st| st.acks > 0);
+    if let Some(acc) = accepted {
         r.accepted = Some((
-            acc.created_at.0,
+            acc.created_at,
             acc.files,
-            u32::try_from(acks).unwrap_or(u32::MAX),
+            u32::try_from(acc.acks).unwrap_or(u32::MAX),
         ));
-        let blocks: Vec<&SourceBlockId> = std::iter::once(&acc.base).chain(&acc.diffs).collect();
+        let blocks: Vec<&SourceBlockId> = std::iter::once(acc.base).chain(acc.diffs).collect();
         r.blocks_total = u32::try_from(blocks.len()).unwrap_or(u32::MAX);
         for b in blocks {
             if block_strength(db, b, now_secs, time_scale)? >= 1.0 {
                 r.blocks_placed += 1;
             }
         }
-        r.ready = acks >= threshold && r.blocks_placed == r.blocks_total;
+        r.ready = acc.acks >= threshold && r.blocks_placed == r.blocks_total;
     }
     Ok(r)
+}
+
+/// The envelope a place stands on for readiness (dr-i52).
+struct Standing<'a> {
+    base: &'a SourceBlockId,
+    diffs: &'a [SourceBlockId],
+    created_at: u64,
+    files: u32,
+    acks: usize,
+}
+
+/// A place stands on its own envelope, unless that one is short of the threshold and
+/// an earlier envelope of the same base that reached it is still unexpired: then on
+/// that one, so a new envelope collecting acks does not make readiness blink.
+fn standing(r: &PlacePublication, threshold: usize, now_secs: u64) -> Standing<'_> {
+    match r.reached.as_ref() {
+        Some(e) if r.acks.len() < threshold && e.expires_at > now_secs => Standing {
+            base: &r.base,
+            diffs: &e.diffs,
+            created_at: e.created_at.0,
+            files: e.files,
+            acks: e.acks as usize,
+        },
+        _ => Standing {
+            base: &r.base,
+            diffs: &r.diffs,
+            created_at: r.created_at.0,
+            files: r.files,
+            acks: r.acks.len(),
+        },
+    }
 }

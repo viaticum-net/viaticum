@@ -24,6 +24,11 @@
 //      outside META and the running candidate are retired (`sweep_ss_ledger`);
 //   5. `waiting` is set while the newest catalog state is in no accepted pointer.
 //
+// dr-i52: an envelope replaced in its place with the same base (a diff, a refresh, a
+// re-seal) is kept as the record's `reached` when it had the threshold; readiness
+// counts it until the new envelope reaches the threshold. A new base in a place
+// starts without it.
+//
 // The daemon never reads its pointer box (РС3.1): this state is what the node knows.
 
 use std::path::Path;
@@ -36,8 +41,8 @@ use viaticum_core::mailbox::seal::{
 use viaticum_core::mailbox::{MailboxEntry, class_config, scaled_ttl_secs};
 use viaticum_core::system_state::SelfPointer;
 use viaticum_core::system_state::catalog::{
-    PlacePublication, PointerPublications, PointerRefusal, RefusalKind, RetiredPointer, Waiting,
-    WaitingReason,
+    PlacePublication, PointerPublications, PointerRefusal, ReachedEnvelope, RefusalKind,
+    RetiredPointer, Waiting, WaitingReason,
 };
 use viaticum_core::types::{SourceBlockId, Timestamp, from_cbor_bytes, hex_encode, to_cbor_bytes};
 
@@ -132,7 +137,7 @@ impl PointerPublisher<'_> {
                 },
             };
             if let Some(record) = self.seal_record(&pointer, running.base, place, now_secs) {
-                install(&mut meta, record, running.base);
+                install(&mut meta, record, running.base, threshold);
                 fresh = Some(pointer);
             }
         }
@@ -142,7 +147,7 @@ impl PointerPublisher<'_> {
 
         // 2b. mailbox-i58: every other record keeps a live envelope — the SAME signed
         // pointer re-sealed with a new stored_at / expires_at before it expires.
-        let resealed = self.reseal_due(&mut meta, fresh_place, now_secs);
+        let resealed = self.reseal_due(&mut meta, fresh_place, threshold, now_secs);
 
         // mailbox-i52, i59: META is on disk before anything leaves this tick; when it
         // cannot be written nothing is sent (no new envelope, no re-offer).
@@ -188,11 +193,21 @@ impl PointerPublisher<'_> {
             );
         }
 
-        // 4. Retire what the records that reached the threshold displaced.
+        // 4. Retire what the records that reached the threshold displaced. dr-i52: a
+        // record at the threshold no longer needs the earlier envelope it kept; an
+        // expired one is no longer held by the postmen.
         for record in [meta.current.as_mut(), meta.other.as_mut()]
             .into_iter()
             .flatten()
         {
+            if record.acks.len() >= threshold
+                || record
+                    .reached
+                    .as_ref()
+                    .is_some_and(|r| r.expires_at <= now_secs)
+            {
+                record.reached = None;
+            }
             if record.acks.len() >= threshold && !record.to_retire.is_empty() {
                 info!(
                     place = ?record.place,
@@ -276,10 +291,12 @@ impl PointerPublisher<'_> {
     /// never rebuilt: a newer `created_at` would make an old state the head of the
     /// history for DR. Acks restart (they count holders of the newest envelope); the
     /// re-offer step sends it this tick. `skip` = the place sealed fresh this tick.
+    /// dr-i52: the replaced envelope stays `reached` while it was at the threshold.
     fn reseal_due(
         &self,
         meta: &mut PointerPublications,
         skip: Option<PointerPlace>,
+        threshold: usize,
         now_secs: u64,
     ) -> bool {
         let lineage = meta.lineage.0;
@@ -321,6 +338,7 @@ impl PointerPublisher<'_> {
                     continue;
                 }
             };
+            record.reached = reached_of(record, threshold);
             record.entry_cbor = to_cbor_bytes(sealed.entry());
             record.target_sig = sealed
                 .target_sig()
@@ -381,6 +399,7 @@ impl PointerPublisher<'_> {
                 .expect("a sealed pointer carries its store signature"),
             last_refusal: None,
             to_retire: Vec::new(),
+            reached: None,
         })
     }
 
@@ -436,7 +455,8 @@ impl PointerPublisher<'_> {
 /// Put a freshly sealed record into META as `current`.
 ///
 /// Same base as `current` → it replaces `current` in its place and keeps its
-/// `to_retire`. A new base → the record in its place (if any) is displaced into the new
+/// `to_retire`; the replaced envelope becomes `reached` if it was at the threshold
+/// (else the one it kept stays, dr-i52). A new base → the record in its place (if any) is displaced into the new
 /// record's `to_retire` (together with what that one was still to retire); if two
 /// displaced bases would wait, the older is dropped from the list at once (its place was
 /// replaced twice at the postmen, V.17.2) and the sweep retires it. The record of the
@@ -445,6 +465,7 @@ pub(crate) fn install(
     meta: &mut PointerPublications,
     mut record: PlacePublication,
     running_base: &SourceBlockId,
+    threshold: usize,
 ) {
     let same_base = meta
         .current
@@ -452,6 +473,7 @@ pub(crate) fn install(
         .is_some_and(|c| c.base == *running_base && c.place == record.place);
     if same_base {
         let old = meta.current.take().expect("checked");
+        record.reached = reached_of(&old, threshold);
         record.to_retire = old.to_retire;
         meta.current = Some(record);
         return;
@@ -481,6 +503,23 @@ pub(crate) fn install(
     }
     meta.other = kept;
     meta.current = Some(record);
+}
+
+/// dr-i52: what an envelope being replaced in its place (same base) leaves for
+/// readiness: itself when it reached the threshold, else the earlier one it kept.
+fn reached_of(record: &PlacePublication, threshold: usize) -> Option<ReachedEnvelope> {
+    if record.acks.len() < threshold {
+        return record.reached.clone();
+    }
+    let (entry, _) = envelope(record)?;
+    Some(ReachedEnvelope {
+        diffs: record.diffs.clone(),
+        generation: record.generation,
+        created_at: record.created_at,
+        files: record.files,
+        acks: u32::try_from(record.acks.len()).unwrap_or(u32::MAX),
+        expires_at: entry.expires_at,
+    })
 }
 
 /// Merge one publication's answers into `record`. Late acks (after the publication

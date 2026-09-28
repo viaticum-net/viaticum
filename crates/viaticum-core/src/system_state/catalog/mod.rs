@@ -138,6 +138,30 @@ pub struct PlacePublication {
     /// has the dr-i39 number of acks (V.17.2). At most one waits: when a second one
     /// would join, the older is retired at once (its place was replaced twice).
     pub to_retire: Vec<RetiredPointer>,
+    /// dr-i52: the last earlier envelope of this place AND this base that reached the
+    /// dr-i39 threshold, kept while this envelope has fewer acks; DR readiness counts
+    /// it until then (a new envelope starts with no acks, readiness must not blink).
+    /// `None` after a change of base in the place and once this envelope reaches the
+    /// threshold.
+    #[serde(default)]
+    pub reached: Option<ReachedEnvelope>,
+}
+
+/// An earlier envelope of a place (same base) that reached the dr-i39 threshold
+/// (dr-i52). The postmen that acked it keep it until they accept a newer one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReachedEnvelope {
+    /// The diff blocks its pointer lists.
+    pub diffs: Vec<SourceBlockId>,
+    pub generation: u32,
+    /// Its pointer's `created_at`.
+    pub created_at: Timestamp,
+    /// Live files of the state it restores.
+    pub files: u32,
+    /// Distinct postmen that acked it.
+    pub acks: u32,
+    /// Its envelope's `expires_at`: after that the postmen no longer hold it.
+    pub expires_at: u64,
 }
 
 /// A base and its diffs displaced out of a place, waiting to be retired locally.

@@ -1806,6 +1806,7 @@ fn place_record(
         target_sig: [0; 64],
         last_refusal: None,
         to_retire: vec![],
+        reached: None,
     }
 }
 
