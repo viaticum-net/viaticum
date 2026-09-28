@@ -1963,7 +1963,7 @@ async fn status_names_the_date_dr_would_restore() {
     let rendered = crate::cli::output::render_status(&data);
     assert!(
         rendered.contains(&format!(
-            "DR would restore the catalog as of {}",
+            "DR would restore the catalog as of {} or newer",
             super::unix_secs_to_iso(1_790_000_000, true)
         )),
         "got: {rendered}"

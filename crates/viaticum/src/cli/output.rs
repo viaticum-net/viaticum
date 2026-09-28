@@ -146,7 +146,7 @@ pub fn render_dr_readiness(data: &StatusData) -> String {
         ));
         if data.dr_restores_state_of > 0 {
             out.push_str(&format!(
-                "                  DR would restore the catalog as of {}\n",
+                "                  DR would restore the catalog as of {} or newer\n",
                 iso(data.dr_restores_state_of)
             ));
         }
