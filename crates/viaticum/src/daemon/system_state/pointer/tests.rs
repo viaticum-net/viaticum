@@ -3,7 +3,7 @@
 // (`InProcessPostmanNet` runs the real postman handlers); a gate decides which postmen
 // answer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -37,10 +37,13 @@ const LINEAGE: CatalogLineageId = CatalogLineageId([0x4C; 16]);
 /// Real postmen behind a gate: `answering = None` → all answer; `Some(set)` → only
 /// those (others fail at the network level). Records every store and whether the
 /// owner's META already held this exact envelope as `current` when it was sent.
+/// `delays`: a postman listed answers after `Some(secs)` of virtual time, or sleeps
+/// (`None`: no answer for 10 minutes); unlisted postmen answer at once.
 struct Gate {
     inner: InProcessPostmanNet,
     owner_db: Db,
     answering: Mutex<Option<HashSet<DeviceId>>>,
+    delays: Mutex<HashMap<DeviceId, Option<u64>>>,
     sent: Mutex<Vec<(DeviceId, MailboxEntry)>>,
     meta_before_send: Mutex<Vec<bool>>,
 }
@@ -70,6 +73,15 @@ impl MailboxNetworkSender for Gate {
         };
         if !open {
             anyhow::bail!("postman {device} unreachable");
+        }
+        let delay = self.delays.lock().unwrap().get(&device).copied();
+        match delay {
+            None => {}
+            Some(Some(s)) => tokio::time::sleep(std::time::Duration::from_secs(s)).await,
+            Some(None) => {
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                anyhow::bail!("postman {device} asleep");
+            }
         }
         self.inner.send_store(device, req).await
     }
@@ -134,6 +146,7 @@ fn fx_on(db: Db, n: usize) -> Fx {
         inner: InProcessPostmanNet::new(&devices, me, devices[0]),
         owner_db: db.clone(),
         answering: Mutex::new(None),
+        delays: Mutex::new(HashMap::new()),
         sent: Mutex::new(vec![]),
         meta_before_send: Mutex::new(vec![]),
     });
@@ -490,6 +503,34 @@ async fn other_place_is_resealed_with_the_same_pointer_before_expiry() {
     assert_eq!(held.len(), 1);
     assert_eq!(held[0].stored_at, t + refresh, "the postman replaced it");
     assert_eq!(to_cbor_bytes(&f.opened(&held[0])), old_pointer);
+}
+
+/// dr-i39, mailbox-i60: the fresh envelope's send returns only once the threshold of
+/// postmen acked, and META records exactly those acks — not the first one.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn pointer_publish_waits_for_threshold_acks_before_writing_meta() {
+    use crate::daemon::system_state::strength::readiness_ack_threshold;
+    let f = fx(5);
+    assert_eq!(readiness_ack_threshold(f.devices.len()), 3);
+    let b1 = f.block(1, 5);
+    *f.gate.delays.lock().unwrap() = HashMap::from([
+        (f.devices[0], Some(0)),
+        (f.devices[1], Some(1)),
+        (f.devices[2], Some(2)),
+        (f.devices[3], None),
+        (f.devices[4], None),
+    ]);
+    let start = tokio::time::Instant::now();
+    f.tick(1, &b1, &[], now()).await;
+    assert_eq!(
+        start.elapsed(),
+        std::time::Duration::from_secs(2),
+        "returns at the third ack"
+    );
+    let cur = f.meta().current.expect("current written");
+    assert_eq!(cur.acks.len(), 3, "the threshold of acks, not the first");
+    let acked: HashSet<DeviceId> = cur.acks.iter().copied().collect();
+    assert_eq!(acked, f.devices.iter().take(3).copied().collect());
 }
 
 // ─── Retirement (V.17.2, V.16.4 п.5-6) ────────────────────────────────────────
@@ -901,4 +942,55 @@ async fn new_base_in_a_place_does_not_keep_the_displaced_base_ready() {
         m.other.as_ref().unwrap().created_at.0,
         "readiness stands on the other place (b2), not on the displaced b1"
     );
+}
+
+/// dr-i52, mailbox-i58: a re-seal of the other place keeps the envelope that reached
+/// the threshold as `reached`; readiness stands on it while the re-sealed envelope has
+/// no acks yet.
+#[tokio::test]
+async fn reseal_keeps_reached_while_the_resealed_envelope_collects_acks() {
+    use crate::daemon::system_state::strength::pointer_readiness;
+    let f = fx(6); // threshold 3
+    let ts = 100_000;
+    let p = PointerPublisher {
+        time_scale: ts,
+        ..f.publisher()
+    };
+    let refresh = pointer_refresh_interval_secs(ts);
+    let t = now();
+    let b1 = f.block(1, 6);
+    f.tick_with(&p, 1, &b1, &[], t).await; // A, every postman acks
+    let b2 = f.block(2, 6);
+    f.answering(Some(2));
+    f.tick_with(&p, 2, &b2, &[], t + 1).await; // B, short of the threshold
+    let m = f.meta();
+    let a = m.other.clone().expect("b1 in the other place");
+    assert_eq!((a.place, a.base), (PointerPlace::A, b1));
+    assert!(a.acks.len() >= 3);
+    assert_eq!(m.current.as_ref().unwrap().acks.len(), 2);
+    let readiness = |at| pointer_readiness(&f.db, 6, at, ts).unwrap();
+    assert_eq!(readiness(t + 1).restores_state_of, Some(a.created_at.0));
+
+    f.answering(Some(0));
+    let at = t + refresh;
+    for d in &f.devices {
+        f.db.upsert_peer(&peer(*d, at)).unwrap(); // holders seen lately
+    }
+    f.tick_with(&p, 2, &b2, &[], at).await;
+    let other = f.meta().other.expect("still in META");
+    let resealed: MailboxEntry = from_cbor_bytes(&other.entry_cbor).unwrap();
+    assert_eq!(resealed.stored_at, at, "re-sealed this tick");
+    assert!(
+        other.acks.is_empty(),
+        "nobody acked the re-sealed envelope yet"
+    );
+    let reached = other
+        .reached
+        .as_ref()
+        .expect("the envelope at the threshold kept");
+    assert_eq!(reached.created_at, a.created_at);
+    assert!(reached.acks >= 3);
+    let r = readiness(at);
+    assert!(r.ready, "readiness holds on place A");
+    assert_eq!(r.restores_state_of, Some(a.created_at.0));
 }

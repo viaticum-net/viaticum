@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, timeout, timeout_at};
 use tracing::{debug, warn};
 use viaticum_core::constants::AVAIL_EWMA_ALPHA;
 use viaticum_core::db::Db;
@@ -100,7 +100,8 @@ fn count(outcome: &mut PublishOutcome, device: DeviceId, answer: StoreAnswer) {
     }
 }
 
-/// One postman: send, then record the answer (contact on Ack, log otherwise).
+/// One postman: send, then record the answer (contact on Ack, log otherwise). The
+/// send is bounded by `PEER_REQUEST_TIMEOUT` whatever the sender, so the task ends.
 async fn store_one(
     sender: &dyn MailboxNetworkSender,
     db: &Db,
@@ -110,7 +111,10 @@ async fn store_one(
     let target = req.entry.target;
     let msg_id = req.entry.msg_id;
     let class = req.entry.class;
-    match sender.send_store(device, req).await {
+    let answer = timeout(PEER_REQUEST_TIMEOUT, sender.send_store(device, req))
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("mailbox store timeout to {device}")));
+    match answer {
         Ok(MailboxStoreResponse::Ack { .. }) => {
             record_avail_contact(db, device, unix_now());
             StoreAnswer::Ack
