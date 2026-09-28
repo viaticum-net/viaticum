@@ -92,6 +92,14 @@ const META_KEY_NEXT_FILE_ID: &str = "next_file_id";
 /// Meta flag: HOLDINGS keys are owner-first (block‖owner → owner‖block migration done, S-4).
 const META_KEY_HOLDINGS_OWNER_KEYED: &str = "holdings_owner_keyed_v1";
 
+/// Meta key: this DB's catalog history id (CBOR `CatalogLineageId`). Minted once per DB,
+/// never part of the SystemState snapshot (spec B2).
+const META_KEY_CATALOG_LINEAGE: &str = "catalog_lineage_v1";
+
+/// Meta key: this node's last pointer publication accepted by ≥ 1 postman
+/// (CBOR `PointerPublication`, dr-i9).
+const META_KEY_POINTER_PUBLICATION: &str = "pointer_publication_v1";
+
 // --- Indices ---
 
 /// file → holders index. Key = (FileId u64 BE[8] || holder DeviceId[32]) = [u8;40].
@@ -135,9 +143,10 @@ const MAILBOX_BYTES_BY_TARGET: TableDefinition<&[u8; 32], &[u8]> =
 /// This does NOT make "no decision reads the ledger" structural — `Db` is reachable from
 /// every module and `get_pair_ledger` is an ordinary `pub` method. The actual guarantee
 /// today is only WHICH call sites read it: the recorder that writes it
-/// ([`crate::pair_ledger`], which reads the previous row to continue the integral) and the
-/// SystemState snapshot/restore pair that carries it through disaster recovery. No
-/// placement, eviction, offer-admission or PoS-cadence path touches it.
+/// ([`crate::pair_ledger`], which reads the previous row to continue the integral), the
+/// SystemState snapshot/restore pair that carries it through disaster recovery, and the 4R
+/// shadow (В-0, [`crate::four_r_holder`]) whose outputs are only log lines and its own latch
+/// row. No placement, eviction, offer-admission or PoS-cadence path decides on it.
 ///
 /// `create_tables` opens it on every `Db::open`, so a database written before this table
 /// existed simply gains it empty (no migration step).
@@ -236,10 +245,34 @@ pub struct WeeklyPosEntry {
 /// Hot layer: in-memory aggregates loaded at startup.
 /// Per-block worker cooldown (B-4). RAM-only: never persisted, so it resets on
 /// daemon restart — a restart is a fine moment to re-attempt every block.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BlockCooldown {
     pub last_attempted_at: Option<Timestamp>,
     pub last_pool_signature: u64,
+    /// Last attempt found nobody to take symbols (no candidate / empty allocation /
+    /// pool too small / no swarm / unreadable source). A parked block is skipped until
+    /// the pool signature changes, a placement of this block changes status, cooldowns
+    /// are reset, or `parked_cooldown` elapses (repair-i4).
+    pub parked: bool,
+}
+
+/// Clear the worker park flag of `block_id` if the placement's status changed
+/// (None → Some, Some(a) → Some(b≠a), Some → None). Called with the hot write lock
+/// held, from every path that updates `hot.placements`, so no status writer
+/// (scheduler, processor, deletion, DR) needs to know about parking (repair-i4).
+/// The normal cooldown (`last_attempted_at`) is kept: only the long park is lifted.
+fn unpark_on_status_change(
+    hot: &mut HotCache,
+    block_id: &SourceBlockId,
+    old: Option<PlacementStatus>,
+    new: Option<PlacementStatus>,
+) {
+    if old == new {
+        return;
+    }
+    if let Some(cd) = hot.block_cooldown.get_mut(block_id) {
+        cd.parked = false;
+    }
 }
 
 pub struct HotCache {
@@ -403,6 +436,11 @@ impl Db {
             tx.open_table(MAILBOX_BYTES_BY_TARGET)?;
             tx.open_table(PAIR_LEDGER)?;
             tx.open_table(PAIR_LEDGER_PENDING_DROPS)?;
+            // DN-1: applied signed letters + their expiry index (outside snapshot_db, 4r-i51).
+            tx.open_table(seen_signed_letters::SEEN_SIGNED_LETTERS)?;
+            tx.open_table(seen_signed_letters::SEEN_SIGNED_LETTERS_BY_EXPIRY)?;
+            // В-0: 4R holder latch (shadow only; outside snapshot_db, node-local).
+            tx.open_table(four_r_state::FOUR_R_STATE)?;
         }
         tx.commit()?;
         Ok(())
@@ -428,6 +466,69 @@ impl Db {
             let mut table = tx.open_table(META)?;
             let bytes = to_cbor_bytes(&value);
             table.insert(META_KEY_NEXT_FILE_ID, bytes.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// This DB's catalog history id, if one was minted.
+    pub fn catalog_lineage(
+        &self,
+    ) -> Result<Option<crate::system_state::CatalogLineageId>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(META)?;
+        match table.get(META_KEY_CATALOG_LINEAGE)? {
+            Some(v) => Ok(Some(from_cbor_bytes(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read this DB's catalog history id, minting a random one if there is none yet.
+    /// One write transaction, so two callers racing on a fresh DB get the same id.
+    pub fn get_or_create_catalog_lineage(
+        &self,
+    ) -> Result<crate::system_state::CatalogLineageId, DbError> {
+        let tx = self.inner.begin_write()?;
+        let id = {
+            let mut table = tx.open_table(META)?;
+            let existing = match table.get(META_KEY_CATALOG_LINEAGE)? {
+                Some(v) => Some(from_cbor_bytes(v.value())?),
+                None => None,
+            };
+            match existing {
+                Some(id) => id,
+                None => {
+                    let id = crate::system_state::CatalogLineageId::random();
+                    table.insert(META_KEY_CATALOG_LINEAGE, to_cbor_bytes(&id).as_slice())?;
+                    id
+                }
+            }
+        };
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// This node's last pointer publication accepted by ≥ 1 postman (dr-i9).
+    pub fn last_pointer_publication(
+        &self,
+    ) -> Result<Option<crate::system_state::catalog::PointerPublication>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(META)?;
+        match table.get(META_KEY_POINTER_PUBLICATION)? {
+            Some(v) => Ok(Some(from_cbor_bytes(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Record a pointer publication accepted by ≥ 1 postman (replaces the previous one).
+    pub fn record_pointer_publication(
+        &self,
+        p: &crate::system_state::catalog::PointerPublication,
+    ) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(META)?;
+            table.insert(META_KEY_POINTER_PUBLICATION, to_cbor_bytes(p).as_slice())?;
         }
         tx.commit()?;
         Ok(())
@@ -615,6 +716,38 @@ impl Db {
             inner: Arc::new(db),
             hot: Arc::new(RwLock::new(hot)),
         })
+    }
+
+    /// Test seam (DN1-16): overwrite the stored row of placement (block, holder) with bytes that
+    /// do not decode as a `SymbolPlacement`, so [`Db::get_placement`] answers `Err` — a damaged
+    /// row, not a missing one. Bypasses the hot cache on purpose.
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn corrupt_placement_row_for_test(
+        &self,
+        block_id: &SourceBlockId,
+        holder_id: &DeviceId,
+    ) -> Result<(), DbError> {
+        let key = placement_key(block_id, holder_id);
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(SYMBOL_PLACEMENTS)?;
+            table.insert(&key, [0xffu8, 0x00, 0x13].as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Test seam (В-0, D-1b): overwrite the pair-ledger row of `master` with bytes that do not
+    /// decode as a `PairLedger`, so [`Db::list_pair_ledgers`] answers `Err`.
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn corrupt_pair_ledger_row_for_test(&self, master: &IdentityPub) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(PAIR_LEDGER)?;
+            table.insert(&master.0, [0xffu8, 0x00, 0x13].as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Access hot cache for read.
@@ -861,11 +994,15 @@ impl Db {
     /// Record a worker attempt on `block_id` (B-4). Cooldown lives only in RAM,
     /// so this performs no disk write — it replaces the per-attempt fsync that
     /// persisting `last_attempted_at`/`last_pool_signature` used to incur.
+    ///
+    /// `parked = true` records that the attempt found nobody to take symbols; see
+    /// [`BlockCooldown::parked`] and [`Db::next_work_item`].
     pub fn set_block_cooldown(
         &self,
         block_id: &SourceBlockId,
         last_attempted_at: Option<Timestamp>,
         last_pool_signature: u64,
+        parked: bool,
     ) {
         let mut hot = self.hot.write().unwrap_or_else(|e| e.into_inner());
         hot.block_cooldown.insert(
@@ -873,6 +1010,7 @@ impl Db {
             BlockCooldown {
                 last_attempted_at,
                 last_pool_signature,
+                parked,
             },
         );
     }
@@ -999,11 +1137,17 @@ impl Db {
     /// Return the highest-priority source block that needs work, or `None` if nothing to do.
     ///
     /// "Needs work" means: `status == Active`, `target_reliability > 0.0`, and
-    /// `current_reliability < target_reliability`.
+    /// `!reliability::meets_target(current_reliability, target_reliability)` (repair-i3:
+    /// the single tolerance-aware definition of "at target").
     ///
     /// Blocks in cooldown are excluded. A block is in cooldown when:
-    /// - it was attempted recently (`last_attempted_at` is `Some(t)` with `now - t < cooldown`), AND
+    /// - it was attempted recently (`last_attempted_at` is `Some(t)` with
+    ///   `now - t < cooldown`, or `< parked_cooldown` if the block is parked), AND
     /// - the authenticated peer pool has not changed (`last_pool_signature == current_pool_sig`).
+    ///
+    /// A parked block (last attempt found nobody to take symbols, repair-i4) is also
+    /// released early by a placement-status change of the block (the park flag is
+    /// cleared in the hot cache) or by `clear_all_block_cooldowns`.
     ///
     /// Cooldown is skipped entirely when `current_pool_sig == 0` (no authenticated peers).
     ///
@@ -1015,6 +1159,7 @@ impl Db {
     ///
     /// * `coef` — completion bonus coefficient from `ReliabilityConfig`. Typically 1.5.
     /// * `cooldown` — cooldown window. Typically `Duration::from_secs(cfg.reliability.cooldown_base_secs)`.
+    /// * `parked_cooldown` — the longer window applied to parked blocks (repair-i4).
     /// * `now` — current time. Pass `Timestamp::now()` in production; pass a fixed value in tests.
     /// * `current_pool_sig` — XxHash64 of the sorted authenticated peer DeviceId set at this moment.
     ///   `0` = no authenticated peers (cooldown bypassed).
@@ -1040,11 +1185,13 @@ impl Db {
         &self,
         coef: f64,
         cooldown: Duration,
+        parked_cooldown: Duration,
         now: Timestamp,
         current_pool_sig: u64,
     ) -> Result<Option<SourceBlockRecord>, DbError> {
         let all = self.list_all_source_blocks()?;
         let cooldown_secs = cooldown.as_secs();
+        let parked_cooldown_secs = parked_cooldown.as_secs();
         // Cooldown state is RAM-only (B-4); take one read lock for the whole pass.
         let hot = self.hot();
         let cooldown_of = |id: &SourceBlockId| -> BlockCooldown {
@@ -1055,14 +1202,21 @@ impl Db {
             if b.status != SourceBlockStatus::Active {
                 return false;
             }
-            if b.target_reliability <= 0.0 || b.current_reliability >= b.target_reliability {
+            if b.target_reliability <= 0.0
+                || crate::reliability::meets_target(b.current_reliability, b.target_reliability)
+            {
                 return false;
             }
             if current_pool_sig != 0 {
                 let cd = cooldown_of(&b.block_id);
                 if let Some(last_at) = cd.last_attempted_at {
                     let elapsed = now.0.saturating_sub(last_at.0);
-                    if elapsed < cooldown_secs && cd.last_pool_signature == current_pool_sig {
+                    let window = if cd.parked {
+                        parked_cooldown_secs
+                    } else {
+                        cooldown_secs
+                    };
+                    if elapsed < window && cd.last_pool_signature == current_pool_sig {
                         return false;
                     }
                 }
@@ -1157,13 +1311,22 @@ impl Db {
             block_agg.total_alive_symbols.saturating_sub(old_alive) + new_alive;
 
         // Update per-(block, holder) aggregate.
-        hot.placements.insert(
-            (record.source_block_id, record.holder_id),
-            PlacementAgg {
-                symbol_count: count,
-                status: record.status,
-                last_pos: record.last_verified,
-            },
+        let old_status = hot
+            .placements
+            .insert(
+                (record.source_block_id, record.holder_id),
+                PlacementAgg {
+                    symbol_count: count,
+                    status: record.status,
+                    last_pos: record.last_verified,
+                },
+            )
+            .map(|agg| agg.status);
+        unpark_on_status_change(
+            &mut hot,
+            &record.source_block_id,
+            old_status,
+            Some(record.status),
         );
 
         Ok(())
@@ -1250,7 +1413,11 @@ impl Db {
         // DB is committed; now apply delta to the hot cache.
         if let Some(ref old_rec) = old_record {
             let mut hot = self.hot.write().unwrap_or_else(|e| e.into_inner());
-            hot.placements.remove(&(*block_id, *holder_id));
+            let old_status = hot
+                .placements
+                .remove(&(*block_id, *holder_id))
+                .map(|agg| agg.status);
+            unpark_on_status_change(&mut hot, block_id, old_status, None);
 
             if matches!(
                 old_rec.status,
@@ -3310,14 +3477,18 @@ impl<'db> DbWriteTxn<'db> {
                         block_agg.total_alive_symbols.saturating_sub(old_alive) + new_alive;
 
                     // Update per-(block, holder) aggregate.
-                    hot.placements.insert(
-                        (block_id, holder_id),
-                        PlacementAgg {
-                            symbol_count: new_count,
-                            status: new_status,
-                            last_pos: new_last_pos,
-                        },
-                    );
+                    let old_status = hot
+                        .placements
+                        .insert(
+                            (block_id, holder_id),
+                            PlacementAgg {
+                                symbol_count: new_count,
+                                status: new_status,
+                                last_pos: new_last_pos,
+                            },
+                        )
+                        .map(|agg| agg.status);
+                    unpark_on_status_change(&mut hot, &block_id, old_status, Some(new_status));
                 }
                 HotCacheDelta::PlacementDeleted {
                     block_id,
@@ -3325,7 +3496,11 @@ impl<'db> DbWriteTxn<'db> {
                     was_alive,
                     old_count,
                 } => {
-                    hot.placements.remove(&(block_id, holder_id));
+                    let old_status = hot
+                        .placements
+                        .remove(&(block_id, holder_id))
+                        .map(|agg| agg.status);
+                    unpark_on_status_change(&mut hot, &block_id, old_status, None);
 
                     if was_alive {
                         if let Some(agg) = hot.blocks.get_mut(&block_id) {
@@ -3429,6 +3604,12 @@ pub mod testutil {
         Timestamp(n as u64 * crate::constants::SECS_PER_WEEK)
     }
 }
+
+/// DN-1: applied signed letters by signature (`seen_signed_letters` + expiry index).
+mod seen_signed_letters;
+
+/// В-0: 4R holder state (`four_r_state`: the relay latch row).
+mod four_r_state;
 
 #[cfg(test)]
 mod tests;

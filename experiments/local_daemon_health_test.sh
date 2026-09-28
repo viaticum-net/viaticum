@@ -40,18 +40,12 @@
 #               scenario — here the units have no Restart=); self-enrollment
 #               after DR (unit tests here; E2E = local_dr_test, dr-i22);
 #               redb Corrupted/UpgradeRequired → 78 (unit tests only).
-# Caveat:       work_pipeline starvation (separate bug, reported with R1-b1):
-#               the worker places one block per tick, highest importance first,
-#               with a time-only cooldown; two SystemState blocks (importance
-#               1.0) that cannot reach their target in a 4-node pool alternate
-#               forever and no file block is ever placed. A node publishes its
-#               first SystemState block ~60 s and the second ~120 s after its
-#               start (time_scale 1000); with one stuck block the file block
-#               still gets every other turn, with two it gets none. So steps 2
-#               and 3 back up on nodes younger than ~2 minutes (step 2b, which
-#               waits ~64 s, runs after step 2 for this reason).
-#               A FAIL of step 3 with many 'no new candidates' lines is that
-#               bug, not daemon-i3 — the step prints both counters.
+# Note:         the work_pipeline starvation seen with R1-b1 (two stuck
+#               SystemState blocks alternating forever, no file block placed on
+#               nodes younger than ~2 minutes) is fixed by R1-e (repair-i4:
+#               stuck blocks park, the worker moves on). A FAIL of step 3 with
+#               many 'no new candidates' lines is a regression of repair-i4,
+#               not daemon-i3 — the step prints both counters.
 # Steps:        0. init 4 nodes; node-00 by hand, node-01 as a service; star
 #                  → node-00 sees 1 authenticated peer — check: wait_auth_peers
 #               1. python blocker holds 0.0.0.0:P (no SO_REUSEPORT); node-02 with

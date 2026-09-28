@@ -308,6 +308,12 @@ pub const DEFAULT_ANNUAL_CHURN_RATE: f64 = 0.30;
 /// 99.0% = two nines. Blocks below this get flagged in ReliabilityReport.
 pub const RELIABILITY_REPAIR_THRESHOLD: f64 = 0.99;
 
+/// Relative tolerance, in FAILURE-probability space, for "block reliability meets
+/// its target". Absorbs f64 rounding of the holder-correlated DP (≈1e-10 relative at
+/// the strictest target 1-1e-5) while staying orders of magnitude below any real
+/// reliability step (one trust bucket, one PoS miss). See `reliability::meets_target`.
+pub const RELIABILITY_TARGET_REL_TOL: f64 = 1e-6;
+
 /// Small N threshold: use exact binomial CDF for N < this value, normal
 /// approximation for N >= this value.
 pub const BINOMIAL_EXACT_THRESHOLD: u32 = 100;
@@ -608,6 +614,42 @@ pub const PAIR_LEDGER_TICK_SECS: u64 = 3600;
 ///   "3.5 days of confirmed service".
 pub const PAIR_LEDGER_OBSERVED_WINDOW_TICKS: u64 = 3;
 
+// === 4R v1 holder-side dials (`[four_r]` config defaults, В-0) ===
+//
+// Defaults of the `[four_r]` section (release map, "Константы v1"). PROVISIONAL: frozen only
+// after the В-3½ sweep. In В-0 they feed the SHADOW only (logs what 4R would do); no decision
+// of the old path reads them. Units: "gb" = bytes / BYTES_PER_GB (2^30), days are scaled days.
+
+/// `V_free` [gb]: the free retention floor every owner keeps on a holder.
+pub const FOUR_R_V_FREE_GB_DEFAULT: f64 = 0.0;
+/// `c_recip` [days]: gb·days of κ_O per +1 gb of retention (`V_ret = V_free + κ/c_recip`).
+pub const FOUR_R_C_RECIP_DAYS_DEFAULT: f64 = 30.0;
+/// `w_d`: weight of the depth (loyalty) floor in κ_O.
+pub const FOUR_R_W_D_DEFAULT: f64 = 0.5;
+/// `τ_ref` [days]: per-pair `d_ref = τ_ref · v_dem`.
+pub const FOUR_R_TAU_REF_DAYS_DEFAULT: f64 = 365.0;
+/// `θ_p`: preemption margin factor; margin = θ_p · max(V_offer, V_min) / λ [gb·days].
+pub const FOUR_R_THETA_P_DEFAULT: f64 = 0.2;
+/// `V_min` [gb]: floor of the offer volume inside the preemption margin.
+pub const FOUR_R_V_MIN_GB_DEFAULT: f64 = 1.0;
+/// Relay thresholds on φ = free share of the quota: evict below `s_hard` …
+pub const FOUR_R_S_HARD_DEFAULT: f64 = 0.05;
+/// … down to `s_target` …
+pub const FOUR_R_S_TARGET_DEFAULT: f64 = 0.15;
+/// … and accept new foreign data freely only above `s_soft`.
+pub const FOUR_R_S_SOFT_DEFAULT: f64 = 0.20;
+
+// === DN-1: stale DropNotice dedup ===
+
+/// How long the owner remembers an applied DropNotice, in multiples of the (scaled) mailbox TTL
+/// of the DropNotice class (DN-1). What bounds an HONEST re-delivery is not the holder's
+/// `expires_at` alone but the postman's clamp on store plus the polling node's own filter —
+/// one raw TTL from the store, each on its own clock. One TTL covers that; the second TTL is a
+/// margin for clock jumps. Caveat: at `time_scale > 1` the clamp is on the RAW (unscaled) TTL
+/// and does not bite, so a holder clock running ahead by more than the SCALED TTL can re-open
+/// a repeat on multi-machine demos (single-machine E2E shares one clock).
+pub const SEEN_DROP_NOTICE_RETENTION_TTLS: u64 = 2;
+
 // === Compile-time sanity checks ===
 
 const _: () = assert!(S_CLAMP_MIN < S_CLAMP_MAX);
@@ -622,6 +664,13 @@ const _: () = assert!(PAIR_LEDGER_LAMBDA_DROP > 0.0);
 // The drop counters are the FASTEST leak and bind the sub-step (Д-L). If this ever flips,
 // the "28-day step" premises in the tests and docs silently become wrong (review N-2).
 const _: () = assert!(PAIR_LEDGER_LAMBDA_DROP >= PAIR_LEDGER_LAMBDA);
+// The 4R relay needs both hysteresis gaps non-zero (formula_phase.md §10, NEW-2).
+const _: () = assert!(
+    0.0 < FOUR_R_S_HARD_DEFAULT
+        && FOUR_R_S_HARD_DEFAULT < FOUR_R_S_TARGET_DEFAULT
+        && FOUR_R_S_TARGET_DEFAULT < FOUR_R_S_SOFT_DEFAULT
+        && FOUR_R_S_SOFT_DEFAULT < 1.0
+);
 // Д-G: 14 d 3 h. A change here changes what "confirmed" means for every recorded series.
 const _: () = assert!(PAIR_LEDGER_CONFIRMATION_WINDOW_SECS == 1_220_400);
 const _: () = assert!(PAIR_LEDGER_MAX_LAMBDA_DT > 0.0 && PAIR_LEDGER_MAX_LAMBDA_DT < 1.0);
@@ -633,6 +682,8 @@ const _: () = assert!(PAIR_LEDGER_MAX_LAMBDA_DT > 0.0 && PAIR_LEDGER_MAX_LAMBDA_
 // gate). Nothing here can express the scale-dependence — that is checked at run time by
 // `pair_ledger::tests::the_observed_window_is_three_tick_periods_at_every_time_scale`.
 const _: () = assert!(PAIR_LEDGER_OBSERVED_WINDOW_TICKS >= 1);
+// DN-1: a notice must be remembered at least as long as the mailbox hands it out.
+const _: () = assert!(SEEN_DROP_NOTICE_RETENTION_TTLS >= 1);
 const _: () = assert!(OVERHEAD_BASE > 1.0);
 const _: () = assert!(DECODE_OVERHEAD > 0);
 const _: () = assert!(SYMBOL_OFFER_TIMEOUT_SECS < SYMBOL_OFFER_EXPIRY_SECS);

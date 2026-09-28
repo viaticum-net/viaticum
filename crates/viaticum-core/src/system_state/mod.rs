@@ -17,10 +17,13 @@ use sha2::Sha256;
 use std::io::Cursor;
 
 use crate::cluster::StoredClusterState;
+
+pub mod catalog;
 use crate::types::{
     DeviceId, FileId, FileRecord, IdentityPub, PairLedger, PeerRecord, SourceBlockId,
     SourceBlockRecord, SymbolPlacement, Timestamp, to_cbor_bytes,
 };
+pub use catalog::{CatalogLineageId, CatalogSummary};
 
 // ============================================================
 // Local table definition (mirrors db/mod.rs, same name string)
@@ -326,6 +329,33 @@ pub fn restore_db(db: &crate::db::Db, state: &SystemState) -> Result<(), SystemS
 /// has to justify that same precondition.
 pub fn restore_db_force(db: &crate::db::Db, state: &SystemState) -> Result<(), SystemStateError> {
     restore_db_inner(db, state)
+}
+
+/// Merge a peer record learned live (during DR) over the snapshot record of the same
+/// device (dr-i18). `restore_db_force` overwrites peers with the snapshot, which may be
+/// days old; what DR saw on the wire is fresher evidence of how to reach the peer.
+///
+/// The snapshot keeps the peer's history (trust p/i/s, byte counters, first_seen,
+/// revoked keys, avail_ewma, last_avail_sample). Live wins where it is fresher:
+///   addrs           = live addrs, then snapshot addrs not already present (order kept);
+///   last_seen       = max(live, snapshot);
+///   master_identity = live if non-zero, else snapshot;
+///   x25519_pub      = live, else snapshot.
+pub fn merge_live_peer(snapshot: &PeerRecord, live: &PeerRecord) -> PeerRecord {
+    let mut merged = snapshot.clone();
+    let mut addrs = live.addrs.clone();
+    for a in &snapshot.addrs {
+        if !addrs.contains(a) {
+            addrs.push(a.clone());
+        }
+    }
+    merged.addrs = addrs;
+    merged.last_seen = snapshot.last_seen.max(live.last_seen);
+    if live.master_identity.0 != [0u8; 32] {
+        merged.master_identity = live.master_identity;
+    }
+    merged.x25519_pub = live.x25519_pub.or(snapshot.x25519_pub);
+    merged
 }
 
 fn restore_db_inner(db: &crate::db::Db, state: &SystemState) -> Result<(), SystemStateError> {
@@ -793,7 +823,12 @@ pub struct BlockRef {
 /// embedded (the verifier already knows the expected identity, and omitting it binds
 /// verification to that identity).
 ///
-/// **Freshness ordering (DR):** select by `created_at` (wall clock at publish) primary,
+/// **Catalog history.** `catalog` (signed) names the history (DB) this pointer belongs
+/// to, the device that published it and its live file count. Freshness decides only
+/// INSIDE one history; between histories DR does not pick by time
+/// (`catalog::select_catalog`).
+///
+/// **Freshness ordering inside a history:** `created_at` (wall clock at publish) primary,
 /// `generation` only as a same-timestamp tiebreak. `generation` is NOT a reliable global
 /// freshness key: the publisher holds it in RAM and it **resets to 1 on every owner restart**
 /// (see `run_periodic_push`), so a post-restart pointer legitimately has a *lower* generation
@@ -807,21 +842,28 @@ pub struct SelfPointer {
     pub base: BlockRef,
     pub diffs: Vec<BlockRef>,
     pub created_at: Timestamp,
+    /// Which catalog this pointer restores (history, publisher, live files). Signed.
+    pub catalog: CatalogSummary,
     #[serde(with = "crate::types::sig_serde")]
     pub signature: [u8; 64],
 }
 
-const SELF_POINTER_DOMAIN: &[u8] = b"viaticum-self-pointer-v1";
+/// `-v2`: the payload gained `catalog` (spec B2). A `-v1` signature never verifies.
+const SELF_POINTER_DOMAIN: &[u8] = b"viaticum-self-pointer-v2";
 
-/// Canonical signing payload: domain tag || CBOR((generation, base, diffs, created_at)).
+/// Canonical signing payload:
+/// domain tag || CBOR((generation, base, diffs, created_at, catalog)).
 fn self_pointer_payload(
     generation: u32,
     base: &BlockRef,
     diffs: &[BlockRef],
     created_at: Timestamp,
+    catalog: &CatalogSummary,
 ) -> Vec<u8> {
     let mut payload = SELF_POINTER_DOMAIN.to_vec();
-    payload.extend_from_slice(&to_cbor_bytes(&(generation, base, diffs, created_at)));
+    payload.extend_from_slice(&to_cbor_bytes(&(
+        generation, base, diffs, created_at, catalog,
+    )));
     payload
 }
 
@@ -832,15 +874,17 @@ pub fn sign_self_pointer(
     base: BlockRef,
     diffs: Vec<BlockRef>,
     created_at: Timestamp,
+    catalog: CatalogSummary,
 ) -> SelfPointer {
     use ed25519_dalek::Signer;
-    let payload = self_pointer_payload(generation, &base, &diffs, created_at);
+    let payload = self_pointer_payload(generation, &base, &diffs, created_at, &catalog);
     let sig = master_key.sign(&payload);
     SelfPointer {
         generation,
         base,
         diffs,
         created_at,
+        catalog,
         signature: sig.to_bytes(),
     }
 }
@@ -858,6 +902,7 @@ pub fn verify_self_pointer(
         &pointer.base,
         &pointer.diffs,
         pointer.created_at,
+        &pointer.catalog,
     );
     verifying_key
         .verify_strict(&payload, &sig)

@@ -4,7 +4,7 @@
 // RepairAgent, SwarmHandle, Processor, Watcher, Scheduler, the mailbox poll/sweep
 // tasks, and CliServer.
 
-mod redial;
+pub(crate) mod redial;
 pub mod shutdown;
 pub mod startup;
 #[cfg(test)]
@@ -33,9 +33,7 @@ use crate::daemon::identity::{
 };
 use crate::daemon::processor::Processor;
 use crate::daemon::repair::RepairTrigger;
-use crate::daemon::restore::{
-    RestoreConfig, RestoreCoordinator, RestoreError, RestoreRequest, RestoreResult,
-};
+use crate::daemon::restore::{RestoreConfig, RestoreCoordinator, RestoreRequest};
 use crate::daemon::scheduler::{PendingChallenges, Scheduler, SchedulerConfig};
 use crate::daemon::watcher::{WatcherCommand, WatcherConfig};
 
@@ -71,11 +69,16 @@ pub struct DaemonState {
     pub identity_pub: IdentityPub,
     /// This device's ID.
     pub device_id: DeviceId,
-    /// Channel to send restore requests to RestoreCoordinator.
-    pub restore_tx: mpsc::Sender<(
-        RestoreRequest,
-        tokio::sync::oneshot::Sender<Result<RestoreResult, RestoreError>>,
-    )>,
+    /// Queue of restore jobs for the RestoreCoordinator (restore-i4: submit and
+    /// answer at once; the job runs in the coordinator).
+    pub restore_tx: mpsc::Sender<RestoreRequest>,
+    /// Restore job registry, seeded from staging before the web API starts
+    /// (restore-i14); shared with the coordinator.
+    pub restore_jobs: crate::daemon::restore::jobs::RestoreJobs,
+    /// Restore staging status (job dirs, bytes, publish probe), set before the web
+    /// API starts, refreshed by the staging monitor and by the restore coordinator
+    /// after each job; read by `status` (restore-i8, i18, i19).
+    pub restore_staging: Arc<Mutex<crate::daemon::restore::cleanup::StagingStatus>>,
     /// Cluster state. Always `Some` in a running daemon (`start` refuses
     /// otherwise); `None` only in dispatch tests that do not build one.
     pub cluster_state: Option<Arc<Mutex<ClusterState>>>,
@@ -115,6 +118,9 @@ pub struct DaemonState {
     /// revocation entries to storage-relationship peers instead of relay broadcast.
     /// None in tests that do not wire up a MailboxRouter.
     pub mailbox_router: Option<std::sync::Arc<crate::daemon::mailbox::routing::MailboxRouter>>,
+    /// dr-i11: background-counted "files without a local source" for `status`.
+    pub missing_sources:
+        std::sync::Arc<crate::daemon::dispatch::missing_sources::MissingSourceCache>,
 }
 
 /// Web API pieces prepared before the swarm starts (see step 9.4 of `start`).
@@ -348,12 +354,8 @@ impl DaemonHandle {
 
         // ── 6. Create inter-subsystem channels ────────────────────────────────
         let (dirty_tx, dirty_rx) = mpsc::channel::<DirtyEvent>(256);
-        let (restore_tx, restore_rx) = mpsc::channel::<(
-            RestoreRequest,
-            tokio::sync::oneshot::Sender<
-                Result<RestoreResult, crate::daemon::restore::RestoreError>,
-            >,
-        )>(16);
+        // Queue of restore jobs; a full queue answers `busy` (try_send, A14).
+        let (restore_tx, restore_rx) = mpsc::channel::<RestoreRequest>(16);
         let (repair_tx, repair_rx) = mpsc::channel::<RepairTrigger>(64);
         let (backup_event_tx, backup_event_rx) =
             mpsc::channel::<crate::daemon::backup::BackupEvent>(64);
@@ -394,6 +396,19 @@ impl DaemonHandle {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&staging_root, std::fs::Permissions::from_mode(0o700))
                 .map_err(|e| dir_error(&staging_root, e))?;
+        }
+        // Staging status for `status`, known before the web API starts (job-dir count,
+        // publish probe); bytes come from the staging monitor (9.2).
+        let restore_staging = Arc::new(Mutex::new(
+            crate::daemon::restore::cleanup::initial_staging_status(&staging_root),
+        ));
+        // restore-i14: every job dir in staging is a known job before the web API
+        // answers `--status <id>`; leftover temp files of jobs the previous run did
+        // not finish are removed (nothing runs yet, restore-i24).
+        let restore_jobs = crate::daemon::restore::jobs::RestoreJobs::new(staging_root.clone());
+        let seeded = restore_jobs.seed_from_staging();
+        if seeded > 0 {
+            tracing::info!(jobs = seeded, "restore: job dirs registered from staging");
         }
 
         // ── 9.4. Bind the web API listener (optional) ─────────────────────────
@@ -619,17 +634,33 @@ impl DaemonHandle {
             encoder.clone(),
         );
 
+        // ── 11. CancellationToken ─────────────────────────────────────────────
+        // Created before the restore coordinator: a running restore job stops on it
+        // and is recorded `interrupted` within the drain (T10).
+        let cancel = CancellationToken::new();
+
         let restore = RestoreCoordinator::new(
             db.clone(),
             RestoreConfig {
                 epoch_key: epoch_key_bytes,
-                parallel_holders: 5,
-                swarm: Some(swarm_handle_arc.clone()),
+                // Requests over the swarm; redial of holders that did not answer
+                // before a retry (restore-i26).
+                symbols: Some(Arc::new(crate::daemon::symbol_fetch::SwarmSymbols::new(
+                    swarm_handle_arc.clone(),
+                    db.clone(),
+                ))),
                 staging_root: staging_root.clone(),
                 data_dir: cfg.data_dir.clone(),
-                fetch_timeout: std::time::Duration::from_secs(
-                    app_config.restore.fetch_timeout_secs,
-                ),
+                jobs: restore_jobs.clone(),
+                cancel: cancel.clone(),
+                staging_status: Arc::clone(&restore_staging),
+                pressure: Some(crate::daemon::restore::cleanup::HoldingsPressure {
+                    db: db.clone(),
+                    data_dir: cfg.data_dir.clone(),
+                    soft_quota_bytes: viaticum_core::config::soft_quota_bytes(&app_config),
+                    disk_reserve_bytes: viaticum_core::config::disk_reserve_bytes(&app_config),
+                }),
+                time_scale: cfg.time_scale.max(1),
             },
             encoder.clone(),
         );
@@ -637,9 +668,6 @@ impl DaemonHandle {
         // RepairAgent is now only used for periodic reliability_scan (Wave 11b).
         // The repair instance is created in the reliability_scan task below.
         // The old repair.run() task is replaced by the WorkPipeline worker.
-
-        // ── 11. CancellationToken ─────────────────────────────────────────────
-        let cancel = CancellationToken::new();
 
         // ── Step D: Create WatchAdmin ──────────────────────────────────────────
         let watch_admin = Arc::new(crate::daemon::watch_admin::WatchAdmin::new(
@@ -674,6 +702,8 @@ impl DaemonHandle {
             identity_pub,
             device_id,
             restore_tx: restore_tx.clone(),
+            restore_jobs: restore_jobs.clone(),
+            restore_staging: Arc::clone(&restore_staging),
             cluster_state: Some(cluster_state.clone()),
             master_key: master_key.clone(),
             seed: keyfile.seed.clone(),
@@ -703,6 +733,7 @@ impl DaemonHandle {
             peer_backoff: Arc::clone(&peer_backoff),
             // T-13b-2: router shared with dispatch_device_revoke for directed revocation publish.
             mailbox_router: Some(std::sync::Arc::clone(&early_mailbox_router)),
+            missing_sources: Default::default(),
         });
 
         // Clone state for web API and metrics pusher.
@@ -813,35 +844,28 @@ impl DaemonHandle {
             })));
         }
 
-        // ── 9.2. Spawn staging cleanup checker (warn + evict stale) ──
+        // ── 9.2. Restore staging report (restore-i8: report, never delete) ──
         {
-            let staging_root_for_warn = staging_root.clone();
-            let warn_bytes = (app_config.restore.staging_warn_gb * 1_073_741_824.0) as u64;
-            let cancel_for_warn = cancel.clone();
-            let ttl =
-                std::time::Duration::from_secs(crate::daemon::restore::cleanup::STAGING_TTL_SECS);
-            tasks.push(("staging_cleanup", tokio::spawn(async move {
-                // Check immediately at startup: evict stale dirs, then warn if still over.
-                tokio::task::block_in_place(|| {
-                    let _ = crate::daemon::restore::cleanup::evict_stale_stagings(&staging_root_for_warn, ttl);
-                    crate::daemon::restore::cleanup::check_staging_warn(&staging_root_for_warn, warn_bytes);
-                });
-                // Then check every hour.
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-                interval.tick().await; // skip immediate tick (already checked above)
-                loop {
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            tokio::task::block_in_place(|| {
-                                let _ = crate::daemon::restore::cleanup::evict_stale_stagings(&staging_root_for_warn, ttl);
-                                crate::daemon::restore::cleanup::check_staging_warn(&staging_root_for_warn, warn_bytes);
-                            });
-                        }
-                        _ = cancel_for_warn.cancelled() => break,
-                    }
-                }
-                Ok(())
-            })));
+            let monitor = crate::daemon::restore::cleanup::run_staging_monitor(
+                staging_root.clone(),
+                (app_config.restore.staging_warn_gb * 1_073_741_824.0) as u64,
+                crate::daemon::restore::cleanup::STAGING_CHECK_INTERVAL,
+                Arc::clone(&restore_staging),
+                Some(crate::daemon::restore::cleanup::HoldingsPressure {
+                    db: db.clone(),
+                    data_dir: cfg.data_dir.clone(),
+                    soft_quota_bytes: viaticum_core::config::soft_quota_bytes(&app_config),
+                    disk_reserve_bytes: viaticum_core::config::disk_reserve_bytes(&app_config),
+                }),
+                cancel.clone(),
+            );
+            tasks.push((
+                "staging_monitor",
+                tokio::spawn(async move {
+                    monitor.await;
+                    Ok(())
+                }),
+            ));
         }
         // ── 9.25. EWMA availability decay task (daily) ────────────────────────
         {
@@ -957,6 +981,10 @@ impl DaemonHandle {
             // Wire WorkPipeline event channel to Processor so on_peer_authenticated
             // sends WorkEvent::PeerAuthenticated to wake the worker.
             processor.set_work_event_tx(work_event_tx.clone());
+            // В-0b: the [four_r] dials drive the 4R offer shadow (logs only, off the reply path).
+            processor.set_four_r(viaticum_core::four_r_holder::FourRParams::from_cfg(
+                &app_config.four_r,
+            ));
 
             // ── Spawn WorkPipeline worker ──────────────────────────────────────
             {
@@ -1135,7 +1163,8 @@ impl DaemonHandle {
 
             // T-13a: pass repair_tx so ProcessorDropHandler can wake the repair worker
             // for immediate-drop DropNotice entries (deadline ≈ now).
-            let drop_handler = ProcessorDropHandler::new(db.clone(), repair_tx.clone());
+            let drop_handler = ProcessorDropHandler::new(db.clone(), repair_tx.clone())
+                .with_time_scale(time_scale);
 
             // T-13b-1: ProcessorDeleteHandler handles Delete/CancelDelete via mailbox.
             // Only requires db — same as SymbolDropHandler.
@@ -1249,6 +1278,8 @@ impl DaemonHandle {
             let ss_interval = (6 * 3600 / time_scale).max(60);
             let ss_mailbox_router = std::sync::Arc::clone(&mailbox_router);
             let ss_my_master_pub = identity_pub;
+            // Spec B2 (dr-i19): pointers name the device that published them.
+            let ss_publisher = device_id;
             let ss_current_pointer = std::sync::Arc::clone(&current_pointer);
             let cancel_ss = cancel.clone();
             tasks.push((
@@ -1265,6 +1296,7 @@ impl DaemonHandle {
                         cancel_ss,
                         ss_mailbox_router,
                         ss_my_master_pub,
+                        ss_publisher,
                         ss_current_pointer,
                     )
                     .await
@@ -1286,6 +1318,9 @@ impl DaemonHandle {
             let cleanup_master_key = master_key.clone();
             let cleanup_interval = (3600 / time_scale).max(1);
             let pressure_interval = (3600 / time_scale).max(60);
+            // В-0: the [four_r] dials drive the 4R shadow of the pressure tick (logs only).
+            let cleanup_four_r =
+                viaticum_core::four_r_holder::FourRParams::from_cfg(&app_config.four_r);
             tasks.push((
                 "holder_cleanup",
                 tokio::spawn(async move {
@@ -1301,6 +1336,7 @@ impl DaemonHandle {
                         pressure_interval,
                         time_scale,
                         cleanup_master_key,
+                        cleanup_four_r,
                         cleanup_cancel,
                     )
                     .await

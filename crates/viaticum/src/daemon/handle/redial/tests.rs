@@ -8,7 +8,7 @@ use viaticum_core::constants::{AVAIL_EWMA_INITIAL, INITIAL_TRUST_P};
 use viaticum_core::db::Db;
 use viaticum_core::types::{DeviceId, PeerRecord, Timestamp};
 
-use super::{RedialStats, redial_known_peers};
+use super::{RedialStats, redial_devices, redial_known_peers};
 use crate::daemon::network::swarm::{SwarmHandle, device_id_to_peer_id};
 use crate::daemon::network::swarm_test_helpers::{
     get_listen_addr, make_swarm_config, wait_for_authenticated,
@@ -153,4 +153,68 @@ async fn redial_counts_peer_without_addrs() {
             skipped_addrs: 0,
         }
     );
+}
+
+/// restore-i26: the redial before a restore retry dials only the given holders
+/// (once each, however often listed), counts a holder without a PeerRecord as
+/// `no_addrs`, and really reaches the holder.
+#[tokio::test]
+async fn redial_devices_dials_only_given_holders_once() {
+    let (_dir, db) = tmp_db();
+    let (handle_a, mut events_a) = SwarmHandle::start(make_swarm_config(78))
+        .await
+        .expect("swarm A");
+    let (handle_b, _events_b) = SwarmHandle::start(make_swarm_config(79))
+        .await
+        .expect("swarm B");
+    let (handle_c, _events_c) = SwarmHandle::start(make_swarm_config(80))
+        .await
+        .expect("swarm C");
+    let addr_b = get_listen_addr(&handle_b).await;
+    let addr_c = get_listen_addr(&handle_c).await;
+    db.upsert_peer(&peer_record(handle_b.device_id, vec![addr_b.to_string()]))
+        .unwrap();
+    db.upsert_peer(&peer_record(handle_c.device_id, vec![addr_c.to_string()]))
+        .unwrap();
+    let unknown = DeviceId(
+        make_swarm_config(81)
+            .device_signing_key
+            .verifying_key()
+            .to_bytes(),
+    );
+
+    let stats = redial_devices(
+        &db,
+        &handle_a,
+        &[
+            handle_b.device_id,
+            handle_b.device_id,
+            unknown,
+            handle_a.device_id,
+        ],
+    )
+    .await
+    .expect("pass");
+    assert_eq!(
+        stats,
+        RedialStats {
+            known_peers: 2,
+            already_connected: 0,
+            dialed: 1,
+            no_addrs: 1,
+            skipped_addrs: 0,
+        }
+    );
+    wait_for_authenticated(&mut events_a, handle_b.device_id).await;
+    let (authenticated, _) = handle_a.peer_sets().await.unwrap();
+    assert!(
+        !authenticated.contains(&handle_c.device_id),
+        "C was not in the list: not dialed"
+    );
+
+    let stats = redial_devices(&db, &handle_a, &[handle_b.device_id])
+        .await
+        .expect("pass 2");
+    assert_eq!(stats.already_connected, 1);
+    assert_eq!(stats.dialed, 0);
 }

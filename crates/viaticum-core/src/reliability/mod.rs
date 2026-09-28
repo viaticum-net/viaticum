@@ -450,11 +450,34 @@ pub fn target_reliability(importance: f64) -> f64 {
     1.0 - 10f64.powf(log10_failure)
 }
 
+/// True if `current` reliability meets `target`, compared in failure-probability
+/// space with a relative tolerance: `(1 - current) <= (1 - target) * (1 + TOL)`.
+///
+/// The single definition of "at target" for the whole system (worker selection,
+/// `is_safe_to_delete`, importance-bucket status, placement solver). Raw `>=` on
+/// reliabilities is forbidden outside this function: e.g. five full copies at
+/// p = 0.9 are exactly at target 1-1e-5 mathematically but compute to
+/// 0.9999899999999999 < 0.99999 in f64.
+///
+/// Why failure space: targets are set in "nines", so the meaningful quantity is the
+/// ratio of failure probabilities. For `current ∈ [0.5, 1]` the subtraction
+/// `1 - current` is exact (Sterbenz), so the tolerance absorbs the DP's rounding
+/// instead of adding its own.
+///
+/// NaN in either argument → false (treated as "not at target", as before).
+/// `target <= 0.0` is NOT special-cased here (callers keep their sentinel checks).
+pub fn meets_target(current: f64, target: f64) -> bool {
+    let fail_current = 1.0 - current;
+    let fail_target = 1.0 - target;
+    fail_current <= fail_target * (1.0 + crate::constants::RELIABILITY_TARGET_REL_TOL)
+}
+
 // ============================================================
 // Public API: solve_n_for_target
 // ============================================================
 
-/// Find the smallest N such that `binomial_survival(N, k_eff, mean_p) >= target_p`.
+/// Find the smallest N such that `binomial_survival(N, k_eff, mean_p)` meets `target_p`
+/// (see [`meets_target`]).
 ///
 /// Uses the pool's equal-weight mean survival probability (`weighted_mean_trust`)
 /// as the per-symbol survival proxy. Searches N in the range
@@ -499,7 +522,7 @@ pub fn solve_n_for_target(
     let max_n = k_eff * MAX_OVERHEAD_FACTOR;
 
     for n in min_n..=max_n {
-        if binomial_survival(n, k_eff, mean_p)? >= target_p {
+        if meets_target(binomial_survival(n, k_eff, mean_p)?, target_p) {
             return Ok(n);
         }
     }
@@ -518,7 +541,8 @@ pub struct PlacementPlan {
     /// Symbols assigned to each input candidate, index-aligned with the `holders`
     /// slice passed to `solve_placement_for_target`. `0` = candidate unused.
     pub per_holder: Vec<u32>,
-    /// True if the achieved holder-correlated reliability reached `target_p`.
+    /// True if the achieved holder-correlated reliability meets `target_p`
+    /// ([`meets_target`]).
     /// False = best-effort placement under the limits (caller flags under-target).
     pub reached_target: bool,
 }
@@ -539,7 +563,7 @@ pub struct PlacementPlan {
 ///   - at most `max_holders` distinct holders used,
 ///   - at most `k_eff × max_overhead` symbols in total.
 ///
-/// Stops when R ≥ `target_p` (`reached_target = true`) or no legal increment
+/// Stops when R meets `target_p` per [`meets_target`] (`reached_target = true`) or no legal increment
 /// remains; on a small/weak pool it returns a best-effort plan with
 /// `reached_target = false` rather than erroring (DR doctrine: defer-not-refuse).
 ///
@@ -603,7 +627,7 @@ pub fn solve_placement_for_target(
     // `take(max_holders)` opens at most `max_holders` distinct holders (one per
     // non-broken iteration), so no separate counter is needed.
     for &idx in order.iter().take(max_holders) {
-        if current_r >= target_p {
+        if meets_target(current_r, target_p) {
             break;
         }
         let total: u64 = per_holder.iter().map(|&s| s as u64).sum();
@@ -625,7 +649,7 @@ pub fn solve_placement_for_target(
     // total symbol count T under an even split, so binary-search the smallest T whose
     // even split reaches target. O(log(H·k_eff) · H·k_eff). Equivalent to the
     // emptier-first per-symbol deepen (both keep holder counts within 1 of each other).
-    if current_r < target_p {
+    if !meets_target(current_r, target_p) {
         let opened: Vec<usize> = order
             .iter()
             .copied()
@@ -647,7 +671,7 @@ pub fn solve_placement_for_target(
             let hi_t = (h * k_eff as u64).min(max_total);
 
             apply_even(&mut per_holder, hi_t);
-            if recovery(&per_holder) < target_p {
+            if !meets_target(recovery(&per_holder), target_p) {
                 // Unreachable even at the cap — keep the best-effort max placement.
                 current_r = recovery(&per_holder);
             } else {
@@ -656,7 +680,7 @@ pub fn solve_placement_for_target(
                 while lo < hi {
                     let mid = lo + (hi - lo) / 2;
                     apply_even(&mut per_holder, mid);
-                    if recovery(&per_holder) >= target_p {
+                    if meets_target(recovery(&per_holder), target_p) {
                         hi = mid;
                     } else {
                         lo = mid + 1;
@@ -669,7 +693,7 @@ pub fn solve_placement_for_target(
     }
 
     Ok(PlacementPlan {
-        reached_target: current_r >= target_p,
+        reached_target: meets_target(current_r, target_p),
         per_holder,
     })
 }

@@ -67,14 +67,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
 fn restore_config(_symbols_dir: &TempDir, staging_dir: &TempDir) -> RestoreConfig {
     let staging_root = staging_dir.path().join("restore");
     std::fs::create_dir_all(&staging_root).expect("create staging_root");
-    RestoreConfig {
-        epoch_key: EPOCH_KEY,
-        parallel_holders: 5,
-        swarm: None,
-        staging_root,
-        data_dir: staging_dir.path().to_path_buf(),
-        fetch_timeout: std::time::Duration::from_secs(60),
-    }
+    RestoreConfig::new(EPOCH_KEY, staging_root, staging_dir.path().to_path_buf())
 }
 
 fn write_file(dir: &TempDir, name: &str, content: &[u8]) -> String {

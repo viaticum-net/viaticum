@@ -1,4 +1,5 @@
 pub mod output;
+pub mod restore;
 pub mod types;
 
 #[cfg(test)]
@@ -138,10 +139,15 @@ pub enum Command {
         json: bool,
     },
 
-    /// Restore a file or directory from backup
+    /// Restore a file or directory from backup into a staging directory.
+    ///
+    /// Restore is a job in the daemon: this command submits it and, by default,
+    /// waits for it (it can take hours). Ctrl-C stops waiting, not the restore.
+    /// Exit code: 0 all restored, 2 some restored, 1 nothing restored / refused /
+    /// interrupted / lost contact with the daemon.
     Restore {
-        /// Path to restore (as stored in the backup catalog)
-        path: String,
+        /// Path to restore (as stored in the backup catalog). Required unless --status.
+        path: Option<String>,
 
         /// Version number to restore (1-based, 1 = oldest). Default: latest.
         #[arg(long)]
@@ -154,6 +160,25 @@ pub enum Command {
         /// Restore to this destination path instead of the original location.
         #[arg(long)]
         dest: Option<String>,
+
+        /// Submit the job and exit without waiting for it.
+        #[arg(long)]
+        no_wait: bool,
+
+        /// `--status` lists recent restore jobs; `--status <JOB_ID>` shows one.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "",
+            value_name = "JOB_ID",
+            conflicts_with_all = ["path", "version", "date", "dest", "no_wait"]
+        )]
+        status: Option<String>,
+
+        /// JSON output: the submitted job on the first line, the finished job on the
+        /// last line (with --status: the job or the job list, one line).
+        #[arg(long)]
+        json: bool,
     },
 
     /// Manage cluster devices
@@ -192,6 +217,9 @@ pub enum Command {
         /// Data directory to restore into (default: global --data-dir)
         #[arg(long)]
         data_dir: Option<String>,
+        /// Restore this catalog (hex prefix, at least 8 characters) when DR finds several
+        #[arg(long)]
+        catalog: Option<String>,
     },
 
     /// Open the web UI in the default browser
@@ -277,12 +305,34 @@ fn launch_browser(url: &str) -> std::io::Result<()> {
 // ============================================================
 
 /// Send the command over HTTP to the daemon, receive `CliResponse`,
-/// format and print to stdout.
-pub fn run_command(cmd: &Command, connection: &Connection) -> Result<(), CliError> {
+/// format and print to stdout. Returns the process exit code (`restore` exits by
+/// the job's outcome, see `restore::run_restore`).
+pub fn run_command(cmd: &Command, connection: &Connection) -> Result<i32, CliError> {
+    if let Command::Restore {
+        path,
+        version,
+        date,
+        dest,
+        no_wait,
+        status,
+        json,
+    } = cmd
+    {
+        let args = restore::RestoreArgs {
+            path: path.as_deref(),
+            version: *version,
+            date: date.as_deref(),
+            dest: dest.as_deref(),
+            no_wait: *no_wait,
+            status: status.as_deref(),
+            json: *json,
+        };
+        return restore::run_restore(args, connection);
+    }
     let response = send_command_http(connection, cmd)?;
     let json_output = matches!(cmd, Command::Status { json: true });
     handle_response(response, json_output);
-    Ok(())
+    Ok(0)
 }
 
 fn send_command_http(conn: &Connection, cmd: &Command) -> Result<CliResponse, CliError> {
@@ -337,31 +387,8 @@ fn command_to_http(cmd: &Command) -> Result<(reqwest::Method, String, Option<Str
         Command::Open | Command::Token { .. } => {
             unreachable!("Open/Token handled locally in main.rs before run_command")
         }
+        Command::Restore { .. } => unreachable!("restore is handled by restore::run_restore"),
         Command::Status { .. } => Ok((Method::GET, "/api/status".into(), None)),
-        Command::Restore {
-            path,
-            version,
-            date,
-            dest,
-        } => {
-            if version.is_some() && date.is_some() {
-                return Err(CliError::InvalidArgument(
-                    "cannot specify both --version and --date".into(),
-                ));
-            }
-            if let Some(v) = *version
-                && v == 0
-            {
-                return Err(CliError::InvalidArgument("--version must be >= 1".into()));
-            }
-            let body = serde_json::json!({
-                "path": path,
-                "version": version,
-                "date": date,
-                "dest": dest,
-            });
-            Ok((Method::POST, "/api/restore".into(), Some(body.to_string())))
-        }
         Command::Device { action } => match action {
             DeviceAction::List => Ok((Method::GET, "/api/devices".into(), None)),
             DeviceAction::Add { label } => {
@@ -399,16 +426,12 @@ fn response_from_http(
     cmd: &Command,
     resp: reqwest::blocking::Response,
 ) -> Result<CliResponse, CliError> {
-    use crate::cli::types::{DeviceEntry, FileEntry, RestoreData, StatusData, VersionEntry};
+    use crate::cli::types::{DeviceEntry, FileEntry, StatusData, VersionEntry};
 
     match cmd {
         Command::Status { .. } => {
             let data: StatusData = resp.json().map_err(|e| CliError::Decode(e.to_string()))?;
-            Ok(CliResponse::Status(data))
-        }
-        Command::Restore { .. } => {
-            let data: RestoreData = resp.json().map_err(|e| CliError::Decode(e.to_string()))?;
-            Ok(CliResponse::Restore(data))
+            Ok(CliResponse::Status(Box::new(data)))
         }
         Command::Files { .. } => {
             let data: Vec<FileEntry> = resp.json().map_err(|e| CliError::Decode(e.to_string()))?;
@@ -474,7 +497,6 @@ fn handle_response(response: CliResponse, json_output: bool) {
                 output::format_status(&data);
             }
         }
-        CliResponse::Restore(data) => output::format_restore(&data),
         CliResponse::DeviceList(devices) => output::format_device_list(&devices),
         CliResponse::DeviceAdded(device) => output::format_device_added(&device),
         CliResponse::DeviceRevoked { device_id_hex } => {
@@ -487,7 +509,11 @@ fn handle_response(response: CliResponse, json_output: bool) {
             output::format_versions("", &versions)
         }
         CliResponse::Connected { peer_id } => output::format_connected(&peer_id),
-        CliResponse::RestoreBlocked(blocker) => output::format_restore_blocked(&blocker),
+        CliResponse::RestoreJob(_)
+        | CliResponse::RestoreJobs(_)
+        | CliResponse::RestoreRejected(_) => {
+            unreachable!("restore responses are handled by restore::run_restore")
+        }
         CliResponse::Error(msg) => output::format_error(&msg),
     }
 }

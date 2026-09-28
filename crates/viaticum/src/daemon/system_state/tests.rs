@@ -14,7 +14,8 @@ mod t8 {
         MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse,
     };
     use viaticum_core::system_state::{
-        BlockRef, HolderHint, SelfPointer, sign_self_pointer, verify_self_pointer,
+        BlockRef, CatalogLineageId, CatalogSummary, HolderHint, SelfPointer, sign_self_pointer,
+        verify_self_pointer,
     };
     use viaticum_core::types::{
         DeviceId, IdentityPub, PeerRecord, PlacementStatus, SourceBlockId, SymbolPlacement,
@@ -22,6 +23,7 @@ mod t8 {
     };
 
     use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter};
+    use crate::daemon::system_state::publish::PointerCatalog;
     use crate::daemon::system_state::{
         PointerStructKey, pointer_struct_key, publish_pointer_step, should_republish,
     };
@@ -75,6 +77,26 @@ mod t8 {
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    const TEST_LINEAGE: CatalogLineageId = CatalogLineageId([0x4c; 16]);
+    const TEST_PUBLISHER: DeviceId = DeviceId([0xd1; 32]);
+
+    fn test_catalog() -> CatalogSummary {
+        CatalogSummary {
+            lineage: TEST_LINEAGE,
+            publisher: TEST_PUBLISHER,
+            files: 0,
+        }
+    }
+
+    /// Catalog of a pointer over a base only (live files after the base: 3).
+    fn test_pc() -> PointerCatalog<'static> {
+        PointerCatalog {
+            lineage: TEST_LINEAGE,
+            publisher: TEST_PUBLISHER,
+            files_after: &[3],
+        }
+    }
 
     fn gen_device_id() -> DeviceId {
         use libp2p::identity::Keypair;
@@ -177,12 +199,126 @@ mod t8 {
                 esi_ranges: vec![(0, 5)],
             }],
         };
-        let pointer = sign_self_pointer(&master_key, 1, block_ref, vec![], Timestamp::now());
+        let pointer = sign_self_pointer(
+            &master_key,
+            1,
+            block_ref,
+            vec![],
+            Timestamp::now(),
+            test_catalog(),
+        );
 
         (pointer, master_key, my_master_pub, block_id, holder_device)
     }
 
     // ─── Tests ───────────────────────────────────────────────────────────────
+
+    /// Answers every store with a Reject: the publish gets 0 acks.
+    struct RejectingSender;
+
+    #[async_trait]
+    impl MailboxNetworkSender for RejectingSender {
+        async fn send_store(
+            &self,
+            _device: DeviceId,
+            req: MailboxStoreRequest,
+        ) -> anyhow::Result<MailboxStoreResponse> {
+            Ok(MailboxStoreResponse::Reject {
+                msg_id: req.entry.msg_id,
+                reason: viaticum_core::mailbox::MailboxRejectReason::NotInCandidateSet,
+            })
+        }
+
+        async fn send_fetch(
+            &self,
+            _device: DeviceId,
+            _req: MailboxFetchRequest,
+        ) -> anyhow::Result<MailboxFetchResponse> {
+            Ok(MailboxFetchResponse {
+                v: 1,
+                entries: vec![],
+                served_msg_ids: vec![],
+            })
+        }
+    }
+
+    /// dr-i9: a publication accepted by a postman is recorded (status reads it), with
+    /// the pointer's history, file count and ack count; the published pointer carries
+    /// the catalog summary.
+    #[tokio::test]
+    async fn publish_step_records_publication_only_on_acks() {
+        let db = test_db();
+        let (_p, master_key, my_master_pub, block_id, _h) = build_placed_pointer(&db);
+        let sender = MockSender::new();
+        db.upsert_peer(&make_peer(gen_device_id())).unwrap();
+        let router =
+            MailboxRouter::with_sender(sender.clone() as Arc<dyn MailboxNetworkSender>, db.clone());
+        let current: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
+        assert_eq!(db.last_pointer_publication().unwrap(), None);
+
+        publish_pointer_step(
+            &db,
+            &router,
+            &master_key,
+            &my_master_pub,
+            &current,
+            1,
+            &block_id,
+            &[],
+            test_pc(),
+            None,
+            0,
+            Timestamp::now().0,
+            1,
+        )
+        .await;
+
+        let rec = db
+            .last_pointer_publication()
+            .unwrap()
+            .expect("an accepted publication is recorded");
+        assert_eq!(rec.lineage, TEST_LINEAGE);
+        assert_eq!(rec.files, 3);
+        assert_eq!(rec.generation, 1);
+        assert!(rec.acks >= 1);
+        let published = from_cbor_bytes::<SelfPointer>(&sender.store_calls()[0].1.payload).unwrap();
+        assert_eq!(published.catalog.lineage, TEST_LINEAGE);
+        assert_eq!(published.catalog.publisher, TEST_PUBLISHER);
+        assert_eq!(published.catalog.files, 3);
+        assert_eq!(rec.created_at, published.created_at);
+    }
+
+    /// dr-i9 mutation guard: a pointer that no postman accepted must not make `status`
+    /// say "DR ready".
+    #[tokio::test]
+    async fn publish_step_does_not_record_publication_on_zero_acks() {
+        let db = test_db();
+        let (_p, master_key, my_master_pub, block_id, _h) = build_placed_pointer(&db);
+        db.upsert_peer(&make_peer(gen_device_id())).unwrap();
+        let router = MailboxRouter::with_sender(
+            Arc::new(RejectingSender) as Arc<dyn MailboxNetworkSender>,
+            db.clone(),
+        );
+        let current: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
+        publish_pointer_step(
+            &db,
+            &router,
+            &master_key,
+            &my_master_pub,
+            &current,
+            1,
+            &block_id,
+            &[],
+            test_pc(),
+            None,
+            0,
+            Timestamp::now().0,
+            1,
+        )
+        .await;
+        assert_eq!(db.last_pointer_publication().unwrap(), None);
+        assert!(current.lock().unwrap().is_none());
+    }
 
     /// T-8 spec (Fix 1, WARN-2): publish_pointer_step with a placed base and
     /// last_key=None/last_publish_at=0 → one SelfPointer-class entry published to
@@ -215,6 +351,7 @@ mod t8 {
             1,
             &block_id,
             &[],
+            test_pc(),
             None,
             0,
             now_secs,
@@ -312,6 +449,7 @@ mod t8 {
             1,
             &block_id,
             &[],
+            test_pc(),
             None,
             0,
             now_secs,
@@ -366,6 +504,7 @@ mod t8 {
             1,
             &block_id,
             &[],
+            test_pc(),
             None,
             0,
             now_secs,
@@ -387,6 +526,7 @@ mod t8 {
             1,
             &block_id,
             &[],
+            test_pc(),
             first_key.as_ref(),
             first_publish_at,
             now_secs2,
@@ -439,6 +579,7 @@ mod t8 {
             1,
             &block_id,
             &[],
+            test_pc(),
             Some(&fake_key),
             last_publish_at,
             now_secs,
@@ -497,6 +638,7 @@ mod t8 {
             &block_id,
             &[],
             now,
+            test_pc(),
         )
         .unwrap();
 
@@ -523,8 +665,22 @@ mod t8 {
             holders: vec![],
         };
 
-        let pointer1 = sign_self_pointer(&master_key, 1, block_ref1, vec![], Timestamp::now());
-        let pointer2 = sign_self_pointer(&master_key, 2, block_ref2, vec![], Timestamp::now());
+        let pointer1 = sign_self_pointer(
+            &master_key,
+            1,
+            block_ref1,
+            vec![],
+            Timestamp::now(),
+            test_catalog(),
+        );
+        let pointer2 = sign_self_pointer(
+            &master_key,
+            2,
+            block_ref2,
+            vec![],
+            Timestamp::now(),
+            test_catalog(),
+        );
 
         // After publishing pointer1, record its struct key.
         let key1 = pointer_struct_key(&pointer1);
@@ -548,7 +704,14 @@ mod t8 {
             holders: vec![],
         };
 
-        let pointer = sign_self_pointer(&master_key, 1, block_ref, vec![], Timestamp::now());
+        let pointer = sign_self_pointer(
+            &master_key,
+            1,
+            block_ref,
+            vec![],
+            Timestamp::now(),
+            test_catalog(),
+        );
         let key = pointer_struct_key(&pointer);
         let last_publish_at = Timestamp::now().0;
 
@@ -570,7 +733,14 @@ mod t8 {
             holders: vec![],
         };
 
-        let pointer = sign_self_pointer(&master_key, 1, block_ref, vec![], Timestamp::now());
+        let pointer = sign_self_pointer(
+            &master_key,
+            1,
+            block_ref,
+            vec![],
+            Timestamp::now(),
+            test_catalog(),
+        );
         let key = pointer_struct_key(&pointer);
         let last_publish_at = 1_000_000u64;
 
@@ -626,6 +796,7 @@ mod t8 {
             &unplaced_id,
             &[],
             now,
+            test_pc(),
         )
         .unwrap();
         assert!(
@@ -643,7 +814,8 @@ mod t8 {
                 esi_ranges: vec![],
             }],
         };
-        let old_pointer = sign_self_pointer(&master_key, 1, old_block_ref, vec![], now);
+        let old_pointer =
+            sign_self_pointer(&master_key, 1, old_block_ref, vec![], now, test_catalog());
         let current_pointer: Arc<Mutex<Option<SelfPointer>>> =
             Arc::new(Mutex::new(Some(old_pointer.clone())));
 
@@ -665,6 +837,7 @@ mod t8 {
             2, // new generation, but base is unplaced
             &unplaced_id,
             &[],
+            test_pc(),
             None, // no prior key — would normally force publish if placed
             0,
             now_secs,
@@ -725,8 +898,14 @@ mod t8 {
             encrypted_size: 512,
             holders: vec![],
         };
-        let pointer_gen2 =
-            sign_self_pointer(&master_key, 2, block_ref.clone(), vec![], Timestamp::now());
+        let pointer_gen2 = sign_self_pointer(
+            &master_key,
+            2,
+            block_ref.clone(),
+            vec![],
+            Timestamp::now(),
+            test_catalog(),
+        );
         let payload_gen2 = to_cbor_bytes(&pointer_gen2);
 
         let now_secs = Timestamp::now().0;
@@ -753,7 +932,14 @@ mod t8 {
         }
 
         // Now feed gen=1 (lower generation). Must NOT overwrite gen=2.
-        let pointer_gen1 = sign_self_pointer(&master_key, 1, block_ref, vec![], Timestamp::now());
+        let pointer_gen1 = sign_self_pointer(
+            &master_key,
+            1,
+            block_ref,
+            vec![],
+            Timestamp::now(),
+            test_catalog(),
+        );
         let payload_gen1 = to_cbor_bytes(&pointer_gen1);
         let entry_low = MailboxEntry {
             target: my_master_pub,
@@ -786,8 +972,22 @@ mod t8 {
             encrypted_size: 100,
             holders: vec![],
         };
-        let p1 = sign_self_pointer(&master_key, 1, block_ref.clone(), vec![], Timestamp::now());
-        let p2 = sign_self_pointer(&master_key, 1, block_ref.clone(), vec![], Timestamp::now());
+        let p1 = sign_self_pointer(
+            &master_key,
+            1,
+            block_ref.clone(),
+            vec![],
+            Timestamp::now(),
+            test_catalog(),
+        );
+        let p2 = sign_self_pointer(
+            &master_key,
+            1,
+            block_ref.clone(),
+            vec![],
+            Timestamp::now(),
+            test_catalog(),
+        );
         // Same generation and block_ids → same key even if created_at or signature differ.
         assert_eq!(pointer_struct_key(&p1), pointer_struct_key(&p2));
     }
@@ -801,8 +1001,22 @@ mod t8 {
             encrypted_size: 100,
             holders: vec![],
         };
-        let p1 = sign_self_pointer(&master_key, 1, block_ref.clone(), vec![], Timestamp::now());
-        let p2 = sign_self_pointer(&master_key, 2, block_ref.clone(), vec![], Timestamp::now());
+        let p1 = sign_self_pointer(
+            &master_key,
+            1,
+            block_ref.clone(),
+            vec![],
+            Timestamp::now(),
+            test_catalog(),
+        );
+        let p2 = sign_self_pointer(
+            &master_key,
+            2,
+            block_ref.clone(),
+            vec![],
+            Timestamp::now(),
+            test_catalog(),
+        );
         assert_ne!(pointer_struct_key(&p1), pointer_struct_key(&p2));
     }
 
@@ -820,8 +1034,22 @@ mod t8 {
             encrypted_size: 100,
             holders: vec![],
         };
-        let p1 = sign_self_pointer(&master_key, 1, ref1, vec![], Timestamp::now());
-        let p2 = sign_self_pointer(&master_key, 1, ref2, vec![], Timestamp::now());
+        let p1 = sign_self_pointer(
+            &master_key,
+            1,
+            ref1,
+            vec![],
+            Timestamp::now(),
+            test_catalog(),
+        );
+        let p2 = sign_self_pointer(
+            &master_key,
+            1,
+            ref2,
+            vec![],
+            Timestamp::now(),
+            test_catalog(),
+        );
         assert_ne!(pointer_struct_key(&p1), pointer_struct_key(&p2));
     }
 }

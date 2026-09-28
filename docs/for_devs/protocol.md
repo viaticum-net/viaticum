@@ -855,14 +855,31 @@ pub struct BlockRef {
     pub encrypted_size: u64,        // DR recomputes ErasureParams from this
 }
 
+pub struct CatalogSummary {
+    pub lineage: CatalogLineageId,  // 16 random bytes: this DB's history, minted once per DB
+    pub publisher: DeviceId,        // the device that published the pointer
+    pub files: u32,                 // live files of the state this pointer restores
+}
+
 pub struct SelfPointer {
     pub generation: u32,            // resets to 1 per owner restart — NOT a global freshness key
     pub base: BlockRef,
     pub diffs: Vec<BlockRef>,
-    pub created_at: Timestamp,      // primary freshness key at DR
-    pub signature: [u8; 64],        // Ed25519 master_key.sign(domain || cbor(gen,base,diffs,created_at))
+    pub created_at: Timestamp,      // freshness key INSIDE one history
+    pub catalog: CatalogSummary,
+    pub signature: [u8; 64],        // Ed25519 master_key.sign("viaticum-self-pointer-v2" ||
+                                    //   cbor(gen, base, diffs, created_at, catalog))
 }
 ```
+
+**Catalog history.** Every database is its own history: the daemon mints a random
+`lineage` when its pointer-push task starts on a database that has none, and a DR mints a NEW one for the database it
+restores (the id lives in the DB's meta table, not in the SystemState snapshot, so it
+never travels with restored state). Two installations of one identity — the lost
+machine and a node started with `init --mnemonic`, or a DR node left running — are
+therefore always two histories. `files` counts live file records (not deleted on every
+device). `publisher` lets DR move the restored files from the lost device to its own
+(otherwise a deletion on the recovered machine would wait forever for the lost device).
 
 The pointer carries holder identities and ESI ranges directly because at DR the
 `symbol_placements` table does not exist yet — it is part of what is being recovered
@@ -875,8 +892,11 @@ that identity.
 `run_periodic_push` republishes the pointer when the state changes structurally, or
 every 30 days otherwise. The `SelfPointer` mailbox entry is **high-trust**: postmen
 never evict it under membership churn or disk pressure — only its 5-year TTL removes
-it. Freshness at DR is decided by `created_at` (wall clock), with `generation` only as
-a same-timestamp tiebreak, because generation resets on restart.
+it. Inside one history the freshest pointer wins by `created_at` (wall clock), with
+`generation` only as a same-timestamp tiebreak, because generation resets on restart.
+Between histories time does not decide: DR restores the only history it finds, and when
+it finds several it lists them (history, live files, date of the newest pointer,
+publisher) and requires `--catalog <first 8 hex>`.
 
 #### Peer discovery
 
@@ -958,25 +978,43 @@ Repair (triggered by PresumedLost / Lost):
 ### 3.3. Restore
 
 ```
-viaticum restore <path> [--version N] [--date YYYY-MM-DD]
+viaticum restore <path> [--version N] [--date YYYY-MM-DD] [--no-wait] [--json]
+viaticum restore --status [JOB_ID] [--json]
 
-1. DB lookup: path → FileRecord → FileVersion
+Restore is a job in the daemon: POST /api/restore → 202 + the job (id, queued);
+GET /api/restore/jobs/{id}, GET /api/restore/jobs. A path not in the catalog, or with
+no backed-up version under it, is refused at once (404 / 422), as is a --version N
+that is not backed up there (404 version_not_found, with the available numbers);
+no job, no staging dir.
+The CLI polls every 2 s with no overall deadline; Ctrl-C detaches the terminal, the
+job goes on. Exit code: 0 all restored / 2 some / 1 none, refused, interrupted, or
+lost contact with the daemon.
+
+1. DB lookup: path → FileRecord → FileVersion (a prefix matches only at a '/')
 2. FileVersion → source_block_id
-3. Dedup: multiple files in same batch → single download
-4. Per source_block:
-   a. Find holders: SymbolPlacement WHERE status=Alive
-   b. (no restore gate on the holder side, §1.8)
-   c. RestoreRequest to K_eff holders in parallel
-   d. Collect K_eff bound symbols (any ESI)
+3. Dedup: several files in one block → one download
+4. Per source_block (by importance):
+   a. source files present → rebuild the block locally, no network
+   b. otherwise candidates: SymbolPlacement status ∈ {Alive, Uncertain, PresumedLost}
+   c. (no restore gate on the holder side, §1.8)
+   d. rounds over the holders: each gets RestoreRequests of ≤ 4 MiB of its ESIs;
+      a holder that does not answer within 30 s is skipped for the round and asked
+      again in the next; no deadline per block — give up only after a round with no
+      new ESI. Only holders with a live authenticated connection are asked; a holder
+      not connected refuses at once and is not dialled (a retry that redials is the
+      separate slice restore-i26)
    e. Unbind: XOR ChaCha20(HKDF(block_id, holder_id))
    f. RaptorQ decode → ciphertext
    g. decrypt (epoch_key) → decompress → plaintext
 5. Pack → PackIndex → extract files by offset+size
-6. Write to disk, FileRecord.local_state → Present
+6. Write into staging <data_dir>/restore/<job>/<path>: a temp file in .viaticum-partial/,
+   visible under its name only when complete; the job outcome in .viaticum-job.json.
+   LocalState is not touched; every file ends restored or as a failure with a kind.
+7. Daemon shutdown: the job is recorded interrupted (requests abandoned, 10 s drain).
 ```
 
 Version selection:
-- `--version N`: specific (0 = oldest, -1 or default = latest)
+- `--version N`: specific, 1-based as listed by `versions` (default = latest backed up)
 - `--date D`: nearest version ≤ D
 
 ### 3.4. Disaster Recovery
@@ -987,15 +1025,27 @@ All devices lost, only the seed phrase remains:
 viaticum dr --mnemonic "24 words" --peer <addr>
 
 1. Derive identity from seed → IdentityPub
-2. Open a fresh DB, seeded with the provided --peer addresses (restore_db_force)
+2. Preflight (phrase, folder, locks) and claim a staging DB (db.redb.dr-new); the --peer
+   addresses are the Kademlia bootstrap peers, and peers are written to the staging DB as they
+   authenticate
 3. Start minimal SwarmHandle (libp2p, no Processor)
 4. wait_for_kad_bootstrap_stable: join the DHT, drain PeerAuthenticated, upsert discovered peers into the DB
-5. get_closest_peers(SHA256(master_pub)) → dial + authenticate candidates → the postmen closest to our own identity are now known
-6. dr_walk_for_pointer: poll the mailbox in expanding batches [100, 300, 1000], keep SelfPointer entries, verify each signature against the mnemonic identity, select the freshest by created_at
-7. From the pointer's base + diffs, dial each HolderHint (its addrs first, else get_closest_peers(holder_id)) → fetch the SS-block symbols
-8. RaptorQ decode → decrypt (ChaCha20-Poly1305, key derived from seed) → SystemState
-9. Restore DB: files, source blocks, placements, peers, pos_weekly, cluster_state
-10. "Run viaticum daemon, then viaticum restore <path>"
+5. get_closest_peers(master_pub) — the preimage: libp2p hashes it to SHA256(master_pub), where
+   the postmen are ranked → dial + authenticate candidates
+6. dr_collect_pointers: ask every candidate once, in expanding batches [100, 300, 1000], keep every
+   SelfPointer whose signature verifies against the mnemonic identity (no early exit)
+7. Choose the catalog: group by catalog history; one history → its freshest pointer; several →
+   print them all and stop unless --catalog <prefix> names one
+8. From the pointer's base + diffs, dial each HolderHint (one dial over all its addrs, all holders
+   at once; the rest via get_closest_peers(holder_id)) → fetch the SS-block symbols
+9. RaptorQ decode → decrypt (ChaCha20-Poly1305, key derived from seed) → SystemState
+10. Replace the publishing (lost) device by this device in every file record; restore DB (files,
+    source blocks, placements, peers, pos_weekly, cluster_state); merge the peers seen live back
+    over the snapshot (the --peer address first); mint a new catalog history
+11. All of 2-10 runs on drafts (db.redb.dr-new, identity.key.dr-new) and is installed by renames at
+    the end: a failed or interrupted (Ctrl-C) DR changes nothing; an old db.redb is kept as
+    db.redb.dr-bak[.N]
+12. "Run viaticum daemon, then viaticum restore <path>"
 
 The self-pointer is published periodically by the daemon (1.10) as a high-trust mailbox
 entry under the owner's own identity (5-year TTL), so it outlives long owner outages.

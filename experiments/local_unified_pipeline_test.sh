@@ -301,9 +301,13 @@ else
     fail "owner logged PoS timeouts for ${DETECTED}/2 dead holders of block $BSHORT.. within 420s"
 fi
 
-# Repair waits for PresumedLost (3 consecutive misses): ~400 s after the kill here.
+# Repair does not wait for PresumedLost (3 misses, ~400 s): the spare gets symbols
+# ~170 s after the kill, right after the first PoS timeouts. The old 480 s deadline
+# masked a worker starved by below-target SystemState blocks; 240 s is the margin
+# that lets this step catch such starvation again (repair-i4).
+REPAIR_DEADLINE=240
 GOT=0
-for _ in $(seq 1 240); do
+while [ $(( $(date +%s) - T0 )) -lt "$REPAIR_DEADLINE" ]; do
     GOT=$(block_symbols_on "$SPARE" "$BLOCK")
     [ "$GOT" -gt 0 ] && break
     sleep 2
@@ -311,7 +315,7 @@ done
 if [ "$GOT" -gt 0 ]; then
     pass "worker repaired the degraded block: ${GOT} symbols on the spare after $(( $(date +%s) - T0 ))s"
 else
-    fail "no symbols of the block on the spare after the kill"
+    fail "no symbols of the block on the spare within ${REPAIR_DEADLINE}s of the kill"
     plain_log 0 | grep -a "$BSHORT" | grep -ai "picked block\|candidates\|repair" | tail -6 || true
 fi
 

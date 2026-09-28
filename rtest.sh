@@ -1,5 +1,5 @@
 #!/bin/bash
-# Remote test: run cargo test on server if available, locally otherwise.
+# Remote test: run the gate on the build server. Local run only with an explicit --local.
 set -euo pipefail
 
 # Load local-only config (real server address). .env is gitignored.
@@ -15,10 +15,28 @@ REMOTE_DIR="projects/$(basename "$SCRIPT_DIR")"
 # clippy-checked, its tests skipped). `--full` runs everything — required when
 # touching viaticum-core / viaticum-sim, and on every branch merge.
 SIM_FILTER="-E 'not package(viaticum-sim)'"
-if [ "${1:-}" = "--full" ]; then SIM_FILTER=""; shift; fi
+LOCAL=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --full) SIM_FILTER=""; shift ;;
+        --local) LOCAL=1; shift ;;
+        *) break ;;
+    esac
+done
 ARGS="${@:---workspace}"
 
-if ssh -o ConnectTimeout=2 -o BatchMode=yes "$SERVER" "echo ok" &>/dev/null; then
+# Server probe: 3 tries, 5 s each. A single failed 2-second probe used to fall
+# through to a silent LOCAL build (2026-09-27: ~30 min and 7.8 GB on the laptop).
+server_up() {
+    local i
+    for i in 1 2 3; do
+        ssh -o ConnectTimeout=5 -o BatchMode=yes "$SERVER" "echo ok" &>/dev/null && return 0
+        sleep 2
+    done
+    return 1
+}
+
+if [ -z "$LOCAL" ] && server_up; then
     echo "=== Server online, testing remotely ==="
     # --checksum --no-times: sync by content and stamp changed files with a fresh mtime.
     # Plain -a keeps the source mtime, so a file reverted to older content (branch
@@ -35,8 +53,11 @@ if ssh -o ConnectTimeout=2 -o BatchMode=yes "$SERVER" "echo ok" &>/dev/null; the
         else cargo test $ARGS; fi && \
         cargo clippy --workspace --all-targets -- -D warnings"
     echo "=== Done (remote) ==="
+elif [ -z "$LOCAL" ]; then
+    echo "=== Build server $SERVER unreachable (3 tries) — NOT testing locally. Retry, or pass --local explicitly. ===" >&2
+    exit 9
 else
-    echo "=== Server offline, testing locally ==="
+    echo "=== --local: testing on this machine ==="
     cargo fmt --all --check
     cargo test $ARGS
     cargo clippy --workspace --all-targets -- -D warnings

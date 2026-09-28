@@ -44,13 +44,31 @@ async fn mock_files() -> Json<serde_json::Value> {
 async fn mock_versions() -> Json<serde_json::Value> {
     Json(serde_json::json!([]))
 }
-async fn mock_restore() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+const JOB_ID: &str = "3f2a0000-0000-4000-8000-000000000001";
+
+fn mock_job(state: &str, outcome: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "job_id": JOB_ID,
         "path": "some/file",
-        "version_used": 1,
-        "content_hash_hex": "00".repeat(32),
-        "status": "queued",
-    }))
+        "state": state,
+        "files_total": 1,
+        "files_restored": if outcome.is_some() { 1 } else { 0 },
+        "restored_paths": if outcome.is_some() { vec!["some/file"] } else { vec![] },
+        "failures": [],
+        "outcome": outcome,
+        "staging_path": format!("/tmp/restore/{JOB_ID}"),
+        "submitted_at": "2026-09-27T10:00:00Z",
+        "finished_at": null,
+    })
+}
+async fn mock_restore() -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::ACCEPTED, Json(mock_job("queued", None)))
+}
+async fn mock_restore_job() -> Json<serde_json::Value> {
+    Json(mock_job("finished", Some("complete")))
+}
+async fn mock_restore_jobs() -> Json<serde_json::Value> {
+    Json(serde_json::json!([mock_job("finished", Some("complete"))]))
 }
 async fn mock_devices_list() -> Json<serde_json::Value> {
     Json(serde_json::json!([]))
@@ -77,6 +95,8 @@ fn mock_router(auth: AuthState) -> Router {
         .route("/api/files", get(mock_files))
         .route("/api/versions", get(mock_versions))
         .route("/api/restore", post(mock_restore))
+        .route("/api/restore/jobs", get(mock_restore_jobs))
+        .route("/api/restore/jobs/{job_id}", get(mock_restore_job))
         .route("/api/devices", get(mock_devices_list).post(mock_device_add))
         .route("/api/devices/{device_id}", delete(mock_device_revoke))
         .route("/api/connect", post(mock_connect))
@@ -126,11 +146,33 @@ async fn all_commands_roundtrip_via_http() {
         Command::Versions {
             path: "/nonexistent".into(),
         },
+        // Submit, then wait: the mock job is already complete → exit 0.
         Command::Restore {
-            path: "some/file".into(),
+            path: Some("some/file".into()),
             version: None,
             date: None,
             dest: None,
+            no_wait: false,
+            status: None,
+            json: false,
+        },
+        Command::Restore {
+            path: None,
+            version: None,
+            date: None,
+            dest: None,
+            no_wait: false,
+            status: Some(String::new()),
+            json: true,
+        },
+        Command::Restore {
+            path: None,
+            version: None,
+            date: None,
+            dest: None,
+            no_wait: false,
+            status: Some(JOB_ID.into()),
+            json: false,
         },
         Command::Device {
             action: DeviceAction::List,
@@ -154,7 +196,7 @@ async fn all_commands_roundtrip_via_http() {
         let conn = conn.clone();
         let handle = tokio::task::spawn_blocking(move || cli::run_command(&cmd, &conn));
         let result = handle.await.expect("task panicked");
-        assert!(result.is_ok(), "run_command failed: {:?}", result.err());
+        assert_eq!(result.ok(), Some(0), "run_command failed");
     }
 }
 

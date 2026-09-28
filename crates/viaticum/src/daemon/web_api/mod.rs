@@ -76,11 +76,67 @@ pub async fn start_with_listener(
     state: Arc<DaemonState>,
     auth: AuthState,
 ) -> Result<tokio::task::JoinHandle<anyhow::Result<()>>, anyhow::Error> {
-    let api = Router::new()
+    let mut app = authed_router(state, auth);
+
+    if let Some(ref dir) = config.static_dir {
+        if dir.exists() {
+            use tower_http::services::{ServeDir, ServeFile};
+            let index = dir.join("index.html");
+            let serve = ServeDir::new(dir).fallback(ServeFile::new(index));
+            app = app.fallback_service(serve);
+        } else {
+            tracing::warn!(
+                path = %dir.display(),
+                "static_dir does not exist, falling back to embedded assets"
+            );
+            app = app.fallback(embedded::handle_embedded);
+        }
+    } else {
+        app = app.fallback(embedded::handle_embedded);
+    }
+
+    // Apply security headers to every response, regardless of route.
+    let app = app.layer(axum::middleware::map_response(add_security_headers));
+
+    let actual = listener.local_addr()?;
+    tracing::info!(bind = %actual, "web API server started");
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(cancel.cancelled_owned())
+            .await
+            .map_err(|e| anyhow::anyhow!("web API server error: {e}"))
+    });
+
+    Ok(handle)
+}
+
+/// `/api/*` behind `require_auth`, plus `/auth/start` (no static files).
+pub(crate) fn authed_router(state: Arc<DaemonState>, auth: AuthState) -> Router {
+    let api = api_routes()
+        .with_state(state)
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            require_auth,
+        ));
+    let auth_routes = Router::new()
+        .route("/auth/start", axum::routing::get(auth_start_handler))
+        .with_state(auth);
+    api.merge(auth_routes)
+}
+
+/// Every `/api/*` route, without state and auth (see `authed_router`).
+fn api_routes() -> Router<Arc<DaemonState>> {
+    Router::new()
         .route("/api/status", axum::routing::get(handle_status))
         .route("/api/files", axum::routing::get(handle_files))
         .route("/api/versions", axum::routing::get(handle_versions))
         .route("/api/restore", axum::routing::post(handle_restore))
+        .route("/api/restore/jobs", axum::routing::get(handle_restore_jobs))
+        .route(
+            "/api/restore/jobs/{job_id}",
+            axum::routing::get(handle_restore_job),
+        )
         .route(
             "/api/devices",
             axum::routing::get(handle_devices).post(handle_device_add),
@@ -116,49 +172,6 @@ pub async fn start_with_listener(
             axum::routing::get(handle_config_get).put(handle_config_put),
         )
         .route("/api/restart", axum::routing::post(handle_restart))
-        .with_state(state)
-        .route_layer(axum::middleware::from_fn_with_state(
-            auth.clone(),
-            require_auth,
-        ));
-
-    let auth_routes = Router::new()
-        .route("/auth/start", axum::routing::get(auth_start_handler))
-        .with_state(auth);
-
-    let mut app = api.merge(auth_routes);
-
-    if let Some(ref dir) = config.static_dir {
-        if dir.exists() {
-            use tower_http::services::{ServeDir, ServeFile};
-            let index = dir.join("index.html");
-            let serve = ServeDir::new(dir).fallback(ServeFile::new(index));
-            app = app.fallback_service(serve);
-        } else {
-            tracing::warn!(
-                path = %dir.display(),
-                "static_dir does not exist, falling back to embedded assets"
-            );
-            app = app.fallback(embedded::handle_embedded);
-        }
-    } else {
-        app = app.fallback(embedded::handle_embedded);
-    }
-
-    // Apply security headers to every response, regardless of route.
-    let app = app.layer(axum::middleware::map_response(add_security_headers));
-
-    let actual = listener.local_addr()?;
-    tracing::info!(bind = %actual, "web API server started");
-
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(cancel.cancelled_owned())
-            .await
-            .map_err(|e| anyhow::anyhow!("web API server error: {e}"))
-    });
-
-    Ok(handle)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -167,7 +180,7 @@ async fn handle_status(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<Json<StatusData>, (StatusCode, String)> {
     match dispatch(CliRequest::Status, &state).await {
-        CliResponse::Status(data) => Ok(Json(data)),
+        CliResponse::Status(data) => Ok(Json(*data)),
         CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
         _ => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -233,29 +246,45 @@ async fn handle_restore(
     State(state): State<Arc<DaemonState>>,
     Json(body): Json<RestoreBody>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
     let req = CliRequest::Restore {
         path: body.path,
         version: body.version,
         date: body.date,
         dest: body.dest,
     };
-    match dispatch(req, &state).await {
-        CliResponse::Restore(data) => (StatusCode::OK, Json(data)).into_response(),
-        // 409 Conflict: restore preconditions not met. Body is structured
-        // RestoreBlocker so the UI can show a precise reason and ETA.
-        CliResponse::RestoreBlocked(blocker) => {
-            (StatusCode::CONFLICT, Json(blocker)).into_response()
-        }
-        // 400 Bad Request: dest is not supported in alpha.
-        CliResponse::Error(ref e) if e == "dest_not_supported_in_alpha" => {
-            let body = serde_json::json!({ "error": "dest_not_supported_in_alpha" });
-            (StatusCode::BAD_REQUEST, Json(body)).into_response()
-        }
-        // 504 Gateway Timeout: fetch from holder timed out (daemon acted as proxy to offline peer).
-        CliResponse::Error(ref e) if e.contains("fetch from holders timed out") => {
-            let body = serde_json::json!({ "error": e });
-            (StatusCode::GATEWAY_TIMEOUT, Json(body)).into_response()
+    restore_response(dispatch(req, &state).await, StatusCode::ACCEPTED)
+}
+
+async fn handle_restore_jobs(State(state): State<Arc<DaemonState>>) -> axum::response::Response {
+    restore_response(
+        dispatch(CliRequest::RestoreJobList, &state).await,
+        StatusCode::OK,
+    )
+}
+
+async fn handle_restore_job(
+    State(state): State<Arc<DaemonState>>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    restore_response(
+        dispatch(CliRequest::RestoreJobStatus { job_id }, &state).await,
+        StatusCode::OK,
+    )
+}
+
+/// HTTP shape of the restore responses: a job or the job list → `ok` (202 for a
+/// submitted job, 200 for a lookup), a rejection → its status
+/// (`RestoreRejection::http_status`) with the rejection as JSON
+/// (`{"error": "<kind>", ...}`).
+fn restore_response(response: CliResponse, ok: StatusCode) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match response {
+        CliResponse::RestoreJob(job) => (ok, Json(job)).into_response(),
+        CliResponse::RestoreJobs(jobs) => (ok, Json(jobs)).into_response(),
+        CliResponse::RestoreRejected(rejection) => {
+            let status = StatusCode::from_u16(rejection.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(rejection)).into_response()
         }
         CliResponse::Error(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "unexpected response").into_response(),

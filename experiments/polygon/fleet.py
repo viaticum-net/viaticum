@@ -97,6 +97,8 @@ class Fleet:
         # label -> NodePlan (set by join_node / recorded by the orchestrator via
         # set_plan); used for full fresh onboarding mid-run.
         self._plans: dict[str, object] = {}
+        # (label, basename) -> restore job id from `restore --no-wait --json`.
+        self._restore_jobs: dict[tuple[str, str], str] = {}
         # label -> {node_identity, device_id, archetype, join_virtual_day} once ready.
         self._index: dict[str, dict] = {}
         # label of the star seed (set by star_connect / join_node for reconnects).
@@ -465,29 +467,53 @@ class Fleet:
 
     # ------------------------------------------------------------- restore
     def request_restore(self, label: str, original_path) -> None:
-        """Ask the node to restore a backed-up path. Fire-and-forget: restore is
-        async ('started'/'queued'), so the caller polls find_restored() afterwards.
+        """Submit a restore job and return at once (`restore --no-wait --json`).
 
-        The restored bytes are staged under <data_dir>/restore/<job_id>/<rel_path>
-        (the staging writer strips the leading '/' from the absolute path)."""
-        res = self._cli(label, ["restore", str(original_path)], timeout=30.0)
-        if res.returncode != 0:
+        Restore is a job in the daemon (restore-i4): the CLI prints the accepted
+        job (with its id) and exits; find_restored() then follows the job with
+        `restore --status <id> --json`. A refused request (path not in the catalog,
+        nothing backed up) exits 1 and records no job."""
+        res = self._cli(
+            label, ["restore", str(original_path), "--no-wait", "--json"], timeout=30.0
+        )
+        first = (res.stdout or "").strip().splitlines()[:1]
+        job_id = None
+        if res.returncode == 0 and first:
+            try:
+                job_id = json.loads(first[0]).get("job_id")
+            except ValueError:
+                job_id = None
+        if job_id:
+            self._restore_jobs[(label, os.path.basename(str(original_path)))] = job_id
+        else:
             self.log(f"[fleet] restore {label} {original_path} rc={res.returncode}: "
                      f"{(res.stderr or res.stdout or '').strip()[:200]}")
 
     def find_restored(self, label: str, filename: str) -> Optional[Path]:
-        """Find a restored file by basename under <data_dir>/restore/.
+        """The restored file, once its job is finished and lists it as restored.
 
-        Returns the first match (per-job staging dirs are unique, and the polygon
-        restores distinct filenames), or None if the restore has not landed yet.
+        Asks the daemon for the job (`restore --status <id> --json`); returns
+        <staging_path>/<catalog path> for the restored path whose basename is
+        `filename` (the polygon restores distinct filenames), or None while the
+        job runs, if it did not restore the file, or if no job was submitted.
         """
-        restore_root = self.node_dir(label) / "restore"
-        if not restore_root.exists():
-            return None
         base = os.path.basename(filename)
-        for p in restore_root.rglob("*"):
-            if p.is_file() and p.name == base:
-                return p
+        job_id = self._restore_jobs.get((label, base))
+        if not job_id:
+            return None
+        res = self._cli(label, ["restore", "--status", job_id, "--json"], timeout=30.0)
+        if res.returncode != 0:
+            return None
+        try:
+            job = json.loads((res.stdout or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return None
+        if job.get("state") != "finished":
+            return None
+        for p in job.get("restored_paths", []):
+            if os.path.basename(p) == base:
+                staged = Path(job["staging_path"]) / p.lstrip("/")
+                return staged if staged.is_file() else None
         return None
 
     # ------------------------------------------------------------- disaster recovery

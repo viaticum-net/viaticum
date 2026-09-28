@@ -5,10 +5,9 @@
 // Source block size is small (65_535 * 2 = ~128 KB) to keep encode/decode fast.
 // Async tests use #[tokio::test(flavor = "multi_thread", worker_threads = 2)].
 //
-// Network-fetch tests (Phase 7.7 iroh era) removed in ε.5:
-//   - fetch_skips_denied_holder_and_tries_next — used iroh NetworkHandle
-//   - decode_block_fetches_from_network_when_local_files_missing — used iroh NetworkHandle
-// Network restore via libp2p SwarmHandle is tested in swarm_tests.rs and E2E.
+// Network restore goes through `SymbolSource`: the job tests below script a fake
+// holder set (restore-i12 chunk rounds, T10 cancel); the libp2p round trip is
+// covered by the E2E scenarios.
 
 use std::sync::Arc;
 
@@ -25,13 +24,16 @@ use viaticum_core::types::{
 use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
 
 use super::{RestoreConfig, RestoreCoordinator, VersionSelector, collect_esis_from_ranges};
+use crate::cli::types::{RestoreFailureKind, RestoreJobState, RestoreOutcome};
+use crate::daemon::restore::no_answer::NoAnswerPauses;
 use crate::daemon::restore::staging::JobId;
+use crate::daemon::restore::staging::record::{RecordStatus, read_job_record, scan_staging};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Small source block size for fast tests (2 * SYMBOL_SIZE = ~128 KB).
 const SMALL_BLOCK_SIZE: u64 = 65_535 * 2;
-const TEST_EPOCH_KEY: [u8; 32] = [42u8; 32];
+pub(super) const TEST_EPOCH_KEY: [u8; 32] = [42u8; 32];
 
 /// Build mock holders for backup tests.
 fn test_holders() -> Vec<viaticum_core::placement::HolderCandidate> {
@@ -75,14 +77,11 @@ fn test_restore_coord(db: Db, _symbols_dir: &TempDir, staging_dir: &TempDir) -> 
     let staging_root = staging_dir.path().join("restore");
     std::fs::create_dir_all(&staging_root).expect("create staging_root");
 
-    let restore_config = RestoreConfig {
-        epoch_key: TEST_EPOCH_KEY,
-        parallel_holders: 5,
-        swarm: None,
+    let restore_config = RestoreConfig::new(
+        TEST_EPOCH_KEY,
         staging_root,
-        data_dir: staging_dir.path().to_path_buf(),
-        fetch_timeout: std::time::Duration::from_secs(60),
-    };
+        staging_dir.path().to_path_buf(),
+    );
 
     RestoreCoordinator::new(db, restore_config, Arc::new(RaptorQEncoder::new()))
 }
@@ -538,7 +537,262 @@ async fn restore_missing_path_returns_empty_result() {
 
     assert_eq!(result.files_restored, 0);
     assert_eq!(result.failures.len(), 1);
-    assert_eq!(result.failures[0].0, "/nonexistent/file.txt");
+    assert_eq!(result.failures[0].path, "/nonexistent/file.txt");
+    assert_eq!(result.failures[0].kind, RestoreFailureKind::NotBackedUp);
+}
+
+/// CS-DR-10 + restore-i8: a path that matches nothing creates no job dir (staging
+/// is never cleaned up by the daemon, so a typo must leave nothing behind).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_of_unmatched_path_creates_no_staging_dir() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+    db.upsert_file(&catalog_record("/a/bc/file.txt", 1))
+        .unwrap();
+
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
+    for path in ["/nope.bin", "/a/b"] {
+        let result = restore
+            .restore(super::RestoreRequest {
+                path: path.to_string(),
+                version_selector: VersionSelector::Latest,
+                job_id: JobId::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.files_restored, 0, "{path}");
+        assert!(result.staging_path.as_os_str().is_empty(), "{path}");
+    }
+    let job_dirs = std::fs::read_dir(staging_dir.path().join("restore"))
+        .unwrap()
+        .count();
+    assert_eq!(
+        job_dirs, 0,
+        "no job dir may be created for an unmatched path"
+    );
+}
+
+/// restore-i14: a successful job leaves a finished record naming the restored file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_writes_finished_job_record_with_restored_paths() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+    let path = write_file(&files_dir, "rec.txt", b"job record content");
+
+    let mut backup = test_backup_coord(db.clone(), &symbols_dir);
+    backup.process_event(added_event(&path)).unwrap();
+    backup.flush_all(true, &Default::default()).unwrap();
+
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
+    let job_id = JobId::new();
+    let result = restore
+        .restore(super::RestoreRequest {
+            path: path.clone(),
+            version_selector: VersionSelector::Latest,
+            job_id,
+        })
+        .await
+        .unwrap();
+
+    let record = read_job_record(&result.staging_path).unwrap().unwrap();
+    assert_eq!(record.job_id, job_id);
+    assert_eq!(record.path, path);
+    assert_eq!(record.state, RestoreJobState::Finished);
+    assert_eq!(record.outcome, Some(RestoreOutcome::Complete));
+    assert_eq!((record.files_total, record.files_restored), (1, 1));
+    assert_eq!(record.restored_paths, vec![path.clone()]);
+    assert!(record.failures.is_empty());
+    assert!(record.finished_at.is_some());
+
+    // The scan after a "restart" reports the same outcome, and the staged file is
+    // not confused with the service entries.
+    let jobs = scan_staging(&staging_dir.path().join("restore"));
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].outcome, RestoreOutcome::Complete);
+    assert_eq!(
+        jobs[0].partial_files, 0,
+        "no temp may remain after a clean job"
+    );
+}
+
+/// N1 / restore-i14: the job dir carries a `running` record before the first file
+/// is written, so a crash at any later point reads as `interrupted`, not unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn begin_job_writes_running_record_before_any_file() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+    let restore = test_restore_coord(db, &symbols_dir, &staging_dir);
+    let request = super::RestoreRequest {
+        path: "/home/kolya/photos/".to_string(),
+        version_selector: VersionSelector::Latest,
+        job_id: JobId::new(),
+    };
+
+    restore
+        .config
+        .jobs
+        .mark_running(request.job_id, &request.path, 7);
+    let writer = restore.begin_job(&request).unwrap();
+
+    let on_disk = read_job_record(writer.staging_path()).unwrap().unwrap();
+    assert_eq!(
+        Some(&on_disk),
+        restore.config.jobs.record(request.job_id).as_ref()
+    );
+    assert_eq!(on_disk.state, RestoreJobState::Running);
+    assert_eq!(on_disk.job_id, request.job_id);
+    assert_eq!(on_disk.files_total, 7);
+    // "Crash" now: the scan reports the job as interrupted, with 0 files.
+    let jobs = scan_staging(&staging_dir.path().join("restore"));
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].record, RecordStatus::NotFinished);
+    assert_eq!(jobs[0].outcome, RestoreOutcome::Interrupted);
+    assert_eq!(jobs[0].files_restored, 0);
+}
+
+/// W2 / restore-i14: a file whose target is taken (a directory already sits there)
+/// fails with AlreadyExists after its block was decoded; it is not counted, it is
+/// in failures, and the files on disk are exactly the record's restored_paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_with_taken_target_counts_only_published_files() {
+    let db = Db::open_in_memory().unwrap();
+    let symbols_dir = TempDir::new().unwrap();
+    let files_dir = TempDir::new().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+    let a = write_file(&files_dir, "a.txt", b"file a content");
+    let b = write_file(&files_dir, "b.txt", b"file b content");
+
+    let mut backup = test_backup_coord(db.clone(), &symbols_dir);
+    backup.process_event(added_event(&a)).unwrap();
+    backup.process_event(added_event(&b)).unwrap();
+    backup.flush_all(true, &Default::default()).unwrap();
+
+    let job_id = JobId::new();
+    let job_dir = staging_dir.path().join("restore").join(job_id.to_string());
+    std::fs::create_dir_all(job_dir.join(b.trim_start_matches('/'))).unwrap();
+
+    let restore = test_restore_coord(db.clone(), &symbols_dir, &staging_dir);
+    let prefix = files_dir.path().to_string_lossy().to_string() + "/";
+    let result = restore
+        .restore(super::RestoreRequest {
+            path: prefix,
+            version_selector: VersionSelector::Latest,
+            job_id,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.files_restored, 1, "failures: {:?}", result.failures);
+    assert!(
+        result.failures.iter().any(|f| f.path == b
+            && f.detail.contains("already exists")
+            && f.kind == RestoreFailureKind::WriteFailed),
+        "b must fail with AlreadyExists: {:?}",
+        result.failures
+    );
+    let record = read_job_record(&job_dir).unwrap().unwrap();
+    assert_eq!(record.outcome, Some(RestoreOutcome::Partial));
+    assert_eq!(record.files_restored, 1);
+    assert_eq!(record.restored_paths, vec![a.clone()]);
+    assert_eq!(record.failures.len(), 1);
+    assert_eq!(record.failures[0].path, b);
+
+    // The disk agrees with the record: regular files outside `.viaticum-*`.
+    let mut on_disk = Vec::new();
+    collect_user_files(&job_dir, &job_dir, &mut on_disk);
+    assert_eq!(on_disk, record.restored_paths);
+}
+
+/// Regular files under `job_dir` (top-level `.viaticum-*` skipped) as catalog paths.
+fn collect_user_files(job_dir: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if dir == job_dir && e.file_name().to_string_lossy().starts_with(".viaticum-") {
+            continue;
+        }
+        let m = std::fs::symlink_metadata(&p).unwrap();
+        if m.is_dir() {
+            collect_user_files(job_dir, &p, out);
+        } else if m.is_file() {
+            out.push(format!("/{}", p.strip_prefix(job_dir).unwrap().display()));
+        }
+    }
+    out.sort();
+}
+
+// ─── CS-DR-10: resolve_path ───────────────────────────────────────────────────
+
+fn catalog_record(path: &str, id: u64) -> FileRecord {
+    FileRecord {
+        file_id: FileId(id),
+        path: path.to_string(),
+        importance: 0.5,
+        devices: vec![],
+        versions: vec![make_version(Some(200))],
+        first_seen: Timestamp(0),
+    }
+}
+
+fn resolved_paths(db: &Db, path: &str) -> Vec<String> {
+    let mut v: Vec<String> = super::resolve_path(db, path)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+    v.sort();
+    v
+}
+
+/// CS-DR-10: "/a/b" is a directory prefix only on a separator boundary; it must not
+/// capture the sibling "/a/bc".
+#[test]
+fn resolve_path_prefix_without_separator_does_not_match_sibling() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_file(&catalog_record("/a/b/x.txt", 1)).unwrap();
+    db.upsert_file(&catalog_record("/a/b/sub/y.txt", 2))
+        .unwrap();
+    db.upsert_file(&catalog_record("/a/bc/z.txt", 3)).unwrap();
+    db.upsert_file(&catalog_record("/a/b-old/w.txt", 4))
+        .unwrap();
+
+    assert_eq!(
+        resolved_paths(&db, "/a/b"),
+        vec!["/a/b/sub/y.txt".to_string(), "/a/b/x.txt".to_string()]
+    );
+    assert!(
+        resolved_paths(&db, "/a/bc/z").is_empty(),
+        "no partial-name match"
+    );
+    assert!(
+        resolved_paths(&db, "/a/b/x").is_empty(),
+        "no file-name prefix match"
+    );
+}
+
+/// An exact record wins over a directory of the same name.
+#[test]
+fn resolve_path_prefers_exact_record_over_prefix() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_file(&catalog_record("/a/report", 1)).unwrap();
+    db.upsert_file(&catalog_record("/a/report/inner.txt", 2))
+        .unwrap();
+    assert_eq!(
+        resolved_paths(&db, "/a/report"),
+        vec!["/a/report".to_string()]
+    );
+}
+
+/// A trailing separator is a plain prefix query (the directory's contents only).
+#[test]
+fn resolve_path_trailing_separator_is_prefix_query() {
+    let db = Db::open_in_memory().unwrap();
+    db.upsert_file(&catalog_record("/a/b/x.txt", 1)).unwrap();
+    db.upsert_file(&catalog_record("/a/bc/z.txt", 2)).unwrap();
+    assert_eq!(resolved_paths(&db, "/a/b/"), vec!["/a/b/x.txt".to_string()]);
 }
 
 /// CS-DR-6 / restore-i11: restore writes the file into staging and leaves the
@@ -757,10 +1011,20 @@ async fn one_unrecoverable_block_does_not_abort_remaining_blocks() {
     // The bad block is recorded in failures (error still detected/recorded — the
     // underlying decode error is NOT swallowed, just contained per-block).
     assert!(
-        result.failures.iter().any(|(p, _)| p == &bad_path_str),
+        result.failures.iter().any(|f| f.path == bad_path_str),
         "the unrecoverable block's file must appear in failures, got: {:?}",
         result.failures
     );
+
+    // restore-i14: the job record carries the same per-file outcome.
+    let record = read_job_record(&result.staging_path).unwrap().unwrap();
+    assert_eq!(record.state, RestoreJobState::Finished);
+    assert_eq!(record.outcome, Some(RestoreOutcome::Partial));
+    assert_eq!(record.files_total, 2);
+    assert_eq!(record.files_restored, 1);
+    assert_eq!(record.restored_paths, vec![good_path_str.clone()]);
+    assert_eq!(record.failures.len(), 1);
+    assert_eq!(record.failures[0].path, bad_path_str);
 }
 
 // ─── collect_esis_from_ranges unit tests ──────────────────────────────────────
@@ -818,7 +1082,12 @@ async fn fetch_from_holders_returns_insufficient_when_no_peers_reachable() {
     let params = ErasureParams::compute(65_535_u64, 0.5).unwrap();
 
     let result = coord
-        .fetch_from_holders(&block_id, &placements, &params)
+        .fetch_from_holders(
+            &block_id,
+            &placements,
+            &params,
+            &mut NoAnswerPauses::new(JobId::new(), 1),
+        )
         .await;
 
     assert!(
@@ -827,59 +1096,6 @@ async fn fetch_from_holders_returns_insufficient_when_no_peers_reachable() {
             Err(super::RestoreError::InsufficientSymbols { got: 0, .. })
         ),
         "expected InsufficientSymbols(got=0), got: {result:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fetch_from_holders_attempts_presumed_lost_and_uncertain_placements() {
-    // Regression: PresumedLost/Uncertain placements must be included in network
-    // fetch attempts. Before the fix, only Alive placements were tried — a holder
-    // that temporarily went offline and came back would be unreachable because
-    // its placement was PresumedLost (missed 3 PoS rounds) until the next PoS pass.
-    //
-    // With swarm=None all fetch attempts fail the same way (InsufficientSymbols),
-    // so we can't distinguish success vs skip here. This test verifies that
-    // passing PresumedLost/Uncertain placements does NOT cause a panic or a
-    // different error class — the caller code path reaches fetch_unbound_symbols.
-    let db = Db::open_in_memory().unwrap();
-    let symbols_dir = TempDir::new().unwrap();
-
-    let block_id = SourceBlockId([0xCCu8; 32]);
-
-    let placements: Vec<SymbolPlacement> = [
-        PlacementStatus::PresumedLost,
-        PlacementStatus::Uncertain,
-        PlacementStatus::Alive,
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(i, status)| SymbolPlacement {
-        source_block_id: block_id,
-        holder_id: viaticum_core::types::DeviceId([(i as u8 + 1) * 0x11; 32]),
-        file_id: FileId(1),
-        esi_ranges: vec![(i as u32 * 3, 3)],
-        binding_seed: [0u8; 32],
-        status,
-        last_verified: None,
-        placed_at: Timestamp(0),
-        consecutive_misses: i as u32,
-    })
-    .collect();
-
-    let staging_dir2 = TempDir::new().unwrap();
-    let coord = test_restore_coord(db, &symbols_dir, &staging_dir2);
-    let params = ErasureParams::compute(65_535_u64, 0.5).unwrap();
-
-    let result = coord
-        .fetch_from_holders(&block_id, &placements, &params)
-        .await;
-
-    assert!(
-        matches!(
-            result,
-            Err(super::RestoreError::InsufficientSymbols { got: 0, .. })
-        ),
-        "expected InsufficientSymbols(got=0) for all-no-swarm case, got: {result:?}"
     );
 }
 
@@ -1113,379 +1329,6 @@ async fn restore_result_contains_staging_path() {
     );
 }
 
-// ─── StagingWriter tests ───────────────────────────────────────────────────────
-
-mod staging_tests {
-    use crate::daemon::restore::staging::{JobId, StagingError, StagingWriter};
-    use std::path::Path;
-    use tempfile::TempDir;
-    use viaticum_core::path_safety::validate_record_path;
-
-    /// G1: staging writer creates file at the correct relative path.
-    #[test]
-    fn staging_writer_creates_file_at_correct_path() {
-        let data_dir = TempDir::new().unwrap();
-        let staging_root = data_dir.path().join("restore");
-        std::fs::create_dir_all(&staging_root).unwrap();
-
-        let job_id = JobId::new();
-        let writer = StagingWriter::open(&staging_root, data_dir.path(), job_id).unwrap();
-
-        let validated = validate_record_path("home/alice/docs/report.docx").unwrap();
-        let out = writer.write_file(&validated, b"report content").unwrap();
-
-        // File must exist at the returned path.
-        assert!(out.exists(), "file must exist at {out:?}");
-        let content = std::fs::read(&out).unwrap();
-        assert_eq!(content, b"report content");
-
-        // Path must be rooted in staging_path.
-        assert!(
-            out.starts_with(writer.staging_path()),
-            "file must be inside staging dir"
-        );
-    }
-
-    /// Basic open test: job dir is created.
-    #[test]
-    fn staging_writer_open_creates_job_dir() {
-        let data_dir = TempDir::new().unwrap();
-        let staging_root = data_dir.path().join("restore");
-        std::fs::create_dir_all(&staging_root).unwrap();
-
-        let job_id = JobId::new();
-        let writer = StagingWriter::open(&staging_root, data_dir.path(), job_id).unwrap();
-
-        assert!(
-            writer.staging_path().is_dir(),
-            "job staging dir must exist: {:?}",
-            writer.staging_path()
-        );
-        // Job dir name must be the UUID string.
-        let dir_name = writer.staging_path().file_name().unwrap().to_string_lossy();
-        assert_eq!(
-            dir_name,
-            job_id.to_string(),
-            "job dir name must be the UUID"
-        );
-    }
-
-    /// Mode 0o600 on written files (Unix only).
-    #[cfg(unix)]
-    #[test]
-    fn staging_writer_mode_is_600_on_unix() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let data_dir = TempDir::new().unwrap();
-        let staging_root = data_dir.path().join("restore");
-        std::fs::create_dir_all(&staging_root).unwrap();
-
-        let writer = StagingWriter::open(&staging_root, data_dir.path(), JobId::new()).unwrap();
-        let validated = validate_record_path("secret.txt").unwrap();
-        let out = writer.write_file(&validated, b"secret").unwrap();
-
-        let meta = std::fs::metadata(&out).unwrap();
-        let mode = meta.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "file mode must be 0o600, got {:o}", mode);
-    }
-
-    /// Mode 0o700 on job staging directory (Unix only).
-    #[cfg(unix)]
-    #[test]
-    fn staging_writer_job_dir_mode_is_700_on_unix() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let data_dir = TempDir::new().unwrap();
-        let staging_root = data_dir.path().join("restore");
-        std::fs::create_dir_all(&staging_root).unwrap();
-
-        let writer = StagingWriter::open(&staging_root, data_dir.path(), JobId::new()).unwrap();
-
-        let meta = std::fs::metadata(writer.staging_path()).unwrap();
-        let mode = meta.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "job dir mode must be 0o700, got {:o}", mode);
-    }
-
-    /// C1: Writing the same path twice in the same job fails on the second attempt.
-    #[test]
-    fn write_twice_same_path_fails_second() {
-        let data_dir = TempDir::new().unwrap();
-        let staging_root = data_dir.path().join("restore");
-        std::fs::create_dir_all(&staging_root).unwrap();
-
-        let writer = StagingWriter::open(&staging_root, data_dir.path(), JobId::new()).unwrap();
-        let validated = validate_record_path("docs/file.txt").unwrap();
-
-        // First write succeeds.
-        writer.write_file(&validated, b"first content").unwrap();
-
-        // Second write fails with AlreadyExists.
-        let result = writer.write_file(&validated, b"second content");
-        assert!(
-            matches!(result, Err(StagingError::AlreadyExists(_))),
-            "second write must fail with AlreadyExists, got: {result:?}"
-        );
-
-        // First file must be intact.
-        let out_path = writer.staging_path().join(validated.to_relative_path());
-        let content = std::fs::read(&out_path).unwrap();
-        assert_eq!(content, b"first content", "first file must remain intact");
-    }
-
-    /// B2: staging_root that is a symlink pointing outside data_dir is rejected.
-    #[cfg(unix)]
-    #[test]
-    fn staging_root_symlink_outside_data_dir_is_rejected() {
-        let data_dir = TempDir::new().unwrap();
-        // Create a separate "outside" directory.
-        let outside_dir = TempDir::new().unwrap();
-
-        // Create staging_root as a symlink to outside_dir.
-        let staging_root = data_dir.path().join("restore");
-        std::os::unix::fs::symlink(outside_dir.path(), &staging_root).unwrap();
-
-        let job_id = JobId::new();
-        let result = StagingWriter::open(&staging_root, data_dir.path(), job_id);
-
-        assert!(
-            matches!(result, Err(StagingError::OutsideDataDir { .. })),
-            "symlinked staging_root outside data_dir must be rejected, got: {result:?}"
-        );
-    }
-
-    /// B1: Write through a symlink in the staging tree — cap_std prevents symlink following.
-    /// The write should either succeed (capping to staging dir) or fail with an error,
-    /// but must NOT end up writing to the symlink target.
-    #[cfg(unix)]
-    #[test]
-    fn staging_write_does_not_follow_symlink_in_tree() {
-        let data_dir = TempDir::new().unwrap();
-        let staging_root = data_dir.path().join("restore");
-        std::fs::create_dir_all(&staging_root).unwrap();
-
-        let job_id = JobId::new();
-        let writer = StagingWriter::open(&staging_root, data_dir.path(), job_id).unwrap();
-
-        // Create a symlink inside the job dir that points to /tmp.
-        let job_dir = writer.staging_path();
-        let link_path = job_dir.join("link");
-        std::os::unix::fs::symlink("/tmp", &link_path).unwrap();
-
-        // Attempt to write "link/attack_file" — cap_std should not follow the symlink.
-        let validated = validate_record_path("link/attack_file").unwrap();
-        let result = writer.write_file(&validated, b"malicious content");
-
-        // The write must either fail (cap_std rejects symlink in tree) or succeed
-        // but land inside the staging dir (not in /tmp).
-        match result {
-            Err(_) => {
-                // Rejected by cap_std — the ideal outcome.
-                assert!(
-                    !Path::new("/tmp/attack_file").exists(),
-                    "/tmp/attack_file must not be created"
-                );
-            }
-            Ok(out_path) => {
-                // Allowed — but must not be at /tmp/attack_file.
-                assert!(
-                    out_path.starts_with(job_dir),
-                    "written file must be inside staging dir, not symlink target: {out_path:?}"
-                );
-                assert!(
-                    !Path::new("/tmp/attack_file").exists(),
-                    "/tmp/attack_file must not exist"
-                );
-            }
-        }
-    }
-
-    /// G2: Two restore jobs get different job_ids.
-    #[test]
-    fn two_restore_jobs_get_different_job_ids() {
-        let id1 = JobId::new();
-        let id2 = JobId::new();
-        assert_ne!(
-            id1, id2,
-            "two JobId::new() calls must produce different IDs"
-        );
-    }
-}
-
-// ─── Cleanup tests ────────────────────────────────────────────────────────────
-// Moved here from cleanup.rs per convention (tests in separate files).
-
-mod cleanup_tests {
-    use crate::daemon::restore::cleanup::{
-        check_staging_warn, evict_stale_stagings, should_warn, staging_total_bytes,
-    };
-    use std::path::Path;
-    use std::time::Duration;
-    use tempfile::TempDir;
-
-    #[test]
-    fn staging_total_bytes_returns_zero_for_missing_dir() {
-        let total = staging_total_bytes(Path::new("/nonexistent/path/that/does/not/exist"));
-        assert_eq!(total, 0);
-    }
-
-    #[test]
-    fn staging_total_bytes_returns_correct_sum() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("a.bin"), b"hello").unwrap(); // 5 bytes
-        std::fs::write(dir.path().join("b.bin"), b"world!!").unwrap(); // 7 bytes
-
-        let total = staging_total_bytes(dir.path());
-        assert_eq!(total, 12, "expected 5+7=12 bytes");
-    }
-
-    #[test]
-    fn staging_total_bytes_recurses_into_subdirectories() {
-        let dir = TempDir::new().unwrap();
-        let sub = dir.path().join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(dir.path().join("root.bin"), [0u8; 100]).unwrap();
-        std::fs::write(sub.join("nested.bin"), [0u8; 200]).unwrap();
-
-        let total = staging_total_bytes(dir.path());
-        assert_eq!(total, 300, "expected 100+200=300 bytes");
-    }
-
-    /// W2: should_warn returns false when used <= threshold.
-    #[test]
-    fn should_warn_returns_false_when_under_threshold() {
-        assert!(
-            !should_warn(4, 1_073_741_824),
-            "4 bytes must not exceed 1 GB threshold"
-        );
-    }
-
-    /// W2: should_warn returns true when used > threshold.
-    #[test]
-    fn should_warn_returns_true_when_over_threshold() {
-        assert!(should_warn(10, 5), "10 bytes must exceed 5-byte threshold");
-    }
-
-    /// W2: should_warn returns false when equal to threshold.
-    #[test]
-    fn should_warn_returns_false_when_equal_to_threshold() {
-        assert!(!should_warn(5, 5), "equal to threshold must not warn");
-    }
-
-    #[test]
-    fn staging_cleanup_warn_not_emitted_when_under_threshold() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("small.bin"), b"tiny").unwrap();
-
-        // Threshold = 1 GB; actual = 4 bytes → should not warn (no panic/error).
-        check_staging_warn(dir.path(), 1_073_741_824);
-        // No assertion — just verifying it doesn't panic or error.
-    }
-
-    #[test]
-    fn staging_cleanup_warn_emitted_when_over_threshold() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("big.bin"), b"0123456789").unwrap();
-
-        // 10 bytes > 5-byte threshold → should_warn must be true for this size.
-        assert!(should_warn(10, 5), "total must exceed threshold");
-        // check_staging_warn runs without panic.
-        check_staging_warn(dir.path(), 5);
-    }
-
-    #[test]
-    fn evict_stale_stagings_returns_zero_for_missing_root() {
-        let evicted = evict_stale_stagings(
-            Path::new("/nonexistent/staging/root"),
-            Duration::from_secs(1),
-        );
-        assert_eq!(evicted, 0);
-    }
-
-    #[test]
-    fn evict_stale_stagings_keeps_fresh_dirs() {
-        let root = TempDir::new().unwrap();
-        let job = root.path().join("job-fresh");
-        std::fs::create_dir_all(&job).unwrap();
-        std::fs::write(job.join("file.bin"), b"data").unwrap();
-
-        // TTL = 1 hour; dir just created → age << TTL → kept.
-        let evicted = evict_stale_stagings(root.path(), Duration::from_secs(3600));
-        assert_eq!(evicted, 0, "fresh dir must not be evicted");
-        assert!(job.exists(), "fresh dir must remain");
-    }
-
-    #[test]
-    fn evict_stale_stagings_removes_old_dirs() {
-        let root = TempDir::new().unwrap();
-        let job = root.path().join("job-stale");
-        std::fs::create_dir_all(&job).unwrap();
-        std::fs::write(job.join("file.bin"), b"data").unwrap();
-
-        // TTL = 0: any dir with age > 0 (created microseconds ago) is stale.
-        let evicted = evict_stale_stagings(root.path(), Duration::ZERO);
-        assert_eq!(evicted, 1, "stale dir must be evicted");
-        assert!(!job.exists(), "stale dir must be removed");
-    }
-
-    #[test]
-    fn evict_stale_stagings_ignores_files_at_root() {
-        let root = TempDir::new().unwrap();
-        // A loose file (not a job dir) at staging root must be left alone.
-        std::fs::write(root.path().join("loose.txt"), b"x").unwrap();
-        let evicted = evict_stale_stagings(root.path(), Duration::ZERO);
-        assert_eq!(evicted, 0, "files at root are not job dirs — never evicted");
-        assert!(root.path().join("loose.txt").exists());
-    }
-}
-
-// ─── Issue K: fetch timeout tests ────────────────────────────────────────────
-
-// T-K3: RestoreConfig default fetch_timeout is 60 seconds.
-#[test]
-fn restore_fetch_timeout_default_is_60_seconds() {
-    let cfg = RestoreConfig::default();
-    assert_eq!(
-        cfg.fetch_timeout,
-        std::time::Duration::from_secs(60),
-        "default fetch_timeout must be 60 seconds"
-    );
-}
-
-// T-K4: fetch_timeout_secs is configurable via AppConfig and converts correctly.
-#[test]
-fn restore_fetch_timeout_configurable_via_app_config() {
-    let mut app_config = viaticum_core::config::AppConfig::default();
-    app_config.restore.fetch_timeout_secs = 120;
-    // This mirrors the conversion used in handle/mod.rs wiring.
-    let duration = std::time::Duration::from_secs(app_config.restore.fetch_timeout_secs);
-    assert_eq!(
-        duration,
-        std::time::Duration::from_secs(120),
-        "120s config must produce 120s Duration"
-    );
-}
-
-// T-K2 marker: timeout behavior when fetch_from_holders hangs.
-//
-// The timeout path (RestoreError::Timeout) cannot be exercised in unit tests
-// without injecting a slow mock for fetch_from_holders. Adding a trait for
-// fetch_from_holders conflicts with project conventions (no traits for the future).
-//
-// Coverage: manual E2E via experiments/local_fault_test.sh — kill a holder
-// mid-restore and observe 504 response and "fetch from holders timed out" body.
-//
-// This test verifies the compile-time presence of RestoreError::Timeout.
-#[test]
-fn restore_timeout_error_variant_exists() {
-    let block = SourceBlockId([0u8; 32]);
-    let err = super::RestoreError::Timeout { block, secs: 1 };
-    let msg = err.to_string();
-    assert!(
-        msg.contains("timed out after 1s"),
-        "Timeout error message must mention timeout duration, got: {msg}"
-    );
-}
-
 // ─── B2: Wave 11b — restore_reconstructs_from_source_when_raw_missing ─────────
 
 /// Wave 11b invariant (I5): after W11b, `raw/{esi}.bin` files are never written.
@@ -1588,5 +1431,872 @@ async fn restore_reconstructs_from_source_when_raw_missing() {
         restored_bytes.as_slice(),
         original_content,
         "restored bytes must exactly match original content"
+    );
+}
+
+// ─── B1.3: restore as a job (restore-i3, i4, i12, i14, T10) ──────────────────
+//
+// `FakeHolders` plays the holder set behind `SymbolSource`: it serves the real
+// bound symbols of a backed-up block (encode_raw + apply_binding, as holders store
+// them), or hangs, and can run a hook on every request.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use viaticum_core::erasure::{ErasureEncoder, Symbol};
+use viaticum_core::messages::RestoreRequestMsg;
+
+use crate::daemon::restore::jobs::RestoreJobs;
+use crate::daemon::restore::{RestoreError, RestoreRequest, failure_kind};
+use crate::daemon::symbol_fetch::{FetchError, RestoreSource, SymbolSource};
+
+pub(super) type RequestHook = Box<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+pub(super) struct FakeHolders {
+    /// Bound symbols by (holder, block, ESI).
+    pub(super) symbols: Mutex<HashMap<(DeviceId, SourceBlockId, u32), Symbol>>,
+    pub(super) hang: bool,
+    /// Every answered request takes this long (a slow link).
+    pub(super) delay: std::time::Duration,
+    /// Holders whose first request runs into the 30 s request timeout.
+    pub(super) silent_first: Mutex<std::collections::HashSet<DeviceId>>,
+    pub(super) requests: Mutex<Vec<(DeviceId, usize)>>,
+    pub(super) on_request: Mutex<Option<RequestHook>>,
+    /// The owner has no connection to any holder: every request fails at once,
+    /// as `send_to_device` does without a live connection (restore-i26).
+    pub(super) offline: std::sync::atomic::AtomicBool,
+    /// Holders that never answer: every request to them fails at once.
+    pub(super) dead: Mutex<std::collections::HashSet<DeviceId>>,
+    /// `reconnect` call number at which `offline` clears (the redial worked).
+    pub(super) online_after_reconnects: Mutex<Option<usize>>,
+    /// Every `reconnect` call: when (tokio clock) and with which holders.
+    pub(super) reconnects: Mutex<Vec<(tokio::time::Instant, Vec<DeviceId>)>>,
+}
+
+#[async_trait::async_trait]
+impl SymbolSource for FakeHolders {
+    async fn request(
+        &self,
+        holder: DeviceId,
+        req: RestoreRequestMsg,
+    ) -> Result<Vec<Symbol>, FetchError> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push((holder, req.esi_list.len()));
+        if let Some(hook) = self.on_request.lock().unwrap().as_ref() {
+            hook();
+        }
+        if self.offline.load(std::sync::atomic::Ordering::SeqCst)
+            || self.dead.lock().unwrap().contains(&holder)
+        {
+            return Err(FetchError::Swarm("peer not authenticated".into()));
+        }
+        if self.hang {
+            std::future::pending::<()>().await;
+        }
+        let silent = self.silent_first.lock().unwrap().remove(&holder);
+        if silent {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            return Err(FetchError::Swarm("request timed out".into()));
+        }
+        tokio::time::sleep(self.delay).await;
+        let map = self.symbols.lock().unwrap();
+        Ok(req
+            .esi_list
+            .iter()
+            .filter_map(|e| map.get(&(holder, req.source_block_id, *e)).cloned())
+            .collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl RestoreSource for FakeHolders {
+    async fn reconnect(&self, holders: &[DeviceId]) {
+        let mut calls = self.reconnects.lock().unwrap();
+        calls.push((tokio::time::Instant::now(), holders.to_vec()));
+        if *self.online_after_reconnects.lock().unwrap() == Some(calls.len()) {
+            self.offline
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Spread every symbol of `path`'s block over three holders: placements in the
+/// catalog, bound symbols in `holders`. Call while the source file still exists.
+pub(super) async fn place_on_fake_holders(db: &Db, path: &str, holders: &FakeHolders) {
+    place_on_fake_holders_with_status(db, path, holders, PlacementStatus::Alive).await;
+}
+
+/// `place_on_fake_holders` with every placement recorded under `status`.
+async fn place_on_fake_holders_with_status(
+    db: &Db,
+    path: &str,
+    holders: &FakeHolders,
+    status: PlacementStatus,
+) {
+    let record = db.get_file(path).unwrap().unwrap();
+    let version = record.versions.last().unwrap();
+    let block = db
+        .get_source_block(&version.source_block_id)
+        .unwrap()
+        .unwrap();
+    let blob = crate::daemon::backup::pipeline::rebuild_source_blob(db, &block, &TEST_EPOCH_KEY)
+        .await
+        .unwrap();
+    let params = block.erasure_params();
+    let enc = RaptorQEncoder::new();
+    let raws = enc.encode_raw(&blob, &params, 0, params.n).unwrap();
+    let per = params.n.div_ceil(3);
+    for h in 0..3u32 {
+        let holder = DeviceId([0x40 + h as u8; 32]);
+        let start = h * per;
+        let count = per.min(params.n.saturating_sub(start));
+        if count == 0 {
+            continue;
+        }
+        db.upsert_placement(&SymbolPlacement {
+            source_block_id: block.block_id,
+            holder_id: holder,
+            file_id: record.file_id,
+            esi_ranges: vec![(start, count)],
+            binding_seed: viaticum_core::erasure::binding_seed(&block.block_id, &holder),
+            status,
+            last_verified: None,
+            placed_at: Timestamp(0),
+            consecutive_misses: 0,
+        })
+        .unwrap();
+        let mut map = holders.symbols.lock().unwrap();
+        for raw in raws
+            .iter()
+            .filter(|s| s.esi >= start && s.esi < start + count)
+        {
+            map.insert(
+                (holder, block.block_id, raw.esi),
+                enc.apply_binding(raw.clone(), &block.block_id, &holder),
+            );
+        }
+    }
+}
+
+/// Back up `name` with `content` as its own block (one flush per file).
+pub(super) fn backup_one(
+    db: &Db,
+    symbols_dir: &TempDir,
+    dir: &std::path::Path,
+    name: &str,
+    content: &[u8],
+) -> String {
+    let path = dir.join(name);
+    std::fs::write(&path, content).unwrap();
+    let path = path.to_string_lossy().into_owned();
+    let mut backup = test_backup_coord(db.clone(), symbols_dir);
+    backup.process_event(added_event(&path)).unwrap();
+    backup.flush_all(true, &Default::default()).unwrap();
+    path
+}
+
+pub(super) fn coord_with_source(
+    db: Db,
+    staging_dir: &TempDir,
+    source: Option<Arc<FakeHolders>>,
+) -> RestoreCoordinator {
+    let staging_root = staging_dir.path().join("restore");
+    std::fs::create_dir_all(&staging_root).unwrap();
+    let mut config = RestoreConfig::new(
+        TEST_EPOCH_KEY,
+        staging_root,
+        staging_dir.path().to_path_buf(),
+    );
+    config.symbols = source.map(|s| s as Arc<dyn RestoreSource>);
+    RestoreCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
+}
+
+pub(super) fn request(path: &str) -> RestoreRequest {
+    RestoreRequest {
+        path: path.to_string(),
+        version_selector: VersionSelector::Latest,
+        job_id: JobId::new(),
+    }
+}
+
+/// The fake holder set is a faithful stand-in: with the source gone, the file
+/// comes back from "the network" byte for byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_without_source_decodes_symbols_from_holders() {
+    let db = Db::open_in_memory().unwrap();
+    let (symbols_dir, files_dir, staging_dir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let content = b"network restore content".repeat(50);
+    let path = backup_one(&db, &symbols_dir, files_dir.path(), "net.bin", &content);
+    let holders = Arc::new(FakeHolders::default());
+    place_on_fake_holders(&db, &path, &holders).await;
+    std::fs::remove_file(&path).unwrap();
+
+    let coord = coord_with_source(db, &staging_dir, Some(holders.clone()));
+    let result = coord.restore(request(&path)).await.unwrap();
+
+    assert_eq!(result.files_restored, 1, "{:?}", result.failures);
+    assert!(
+        !holders.requests.lock().unwrap().is_empty(),
+        "network not used"
+    );
+    let staged = result.staging_path.join(path.trim_start_matches('/'));
+    assert_eq!(std::fs::read(staged).unwrap(), content);
+}
+
+/// restore-i2: the source is gone and every placement of the block is `status`
+/// (the holders missed PoS rounds, but they are back and still hold the symbols).
+/// Restore must ask them and bring the file back byte for byte.
+async fn restore_from_holders_all_marked(status: PlacementStatus) {
+    let db = Db::open_in_memory().unwrap();
+    let (symbols_dir, files_dir, staging_dir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let content = b"holder came back after missed PoS rounds".repeat(40);
+    let path = backup_one(&db, &symbols_dir, files_dir.path(), "back.bin", &content);
+    let holders = Arc::new(FakeHolders::default());
+    place_on_fake_holders_with_status(&db, &path, &holders, status).await;
+    std::fs::remove_file(&path).unwrap();
+
+    let coord = coord_with_source(db, &staging_dir, Some(holders.clone()));
+    let result = coord.restore(request(&path)).await.unwrap();
+
+    assert_eq!(
+        result.files_restored, 1,
+        "{status:?} holders not asked: {:?}",
+        result.failures
+    );
+    assert!(
+        !holders.requests.lock().unwrap().is_empty(),
+        "network not used"
+    );
+    let staged = result.staging_path.join(path.trim_start_matches('/'));
+    assert_eq!(std::fs::read(staged).unwrap(), content);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_without_source_when_all_placements_uncertain_fetches_from_them() {
+    restore_from_holders_all_marked(PlacementStatus::Uncertain).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_without_source_when_all_placements_presumed_lost_fetches_from_them() {
+    restore_from_holders_all_marked(PlacementStatus::PresumedLost).await;
+}
+
+/// restore-i3: source gone and no placements → the file is a failure with the
+/// machine reason `holders_unavailable`; nothing restored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_reports_holders_unavailable_when_no_source_and_no_placements() {
+    let db = Db::open_in_memory().unwrap();
+    let (symbols_dir, files_dir, staging_dir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let path = backup_one(&db, &symbols_dir, files_dir.path(), "gone.bin", b"gone");
+    std::fs::remove_file(&path).unwrap();
+
+    let coord = coord_with_source(db, &staging_dir, Some(Arc::new(FakeHolders::default())));
+    let req = request(&path);
+    let job_id = req.job_id;
+    let result = coord.restore(req).await.unwrap();
+
+    assert_eq!(result.files_restored, 0);
+    assert_eq!(result.failures.len(), 1);
+    assert_eq!(result.failures[0].path, path);
+    assert_eq!(
+        result.failures[0].kind,
+        RestoreFailureKind::HoldersUnavailable
+    );
+    let record = read_job_record(&result.staging_path).unwrap().unwrap();
+    assert_eq!(record.outcome, Some(RestoreOutcome::NothingRestored));
+    assert_eq!(coord.config.jobs.record(job_id), Some(record));
+}
+
+/// A catalog record whose only version was never backed up.
+fn not_backed_up_record(path: &str, id: u64) -> FileRecord {
+    FileRecord {
+        file_id: FileId(id),
+        path: path.to_string(),
+        importance: 0.5,
+        devices: vec![],
+        versions: vec![FileVersion {
+            content_hash: [7u8; 32],
+            source_block_id: SourceBlockId([7u8; 32]),
+            k: 1,
+            t: 64,
+            created_at: Timestamp(10),
+            backed_up_at: None,
+        }],
+        first_seen: Timestamp(0),
+    }
+}
+
+/// restore-i3: a file under the path with no backed-up version is reported
+/// `not_backed_up`; the backed-up sibling is restored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_reports_not_backed_up_for_version_without_backup() {
+    let db = Db::open_in_memory().unwrap();
+    let (symbols_dir, files_dir, staging_dir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let ok = backup_one(&db, &symbols_dir, files_dir.path(), "ok.txt", b"ok content");
+    let pending = files_dir
+        .path()
+        .join("pending.txt")
+        .to_string_lossy()
+        .into_owned();
+    db.upsert_file(&not_backed_up_record(&pending, 900))
+        .unwrap();
+
+    let coord = coord_with_source(db, &staging_dir, None);
+    let prefix = files_dir.path().to_string_lossy().into_owned() + "/";
+    let result = coord.restore(request(&prefix)).await.unwrap();
+
+    assert_eq!(result.files_restored, 1, "{:?}", result.failures);
+    assert_eq!(result.failures.len(), 1);
+    assert_eq!(result.failures[0].path, pending);
+    assert_eq!(result.failures[0].kind, RestoreFailureKind::NotBackedUp);
+    let record = read_job_record(&result.staging_path).unwrap().unwrap();
+    assert_eq!(record.restored_paths, vec![ok]);
+    assert_eq!(record.outcome, Some(RestoreOutcome::Partial));
+}
+
+/// restore-i3 (per-file accounting): every matched file ends either restored or
+/// with a failure — restored + failed == files_total — in the registry, in the job
+/// record on disk, and on disk itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_counts_restored_plus_failed_equal_files_total() {
+    let db = Db::open_in_memory().unwrap();
+    let (symbols_dir, files_dir, staging_dir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let restorable = backup_one(&db, &symbols_dir, files_dir.path(), "a.txt", b"aaaa");
+    let lost = backup_one(&db, &symbols_dir, files_dir.path(), "b.txt", b"bbbb");
+    std::fs::remove_file(&lost).unwrap();
+    let pending = files_dir
+        .path()
+        .join("c.txt")
+        .to_string_lossy()
+        .into_owned();
+    db.upsert_file(&not_backed_up_record(&pending, 901))
+        .unwrap();
+
+    let coord = coord_with_source(db, &staging_dir, None);
+    let prefix = files_dir.path().to_string_lossy().into_owned() + "/";
+    let req = request(&prefix);
+    let job_id = req.job_id;
+    let result = coord.restore(req).await.unwrap();
+
+    let record = coord.config.jobs.record(job_id).unwrap();
+    assert_eq!(record.files_total, 3);
+    assert_eq!(
+        record.files_restored as usize + record.failures.len(),
+        record.files_total as usize,
+        "{record:?}"
+    );
+    assert_eq!(record.restored_paths, vec![restorable]);
+    let mut failed: Vec<(String, RestoreFailureKind)> = record
+        .failures
+        .iter()
+        .map(|f| (f.path.clone(), f.kind))
+        .collect();
+    failed.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        failed,
+        vec![
+            (lost, RestoreFailureKind::HoldersUnavailable),
+            (pending, RestoreFailureKind::NotBackedUp),
+        ]
+    );
+    assert_eq!(
+        read_job_record(&result.staging_path).unwrap().unwrap(),
+        record
+    );
+    let mut on_disk = Vec::new();
+    collect_user_files(&result.staging_path, &result.staging_path, &mut on_disk);
+    assert_eq!(on_disk, record.restored_paths);
+}
+
+/// restore-i4: while the job runs, the registry shows it `running` with the files
+/// already restored; at the end it is `finished` with the restored paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_records_progress_and_restored_paths_into_registered_job() {
+    let db = Db::open_in_memory().unwrap();
+    let (symbols_dir, files_dir, staging_dir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let first = backup_one(&db, &symbols_dir, files_dir.path(), "first.txt", b"first");
+    let second = backup_one(
+        &db,
+        &symbols_dir,
+        files_dir.path(),
+        "second.bin",
+        &[9u8; 3000],
+    );
+    // `first` is restored from its source first (higher importance); `second`
+    // then goes to the network.
+    let first_block = db.get_file(&first).unwrap().unwrap().versions[0].source_block_id;
+    let mut rec = db.get_source_block(&first_block).unwrap().unwrap();
+    rec.importance = 0.99;
+    db.upsert_source_block(&rec).unwrap();
+    let holders = Arc::new(FakeHolders::default());
+    place_on_fake_holders(&db, &second, &holders).await;
+    std::fs::remove_file(&second).unwrap();
+
+    let coord = coord_with_source(db, &staging_dir, Some(holders.clone()));
+    let jobs = coord.config.jobs.clone();
+    let prefix = files_dir.path().to_string_lossy().into_owned() + "/";
+    let job = jobs.submit(JobId::new(), &prefix, 2);
+    let job_id = JobId::parse(&job.job_id).unwrap();
+    assert_eq!(job.state, RestoreJobState::Queued);
+
+    let seen: Arc<Mutex<Vec<crate::cli::types::RestoreJob>>> = Arc::default();
+    {
+        let (jobs, seen) = (jobs.clone(), seen.clone());
+        *holders.on_request.lock().unwrap() = Some(Box::new(move || {
+            seen.lock().unwrap().push(jobs.get(job_id).unwrap());
+        }));
+    }
+    coord
+        .restore(RestoreRequest {
+            path: prefix,
+            version_selector: VersionSelector::Latest,
+            job_id,
+        })
+        .await
+        .unwrap();
+
+    let during = seen.lock().unwrap()[0].clone();
+    assert_eq!(during.state, RestoreJobState::Running);
+    assert_eq!(during.files_restored, 1);
+    assert_eq!(during.restored_paths, vec![first.clone()]);
+    let done = jobs.get(job_id).unwrap();
+    assert_eq!(done.state, RestoreJobState::Finished);
+    assert_eq!(done.outcome, Some(RestoreOutcome::Complete));
+    assert_eq!(done.restored_paths, vec![first, second]);
+}
+
+/// T10: on the daemon's cancel token a job waiting on a silent holder stops at
+/// once; every file not done is `interrupted`, the outcome is `interrupted`, and the
+/// final record is on disk (the drain is 10 s; this takes well under 1 s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_cancelled_marks_remaining_files_interrupted_and_outcome_interrupted() {
+    let db = Db::open_in_memory().unwrap();
+    let (symbols_dir, files_dir, staging_dir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let a = backup_one(&db, &symbols_dir, files_dir.path(), "a.bin", &[1u8; 2000]);
+    let b = backup_one(&db, &symbols_dir, files_dir.path(), "b.bin", &[2u8; 2000]);
+    let holders = Arc::new(FakeHolders {
+        hang: true,
+        ..Default::default()
+    });
+    place_on_fake_holders(&db, &a, &holders).await;
+    place_on_fake_holders(&db, &b, &holders).await;
+    std::fs::remove_file(&a).unwrap();
+    std::fs::remove_file(&b).unwrap();
+
+    let coord = coord_with_source(db, &staging_dir, Some(holders.clone()));
+    let cancel = coord.config.cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        cancel.cancel();
+    });
+    let prefix = files_dir.path().to_string_lossy().into_owned() + "/";
+    let req = request(&prefix);
+    let job_id = req.job_id;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), coord.restore(req))
+        .await
+        .expect("a cancelled restore must not hang")
+        .unwrap();
+
+    assert!(result.interrupted);
+    assert_eq!(
+        holders.requests.lock().unwrap().len(),
+        1,
+        "one request, abandoned"
+    );
+    let record = read_job_record(&result.staging_path).unwrap().unwrap();
+    assert_eq!(record.state, RestoreJobState::Finished);
+    assert_eq!(record.outcome, Some(RestoreOutcome::Interrupted));
+    assert_eq!(record.files_restored, 0);
+    let mut paths: Vec<&str> = record.failures.iter().map(|f| f.path.as_str()).collect();
+    paths.sort();
+    assert_eq!(paths, vec![a.as_str(), b.as_str()]);
+    assert!(
+        record
+            .failures
+            .iter()
+            .all(|f| f.kind == RestoreFailureKind::Interrupted)
+    );
+    assert_eq!(coord.config.jobs.record(job_id), Some(record));
+}
+
+/// A job whose staging dir cannot be opened fails before it starts; `run` still
+/// finishes it in the registry with the reason — never left `queued`/`running`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_finishes_job_even_when_restore_returns_job_level_error() {
+    let db = Db::open_in_memory().unwrap();
+    let (symbols_dir, files_dir, data_dir, elsewhere) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let path = backup_one(&db, &symbols_dir, files_dir.path(), "x.txt", b"x");
+    // Staging root outside data_dir: StagingWriter::open refuses (OutsideDataDir).
+    let staging_root = elsewhere.path().join("restore");
+    std::fs::create_dir_all(&staging_root).unwrap();
+    let config = RestoreConfig::new(TEST_EPOCH_KEY, staging_root, data_dir.path().to_path_buf());
+    let jobs = config.jobs.clone();
+    let coord = RestoreCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()));
+    let job_id = JobId::new();
+    jobs.submit(job_id, &path, 1);
+
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tx.send(RestoreRequest {
+        path: path.clone(),
+        version_selector: VersionSelector::Latest,
+        job_id,
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    coord.run(rx).await.unwrap();
+
+    let job = jobs.get(job_id).unwrap();
+    assert_eq!(job.state, RestoreJobState::Finished);
+    assert_eq!(job.outcome, Some(RestoreOutcome::NothingRestored));
+    assert_eq!(job.failures.len(), 1);
+    assert_eq!(job.failures[0].path, path);
+    assert_eq!(job.failures[0].kind, RestoreFailureKind::WriteFailed);
+}
+
+/// `run` takes a job from the queue and leaves its job record `finished` on disk,
+/// equal to the registry's view.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_rewrites_job_marker_as_finished() {
+    let db = Db::open_in_memory().unwrap();
+    let (symbols_dir, files_dir, staging_dir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let path = backup_one(&db, &symbols_dir, files_dir.path(), "m.txt", b"marker");
+    let coord = coord_with_source(db, &staging_dir, None);
+    let jobs = coord.config.jobs.clone();
+    let job_id = JobId::new();
+    jobs.submit(job_id, &path, 1);
+
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tx.send(RestoreRequest {
+        path: path.clone(),
+        version_selector: VersionSelector::Latest,
+        job_id,
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    coord.run(rx).await.unwrap();
+
+    let job_dir = staging_dir.path().join("restore").join(job_id.to_string());
+    let record = read_job_record(&job_dir).unwrap().unwrap();
+    assert_eq!(record.state, RestoreJobState::Finished);
+    assert_eq!(record.outcome, Some(RestoreOutcome::Complete));
+    assert_eq!(record.restored_paths, vec![path]);
+    assert_eq!(jobs.record(job_id), Some(record));
+}
+
+/// T10: the coordinator task ends on the daemon's cancel token even while the
+/// request channel is open (DaemonState keeps a sender) — it does not hold the
+/// shutdown until the drain deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_returns_on_cancel_while_the_queue_is_open() {
+    let db = Db::open_in_memory().unwrap();
+    let staging_dir = TempDir::new().unwrap();
+    let coord = coord_with_source(db, &staging_dir, None);
+    let cancel = coord.config.cancel.clone();
+    let (_tx, rx) = tokio::sync::mpsc::channel::<RestoreRequest>(4);
+    let task = tokio::spawn(coord.run(rx));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cancel.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("run must return on cancel")
+        .unwrap()
+        .unwrap();
+}
+
+/// N3 / restore-i8: after each job the coordinator (not the HTTP path) refreshes
+/// the cached staging status, so `status` counts the new job dir at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_refreshes_cached_staging_summary_after_job() {
+    let db = Db::open_in_memory().unwrap();
+    let (symbols_dir, files_dir, staging_dir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let path = backup_one(&db, &symbols_dir, files_dir.path(), "s.txt", b"0123456789");
+    let coord = coord_with_source(db, &staging_dir, None);
+    let status = coord.config.staging_status.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tx.send(request(&path)).await.unwrap();
+    drop(tx);
+    coord.run(rx).await.unwrap();
+
+    let cached = *status.lock().unwrap();
+    assert_eq!(cached.job_dirs, 1);
+    let bytes = cached.bytes.expect("bytes counted after the job");
+    assert!(bytes >= 10, "the restored file is counted: {bytes}");
+}
+
+#[derive(Clone, Default)]
+struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn held(total_bytes: u64) -> viaticum_core::types::HoldingRecord {
+    viaticum_core::types::HoldingRecord {
+        source_block_id: SourceBlockId([9u8; 32]),
+        owner_id: viaticum_core::types::IdentityPub([8u8; 32]),
+        esi_ranges: vec![(0, 10)],
+        importance: 0.5,
+        total_bytes,
+        status: viaticum_core::types::HoldingStatus::Active,
+        received_at: Timestamp(100),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    }
+}
+
+/// restore-i20: at the end of a restore job — not on the hourly tick — the node
+/// WARNs when the fresh staging squeezes friends' data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_warns_at_once_when_staging_squeezes_holdings() {
+    let db = Db::open_in_memory().unwrap();
+    let (symbols_dir, files_dir, staging_dir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    // 2 MiB restored into staging (>= the 1 MiB warning floor).
+    let path = backup_one(
+        &db,
+        &symbols_dir,
+        files_dir.path(),
+        "big.bin",
+        &vec![5u8; 2 * 1024 * 1024],
+    );
+    // Quota 1000 bytes, 950 held: the holder no longer takes friends' data.
+    db.upsert_holding(&held(950)).unwrap();
+    let staging_root = staging_dir.path().join("restore");
+    std::fs::create_dir_all(&staging_root).unwrap();
+    let mut config = RestoreConfig::new(
+        TEST_EPOCH_KEY,
+        staging_root,
+        staging_dir.path().to_path_buf(),
+    );
+    config.pressure = Some(crate::daemon::restore::cleanup::HoldingsPressure {
+        db: db.clone(),
+        data_dir: staging_dir.path().to_path_buf(),
+        soft_quota_bytes: 1000,
+        disk_reserve_bytes: 0,
+    });
+    let coord = RestoreCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()));
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tx.send(request(&path)).await.unwrap();
+    drop(tx);
+
+    let buf = LogBuf::default();
+    let writer = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::instrument::WithSubscriber::with_subscriber(
+        coord.run(rx),
+        tracing::Dispatch::new(subscriber),
+    )
+    .await
+    .unwrap();
+    let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("is taking space from your friends' data"),
+        "{logs}"
+    );
+}
+
+/// restore-i3: every RestoreError has a machine reason, and the mapping follows
+/// the spec (§2.4.3).
+#[test]
+fn failure_kind_maps_every_restore_error_variant() {
+    use viaticum_core::path_safety::PathSafetyError;
+    let b = SourceBlockId([1u8; 32]);
+    let cases: Vec<(RestoreError, RestoreFailureKind)> = vec![
+        (
+            RestoreError::FileNotFound { path: "p".into() },
+            RestoreFailureKind::NotBackedUp,
+        ),
+        (
+            RestoreError::VersionNotFound {
+                path: "p".into(),
+                selector: "s".into(),
+            },
+            RestoreFailureKind::NotBackedUp,
+        ),
+        (
+            RestoreError::BlockNotFound(b),
+            RestoreFailureKind::BlockMissing,
+        ),
+        (
+            RestoreError::LegacyRecord(b),
+            RestoreFailureKind::BlockMissing,
+        ),
+        (
+            RestoreError::InsufficientSymbols {
+                block: b,
+                got: 1,
+                need: 3,
+            },
+            RestoreFailureKind::HoldersUnavailable,
+        ),
+        (
+            RestoreError::DecodeFailed(b, "x".into()),
+            RestoreFailureKind::Corrupt,
+        ),
+        (
+            RestoreError::DecryptionFailed(b),
+            RestoreFailureKind::Corrupt,
+        ),
+        (
+            RestoreError::DecompressionFailed(b, "x".into()),
+            RestoreFailureKind::Corrupt,
+        ),
+        (
+            RestoreError::PackIndexParseFailed(b, "x".into()),
+            RestoreFailureKind::Corrupt,
+        ),
+        (
+            RestoreError::Swarm("x".into()),
+            RestoreFailureKind::HoldersUnavailable,
+        ),
+        (
+            RestoreError::PathUnsafe {
+                path: "p".into(),
+                source: PathSafetyError::DotDot,
+            },
+            RestoreFailureKind::PathUnsafe,
+        ),
+        (
+            RestoreError::Staging(
+                crate::daemon::restore::staging::StagingError::AlreadyExists("p".into()),
+            ),
+            RestoreFailureKind::WriteFailed,
+        ),
+        (
+            RestoreError::Db(viaticum_core::db::DbError::Database(
+                redb::DatabaseError::DatabaseAlreadyOpen,
+            )),
+            RestoreFailureKind::Internal,
+        ),
+        (
+            RestoreError::Io(std::io::Error::other("x")),
+            RestoreFailureKind::WriteFailed,
+        ),
+        (RestoreError::Cancelled, RestoreFailureKind::Interrupted),
+    ];
+    for (err, want) in cases {
+        assert_eq!(failure_kind(&err), want, "{err}");
+    }
+}
+
+/// `RestoreConfig::new` gives the coordinator one registry for its staging root;
+/// a clone (what the daemon hands to dispatch) is the same registry.
+#[test]
+fn restore_config_new_shares_one_registry_for_its_staging_root() {
+    let cfg = RestoreConfig::new([0u8; 32], "/d/restore".into(), "/d".into());
+    assert_eq!(cfg.jobs.staging_root(), std::path::Path::new("/d/restore"));
+    let shared: RestoreJobs = cfg.jobs.clone();
+    shared.submit(JobId::new(), "/a", 1);
+    assert_eq!(cfg.jobs.list().len(), 1);
+}
+
+/// restore-i12 (spec claim 13 in miniature): no deadline on a block. Two holders
+/// hit the 30 s request timeout, the third answers slowly; the block is decoded
+/// after well over 60 s (the old per-block deadline) instead of failing. Paused
+/// clock: the minutes are virtual.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn block_fetch_has_no_deadline_slow_holders_past_60s_still_decode() {
+    let db = Db::open_in_memory().unwrap();
+    let (symbols_dir, files_dir, staging_dir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let content = b"slow home link".repeat(200);
+    let path = backup_one(&db, &symbols_dir, files_dir.path(), "slow.bin", &content);
+    let holders = Arc::new(FakeHolders {
+        delay: std::time::Duration::from_secs(25),
+        ..Default::default()
+    });
+    place_on_fake_holders(&db, &path, &holders).await;
+    holders
+        .silent_first
+        .lock()
+        .unwrap()
+        .extend([DeviceId([0x40; 32]), DeviceId([0x41; 32])]);
+    std::fs::remove_file(&path).unwrap();
+    let block = db.get_file(&path).unwrap().unwrap().versions[0].source_block_id;
+    let rec = db.get_source_block(&block).unwrap().unwrap();
+
+    let coord = coord_with_source(db, &staging_dir, Some(holders.clone()));
+    let t0 = tokio::time::Instant::now();
+    let plaintext = coord
+        .decode_block_local(
+            &block,
+            &rec.erasure_params(),
+            rec.encrypted_size.unwrap(),
+            &mut NoAnswerPauses::new(JobId::new(), 1),
+        )
+        .await
+        .expect("a slow holder set is not 'holders unavailable'");
+
+    // A small file is packed: the block is the pack index followed by the bytes.
+    assert!(
+        plaintext.ends_with(&content),
+        "decoded {} bytes without the file content",
+        plaintext.len()
+    );
+    assert!(
+        t0.elapsed() >= std::time::Duration::from_secs(85),
+        "30 s + 30 s + 25 s at least: {:?}",
+        t0.elapsed()
     );
 }

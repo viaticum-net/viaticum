@@ -86,6 +86,7 @@ async fn main() -> ExitCode {
             mnemonic,
             peer,
             data_dir,
+            catalog,
         } => {
             // Logs go to stderr (RUST_LOG, default errors only); stdout is DR's report.
             tracing_subscriber::fmt()
@@ -100,6 +101,7 @@ async fn main() -> ExitCode {
                 mnemonic: mnemonic.clone(),
                 peers: peer.clone(),
                 data_dir: dr_dir,
+                catalog: catalog.clone(),
             };
             if let Err(e) = viaticum::daemon::dr::run_dr(opts).await {
                 eprintln!("error: {e}");
@@ -119,9 +121,14 @@ async fn main() -> ExitCode {
         }
         other => {
             let connection = resolve_or_exit(&cli, &global_dir);
-            if let Err(e) = viaticum::cli::run_command(other, &connection) {
-                eprintln!("error: {e}");
-                std::process::exit(1);
+            match viaticum::cli::run_command(other, &connection) {
+                Ok(0) => {}
+                // restore: 2 = partially restored, 1 = nothing / refused / lost contact.
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
     }

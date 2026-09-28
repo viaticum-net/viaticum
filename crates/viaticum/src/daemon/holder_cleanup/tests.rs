@@ -24,6 +24,9 @@ use viaticum_core::types::{
 
 use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter};
 
+// В-0: the 4R shadow on the pressure tick (D-1a, D-1b, D-2).
+mod shadow;
+
 // ─── Mock MailboxNetworkSender that records store requests ────────────────────
 
 struct RecordingMailboxSender {
@@ -384,6 +387,7 @@ async fn check_pressure_normal_does_nothing() {
         0,
         1, // time_scale
         &test_key(),
+        &viaticum_core::four_r_holder::FourRParams::default(),
     )
     .await
     .unwrap();
@@ -473,6 +477,7 @@ async fn drop_notice_published_to_mailbox_on_eviction() {
         0, // disk_reserve_bytes
         1, // time_scale
         &test_key(),
+        &viaticum_core::four_r_holder::FourRParams::default(),
     )
     .await
     .unwrap();
@@ -593,6 +598,7 @@ async fn drop_notice_has_correct_ttl() {
         0,
         1, // time_scale
         &test_key(),
+        &viaticum_core::four_r_holder::FourRParams::default(),
     )
     .await
     .unwrap();
@@ -836,6 +842,7 @@ async fn holder_drop_notice_sent_at_not_overwritten_on_second_send() {
         0,
         1, // time_scale
         &test_key(),
+        &viaticum_core::four_r_holder::FourRParams::default(),
     )
     .await
     .unwrap();
@@ -936,6 +943,7 @@ async fn holder_pressure_sets_drop_notice_sent_at_on_first_send() {
         0, // disk_reserve_bytes
         1, // time_scale
         &test_key(),
+        &viaticum_core::four_r_holder::FourRParams::default(),
     )
     .await
     .unwrap();

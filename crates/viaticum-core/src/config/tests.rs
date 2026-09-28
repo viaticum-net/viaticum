@@ -6,7 +6,7 @@ use std::io::Write;
 #[cfg(test)]
 use crate::config::{
     AppConfig, BackupCfg, ClusterCfg, ConfigError, DEFAULT_IMPORTANCE,
-    DEFAULT_IMPORTANCE_MULTIPLIER, MetricsCfg, NetworkCfg, ReliabilityConfig, RestoreCfg,
+    DEFAULT_IMPORTANCE_MULTIPLIER, FourRCfg, MetricsCfg, NetworkCfg, ReliabilityConfig, RestoreCfg,
     StorageCfg, WatchConfig, WebApiCfg, derive_file_importance, disk_reserve_bytes,
     expand_data_dir, hard_quota_bytes, soft_quota_bytes, source_block_size_bytes,
 };
@@ -102,6 +102,7 @@ fn config_roundtrips_all_fields() {
         web_api: WebApiCfg::default(),
         restore: RestoreCfg::default(),
         reliability: ReliabilityConfig::default(),
+        four_r: FourRCfg::default(),
         watch: vec![],
     };
 
@@ -915,14 +916,16 @@ fn restore_staging_warn_gb_negative_is_rejected() {
 }
 
 #[test]
-fn restore_fetch_timeout_zero_is_rejected() {
-    let mut cfg = AppConfig::default();
-    cfg.restore.fetch_timeout_secs = 0;
-    let err = cfg.validate().unwrap_err();
-    assert!(
-        matches!(err, ConfigError::Validation { ref field, .. } if field == "restore.fetch_timeout_secs"),
-        "expected Validation error for restore.fetch_timeout_secs, got: {err:?}"
+fn config_with_legacy_escrow_and_fetch_timeout_still_parses() {
+    // restore-i6 / restore-i12: `[escrow]` and `restore.fetch_timeout_secs` are gone;
+    // a config that still has them loads, and the rest of `[restore]` applies.
+    let f = write_toml(
+        "[escrow]\nk_factor = 7.0\n\n[restore]\nstaging_warn_gb = 12.5\nfetch_timeout_secs = 60\n",
     );
+    let cfg = AppConfig::load(f.path()).unwrap();
+    assert_eq!(cfg.restore.staging_warn_gb, 12.5);
+    let text = toml::to_string(&cfg).unwrap();
+    assert!(!text.contains("fetch_timeout"), "{text}");
 }
 
 // ============================================================
@@ -1200,6 +1203,175 @@ fn populate_bursts_handles_missing_directory() {
     );
 }
 
+// ============================================================
+// В-0: [four_r] section (C-1..C-3)
+// ============================================================
+
+/// C-1: the defaults are the release-map v1 dials, enforce off.
+#[test]
+fn four_r_defaults_are_the_v1_dials_with_enforce_off() {
+    let d = FourRCfg::default();
+    assert!(!d.enforce);
+    assert_eq!(d.v_free_gb, 0.0);
+    assert_eq!(d.c_recip_days, 30.0);
+    assert_eq!(d.w_d, 0.5);
+    assert_eq!(d.tau_ref_days, 365.0);
+    assert_eq!(d.theta_p, 0.2);
+    assert_eq!(d.v_min_gb, 1.0);
+    assert_eq!((d.s_hard, d.s_target, d.s_soft), (0.05, 0.15, 0.20));
+    assert_eq!(AppConfig::default().four_r, d);
+    AppConfig::default().validate().expect("defaults validate");
+}
+
+/// C-2: a file without the section gets the defaults; a partial section keeps the other
+/// defaults (serde(default) on the struct).
+#[test]
+fn four_r_section_is_optional_and_partial_sections_merge_with_defaults() {
+    let f = write_toml("[storage]\ndisk_reserve_gb = 0.0\n");
+    let cfg = AppConfig::load(f.path()).unwrap();
+    assert_eq!(cfg.four_r, FourRCfg::default());
+
+    let f = write_toml("[four_r]\nv_min_gb = 0.002\nc_recip_days = 3.0\n");
+    let cfg = AppConfig::load(f.path()).unwrap();
+    assert_eq!(cfg.four_r.v_min_gb, 0.002);
+    assert_eq!(cfg.four_r.c_recip_days, 3.0);
+    assert_eq!(cfg.four_r.w_d, FourRCfg::default().w_d);
+    assert_eq!(cfg.four_r.s_soft, FourRCfg::default().s_soft);
+    assert!(!cfg.four_r.enforce);
+}
+
+/// C-3: validation — enforce is refused in this build; thresholds ordered; ranges.
+#[test]
+fn four_r_validation_refuses_enforce_and_bad_dials() {
+    let field_of = |c: &FourRCfg| {
+        let cfg = AppConfig {
+            four_r: c.clone(),
+            ..Default::default()
+        };
+        match cfg.validate() {
+            Err(ConfigError::Validation { field, .. }) => Some(field),
+            Err(e) => panic!("unexpected error {e}"),
+            Ok(()) => None,
+        }
+    };
+    let d = FourRCfg::default();
+    assert_eq!(field_of(&d), None);
+    let bad: Vec<(FourRCfg, &str)> = vec![
+        (
+            FourRCfg {
+                enforce: true,
+                ..d.clone()
+            },
+            "four_r.enforce",
+        ),
+        (
+            FourRCfg {
+                s_hard: 0.0,
+                ..d.clone()
+            },
+            "four_r.s_hard",
+        ),
+        (
+            FourRCfg {
+                s_target: 0.04,
+                ..d.clone()
+            },
+            "four_r.s_hard",
+        ),
+        (
+            FourRCfg {
+                s_soft: 0.15,
+                ..d.clone()
+            },
+            "four_r.s_hard",
+        ),
+        (
+            FourRCfg {
+                s_soft: 1.0,
+                ..d.clone()
+            },
+            "four_r.s_hard",
+        ),
+        (
+            FourRCfg {
+                v_free_gb: -0.1,
+                ..d.clone()
+            },
+            "four_r.v_free_gb",
+        ),
+        (
+            FourRCfg {
+                c_recip_days: -1.0,
+                ..d.clone()
+            },
+            "four_r.c_recip_days",
+        ),
+        (
+            FourRCfg {
+                w_d: -0.5,
+                ..d.clone()
+            },
+            "four_r.w_d",
+        ),
+        (
+            FourRCfg {
+                tau_ref_days: 0.0,
+                ..d.clone()
+            },
+            "four_r.tau_ref_days",
+        ),
+        (
+            FourRCfg {
+                theta_p: -0.2,
+                ..d.clone()
+            },
+            "four_r.theta_p",
+        ),
+        (
+            FourRCfg {
+                v_min_gb: -1.0,
+                ..d.clone()
+            },
+            "four_r.v_min_gb",
+        ),
+        (
+            FourRCfg {
+                theta_p: f64::NAN,
+                ..d.clone()
+            },
+            "four_r.theta_p",
+        ),
+        (
+            FourRCfg {
+                v_free_gb: f64::INFINITY,
+                ..d.clone()
+            },
+            "four_r.v_free_gb",
+        ),
+    ];
+    for (c, want) in bad {
+        assert_eq!(field_of(&c).as_deref(), Some(want), "{c:?}");
+    }
+    // c_recip = 0 disables the cap and is valid.
+    assert_eq!(
+        field_of(&FourRCfg {
+            c_recip_days: 0.0,
+            ..d.clone()
+        }),
+        None
+    );
+
+    // Through the loader: an `enforce = true` file does not load.
+    let f = write_toml("[four_r]\nenforce = true\n");
+    match AppConfig::load(f.path()) {
+        Err(ConfigError::Validation { field, reason }) => {
+            assert_eq!(field, "four_r.enforce");
+            assert!(reason.contains("shadow"), "{reason}");
+        }
+        other => panic!("enforce = true must be refused, got {other:?}"),
+    }
+}
+
 #[cfg(test)]
 fn section_value(cfg: &AppConfig, section: &str) -> toml::Value {
     toml::Value::try_from(cfg).unwrap()[section].clone()
@@ -1220,6 +1392,7 @@ fn every_section_when_present_but_empty_then_equals_section_default() {
         "web_api",
         "restore",
         "reliability",
+        "four_r",
     ] {
         let f = write_toml(&format!("[{section}]\n"));
         let cfg = AppConfig::load(f.path()).unwrap();

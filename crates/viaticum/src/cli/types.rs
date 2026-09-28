@@ -29,6 +29,12 @@ pub enum CliRequest {
     Versions {
         path: String,
     },
+    /// One restore job by id (restore-i4, i14).
+    RestoreJobStatus {
+        job_id: String,
+    },
+    /// Recent restore jobs, newest first.
+    RestoreJobList,
     /// Connect to a peer by node address string.
     Connect {
         /// Node address of the peer (format: <device_id_hex>@<ip>:<port>).
@@ -39,11 +45,14 @@ pub enum CliRequest {
 /// Response from daemon to CLI process.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CliResponse {
-    Status(StatusData),
-    Restore(RestoreData),
-    /// Restore was rejected before any data movement; reason carried in `RestoreBlocker`.
-    /// Maps to HTTP 409 in `web_api`.
-    RestoreBlocked(RestoreBlocker),
+    /// Boxed: `StatusData` is several times larger than every other variant.
+    Status(Box<StatusData>),
+    /// A restore job: the accepted job (POST /api/restore → 202) or its current state.
+    RestoreJob(RestoreJob),
+    /// Recent restore jobs, newest first.
+    RestoreJobs(Vec<RestoreJob>),
+    /// A restore request refused before any job was created (or an unknown job id).
+    RestoreRejected(RestoreRejection),
     DeviceList(Vec<DeviceEntry>),
     DeviceAdded(DeviceEntry),
     DeviceRevoked {
@@ -129,6 +138,41 @@ pub struct StatusData {
     /// Empty buckets have block_count=0, mean_p_recoverable=0.0, status="empty".
     #[serde(default)]
     pub by_importance: Vec<viaticum_core::types::ImportanceBucketStats>,
+    /// Job dirs under `<data_dir>/restore` (restore-i8: the daemon never deletes them).
+    #[serde(default)]
+    pub restore_staging_jobs: u32,
+    /// Bytes under `<data_dir>/restore`; `None` while the daemon is still counting
+    /// (right after start).
+    #[serde(default)]
+    pub restore_staging_bytes: Option<u64>,
+    /// Absolute path of the staging root (`<data_dir>/restore`) on the daemon host.
+    #[serde(default)]
+    pub restore_staging_path: String,
+    /// How restored files are published in staging (`hard_link`, `rename_noreplace`,
+    /// `checked_rename`), `unavailable` if none works there (restore-i19).
+    #[serde(default)]
+    pub restore_publish: String,
+    /// The holder is under disk pressure while staging holds restored files: staging
+    /// takes space from friends' data (restore-i18).
+    #[serde(default)]
+    pub restore_staging_squeezes_holdings: bool,
+    /// dr-i9: unix secs of this node's last recovery-pointer publication accepted by
+    /// ≥ 1 postman; 0 = never (DR from the phrase would not find this catalog yet).
+    #[serde(default)]
+    pub dr_pointer_published_at: u64,
+    /// Live files in the catalog that publication restores.
+    #[serde(default)]
+    pub dr_pointer_files: u32,
+    /// Postmen that accepted that publication.
+    #[serde(default)]
+    pub dr_pointer_acks: u32,
+    /// Hex of this DB's catalog history id; "" before the node minted one.
+    #[serde(default)]
+    pub catalog_lineage: String,
+    /// dr-i11: live catalog files whose path does not exist on this machine (not
+    /// re-protected until they are back).
+    #[serde(default)]
+    pub files_without_source: u32,
 }
 
 /// Peer summary shown in `viaticum status`.
@@ -171,18 +215,202 @@ fn default_link() -> String {
     "known".to_string()
 }
 
-/// Data returned by `viaticum restore`.
+// ─── Restore jobs (restore-i3, i4, i14, i15) ─────────────────────────────────
+
+/// A restore job as the daemon reports it. The CLI polls it until `Finished`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct RestoreData {
+pub struct RestoreJob {
+    pub job_id: String,
+    /// The path the user asked to restore (a file or a directory prefix).
     pub path: String,
-    pub version_used: u32,
-    pub content_hash_hex: String,
-    /// "started" | "queued" | "error"
-    pub status: String,
-    /// Absolute path to the per-job staging directory on the server.
-    /// Example: "/home/alice/.viaticum/restore/550e8400-.../home/alice/docs/report.docx"
+    pub state: RestoreJobState,
+    /// Catalog files the path matched.
+    pub files_total: u32,
+    /// Files visible under their own names in staging.
+    pub files_restored: u32,
+    /// Catalog paths of the restored files (scripts compare staging with this list).
     #[serde(default)]
+    pub restored_paths: Vec<String>,
+    /// Files that were not restored, each with a machine-readable reason.
+    #[serde(default)]
+    pub failures: Vec<RestoreFailure>,
+    /// `None` until the job is finished.
+    #[serde(default)]
+    pub outcome: Option<RestoreOutcome>,
+    /// The job's staging directory. A restored file lands at `staging_path` + its
+    /// catalog path with the leading '/' stripped.
     pub staging_path: String,
+    /// ISO-8601 UTC.
+    pub submitted_at: String,
+    /// ISO-8601 UTC; `None` while the job runs, and for a job found interrupted at
+    /// startup (the daemon did not see it end).
+    #[serde(default)]
+    pub finished_at: Option<String>,
+    /// ISO-8601 UTC. Set while the running job waits for holders that did not
+    /// answer (redialed, retried at this time, restore-i26); absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for_holders_until: Option<String>,
+}
+
+/// Lifecycle of a restore job. `Queued` exists only in the daemon's memory; the
+/// job record on disk is `Running` or `Finished`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreJobState {
+    Queued,
+    Running,
+    Finished,
+}
+
+/// How a restore job ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreOutcome {
+    /// Every matched file restored, nothing failed.
+    Complete,
+    /// Some files restored, some failed.
+    Partial,
+    /// Nothing restored.
+    NothingRestored,
+    /// The daemon stopped (shutdown, crash, kill) before the job finished.
+    Interrupted,
+}
+
+impl RestoreOutcome {
+    /// `Complete ⇔ failures == 0 ∧ restored == total ∧ total > 0`; `Interrupted` if
+    /// the job was stopped; `NothingRestored ⇔ restored == 0`; otherwise `Partial`.
+    pub fn from_counts(
+        files_total: u32,
+        files_restored: u32,
+        failures: usize,
+        interrupted: bool,
+    ) -> Self {
+        if interrupted {
+            RestoreOutcome::Interrupted
+        } else if failures == 0 && files_restored == files_total && files_total > 0 {
+            RestoreOutcome::Complete
+        } else if files_restored == 0 {
+            RestoreOutcome::NothingRestored
+        } else {
+            RestoreOutcome::Partial
+        }
+    }
+
+    /// CLI exit code: complete 0, partial 2, nothing restored 1, interrupted 1.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            RestoreOutcome::Complete => 0,
+            RestoreOutcome::Partial => 2,
+            RestoreOutcome::NothingRestored | RestoreOutcome::Interrupted => 1,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RestoreOutcome::Complete => "complete",
+            RestoreOutcome::Partial => "partial",
+            RestoreOutcome::NothingRestored => "nothing_restored",
+            RestoreOutcome::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// One file that was not restored, and why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RestoreFailure {
+    /// Catalog path of the file (or the requested path for a job-level failure).
+    pub path: String,
+    /// Records written before B1.3 have no kind: read as `internal`.
+    #[serde(default)]
+    pub kind: RestoreFailureKind,
+    /// Human-readable detail.
+    pub detail: String,
+}
+
+/// Why a file was not restored (machine-readable; the CLI and web UI explain it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreFailureKind {
+    /// Not enough symbols came back from the holders; a retry later may succeed.
+    HoldersUnavailable,
+    /// No backed-up version matches (never backed up, or the selector matches none).
+    NotBackedUp,
+    /// The catalog has no usable block record for the file.
+    BlockMissing,
+    /// The data did not decode, decrypt, decompress or unpack.
+    Corrupt,
+    /// The catalog path is unsafe to write.
+    PathUnsafe,
+    /// Writing into staging failed (disk full, name taken, filesystem).
+    WriteFailed,
+    /// The daemon stopped before this file was restored.
+    Interrupted,
+    #[default]
+    Internal,
+}
+
+impl RestoreFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RestoreFailureKind::HoldersUnavailable => "holders_unavailable",
+            RestoreFailureKind::NotBackedUp => "not_backed_up",
+            RestoreFailureKind::BlockMissing => "block_missing",
+            RestoreFailureKind::Corrupt => "corrupt",
+            RestoreFailureKind::PathUnsafe => "path_unsafe",
+            RestoreFailureKind::WriteFailed => "write_failed",
+            RestoreFailureKind::Interrupted => "interrupted",
+            RestoreFailureKind::Internal => "internal",
+        }
+    }
+}
+
+/// A restore request refused before any job exists, or a lookup of an unknown job.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "error", rename_all = "snake_case")]
+pub enum RestoreRejection {
+    /// No catalog record at the path and none under it as a directory.
+    NotInCatalog {
+        path: String,
+    },
+    /// The path matches catalog records, but none has a selectable backed-up version.
+    NotBackedUp {
+        path: String,
+    },
+    /// `--version N` names no backed-up version under the path; `available` lists
+    /// the (1-based) version numbers that are backed up there, ascending.
+    VersionNotFound {
+        path: String,
+        version: u32,
+        available: Vec<u32>,
+    },
+    /// `--dest` is not supported.
+    DestNotSupported,
+    InvalidDate {
+        date: String,
+    },
+    /// The restore queue is full.
+    Busy {
+        active: u32,
+    },
+    /// The restore coordinator is not running (daemon shutting down).
+    Unavailable,
+    UnknownJob {
+        job_id: String,
+    },
+}
+
+impl RestoreRejection {
+    /// HTTP status the web API answers with.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            RestoreRejection::NotInCatalog { .. }
+            | RestoreRejection::VersionNotFound { .. }
+            | RestoreRejection::UnknownJob { .. } => 404,
+            RestoreRejection::NotBackedUp { .. } => 422,
+            RestoreRejection::DestNotSupported | RestoreRejection::InvalidDate { .. } => 400,
+            RestoreRejection::Busy { .. } | RestoreRejection::Unavailable => 503,
+        }
+    }
 }
 
 /// Device entry for `viaticum device list`.
@@ -218,8 +446,8 @@ pub enum EffectiveStatus {
     Degraded { live: u32, lost: u32, target: u32 },
 }
 
-/// Reason a restore cannot succeed right now. Returned in 409 Conflict from
-/// POST /api/restore; UI surfaces it verbatim with a human-readable message.
+/// Owner-side estimate of why restoring a version would not succeed right now
+/// (`VersionEntry.restore_blocker`, from placement counts).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RestoreBlocker {

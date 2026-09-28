@@ -514,7 +514,7 @@ Incoming request validation: `device_id` must be in the cluster and not revoked.
 **Router methods** (`routing.rs`):
 - `publish(target, entry)` — deposit with the `MAILBOX_WRITE_FANOUT` (30) closest postmen; durable once ≥1 Acks
 - `poll(my_master_pub, since)` — fetch from the `MAILBOX_READ_FANOUT` (300) closest postmen, dedup by msg_id
-- `dr_walk_for_pointer(my_master_pub)` — expanding-batch [100, 300, 1000] search for the freshest signed `SelfPointer` (disaster recovery)
+- `dr_collect_pointers(my_master_pub)` — expanding-batch [100, 300, 1000] collection of every signed `SelfPointer` of the identity, each peer asked once (disaster recovery; the choice between catalog histories is `system_state::catalog::select_catalog`)
 
 **Postman side** (`processor/mailbox`): `handle_mailbox_store` runs the candidate-set `should_store` check then persists (idempotent on duplicate msg_id); `handle_mailbox_fetch` returns entries only to their own target.
 

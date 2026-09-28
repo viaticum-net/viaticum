@@ -10,6 +10,7 @@ use super::{
     install_new_key, next_backup_path, set_faults, two_rename_stuck_text,
 };
 use crate::daemon::dr::DrError;
+use crate::daemon::dr::preflight::test_disk::inode_reusing_tempdir;
 use crate::daemon::dr::preflight::{DrPaths, DrPlan, KeySource, preflight};
 use crate::daemon::identity::{init_identity_new_device, load_identity};
 
@@ -277,21 +278,122 @@ fn abort_removes_only_staging_created_by_this_run() {
     assert_eq!(snapshot(dir.path()), before, "only the drafts go");
 }
 
+// ─── Another DR at the same path (inode-number reuse) ─────────────────────────
+//
+// On a filesystem that reuses a freed inode number (ext4), the file another DR
+// creates right after ours was removed gets our old number. These tests run in a
+// dir where that reuse is checked to happen (`inode_reusing_tempdir`), so they
+// fail for any "is it ours" check built on a remembered (dev, ino).
+
+/// Another DR took the path over: our file unlinked (and our creating handle closed,
+/// as after redb dropped it), theirs created in its place. Our abort leaves it.
 #[cfg(unix)]
 #[test]
 fn abort_does_not_remove_staging_claimed_by_other_dr() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = inode_reusing_tempdir();
     let mut plan = preflight(dir.path(), PHRASE_A).unwrap();
-    // Another DR took the path over (our file unlinked, theirs created in its place).
     drop(plan.staging.file.take());
     std::fs::remove_file(&plan.paths.db_staging).unwrap();
     std::fs::write(&plan.paths.db_staging, b"OTHER DR").unwrap();
+    assert!(
+        !super::path_is(&plan.paths.db_staging, plan.staging.id.as_ref()),
+        "another DR's staging file passed for ours"
+    );
 
     abort(&mut plan);
     assert_eq!(
         std::fs::read(&plan.paths.db_staging).unwrap(),
         b"OTHER DR",
         "another DR's staging file survives our abort"
+    );
+}
+
+/// Commit step 0: a staging DB another DR put at the path after ours was removed
+/// (while redb's lock was already released) is not installed as ours; nothing in
+/// the folder changes and their draft stays.
+#[cfg(unix)]
+#[test]
+fn commit_refuses_staging_replaced_by_other_dr() {
+    let dir = inode_reusing_tempdir();
+    init_identity_new_device(dir.path(), PHRASE_A).unwrap();
+    let db = dir.path().join("db.redb");
+    write_db(&db, 50);
+    let plan = recovered_plan(dir.path(), 51);
+    std::fs::remove_file(&plan.paths.db_staging).unwrap();
+    std::fs::write(&plan.paths.db_staging, b"OTHER DR").unwrap();
+
+    let err = commit(plan).expect_err("not our staging DB");
+    assert!(err.to_string().contains("was replaced"), "{err}");
+    assert_eq!(read_marker(&db), 50, "the old DB stays");
+    assert_eq!(
+        std::fs::read(dir.path().join("db.redb.dr-new")).unwrap(),
+        b"OTHER DR",
+        "the other DR's draft stays"
+    );
+}
+
+/// Commit step 0 when the replacement is locked by the other DR: step 0 locks
+/// before it checks identity, so it stops as "in progress" and touches nothing.
+#[cfg(unix)]
+#[test]
+fn commit_stops_in_progress_when_replacement_is_locked_by_other_dr() {
+    let dir = inode_reusing_tempdir();
+    init_identity_new_device(dir.path(), PHRASE_A).unwrap();
+    let db = dir.path().join("db.redb");
+    write_db(&db, 60);
+    let plan = recovered_plan(dir.path(), 61);
+    std::fs::remove_file(&plan.paths.db_staging).unwrap();
+    std::fs::write(&plan.paths.db_staging, b"OTHER DR").unwrap();
+    let theirs = std::fs::File::open(&plan.paths.db_staging).unwrap();
+    theirs.try_lock().expect("the other DR's lock");
+
+    let err = commit(plan).expect_err("another DR holds the staging path");
+    assert!(matches!(err, DrError::DrInProgress { .. }), "got {err:?}");
+    assert_eq!(read_marker(&db), 60, "the old DB stays");
+    assert_eq!(
+        std::fs::read(dir.path().join("db.redb.dr-new")).unwrap(),
+        b"OTHER DR"
+    );
+}
+
+/// The same for the key draft: a key draft another DR wrote at the path after ours
+/// was removed survives our abort.
+#[cfg(unix)]
+#[test]
+fn abort_does_not_remove_key_draft_written_by_other_dr() {
+    let dir = inode_reusing_tempdir();
+    let mut plan = preflight(dir.path(), PHRASE_A).unwrap();
+    plan.stage_key().unwrap();
+    std::fs::remove_file(&plan.paths.key_staging).unwrap();
+    std::fs::write(&plan.paths.key_staging, b"OTHER DR KEY").unwrap();
+
+    abort(&mut plan);
+    assert_eq!(
+        std::fs::read(&plan.paths.key_staging).unwrap(),
+        b"OTHER DR KEY",
+        "another DR's key draft survives our abort"
+    );
+    assert!(
+        !plan.paths.db_staging.exists(),
+        "our own staging DB is still removed"
+    );
+}
+
+/// N1: on unix a key draft whose identity could not be taken is not provably ours:
+/// abort leaves whatever is at the path (and logs it) rather than removing it.
+#[cfg(unix)]
+#[test]
+fn abort_leaves_key_draft_whose_identity_was_not_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut plan = preflight(dir.path(), PHRASE_A).unwrap();
+    plan.stage_key().unwrap();
+    plan.staged_key = Some(None);
+
+    abort(&mut plan);
+    assert!(plan.paths.key_staging.exists(), "not provably ours: left");
+    assert!(
+        !plan.paths.db_staging.exists(),
+        "our staging DB still removed"
     );
 }
 

@@ -17,6 +17,7 @@ use sha2::Sha256;
 use viaticum_core::constants::MAILBOX_POINTER_REPUBLISH_SECS;
 use viaticum_core::db::Db;
 use viaticum_core::mailbox::{MailboxClass, MailboxEntry, class_config};
+use viaticum_core::system_state::catalog::{PointerPublication, live_file_count};
 use viaticum_core::system_state::{
     SelfPointer, SystemState, diff_states, pack_system_state, restore_db, snapshot_db,
 };
@@ -24,7 +25,7 @@ use viaticum_core::system_state::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 pub use viaticum_core::system_state::SYSTEM_STATE_VERSION;
-use viaticum_core::types::{IdentityPub, SourceBlockId, Timestamp, to_cbor_bytes};
+use viaticum_core::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp, to_cbor_bytes};
 
 use crate::daemon::mailbox::routing::MailboxRouter;
 use crate::daemon::network::swarm::SwarmHandle;
@@ -106,9 +107,16 @@ pub fn decrypt_and_restore(db: &Db, blob: &[u8], seed: &[u8]) -> anyhow::Result<
 /// so poll dispatch (W-2 own-pointer arm) can see the latest pointer. On startup, we seed
 /// `last_published` from this handle (restart-recovery: avoids re-publishing generation 0).
 ///
-/// The pointer lives only in the mailbox candidate-set; DR finds it via
-/// `mailbox_router.dr_walk_for_pointer` (the relay-board / SystemState blob path was
+/// The pointer lives only in the mailbox candidate-set; DR collects it via
+/// `mailbox_router.dr_collect_pointers` (the relay-board / SystemState blob path was
 /// retired in A2 / T-13b-3).
+///
+/// Catalog history (spec B2): every pointer carries this DB's history id (minted here on
+/// first use, never inherited), the publishing device (`publisher` = this daemon's
+/// device, so DR can move ownership of restored files to its own device, dr-i19) and
+/// the live file count of the state it restores. A publication accepted by ≥ 1 postman
+/// is recorded in the DB (`Db::record_pointer_publication`, dr-i9: `status` shows DR
+/// readiness from it).
 ///
 /// The minimum interval is clamped to 60 seconds.
 #[allow(clippy::too_many_arguments)]
@@ -123,10 +131,15 @@ pub async fn run_periodic_push(
     cancel: CancellationToken,
     mailbox_router: Arc<MailboxRouter>,
     my_master_pub: IdentityPub,
+    publisher: DeviceId,
     current_pointer: Arc<Mutex<Option<SelfPointer>>>,
 ) -> anyhow::Result<()> {
     let clamped = interval_secs.max(60);
     let dr_key = identity_key_bytes_from_seed(&seed)?;
+    let lineage = db.get_or_create_catalog_lineage().map_err(|e| {
+        error!(error = %e, "system_state push: cannot read or mint the catalog history id");
+        anyhow::anyhow!("catalog history id: {e}")
+    })?;
     info!(
         interval_secs = clamped,
         "system_state periodic push (SS-as-block): started"
@@ -147,6 +160,9 @@ pub async fn run_periodic_push(
     let mut base_id: Option<SourceBlockId> = None;
     let mut last_published_state: Option<SystemState> = None;
     let mut diff_ids: Vec<SourceBlockId> = Vec::new();
+    // Live file count after the base and after each diff (len == diff_ids.len() + 1
+    // once a base exists): the pointer's catalog.files for any listed prefix.
+    let mut files_after: Vec<u32> = Vec::new();
 
     // T-8: Mailbox republish tracking.
     // Seed from current_pointer so restart doesn't re-publish generation 0.
@@ -190,6 +206,7 @@ pub async fn run_periodic_push(
                     base_id = Some(id);
                     generation = next_gen;
                     diff_ids.clear();
+                    files_after = vec![live_file_count(&state.files)];
                     last_published_state = Some(state);
                     info!(generation, base = %id, "system_state push: base published");
                 }
@@ -225,6 +242,7 @@ pub async fn run_periodic_push(
                             base_id = Some(new_base);
                             generation = next_gen;
                             diff_ids.clear();
+                            files_after = vec![live_file_count(&state.files)];
                             last_published_state = Some(state);
                             info!(generation, base = %new_base, "system_state push: compacted to new base");
                         }
@@ -237,6 +255,7 @@ pub async fn run_periodic_push(
                     match publish::publish_diff_block(&db, &data_dir, &dr_key, generation, &diffs) {
                         Ok(id) => {
                             diff_ids.push(id);
+                            files_after.push(live_file_count(&state.files));
                             last_published_state = Some(state);
                             info!(generation, diff = %id, diffs = diff_ids.len(), "system_state push: diff published");
                         }
@@ -265,6 +284,11 @@ pub async fn run_periodic_push(
             generation,
             &base,
             &diff_ids,
+            publish::PointerCatalog {
+                lineage,
+                publisher,
+                files_after: &files_after,
+            },
             last_pointer_struct_key.as_ref(),
             last_publish_at,
             now_secs,
@@ -296,6 +320,9 @@ pub(crate) type PointerStructKey = (u32, [u8; 32], Vec<[u8; 32]>);
 ///
 /// If `build_pointer_for_placed` returns `None` (base not yet placed), the function
 /// returns the inputs unchanged — the shared `current_pointer` is NOT touched.
+///
+/// dr-i9: a publication with `ack_count ≥ 1` is recorded in the DB
+/// (`record_pointer_publication`); 0 acks or an error record nothing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn publish_pointer_step(
     db: &Db,
@@ -306,6 +333,7 @@ pub(crate) async fn publish_pointer_step(
     generation: u32,
     base_id: &SourceBlockId,
     diff_ids: &[SourceBlockId],
+    catalog: publish::PointerCatalog<'_>,
     last_key: Option<&PointerStructKey>,
     last_publish_at: u64,
     now_secs: u64,
@@ -320,6 +348,7 @@ pub(crate) async fn publish_pointer_step(
         base_id,
         diff_ids,
         Timestamp::now(),
+        catalog,
     ) {
         Ok(Some(p)) => p,
         Ok(None) => {
@@ -386,8 +415,22 @@ pub(crate) async fn publish_pointer_step(
                 pointer_bytes = blob.len(),
                 base_holders = pointer.base.holders.len(),
                 ack_count,
+                catalog_files = pointer.catalog.files,
+                lineage = %pointer.catalog.lineage,
                 "system_state push: SelfPointer published via mailbox"
             );
+            // dr-i9: status reports DR readiness from this record, never from a pointer
+            // that no postman accepted.
+            let publication = PointerPublication {
+                lineage: pointer.catalog.lineage,
+                created_at: pointer.created_at,
+                generation: pointer.generation,
+                files: pointer.catalog.files,
+                acks: ack_count.try_into().unwrap_or(u32::MAX),
+            };
+            if let Err(e) = db.record_pointer_publication(&publication) {
+                warn!(error = %e, "system_state push: cannot record the pointer publication");
+            }
             (Some(new_key), now_secs)
         }
         Err(e) => {
