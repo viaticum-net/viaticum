@@ -17,11 +17,12 @@
 //       mailbox table means no false hits from PeerRecord.addrs or holdings.
 //
 //   inject --data-dir D --target HEX --class C [--version V] [--msg-id HEX]
-//          [--stored-at N] [--expires-in N]
+//          [--stored-at N] [--expires-in N] [--replace]
 //          (--junk-len N | --copy-from TARGET_HEX:MSGID_HEX:CLASS
 //           | --sign-with DIR --drop-block HEX)
 //       Writes one entry straight into redb (`Db::mailbox_insert`), bypassing every
-//       postman rule: a hostile postman. `--sign-with` builds a VALIDLY signed
+//       postman rule: a hostile postman. `--replace` first deletes the entry under the
+//       same (target, msg_id, class), so a pointer place can be swapped (S1 step 6f). `--sign-with` builds a VALIDLY signed
 //       SymbolDropNoticeBatchMsg with the master key of DIR/identity.key (a holder of
 //       the same run) and stores it as plaintext version 1 (S1 step 6c).
 //
@@ -44,6 +45,7 @@ use viaticum_core::messages::{SymbolDropNoticeBatchMsg, build_signed_symbol_drop
 use viaticum_core::types::{DeviceId, SourceBlockId, Timestamp, hex_encode, to_cbor_bytes};
 
 mod audit;
+mod inject;
 mod rendezvous;
 
 #[derive(Parser, Debug)]
@@ -94,6 +96,9 @@ enum Cmd {
         sign_with: Option<PathBuf>,
         #[arg(long)]
         drop_block: Option<String>,
+        /// Overwrite an entry under the same (target, msg_id, class).
+        #[arg(long)]
+        replace: bool,
     },
     /// Offline: the pointer box address and place slots of a recovery phrase.
     Rendezvous {
@@ -206,6 +211,7 @@ fn main() {
             copy_from,
             sign_with,
             drop_block,
+            replace,
         } => {
             let target = MailboxAddress(hex32(&target, "--target"));
             let class = class(&class_name);
@@ -280,7 +286,7 @@ fn main() {
                 stored_at,
                 sender,
             };
-            db.mailbox_insert(&entry, now)
+            let replaced = inject::store_injected(&db, &entry, replace)
                 .unwrap_or_else(|e| die(format!("insert: {e}")));
             println!(
                 "{}",
@@ -292,6 +298,7 @@ fn main() {
                     "payload_len": entry.payload.len(),
                     "stored_at": entry.stored_at,
                     "expires_at": entry.expires_at,
+                    "replaced": replaced,
                 })
             );
         }

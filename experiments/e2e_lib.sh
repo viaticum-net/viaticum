@@ -314,3 +314,77 @@ delete_marks_for() {
     done
     echo "$total"
 }
+
+# ── Pointer places at the postmen (CROWN-1 C3a) ──────────────────────────────
+#
+# The postman logs every accepted pointer as
+#   "mailbox: stored SelfPointer entry target=<16 hex> msg_id=<32 hex> replaced=<bool>";
+# the rendezvous address is `mailbox-probe rendezvous --phrase` .address_short.
+
+# sp_store_lines RADDR16 IDX... : the store lines for RADDR16 across the nodes' logs,
+# each prefixed by "<IDX> ".
+sp_store_lines() {
+    local raddr="$1" i; shift
+    for i in "$@"; do
+        sed 's/\x1b\[[0-9;]*m//g' "$(node_log "$i")" 2>/dev/null \
+            | grep -a "mailbox: stored SelfPointer entry" | grep -a "target=$raddr" \
+            | sed "s/^/$i /" || true
+    done
+}
+
+# sp_msg_ids RADDR16 IDX... : distinct msg_ids stored for RADDR16, space-separated, sorted.
+sp_msg_ids() {
+    sp_store_lines "$@" | grep -oE 'msg_id=[0-9a-f]+' | cut -d= -f2 | sort -u | tr '\n' ' ' \
+        | sed 's/ $//' || true
+}
+
+# sp_postmen_with_store RADDR16 IDX... : how many of the nodes logged >= 1 store for RADDR16.
+sp_postmen_with_store() {
+    local raddr="$1" n=0 i; shift
+    for i in "$@"; do
+        [ -n "$(sp_store_lines "$raddr" "$i")" ] && n=$((n + 1))
+    done
+    echo "$n"
+}
+
+# honest_mailbox_negatives IDX... : lines no honest node may ever log in C3a — a postman
+# refusing a plaintext pointer (an honest publisher seals every pointer) and a pointer
+# found in a master box (pointers live only in the rendezvous box).
+honest_mailbox_negatives() {
+    local i
+    for i in "$@"; do
+        sed 's/\x1b\[[0-9;]*m//g' "$(node_log "$i")" 2>/dev/null \
+            | grep -aE "mailbox: store rejected — plaintext payload|SelfPointer in the master box — dropped" \
+            | sed "s/^/node $i: /" || true
+    done
+}
+
+# holders_of_prefix HEX16 IDX... : the nodes whose holdings hold >= 1 symbol of the block
+# whose id starts with HEX16 (SS blocks are logged by their first 16 hex chars).
+holders_of_prefix() {
+    local hex="$1" out="" i d; shift
+    for i in "$@"; do
+        for d in "$(node_dir "$i")"/holdings/"$hex"*; do
+            [ -d "$d" ] || continue
+            if [ "$(find "$d" -maxdepth 1 -type f -name '*.bin' 2>/dev/null | wc -l)" -gt 0 ]; then
+                out="$out $i"; break
+            fi
+        done
+    done
+    echo "${out# }"
+}
+
+# dr_attempt_plan DR_LOG : the DR attempt lines "i/N place created_at base", one per line.
+dr_attempt_plan() {
+    sed 's/\x1b\[[0-9;]*m//g' "$1" 2>/dev/null | grep -a "dr: attempt " \
+        | sed -E 's/.*dr: attempt ([0-9]+\/[0-9]+) place=([AB-]) created_at=([0-9]+) base=([0-9a-f]+).*/\1 \2 \3 \4/' \
+        || true
+}
+
+# last_published_base IDX PLACE : base (16 hex) of the node's last "SelfPointer published
+# via mailbox" line with place=PLACE ("" when none).
+last_published_base() {
+    sed 's/\x1b\[[0-9;]*m//g' "$(node_log "$1")" 2>/dev/null \
+        | grep -a "SelfPointer published via mailbox" | grep -a "place=$2" | tail -1 \
+        | grep -oE 'base=[0-9a-f]+' | cut -d= -f2 || true
+}
