@@ -2,7 +2,8 @@
 //
 // Pure: `PublishOutcome::verdict` only classifies the answers. Network errors (timeouts,
 // unreachable postmen) never make an "all refused" verdict: a refusal is a postman's
-// explicit answer.
+// explicit answer. Only the answers that arrived before the publication returned are
+// classified (mailbox-i60).
 
 use viaticum_core::mailbox::MailboxRejectReason;
 use viaticum_core::types::DeviceId;
@@ -16,6 +17,10 @@ pub struct PublishOutcome {
     pub rejects: Vec<(DeviceId, MailboxRejectReason)>,
     /// Postmen that did not answer (network error, timeout).
     pub errors: usize,
+    /// Postmen still answering when the publication returned (mailbox-i60: it returns
+    /// at the needed number of acks or after 15 s). Their late answers are not in this
+    /// outcome; a late ack still records the contact (avail, `last_seen`).
+    pub pending: usize,
 }
 
 /// The publication's verdict.

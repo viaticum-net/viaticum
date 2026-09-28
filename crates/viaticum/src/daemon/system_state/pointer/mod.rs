@@ -18,7 +18,8 @@
 //      before any send and a failed write skips the whole tick (mailbox-i59);
 //   3. every other record with fewer than the dr-i39 number of acks re-offers its
 //      envelope byte-identical (acks accumulate as distinct postmen); an expired
-//      envelope is not re-offered;
+//      envelope is not re-offered; every send returns once the dr-i39 number of
+//      postmen acked or after 15 s (mailbox-i60);
 //   4. a record with the dr-i39 number of acks retires its `to_retire`; SS blocks
 //      outside META and the running candidate are retired (`sweep_ss_ledger`);
 //   5. `waiting` is set while the newest catalog state is in no accepted pointer.
@@ -151,7 +152,9 @@ impl PointerPublisher<'_> {
 
         let mut fresh_accepted = false;
         if let Some(pointer) = fresh.as_ref() {
-            let outcome = self.send(meta.current.as_ref().expect("installed")).await;
+            let outcome = self
+                .send(meta.current.as_ref().expect("installed"), threshold)
+                .await;
             let current = meta.current.as_mut().expect("installed");
             fresh_accepted = !outcome.acks.is_empty();
             self.log_fresh(current, pointer, &outcome);
@@ -172,7 +175,10 @@ impl PointerPublisher<'_> {
             if entry.expires_at <= now_secs {
                 continue;
             }
-            let outcome = self.router.publish_detailed(entry, Some(sig)).await;
+            let outcome = self
+                .router
+                .publish_detailed(entry, Some(sig), threshold)
+                .await;
             absorb(record, &outcome, now_secs);
             debug!(
                 place = ?record.place,
@@ -378,9 +384,10 @@ impl PointerPublisher<'_> {
         })
     }
 
-    async fn send(&self, record: &PlacePublication) -> PublishOutcome {
+    /// Publish `record`'s envelope; returns once `need` postmen acked (mailbox-i60).
+    async fn send(&self, record: &PlacePublication, need: usize) -> PublishOutcome {
         match envelope(record) {
-            Some((entry, sig)) => self.router.publish_detailed(entry, Some(sig)).await,
+            Some((entry, sig)) => self.router.publish_detailed(entry, Some(sig), need).await,
             None => PublishOutcome::default(),
         }
     }
@@ -476,7 +483,9 @@ pub(crate) fn install(
     meta.current = Some(record);
 }
 
-/// Merge one publication's answers into `record`.
+/// Merge one publication's answers into `record`. Late acks (after the publication
+/// returned, mailbox-i60) are not merged: a record short of the threshold re-offers
+/// the same envelope next tick (step 3) and the postman acks it again.
 pub(crate) fn absorb(record: &mut PlacePublication, outcome: &PublishOutcome, now_secs: u64) {
     for a in &outcome.acks {
         if !record.acks.contains(a) && record.acks.len() < MAX_ACKS_KEPT {

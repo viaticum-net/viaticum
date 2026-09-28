@@ -1089,6 +1089,7 @@ fn outcome(acks: usize, rejects: &[MailboxRejectReason], errors: usize) -> Publi
             .map(|(i, r)| (DeviceId([0x80 + i as u8; 32]), r.clone()))
             .collect(),
         errors,
+        pending: 0,
     }
 }
 
@@ -1259,7 +1260,7 @@ async fn unsigned_self_pointer_publish_is_refused_by_real_postmen() {
     let mut plain = entry.clone();
     plain.payload_version = 1;
     let out = router
-        .publish_detailed(plain.clone(), Some(rv.sign_store(&plain)))
+        .publish_detailed(plain.clone(), Some(rv.sign_store(&plain)), 1)
         .await;
     assert!(out.acks.is_empty());
     assert!(

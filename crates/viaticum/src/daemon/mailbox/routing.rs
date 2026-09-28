@@ -15,7 +15,8 @@
 // rendezvous address) before the walk.
 //
 // publish_detailed: per-postman outcome (acks, refusals, errors) and its verdict, so the
-// pointer publisher can name a refusal (CROWN-1 V.3, V.15.3).
+// pointer publisher can name a refusal (CROWN-1 V.3, V.15.3). It returns at the needed
+// number of acks, not after the slowest postman (mailbox-i60, submodule `fanout`).
 //
 // Avail observation wiring (T-4a §5):
 // Successful MailboxStoreAck / MailboxFetchResponse → positive observation:
@@ -33,23 +34,25 @@ use libp2p::PeerId;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
 use viaticum_core::constants::{
-    AVAIL_EWMA_ALPHA, AVAIL_EWMA_INITIAL, MAILBOX_CANDIDATES_N, MAILBOX_READ_FANOUT,
-    MAILBOX_WRITE_FANOUT,
+    AVAIL_EWMA_INITIAL, MAILBOX_CANDIDATES_N, MAILBOX_READ_FANOUT, MAILBOX_WRITE_FANOUT,
 };
 use viaticum_core::db::Db;
-use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry, MailboxRejectReason};
+use viaticum_core::mailbox::{MailboxAddress, MailboxEntry};
 use viaticum_core::messages::{
     MAILBOX_WIRE_VERSION, MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest,
     MailboxStoreResponse, Message,
 };
 use viaticum_core::trust::compute_combined;
-use viaticum_core::types::{DeviceId, Timestamp, ewma_contact_observed, hex_encode};
+use viaticum_core::types::DeviceId;
 
 use crate::daemon::mailbox::candidate::KademliaRoutingView;
 use crate::daemon::network::swarm::{SwarmHandle, device_id_to_peer_id};
 
 mod dr_walk;
+mod fanout;
 mod verdict;
+
+use fanout::{record_avail_contact, store_fanout, unix_now};
 
 pub use dr_walk::DrWalk;
 pub use verdict::{PublishOutcome, PublishVerdict};
@@ -236,87 +239,47 @@ impl MailboxRouter {
     // ─── Public API ───────────────────────────────────────────────────────────
 
     /// Publish an entry to the write-fanout (top-30) of candidates for `entry.target`
-    /// and report what every postman answered.
+    /// and report what the postmen answered by the time it returned.
+    ///
+    /// mailbox-i60: returns as soon as `need` postmen acked (directed classes and PoS:
+    /// 1, the W-3 gate; a SelfPointer: the dr-i39 threshold), or when every postman
+    /// answered, or after 15 s, whichever comes first. The stores still reach every
+    /// postman; a late Ack records its contact (avail, `last_seen`) from the postman's
+    /// own task, a late refusal or error is only logged (see `fanout`).
     ///
     /// `target_sig`: signature by the secret key of `entry.target` over
     /// `store_sig_input(&entry)`. Postmen require it for class SelfPointer (only the
     /// box key holder writes a pointer box) and ignore it for directed classes. The
     /// box address comes only from the entry (no second `target`, F3).
-    ///
-    /// Avail observation: on Ack, updates avail_ewma + last_avail_sample for the
-    /// responding peer in the DB.
-    ///
-    /// Logging: a refusal that is our own fault (`Unauthorized`, `PlaintextPayload`)
-    /// is a `warn!` at once; `ClockSkew` / `Superseded` of a SelfPointer are `debug!`
-    /// (the publisher logs the verdict); `ClockSkew` of a directed entry stays `warn!`.
     pub async fn publish_detailed(
         &self,
         entry: MailboxEntry,
         target_sig: Option<[u8; 64]>,
+        need: usize,
     ) -> PublishOutcome {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
         let target = entry.target;
-        let msg_id = entry.msg_id;
         let ranked = self.build_ranked_candidates(&target);
-
-        // Select write-fanout peers.
-        let write_peers = self.select_write_peers_from_ranked(&ranked, &target, now_secs);
-
+        let write_peers = self.select_write_peers_from_ranked(&ranked, &target, unix_now());
         let req = MailboxStoreRequest {
             v: MAILBOX_WIRE_VERSION,
             entry,
             target_sig,
         };
-        let class = req.entry.class;
-
-        // Send in parallel, collect results.
-        let mut handles = Vec::with_capacity(write_peers.len());
-        for device_id in &write_peers {
-            let sender = Arc::clone(&self.sender);
-            let req_clone = req.clone();
-            let dev = *device_id;
-            handles.push(tokio::spawn(async move {
-                (dev, sender.send_store(dev, req_clone).await)
-            }));
-        }
-
-        let mut outcome = PublishOutcome::default();
-        for handle in handles {
-            match handle.await {
-                Ok((device_id, Ok(MailboxStoreResponse::Ack { .. }))) => {
-                    outcome.acks.push(device_id);
-                    self.record_avail_contact(device_id, now_secs);
-                }
-                Ok((device_id, Ok(MailboxStoreResponse::Reject { reason, .. }))) => {
-                    log_store_refusal(device_id, &target, &msg_id, class, &reason);
-                    outcome.rejects.push((device_id, reason));
-                }
-                Ok((device_id, Err(e))) => {
-                    debug!(device = %device_id, err = %e, "mailbox publish: store failed");
-                    outcome.errors += 1;
-                }
-                Err(join_err) => {
-                    warn!("mailbox publish: task panicked: {join_err}");
-                    outcome.errors += 1;
-                }
-            }
-        }
+        let outcome = store_fanout(&self.sender, &self.db, &write_peers, req, need).await;
 
         if outcome.acks.is_empty() {
             warn!(
                 target = %target,
                 peers_tried = write_peers.len(),
                 refused = outcome.rejects.len(),
+                no_answer_in_time = outcome.pending,
                 "mailbox publish: 0 acks — entry may not be stored; will retry on next tick"
             );
         } else {
             debug!(
                 target = %target,
                 ack_count = outcome.acks.len(),
+                still_answering = outcome.pending,
                 peers_tried = write_peers.len(),
                 "mailbox publish: stored"
             );
@@ -324,13 +287,14 @@ impl MailboxRouter {
         outcome
     }
 
-    /// Publish and return the number of Acks (directed producers).
+    /// Publish and return the number of Acks (directed producers): returns at the
+    /// first Ack (mailbox-i60), so the count is ≥ 1 on success, not the fanout size.
     pub async fn publish(
         &self,
         entry: MailboxEntry,
         target_sig: Option<[u8; 64]>,
     ) -> anyhow::Result<usize> {
-        Ok(self.publish_detailed(entry, target_sig).await.acks.len())
+        Ok(self.publish_detailed(entry, target_sig, 1).await.acks.len())
     }
 
     /// Poll the box `target` from read-fanout (300) candidates.
@@ -347,11 +311,7 @@ impl MailboxRouter {
         proof: Option<[u8; 64]>,
         since_stored_at: Option<u64>,
     ) -> anyhow::Result<Vec<MailboxEntry>> {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
+        let now_secs = unix_now();
         let ranked = self.build_ranked_candidates(target);
 
         // Read-fanout: top-300 closest peers.
@@ -386,7 +346,7 @@ impl MailboxRouter {
         for handle in handles {
             match handle.await {
                 Ok((device_id, Ok(resp))) => {
-                    self.record_avail_contact(device_id, now_secs);
+                    record_avail_contact(&self.db, device_id, now_secs);
                     for entry in resp.entries {
                         // Skip expired entries (should not happen; postman filters them,
                         // but be defensive against clock skew).
@@ -514,76 +474,6 @@ impl MailboxRouter {
             .map(|(_, pid)| *pid)
             .collect();
         self.select_write_peers(&candidate_peer_ids, target, now_secs)
-    }
-
-    /// Apply a positive avail observation for `device_id` in the DB.
-    ///
-    /// Called after a successful MailboxStoreAck or MailboxFetchResponse. The peer
-    /// answered, so it is also SEEN now: `last_seen` moves forward (CROWN-1 V.17.1 —
-    /// the strength of an SS base counts only holders seen within 7 days / time_scale;
-    /// without this, a holder on a long-lived connection would look gone, because
-    /// `last_seen` otherwise moves only at (re)authentication).
-    /// Non-fatal: logs warning on DB error.
-    fn record_avail_contact(&self, device_id: DeviceId, now_secs: u64) {
-        match self.db.get_peer(&device_id) {
-            Ok(Some(mut record)) => {
-                record.avail_ewma = ewma_contact_observed(record.avail_ewma, AVAIL_EWMA_ALPHA);
-                record.last_avail_sample = now_secs;
-                record.last_seen = Timestamp(record.last_seen.0.max(now_secs));
-                if let Err(e) = self.db.upsert_peer(&record) {
-                    warn!(
-                        device = %device_id,
-                        err = %e,
-                        "mailbox router: failed to persist avail_ewma contact observation"
-                    );
-                }
-            }
-            Ok(None) => {
-                // Peer not in DB (unusual — they were a candidate). No-op.
-                debug!(device = %device_id, "mailbox router: avail contact for unknown peer");
-            }
-            Err(e) => {
-                warn!(
-                    device = %device_id,
-                    err = %e,
-                    "mailbox router: failed to load peer for avail update"
-                );
-            }
-        }
-    }
-}
-
-/// One postman's refusal of a store (see `publish_detailed` for the levels).
-fn log_store_refusal(
-    device_id: DeviceId,
-    target: &MailboxAddress,
-    msg_id: &[u8; 16],
-    class: MailboxClass,
-    reason: &MailboxRejectReason,
-) {
-    let ours = matches!(
-        reason,
-        MailboxRejectReason::Unauthorized | MailboxRejectReason::PlaintextPayload
-    );
-    let directed_clock =
-        class != MailboxClass::SelfPointer && matches!(reason, MailboxRejectReason::ClockSkew);
-    if ours || directed_clock {
-        warn!(
-            device = %device_id,
-            target = %target,
-            msg_id = %hex_encode(msg_id),
-            ?class,
-            ?reason,
-            "mailbox publish: postman refused the entry — check keys and system clock"
-        );
-    } else {
-        debug!(
-            device = %device_id,
-            msg_id = %hex_encode(msg_id),
-            ?class,
-            ?reason,
-            "mailbox publish: peer rejected store"
-        );
     }
 }
 

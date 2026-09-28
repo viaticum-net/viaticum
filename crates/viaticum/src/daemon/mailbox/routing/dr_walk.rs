@@ -110,7 +110,7 @@ impl MailboxRouter {
                             entries = resp.entries.len(),
                             "dr_walk: fetch response from peer"
                         );
-                        self.record_avail_contact(device_id, unix_now());
+                        super::record_avail_contact(&self.db, device_id, unix_now());
                         for entry in &resp.entries {
                             if let Some(p) = open_pointer(rv, my_master_pub, &device_id, entry)
                                 && seen_sigs.insert(p.signature)
