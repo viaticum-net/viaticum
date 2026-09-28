@@ -43,6 +43,7 @@ fn make_status(peers: Vec<PeerSummary>) -> StatusData {
         dr_pointer_refusal: String::new(),
         dr_waiting_since: 0,
         dr_waiting: String::new(),
+        dr_restores_state_of: 0,
     }
 }
 

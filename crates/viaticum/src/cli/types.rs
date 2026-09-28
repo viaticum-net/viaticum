@@ -197,6 +197,10 @@ pub struct StatusData {
     /// Why they wait, in words ("" = not waiting).
     #[serde(default)]
     pub dr_waiting: String,
+    /// dr-i53: unix secs — the date of the catalog state DR from the phrase would
+    /// restore (the newest restorable pointer place); 0 = DR not ready.
+    #[serde(default)]
+    pub dr_restores_state_of: u64,
 }
 
 /// Peer summary shown in `viaticum status`.

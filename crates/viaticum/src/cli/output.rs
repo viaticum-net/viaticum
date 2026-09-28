@@ -144,6 +144,12 @@ pub fn render_dr_readiness(data: &StatusData) -> String {
             data.dr_pointer_files,
             data.dr_pointer_acks
         ));
+        if data.dr_restores_state_of > 0 {
+            out.push_str(&format!(
+                "                  DR would restore the catalog as of {}\n",
+                iso(data.dr_restores_state_of)
+            ));
+        }
     } else {
         out.push_str(&format!(
             "  DR:             NOT READY: recovery pointer published {}, {} files, accepted by {} of \

@@ -1878,6 +1878,108 @@ async fn status_shows_last_refusal_reason() {
     }
 }
 
+/// An SS block held by `holders` peers seen now (strength = holders; k_eff = 4).
+fn held_ss_block(db: &Db, id: u8, holders: u8) -> viaticum_core::types::SourceBlockId {
+    use viaticum_core::types::{
+        FileId, PeerRecord, PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus,
+        SourceBlockType, SymbolPlacement, Timestamp,
+    };
+    let block_id = SourceBlockId([id; 32]);
+    db.upsert_source_block(&SourceBlockRecord {
+        block_id,
+        k: 1,
+        t: 64,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(1),
+        encrypted_size: Some(64),
+        n: Some(12),
+        overhead: Some(3.0),
+        drop_notice_sent_at: None,
+        importance: 1.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.99,
+    })
+    .unwrap();
+    for h in 0..holders {
+        let device = DeviceId([0xA0 + h; 32]);
+        db.upsert_peer(&PeerRecord {
+            device_id: device,
+            master_identity: IdentityPub(device.0),
+            trust_p: 0.5,
+            trust_i: 0.0,
+            trust_s: 1.0,
+            bytes_we_store_for_peer: 0,
+            bytes_peer_stores_for_us: 0,
+            first_seen: Timestamp(1),
+            last_seen: Timestamp::now(),
+            revoked_device_pub_keys: vec![],
+            addrs: vec![],
+            x25519_pub: None,
+            avail_ewma: 0.5,
+            last_avail_sample: 0,
+        })
+        .unwrap();
+        db.upsert_placement(&SymbolPlacement {
+            source_block_id: block_id,
+            holder_id: device,
+            file_id: FileId(0),
+            esi_ranges: vec![(u32::from(h) * 4, 4)],
+            binding_seed: [0; 32],
+            status: PlacementStatus::Alive,
+            last_verified: None,
+            placed_at: Timestamp(1),
+            consecutive_misses: 0,
+        })
+        .unwrap();
+    }
+    block_id
+}
+
+/// dr-i53: a new base with 1 ack in place B does not make status "not ready" while
+/// place A is restorable; status names the date of the catalog state DR restores
+/// (place A's pointer), in the JSON field and in the CLI line.
+#[tokio::test]
+async fn status_names_the_date_dr_would_restore() {
+    use viaticum_core::mailbox::seal::PointerPlace;
+    use viaticum_core::system_state::catalog::PointerPublications;
+    let state = make_test_state().await;
+    let lineage = state.db.get_or_create_catalog_lineage().unwrap();
+    let old = held_ss_block(&state.db, 7, 3); // 3 known peers → threshold 2
+    let new = held_ss_block(&state.db, 8, 3);
+    let mut meta = PointerPublications::new(lineage);
+    meta.other = Some(place_record(old, 1_790_000_000, 3));
+    let mut newer = place_record(new, 1_790_100_000, 1);
+    newer.place = PointerPlace::B;
+    meta.current = Some(newer);
+    state.db.put_pointer_publications(&meta).unwrap();
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert!(data.dr_ready, "place A is restorable");
+    assert_eq!(data.dr_restores_state_of, 1_790_000_000);
+    assert_eq!(data.dr_pointer_published_at, 1_790_000_000);
+    let rendered = crate::cli::output::render_status(&data);
+    assert!(
+        rendered.contains(&format!(
+            "DR would restore the catalog as of {}",
+            super::unix_secs_to_iso(1_790_000_000, true)
+        )),
+        "got: {rendered}"
+    );
+
+    // Nothing restorable (the new base short of the threshold, place A gone): no date.
+    meta.other = None;
+    state.db.put_pointer_publications(&meta).unwrap();
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert!(!data.dr_ready);
+    assert_eq!(data.dr_restores_state_of, 0);
+    assert!(!crate::cli::output::render_status(&data).contains("DR would restore"));
+}
+
 /// mailbox-i54: the wait is in `status` with its start and reason.
 #[tokio::test]
 async fn status_shows_waiting_since_and_reason() {

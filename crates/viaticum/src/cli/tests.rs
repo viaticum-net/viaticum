@@ -294,6 +294,7 @@ fn make_status_zero_peers() -> StatusData {
         dr_pointer_refusal: String::new(),
         dr_waiting_since: 0,
         dr_waiting: String::new(),
+        dr_restores_state_of: 0,
     }
 }
 
@@ -469,6 +470,7 @@ fn format_status_top_peers_printed() {
         dr_pointer_refusal: String::new(),
         dr_waiting_since: 0,
         dr_waiting: String::new(),
+        dr_restores_state_of: 0,
     };
     let rendered = output::render_status(&data);
     assert!(rendered.contains("a1b2c3d4"), "got: {rendered}");
@@ -925,6 +927,7 @@ fn cli_response_roundtrips_cbor() {
             dr_pointer_refusal: String::new(),
             dr_waiting_since: 0,
             dr_waiting: String::new(),
+            dr_restores_state_of: 0,
         })),
         CliResponse::DeviceList(vec![]),
         CliResponse::Error("oops".into()),

@@ -326,6 +326,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         dr_pointer_refusal: dr.refusal,
         dr_waiting_since: dr.waiting_since,
         dr_waiting: dr.waiting,
+        dr_restores_state_of: dr.restores_state_of,
     }))
 }
 
@@ -347,6 +348,8 @@ pub(crate) struct DrReadiness {
     pub(crate) waiting_since: u64,
     /// Words: why the newest changes are not in the network yet ("" = they are).
     pub(crate) waiting: String,
+    /// dr-i53: `created_at` of the catalog state DR restores; 0 = not ready.
+    pub(crate) restores_state_of: u64,
 }
 
 /// Read-only: the pointer places in META (never a pointer only built, dr-i9) and this
@@ -373,6 +376,7 @@ pub(crate) fn dr_readiness(
                 r.acks = acks;
             }
             r.ready = p.ready;
+            r.restores_state_of = p.restores_state_of.unwrap_or(0);
             r.threshold = p.threshold;
             r.blocks_placed = p.blocks_placed;
             r.blocks_total = p.blocks_total;
