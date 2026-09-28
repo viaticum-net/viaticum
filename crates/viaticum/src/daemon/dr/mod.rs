@@ -341,7 +341,7 @@ async fn recover_into_staging(
     // CROWN-1 C3a: the box and every key come from the phrase only (no clock).
     let rv = RendezvousKeys::derive(&keyfile.seed);
     tracing::info!(address = %rv.address, "dr: rendezvous box");
-    match swarm_handle
+    let closest = match swarm_handle
         .get_closest_peers(dr_lookup_key(&rv.address))
         .await
     {
@@ -350,14 +350,18 @@ async fn recover_into_staging(
                 count = closest.len(),
                 "dr: get_closest_peers returned candidate peers"
             );
-            net::dial_and_authenticate_candidates(&swarm_handle, &mut event_rx, &db, closest).await;
+            closest
         }
         Err(e) => {
             tracing::warn!(
-                "dr: get_closest_peers failed: {e}; proceeding with bootstrap-authenticated peers"
+                "dr: get_closest_peers failed: {e}; proceeding with the authenticated peers"
             );
+            Vec::new()
         }
-    }
+    };
+    // Also on a failed lookup: it upserts the peers that authenticated after the
+    // stabilization wait stopped, so the walk asks every postman DR reached (dr-i1).
+    net::dial_and_authenticate_candidates(&swarm_handle, &mut event_rx, &db, closest).await;
     if db
         .list_all_peers()
         .map_err(|e| dr_failed(format!("recovery database: {e}")))?

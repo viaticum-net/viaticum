@@ -227,6 +227,14 @@ pub(super) async fn wait_for_auth_set(
 /// Dial the peers returned by `get_closest_peers` (one dial per peer over all its
 /// addresses, all at once) and wait for them with one shared deadline, upserting each
 /// into the DB so the mailbox walk has them as candidates. Best-effort.
+///
+/// A candidate that is already authenticated is not dialed, and it is NOT necessarily
+/// in the DB yet: the stabilization wait stops at `KAD_MIN_PEERS_FOR_DR`, so the peers
+/// that authenticated after it have their `PeerAuthenticated` still queued. They are
+/// upserted from the queue at the end ([`upsert_queued_peers`]); without that the walk
+/// asks only the seed peer and a seed that swapped the pointer's place ends DR with
+/// "no catalog" while other postmen hold the real pointer (dr-i1, CROWN-1 S1 step 7).
+/// Call it with an empty `closest` when the lookup failed: the queue is drained the same.
 pub(super) async fn dial_and_authenticate_candidates(
     swarm: &SwarmHandle,
     event_rx: &mut Receiver<ProtocolEvent>,
@@ -262,11 +270,48 @@ pub(super) async fn dial_and_authenticate_candidates(
         Duration::from_secs(CANDIDATE_DIAL_TIMEOUT_SECS),
     )
     .await;
+    let queued = upsert_queued_peers(event_rx, db);
     tracing::info!(
         dialed = wanted,
         authenticated = arrived.len(),
+        already_authenticated_upserted = queued,
         "dr: candidate peers dialed"
     );
+}
+
+/// Upsert every peer whose `PeerAuthenticated` is already queued, without waiting
+/// (`PeerIdentified` addresses are persisted too; other events are dropped, as in the
+/// waits above). The swarm queues the event in the same step that marks the peer
+/// authenticated, so every peer `peer_sets` reported before this call is in the queue.
+/// Returns how many peers were upserted.
+pub(super) fn upsert_queued_peers(event_rx: &mut Receiver<ProtocolEvent>, db: &Db) -> usize {
+    let mut upserted = 0usize;
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            ProtocolEvent::PeerAuthenticated {
+                peer_id: _,
+                device_id,
+                identity_pub,
+                device_cert: _,
+                x25519_pub,
+                listen_addrs,
+            } => {
+                upserted += usize::from(upsert_authenticated(
+                    db,
+                    device_id,
+                    identity_pub,
+                    x25519_pub,
+                    &listen_addrs,
+                ));
+            }
+            ProtocolEvent::PeerIdentified {
+                device_id,
+                listen_addrs,
+            } => persist_identified_addrs(db, device_id, &listen_addrs),
+            _ => {}
+        }
+    }
+    upserted
 }
 
 // ─── Pointer holder dialing ───────────────────────────────────────────────────

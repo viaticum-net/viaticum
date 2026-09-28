@@ -137,6 +137,91 @@ async fn wait_for_auth_set_stops_at_deadline() {
     drop(tx);
 }
 
+// ─── peers authenticated after the stabilization wait (dr-i1) ────────────────
+
+/// The stabilization wait stops at the first peer; a second peer authenticates right
+/// after it. The candidate step does not dial it (already authenticated) and must still
+/// put it in the DB — the mailbox walk asks only DB peers, and a seed that swapped the
+/// pointer's place would otherwise be the only postman DR asks (CROWN-1 S1 step 7).
+#[tokio::test]
+async fn candidate_step_upserts_a_peer_authenticated_after_the_bootstrap_wait_stopped() {
+    use crate::daemon::network::swarm::SwarmHandle;
+    use crate::daemon::network::swarm_test_helpers::{get_listen_addr, make_swarm_config};
+
+    let cfg_a = make_swarm_config(0x41);
+    let cfg_b = make_swarm_config(0x42);
+    let cfg_c = make_swarm_config(0x43);
+    let device_id_b = DeviceId(cfg_b.device_signing_key.verifying_key().to_bytes());
+    let device_id_c = DeviceId(cfg_c.device_signing_key.verifying_key().to_bytes());
+
+    let (handle_a, mut event_rx_a) = SwarmHandle::start(cfg_a).await.unwrap();
+    let (handle_b, _event_rx_b) = SwarmHandle::start(cfg_b).await.unwrap();
+    let (handle_c, _event_rx_c) = SwarmHandle::start(cfg_c).await.unwrap();
+    let addr_b = get_listen_addr(&handle_b).await;
+    let addr_c = get_listen_addr(&handle_c).await;
+    handle_a.dial(handle_b.peer_id, addr_b).await.unwrap();
+    handle_a
+        .dial(handle_c.peer_id, addr_c.clone())
+        .await
+        .unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    assert_eq!(
+        wait_for_kad_bootstrap_stable(&mut event_rx_a, &db, 10, 1).await,
+        1
+    );
+    // Both are authenticated at the swarm before the candidate step runs.
+    let both = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (auth, _) = handle_a.peer_sets().await.unwrap();
+            if auth.contains(&device_id_b) && auth.contains(&device_id_c) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(both.is_ok(), "B and C authenticate at A");
+    assert_eq!(
+        db.list_all_peers().unwrap().len(),
+        1,
+        "the wait upserted one peer"
+    );
+
+    // The lookup returns the late peer, already authenticated → not dialed.
+    let closest = vec![(handle_c.peer_id, vec![addr_c])];
+    dial_and_authenticate_candidates(&handle_a, &mut event_rx_a, &db, closest).await;
+
+    assert!(db.get_peer(&device_id_b).unwrap().is_some(), "B upserted");
+    assert!(
+        db.get_peer(&device_id_c).unwrap().is_some(),
+        "the peer that authenticated after the wait stopped is a walk candidate"
+    );
+}
+
+/// `upsert_queued_peers` takes every queued authentication without waiting and leaves
+/// an empty queue behind.
+#[tokio::test]
+async fn upsert_queued_peers_takes_every_queued_authentication_without_waiting() {
+    let db = Db::open_in_memory().unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    let (ev1, _, d1) = auth_event(0x51, vec![]);
+    let (ev2, _, d2) = auth_event(0x52, vec![]);
+    tx.send(ev1).await.unwrap();
+    tx.send(ev2).await.unwrap();
+
+    let start = std::time::Instant::now();
+    assert_eq!(upsert_queued_peers(&mut rx, &db), 2);
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "does not wait for more"
+    );
+    assert!(db.get_peer(&d1).unwrap().is_some());
+    assert!(db.get_peer(&d2).unwrap().is_some());
+    assert_eq!(upsert_queued_peers(&mut rx, &db), 0, "the queue is empty");
+    drop(tx);
+}
+
 // ─── live_peer_record ─────────────────────────────────────────────────────────
 
 #[test]
