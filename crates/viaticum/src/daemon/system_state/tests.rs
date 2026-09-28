@@ -9,6 +9,9 @@ mod t8 {
     use viaticum_core::cluster::{derive_master_key, master_identity};
     use viaticum_core::constants::{AVAIL_EWMA_INITIAL, MAILBOX_POINTER_REPUBLISH_SECS};
     use viaticum_core::db::testutil::test_db;
+    use viaticum_core::mailbox::seal::{
+        PointerPlace, RendezvousKeys, SEALED_PAYLOAD_VERSION, open_self_pointer,
+    };
     use viaticum_core::mailbox::{MailboxClass, MailboxEntry, class_config};
     use viaticum_core::messages::{
         MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse,
@@ -19,13 +22,14 @@ mod t8 {
     };
     use viaticum_core::types::{
         DeviceId, IdentityPub, PeerRecord, PlacementStatus, SourceBlockId, SymbolPlacement,
-        Timestamp, from_cbor_bytes, to_cbor_bytes,
+        Timestamp, from_cbor_bytes,
     };
 
     use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter};
     use crate::daemon::system_state::publish::PointerCatalog;
     use crate::daemon::system_state::{
-        PointerStructKey, pointer_struct_key, publish_pointer_step, should_republish,
+        PointerStructKey, pointer_refresh_interval_secs, pointer_struct_key, publish_pointer_step,
+        should_republish,
     };
 
     // ─── Mock sender ─────────────────────────────────────────────────────────
@@ -79,6 +83,14 @@ mod t8 {
     // ─── Helpers ─────────────────────────────────────────────────────────────
 
     const TEST_LINEAGE: CatalogLineageId = CatalogLineageId([0x4c; 16]);
+    /// The seed of the rendezvous keys in these tests.
+    const SEED: [u8; 64] = [0xAB; 64];
+
+    /// Open a sealed pointer entry with the test's rendezvous keys.
+    fn opened(rv: &RendezvousKeys, entry: &MailboxEntry) -> SelfPointer {
+        let body = open_self_pointer(rv, entry).expect("the entry opens with the seed keys");
+        from_cbor_bytes::<SelfPointer>(&body).expect("decode")
+    }
     const TEST_PUBLISHER: DeviceId = DeviceId([0xd1; 32]);
 
     fn test_catalog() -> CatalogSummary {
@@ -229,15 +241,14 @@ mod t8 {
             Arc::clone(&net) as Arc<dyn MailboxNetworkSender>,
             db.clone(),
         );
-        let current_pointer: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
+        let rv = RendezvousKeys::derive(&SEED);
         let now_secs = Timestamp::now().0;
 
         let (key, published_at) = publish_pointer_step(
             &db,
             &router,
             &master_key,
-            &my_master_pub,
-            &current_pointer,
+            &rv,
             1,
             &block_id,
             &[],
@@ -257,13 +268,22 @@ mod t8 {
         let held = net
             .postman(&holder)
             .db
-            .mailbox_list_for_target(
-                &viaticum_core::mailbox::MailboxAddress::for_master(&my_master_pub),
-                0,
-            )
+            .mailbox_list_for_target(&rv.address, 0)
             .unwrap();
         assert_eq!(held.len(), 1, "the postman stored the pointer");
         assert_eq!(held[0].class, MailboxClass::SelfPointer);
+        assert_eq!(held[0].payload_version, SEALED_PAYLOAD_VERSION);
+        assert!(
+            net.postman(&holder)
+                .db
+                .mailbox_list_for_target(
+                    &viaticum_core::mailbox::MailboxAddress::for_master(&my_master_pub),
+                    0
+                )
+                .unwrap()
+                .is_empty(),
+            "nothing in the master box"
+        );
     }
 
     /// Answers every store with a Reject: the publish gets 0 acks.
@@ -301,20 +321,19 @@ mod t8 {
     #[tokio::test]
     async fn publish_step_records_publication_only_on_acks() {
         let db = test_db();
-        let (_p, master_key, my_master_pub, block_id, _h) = build_placed_pointer(&db);
+        let (_p, master_key, _my_master_pub, block_id, _h) = build_placed_pointer(&db);
         let sender = MockSender::new();
         db.upsert_peer(&make_peer(gen_device_id())).unwrap();
         let router =
             MailboxRouter::with_sender(sender.clone() as Arc<dyn MailboxNetworkSender>, db.clone());
-        let current: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
+        let rv = RendezvousKeys::derive(&SEED);
         assert_eq!(db.last_pointer_publication().unwrap(), None);
 
         publish_pointer_step(
             &db,
             &router,
             &master_key,
-            &my_master_pub,
-            &current,
+            &rv,
             1,
             &block_id,
             &[],
@@ -334,7 +353,7 @@ mod t8 {
         assert_eq!(rec.files, 3);
         assert_eq!(rec.generation, 1);
         assert!(rec.acks >= 1);
-        let published = from_cbor_bytes::<SelfPointer>(&sender.store_calls()[0].1.payload).unwrap();
+        let published = opened(&rv, &sender.store_calls()[0].1);
         assert_eq!(published.catalog.lineage, TEST_LINEAGE);
         assert_eq!(published.catalog.publisher, TEST_PUBLISHER);
         assert_eq!(published.catalog.files, 3);
@@ -346,19 +365,18 @@ mod t8 {
     #[tokio::test]
     async fn publish_step_does_not_record_publication_on_zero_acks() {
         let db = test_db();
-        let (_p, master_key, my_master_pub, block_id, _h) = build_placed_pointer(&db);
+        let (_p, master_key, _my_master_pub, block_id, _h) = build_placed_pointer(&db);
         db.upsert_peer(&make_peer(gen_device_id())).unwrap();
         let router = MailboxRouter::with_sender(
             Arc::new(RejectingSender) as Arc<dyn MailboxNetworkSender>,
             db.clone(),
         );
-        let current: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
+        let rv = RendezvousKeys::derive(&SEED);
         publish_pointer_step(
             &db,
             &router,
             &master_key,
-            &my_master_pub,
-            &current,
+            &rv,
             1,
             &block_id,
             &[],
@@ -370,7 +388,6 @@ mod t8 {
         )
         .await;
         assert_eq!(db.last_pointer_publication().unwrap(), None);
-        assert!(current.lock().unwrap().is_none());
     }
 
     /// T-8 spec (Fix 1, WARN-2): publish_pointer_step with a placed base and
@@ -391,7 +408,7 @@ mod t8 {
             sender.clone() as Arc<dyn MailboxNetworkSender>;
         let router = MailboxRouter::with_sender(sender_dyn, db.clone());
 
-        let current_pointer: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
+        let rv = RendezvousKeys::derive(&SEED);
         let now_secs = Timestamp::now().0;
 
         // Call publish_pointer_step with no prior state (first publish).
@@ -399,8 +416,7 @@ mod t8 {
             &db,
             &router,
             &master_key,
-            &my_master_pub,
-            &current_pointer,
+            &rv,
             1,
             &block_id,
             &[],
@@ -421,20 +437,15 @@ mod t8 {
 
         let (_, stored_entry) = &calls[0];
         assert_eq!(
-            stored_entry.target,
-            viaticum_core::mailbox::MailboxAddress::for_master(&my_master_pub),
-            "entry must target my_master_pub"
+            stored_entry.target, rv.address,
+            "entry must target the rendezvous box"
         );
         assert_eq!(
             stored_entry.class,
             MailboxClass::SelfPointer,
             "class must be SelfPointer"
         );
-        assert_eq!(
-            stored_entry.sender,
-            Some(my_master_pub),
-            "sender must be Some(my_master_pub)"
-        );
+        assert_eq!(stored_entry.sender, None, "no sender in the header");
 
         // TTL: expires_at - stored_at == SELF_POINTER_TTL (within 2s clock tolerance).
         let ttl_actual = stored_entry
@@ -447,21 +458,12 @@ mod t8 {
         );
 
         // Payload decodes to a valid signed SelfPointer.
-        let decoded = from_cbor_bytes::<SelfPointer>(&stored_entry.payload).expect("decode");
+        let decoded = opened(&rv, stored_entry);
         assert!(
             verify_self_pointer(&decoded, &my_master_pub).is_ok(),
             "payload must decode to a verified SelfPointer"
         );
         assert_eq!(decoded.generation, 1, "SelfPointer generation must be 1");
-
-        // Shared current_pointer handle updated.
-        {
-            let guard = current_pointer.lock().unwrap();
-            let stored = guard
-                .as_ref()
-                .expect("current_pointer must be Some after publish");
-            assert_eq!(stored.generation, 1, "current_pointer generation must be 1");
-        }
 
         // Returned tracking state.
         assert!(
@@ -481,7 +483,7 @@ mod t8 {
     #[tokio::test]
     async fn publish_pointer_step_scales_ttl_by_time_scale() {
         let db = test_db();
-        let (_pointer, master_key, my_master_pub, block_id, _holder) = build_placed_pointer(&db);
+        let (_pointer, master_key, _my_master_pub, block_id, _holder) = build_placed_pointer(&db);
 
         let sender = MockSender::new();
         let peer_d = gen_device_id();
@@ -490,7 +492,7 @@ mod t8 {
             sender.clone() as Arc<dyn MailboxNetworkSender>;
         let router = MailboxRouter::with_sender(sender_dyn, db.clone());
 
-        let current_pointer: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
+        let rv = RendezvousKeys::derive(&SEED);
         let now_secs = Timestamp::now().0;
 
         let time_scale = 60u64;
@@ -498,8 +500,7 @@ mod t8 {
             &db,
             &router,
             &master_key,
-            &my_master_pub,
-            &current_pointer,
+            &rv,
             1,
             &block_id,
             &[],
@@ -536,7 +537,7 @@ mod t8 {
     #[tokio::test]
     async fn publish_pointer_step_skips_when_unchanged_within_window() {
         let db = test_db();
-        let (_pointer, master_key, my_master_pub, block_id, _holder) = build_placed_pointer(&db);
+        let (_pointer, master_key, _my_master_pub, block_id, _holder) = build_placed_pointer(&db);
 
         let sender = MockSender::new();
         let peer_d = gen_device_id();
@@ -545,7 +546,7 @@ mod t8 {
             sender.clone() as Arc<dyn MailboxNetworkSender>;
         let router = MailboxRouter::with_sender(sender_dyn, db.clone());
 
-        let current_pointer: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
+        let rv = RendezvousKeys::derive(&SEED);
         let now_secs = Timestamp::now().0;
 
         // First call — publishes, returns structural key.
@@ -553,8 +554,7 @@ mod t8 {
             &db,
             &router,
             &master_key,
-            &my_master_pub,
-            &current_pointer,
+            &rv,
             1,
             &block_id,
             &[],
@@ -575,8 +575,7 @@ mod t8 {
             &db,
             &router,
             &master_key,
-            &my_master_pub,
-            &current_pointer,
+            &rv,
             1,
             &block_id,
             &[],
@@ -607,7 +606,7 @@ mod t8 {
     #[tokio::test]
     async fn publish_pointer_step_republishes_after_30d_window() {
         let db = test_db();
-        let (_pointer, master_key, my_master_pub, block_id, _holder) = build_placed_pointer(&db);
+        let (_pointer, master_key, _my_master_pub, block_id, _holder) = build_placed_pointer(&db);
 
         let sender = MockSender::new();
         let peer_d = gen_device_id();
@@ -616,7 +615,7 @@ mod t8 {
             sender.clone() as Arc<dyn MailboxNetworkSender>;
         let router = MailboxRouter::with_sender(sender_dyn, db.clone());
 
-        let current_pointer: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
+        let rv = RendezvousKeys::derive(&SEED);
 
         // Simulate: first publish happened at t=0, key known.
         let last_publish_at = 1_000_000u64;
@@ -628,8 +627,7 @@ mod t8 {
             &db,
             &router,
             &master_key,
-            &my_master_pub,
-            &current_pointer,
+            &rv,
             1,
             &block_id,
             &[],
@@ -743,7 +741,7 @@ mod t8 {
         // pointer2 has different generation AND base block_id → must republish.
         let now = last_publish_at + 60; // 60s later, well within 30d window
         assert!(
-            should_republish(&pointer2, Some(&key1), last_publish_at, now),
+            should_republish(&pointer2, Some(&key1), last_publish_at, now, 1),
             "changed pointer must trigger republish"
         );
     }
@@ -772,7 +770,7 @@ mod t8 {
         // Now = last_publish_at + 1h (well within 30d window, same struct key).
         let now = last_publish_at + 3600;
         assert!(
-            !should_republish(&pointer, Some(&key), last_publish_at, now),
+            !should_republish(&pointer, Some(&key), last_publish_at, now, 1),
             "unchanged pointer within 30d must NOT republish"
         );
     }
@@ -801,7 +799,7 @@ mod t8 {
         // now = last_publish_at + MAILBOX_POINTER_REPUBLISH_SECS → exactly at boundary → republish.
         let now = last_publish_at + MAILBOX_POINTER_REPUBLISH_SECS;
         assert!(
-            should_republish(&pointer, Some(&key), last_publish_at, now),
+            should_republish(&pointer, Some(&key), last_publish_at, now, 1),
             "pointer must be republished after 30d window expires"
         );
     }
@@ -819,7 +817,6 @@ mod t8 {
 
         let db = test_db();
         let master_key = derive_master_key(&[0xF2; 64]).unwrap();
-        let my_master_pub = master_identity(&master_key);
 
         // Unplaced base block: registered in DB but has NO Alive placements.
         let unplaced_id = SourceBlockId([0xBB; 32]);
@@ -868,10 +865,9 @@ mod t8 {
                 esi_ranges: vec![],
             }],
         };
-        let old_pointer =
+        let _old_pointer =
             sign_self_pointer(&master_key, 1, old_block_ref, vec![], now, test_catalog());
-        let current_pointer: Arc<Mutex<Option<SelfPointer>>> =
-            Arc::new(Mutex::new(Some(old_pointer.clone())));
+        let rv = RendezvousKeys::derive(&SEED);
 
         // Build router with a candidate peer (to confirm no publish fires, not just no-candidate).
         let sender = MockSender::new();
@@ -886,8 +882,7 @@ mod t8 {
             &db,
             &router,
             &master_key,
-            &my_master_pub,
-            &current_pointer,
+            &rv,
             2, // new generation, but base is unplaced
             &unplaced_id,
             &[],
@@ -907,18 +902,6 @@ mod t8 {
             "no publish must fire when base has no Alive holders (staged rotation)"
         );
 
-        // current_pointer must still hold old_pointer (gen=1, NOT cleared or regressed).
-        {
-            let guard = current_pointer.lock().unwrap();
-            let stored = guard
-                .as_ref()
-                .expect("current_pointer must still be Some (old pointer preserved)");
-            assert_eq!(
-                stored.generation, 1,
-                "old pointer (gen=1) must be preserved — staged rotation must not regress"
-            );
-        }
-
         // Returned tracking state: unchanged (same as inputs, since we skipped).
         assert!(
             returned_key.is_none(),
@@ -928,93 +911,6 @@ mod t8 {
             returned_publish_at, 0,
             "returned last_publish_at must be unchanged (0)"
         );
-    }
-
-    // ─── T-8 / W-2: dispatch_self_pointer updates current_pointer ────────────
-
-    /// W-2: feeding the node its own verified SelfPointer via dispatch updates the
-    /// shared handle (None→Some), and a lower-generation pointer does not overwrite
-    /// a higher-generation one.
-    #[test]
-    fn poll_own_pointer_updates_current_pointer_handle() {
-        use crate::daemon::mailbox::poll::dispatch_self_pointer;
-        use viaticum_core::db::Db;
-
-        let db = Db::open_in_memory().unwrap();
-        let master_key = derive_master_key(&[0xAB; 64]).unwrap();
-        let my_master_pub = master_identity(&master_key);
-
-        let current_pointer: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
-
-        // Build a valid SelfPointer (gen=2).
-        let block_ref = BlockRef {
-            block_id: SourceBlockId([0xAA; 32]),
-            encrypted_size: 512,
-            holders: vec![],
-        };
-        let pointer_gen2 = sign_self_pointer(
-            &master_key,
-            2,
-            block_ref.clone(),
-            vec![],
-            Timestamp::now(),
-            test_catalog(),
-        );
-        let payload_gen2 = to_cbor_bytes(&pointer_gen2);
-
-        let now_secs = Timestamp::now().0;
-
-        // Feed gen=2 to dispatch_self_pointer. Starts with None → should update.
-        let entry = MailboxEntry {
-            target: viaticum_core::mailbox::MailboxAddress::for_master(&my_master_pub),
-            msg_id: [1u8; 16],
-            class: MailboxClass::SelfPointer,
-            payload_version: 1,
-            payload: payload_gen2,
-            expires_at: now_secs + 86400,
-            stored_at: now_secs,
-            sender: Some(my_master_pub),
-        };
-        dispatch_self_pointer(&db, &my_master_pub, &current_pointer, entry, now_secs);
-
-        {
-            let guard = current_pointer.lock().unwrap();
-            let stored = guard
-                .as_ref()
-                .expect("current_pointer must be Some after dispatch");
-            assert_eq!(stored.generation, 2, "gen=2 pointer must be stored");
-        }
-
-        // Now feed gen=1 (lower generation). Must NOT overwrite gen=2.
-        let pointer_gen1 = sign_self_pointer(
-            &master_key,
-            1,
-            block_ref,
-            vec![],
-            Timestamp::now(),
-            test_catalog(),
-        );
-        let payload_gen1 = to_cbor_bytes(&pointer_gen1);
-        let entry_low = MailboxEntry {
-            target: viaticum_core::mailbox::MailboxAddress::for_master(&my_master_pub),
-            msg_id: [2u8; 16],
-            class: MailboxClass::SelfPointer,
-            payload_version: 1,
-            payload: payload_gen1,
-            expires_at: now_secs + 86400,
-            stored_at: now_secs,
-            sender: Some(my_master_pub),
-        };
-        dispatch_self_pointer(&db, &my_master_pub, &current_pointer, entry_low, now_secs);
-
-        {
-            let guard = current_pointer.lock().unwrap();
-            let stored = guard.as_ref().expect("current_pointer must still be Some");
-            assert_eq!(
-                stored.generation, 2,
-                "lower-gen pointer (gen=1) must NOT overwrite higher-gen (gen=2)"
-            );
-        }
     }
 
     /// struct_key is stable for same pointer (same generation + block_ids).
@@ -1105,6 +1001,124 @@ mod t8 {
             test_catalog(),
         );
         assert_ne!(pointer_struct_key(&p1), pointer_struct_key(&p2));
+    }
+
+    // ─── CROWN-1 C3a: the sealed pointer in the rendezvous box ───────────────
+
+    /// V.6 publisher row: the pointer goes to the seed-derived rendezvous box, sealed
+    /// (v2, no header sender), `msg_id` = the history's place slot, with a store
+    /// signature by the box key; nothing names the master in the header.
+    #[tokio::test]
+    async fn published_pointer_goes_to_rendezvous_box_with_slot_msg_id() {
+        let db = test_db();
+        let (_p, master_key, my_master_pub, block_id, _h) = build_placed_pointer(&db);
+        let sender = MockSender::new();
+        db.upsert_peer(&make_peer(gen_device_id())).unwrap();
+        let router =
+            MailboxRouter::with_sender(sender.clone() as Arc<dyn MailboxNetworkSender>, db.clone());
+        let rv = RendezvousKeys::derive(&SEED);
+        publish_pointer_step(
+            &db,
+            &router,
+            &master_key,
+            &rv,
+            1,
+            &block_id,
+            &[],
+            test_pc(),
+            None,
+            0,
+            Timestamp::now().0,
+            1,
+        )
+        .await;
+        let calls = sender.store_calls();
+        assert!(!calls.is_empty());
+        let entry = &calls[0].1;
+        assert_eq!(entry.target, rv.address);
+        assert_ne!(
+            entry.target,
+            viaticum_core::mailbox::MailboxAddress::for_master(&my_master_pub)
+        );
+        assert_eq!(
+            entry.msg_id,
+            rv.pointer_slot(&TEST_LINEAGE.0, PointerPlace::A)
+        );
+        assert_eq!(entry.payload_version, SEALED_PAYLOAD_VERSION);
+        assert_eq!(entry.sender, None);
+        assert!(
+            from_cbor_bytes::<SelfPointer>(&entry.payload).is_err(),
+            "the payload is an envelope, not a plaintext pointer"
+        );
+        let opened = opened(&rv, entry);
+        assert!(verify_self_pointer(&opened, &my_master_pub).is_ok());
+    }
+
+    /// V.6 publisher row: a republish of the same history uses the same slot (the
+    /// postman replaces its entry instead of taking a new place).
+    #[tokio::test]
+    async fn republish_of_same_lineage_reuses_slot() {
+        let db = test_db();
+        let (_p, master_key, _mm, block_id, _h) = build_placed_pointer(&db);
+        let sender = MockSender::new();
+        db.upsert_peer(&make_peer(gen_device_id())).unwrap();
+        let router =
+            MailboxRouter::with_sender(sender.clone() as Arc<dyn MailboxNetworkSender>, db.clone());
+        let rv = RendezvousKeys::derive(&SEED);
+        let now = Timestamp::now().0;
+        let (key, at) = publish_pointer_step(
+            &db,
+            &router,
+            &master_key,
+            &rv,
+            1,
+            &block_id,
+            &[],
+            test_pc(),
+            None,
+            0,
+            now,
+            1,
+        )
+        .await;
+        let later = now + MAILBOX_POINTER_REPUBLISH_SECS;
+        publish_pointer_step(
+            &db,
+            &router,
+            &master_key,
+            &rv,
+            1,
+            &block_id,
+            &[],
+            test_pc(),
+            key.as_ref(),
+            at,
+            later,
+            1,
+        )
+        .await;
+        let calls = sender.store_calls();
+        let stamps: std::collections::HashSet<u64> =
+            calls.iter().map(|(_, e)| e.stored_at).collect();
+        assert_eq!(stamps.len(), 2, "two publications");
+        let slots: std::collections::HashSet<[u8; 16]> =
+            calls.iter().map(|(_, e)| e.msg_id).collect();
+        assert_eq!(slots.len(), 1, "one slot for the history");
+    }
+
+    /// AC-24′ (mailbox-i41): the refresh interval scales like the TTL; TTL / refresh = 60.
+    #[test]
+    fn pointer_refresh_interval_scales_with_time_scale() {
+        for ts in [1u64, 1000, 100_000] {
+            let refresh = pointer_refresh_interval_secs(ts);
+            assert_eq!(refresh, MAILBOX_POINTER_REPUBLISH_SECS / ts);
+            let ttl = viaticum_core::mailbox::scaled_ttl_secs(
+                class_config::SELF_POINTER_TTL.as_secs(),
+                ts,
+            );
+            // Integer division rounds both; the pointer outlives ≥ 60 refreshes at any ts.
+            assert!(ttl >= 60 * refresh && ttl / refresh <= 64, "ts={ts}");
+        }
     }
 }
 

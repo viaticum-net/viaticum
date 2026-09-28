@@ -8,8 +8,8 @@
 // Entry dispatch (§2.17):
 //   PosChallenge   → handle_pos_challenge_from_mailbox (compute response, publish PosResponse)
 //   PosResponse    → pos_response_tx.try_send (scheduler resolves pending challenge)
-//   SelfPointer    → if entry.target == my_master_pub: verify + update in-memory (W-2, no DB store)
-//                    if entry.target != my_master_pub:  store in mailbox DB (we are postman)
+//   SelfPointer    → dropped with a warn: pointers live in the rendezvous box, which the
+//                    daemon never reads (CROWN-1 РС3.1, mailbox-i37; only DR reads it)
 //   DropNotice     → DropNoticeHandler::handle_drop_notice (T-7: decode batch, apply each notice)
 //   DeleteRequest  → DeleteMailboxHandler::handle_delete_request (T-13b-1: Delete/CancelDelete)
 //   Revocation     → RevocationMailboxHandler::handle_revocation (T-13b-2: device revocation)
@@ -27,9 +27,8 @@ use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
 use viaticum_core::messages::{
     PosHashResponseMsg, SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, to_cbor,
 };
-use viaticum_core::system_state::{SelfPointer, verify_self_pointer};
-use viaticum_core::types::IdentityPub;
-use viaticum_core::types::from_cbor_bytes;
+use viaticum_core::system_state::SelfPointer;
+use viaticum_core::types::{IdentityPub, from_cbor_bytes, hex_encode};
 
 use super::routing::MailboxRouter;
 use crate::daemon::processor::{DeleteMailboxHandler, RevocationMailboxHandler};
@@ -54,7 +53,8 @@ pub(crate) fn poll_interval_secs(time_scale: u64) -> u64 {
 /// Dispatches entries to the appropriate handlers.
 ///
 /// Parameters:
-/// - `db`: redb handle for mailbox DB operations (SelfPointer store)
+/// - `_db`: unused since CROWN-1 C3a (it served the own-pointer arm); goes with the
+///   handle wiring of the next commit
 /// - `router`: the MailboxRouter used to poll and publish responses
 /// - `pos_response_tx`: bounded channel (capacity 256) to scheduler for PosResponse entries
 /// - `challenge_handler`: called with (owner_master, challenge_payload_bytes) to process a
@@ -62,15 +62,15 @@ pub(crate) fn poll_interval_secs(time_scale: u64) -> u64 {
 /// - `drop_handler`: called for each DropNotice decoded from a SymbolDropNoticeBatchMsg entry
 /// - `delete_handler`: called for each DeleteRequest entry (T-13b-1)
 /// - `revocation_handler`: called for each Revocation entry (T-13b-2)
-/// - `my_master_pub`: this node's master identity (used to detect own SelfPointers)
-/// - `current_pointer`: shared handle with run_periodic_push. On receiving our own verified
-///   SelfPointer, update this handle (W-2: restart-recovery — re-learn latest published pointer).
+/// - `my_master_pub`: this node's master identity (its master box is polled)
+/// - `_current_pointer`: unused since CROWN-1 C3a (the daemon does not read its pointer
+///   box, РС3.1); the parameter goes with the handle wiring of the next commit.
 /// - `time_scale`: time-acceleration factor; the poll cadence is divided by it
 ///   (see `poll_interval_secs`). Production passes 1.
 /// - `cancel`: cancellation token
 #[allow(clippy::too_many_arguments)]
 pub async fn run_mailbox_poll(
-    db: Db,
+    _db: Db,
     router: Arc<MailboxRouter>,
     pos_response_tx: mpsc::Sender<PosHashResponseMsg>,
     challenge_handler: Arc<dyn PosMailboxChallengeHandler>,
@@ -78,7 +78,7 @@ pub async fn run_mailbox_poll(
     delete_handler: Arc<dyn DeleteMailboxHandler>,
     revocation_handler: Arc<dyn RevocationMailboxHandler>,
     my_master_pub: IdentityPub,
-    current_pointer: Arc<Mutex<Option<SelfPointer>>>,
+    _current_pointer: Arc<Mutex<Option<SelfPointer>>>,
     time_scale: u64,
     cancel: CancellationToken,
 ) {
@@ -95,11 +95,6 @@ pub async fn run_mailbox_poll(
                 break;
             }
             _ = interval.tick() => {
-                let now_secs = SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-
                 // Poll our own mailbox from read-fanout peers.
                 let entries = match router
                     .poll(&MailboxAddress::for_master(&my_master_pub), None, None)
@@ -121,7 +116,6 @@ pub async fn run_mailbox_poll(
 
                 for entry in entries {
                     dispatch_entry(
-                        &db,
                         &router,
                         &pos_response_tx,
                         &challenge_handler,
@@ -129,9 +123,7 @@ pub async fn run_mailbox_poll(
                         &delete_handler,
                         &revocation_handler,
                         &my_master_pub,
-                        &current_pointer,
                         entry,
-                        now_secs,
                         time_scale,
                     )
                     .await;
@@ -144,7 +136,6 @@ pub async fn run_mailbox_poll(
 /// Dispatch a single polled MailboxEntry to the appropriate handler.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_entry(
-    db: &Db,
     router: &Arc<MailboxRouter>,
     pos_response_tx: &mpsc::Sender<PosHashResponseMsg>,
     challenge_handler: &Arc<dyn PosMailboxChallengeHandler>,
@@ -152,9 +143,7 @@ pub(crate) async fn dispatch_entry(
     delete_handler: &Arc<dyn DeleteMailboxHandler>,
     revocation_handler: &Arc<dyn RevocationMailboxHandler>,
     my_master_pub: &IdentityPub,
-    current_pointer: &Arc<Mutex<Option<SelfPointer>>>,
     entry: MailboxEntry,
-    now_secs: u64,
     time_scale: u64,
 ) {
     match entry.class {
@@ -166,7 +155,7 @@ pub(crate) async fn dispatch_entry(
             dispatch_pos_response(pos_response_tx, entry);
         }
         MailboxClass::SelfPointer => {
-            dispatch_self_pointer(db, my_master_pub, current_pointer, entry, now_secs);
+            drop_self_pointer_from_master_box(&entry);
         }
         MailboxClass::DropNotice => {
             dispatch_drop_notice(drop_handler, my_master_pub, entry);
@@ -179,7 +168,7 @@ pub(crate) async fn dispatch_entry(
             // producer is ever added, wire its handler in this arm — otherwise its
             // entries will be discarded here. The entry still expires via its TTL.
             warn!(
-                msg_id = ?entry.msg_id,
+                msg_id = %hex_encode(&entry.msg_id),
                 target = ?entry.target,
                 "mailbox_poll: received a Generic mailbox entry but no Generic handler is \
                  wired (no producer exists by design) — dropping with no effect"
@@ -214,10 +203,9 @@ async fn dispatch_pos_challenge(
     // (the holding lookup keys on owner_master from `entry.sender`), but this guard
     // documents and enforces the routing invariant: a buggy or hostile postman that
     // returns a mis-targeted entry is rejected here rather than processed.
-    // `dispatch_self_pointer` makes the same own-vs-postman distinction.
     if entry.target != MailboxAddress::for_master(my_master_pub) {
         warn!(
-            msg_id = ?entry.msg_id,
+            msg_id = %hex_encode(&entry.msg_id),
             entry_target = ?entry.target,
             "mailbox_poll: PosChallenge not addressed to this node — dropping (routing invariant)"
         );
@@ -228,7 +216,7 @@ async fn dispatch_pos_challenge(
         Some(s) => s,
         None => {
             warn!(
-                msg_id = ?entry.msg_id,
+                msg_id = %hex_encode(&entry.msg_id),
                 "mailbox_poll: PosChallenge has no sender — cannot publish response"
             );
             return;
@@ -344,11 +332,11 @@ async fn dispatch_pos_challenge(
         }
         Ok(None) => {
             // Nack or CannotCompute — challenge_handler already logged
-            debug!(msg_id = ?entry.msg_id, "mailbox_poll: PosChallenge handler returned no response (nack)");
+            debug!(msg_id = %hex_encode(&entry.msg_id), "mailbox_poll: PosChallenge handler returned no response (nack)");
         }
         Err(e) => {
             error!(
-                msg_id = ?entry.msg_id,
+                msg_id = %hex_encode(&entry.msg_id),
                 err = %e,
                 "mailbox_poll: PosChallenge handler error"
             );
@@ -366,11 +354,11 @@ pub(crate) fn dispatch_pos_response(
             // N-5: bounded channel, try_send + WARN on Full.
             match pos_response_tx.try_send(response) {
                 Ok(()) => {
-                    debug!(msg_id = ?entry.msg_id, "mailbox_poll: PosResponse forwarded to scheduler");
+                    debug!(msg_id = %hex_encode(&entry.msg_id), "mailbox_poll: PosResponse forwarded to scheduler");
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     warn!(
-                        msg_id = ?entry.msg_id,
+                        msg_id = %hex_encode(&entry.msg_id),
                         "mailbox_poll: pos_response_tx full — dropping PosResponse (N-5)"
                     );
                 }
@@ -381,7 +369,7 @@ pub(crate) fn dispatch_pos_response(
         }
         Err(e) => {
             warn!(
-                msg_id = ?entry.msg_id,
+                msg_id = %hex_encode(&entry.msg_id),
                 err = %e,
                 "mailbox_poll: failed to decode PosHashResponseMsg"
             );
@@ -389,85 +377,18 @@ pub(crate) fn dispatch_pos_response(
     }
 }
 
-/// Handle a SelfPointer entry.
+/// A SelfPointer polled from the master box (CROWN-1 РС3.1, mailbox-i37).
 ///
-/// W-2: if entry.target == my_master_pub, verify and update in-memory current_pointer;
-/// do NOT store in mailbox DB.
-///
-/// CS-MBX-3: a poll only ever returns OUR own mail (`router.poll(&my_master_pub, ...)`),
-/// so a SelfPointer with `target != my_master_pub` in a poll response is never legitimately
-/// ours to store. We drop it with a warn. The previous code stored such foreign-target
-/// entries DIRECTLY via `MailboxEngine::store`, bypassing both the candidate-set
-/// `should_store()` gate (the real postman path's admission check) AND `verify_self_pointer`
-/// — letting a hostile read-fanout postman inject arbitrary unverified entries for
-/// third-party targets into our local mailbox DB (disk/quota amplification + pollution).
-///
-/// T-8: The `current_pointer` handle is shared with `run_periodic_push`. When the node
-/// re-learns its own pointer from the candidate-set (restart-recovery), we update the
-/// handle so that the periodic push loop doesn't re-publish unchanged state. Only update
-/// if the incoming generation is strictly greater than what we have, preventing regression
-/// to an older pointer.
-pub(crate) fn dispatch_self_pointer(
-    // CS-MBX-3: `db`/`now_secs` were only used by the removed foreign-store branch.
-    // Kept in the signature (prefixed `_`) so the poll-loop's resource threading and
-    // the call sites stay unchanged; a poll never yields a foreign-target entry to store.
-    _db: &Db,
-    my_master_pub: &IdentityPub,
-    current_pointer: &Arc<Mutex<Option<SelfPointer>>>,
-    entry: MailboxEntry,
-    _now_secs: u64,
-) {
-    if entry.target == MailboxAddress::for_master(my_master_pub) {
-        // Own SelfPointer returned from candidate-set — verify, do NOT store (W-2).
-        match from_cbor_bytes::<SelfPointer>(&entry.payload) {
-            Ok(pointer) => {
-                if verify_self_pointer(&pointer, my_master_pub).is_ok() {
-                    // T-8: update in-memory current_pointer for restart-recovery.
-                    // Only store if None OR incoming.generation > current.generation.
-                    let mut guard = current_pointer.lock().expect("current_pointer lock");
-                    let should_update = match guard.as_ref() {
-                        None => true,
-                        Some(existing) => pointer.generation > existing.generation,
-                    };
-                    if should_update {
-                        let prev_gen = guard.as_ref().map(|p| p.generation);
-                        debug!(
-                            generation = pointer.generation,
-                            prev_generation = ?prev_gen,
-                            created_at = pointer.created_at.0,
-                            "mailbox_poll: own SelfPointer updated in-memory (W-2: not stored in DB)"
-                        );
-                        *guard = Some(pointer);
-                    } else {
-                        debug!(
-                            generation = pointer.generation,
-                            created_at = pointer.created_at.0,
-                            "mailbox_poll: own SelfPointer received but generation not newer — not updating (W-2)"
-                        );
-                    }
-                } else {
-                    warn!(msg_id = ?entry.msg_id, "mailbox_poll: own SelfPointer signature verification failed");
-                }
-            }
-            Err(e) => {
-                warn!(
-                    msg_id = ?entry.msg_id,
-                    err = %e,
-                    "mailbox_poll: failed to decode own SelfPointer"
-                );
-            }
-        }
-    } else {
-        // CS-MBX-3: foreign-target SelfPointer in a poll response — never legitimately
-        // ours. Drop with warn instead of storing it (the old foreign-store path bypassed
-        // candidate-set admission and signature verification). The postman storage path
-        // is the dedicated `handle_mailbox_store`, not this poll-dispatch arm.
-        warn!(
-            msg_id = ?entry.msg_id,
-            entry_target = ?entry.target,
-            "mailbox_poll: SelfPointer not addressed to this node — dropping (routing invariant, CS-MBX-3)"
-        );
-    }
+/// Pointers live in the seed-derived rendezvous box, and the daemon never reads its
+/// own pointer box: only DR does. A SelfPointer in the master box is either a
+/// pre-C3a leftover or a postman's plant; it is dropped with a warn and no effect
+/// (nothing is stored, nothing in the push loop changes).
+pub(crate) fn drop_self_pointer_from_master_box(entry: &MailboxEntry) {
+    warn!(
+        msg_id = %hex_encode(&entry.msg_id),
+        target = %entry.target,
+        "mailbox_poll: SelfPointer in the master box — dropped (pointers live in the rendezvous box)"
+    );
 }
 
 /// Handle a DropNotice entry (T-7).
@@ -489,7 +410,7 @@ pub(crate) fn dispatch_drop_notice(
     // entry is rejected here. Mirrors `dispatch_pos_challenge`.
     if entry.target != MailboxAddress::for_master(my_master_pub) {
         warn!(
-            msg_id = ?entry.msg_id,
+            msg_id = %hex_encode(&entry.msg_id),
             entry_target = ?entry.target,
             "mailbox_poll: DropNotice not addressed to this node — dropping (routing invariant)"
         );
@@ -500,7 +421,7 @@ pub(crate) fn dispatch_drop_notice(
         Some(s) => s,
         None => {
             warn!(
-                msg_id = ?entry.msg_id,
+                msg_id = %hex_encode(&entry.msg_id),
                 target = %entry.target,
                 "mailbox_poll: DropNotice has no sender — cannot identify holder, dropping"
             );
@@ -511,7 +432,7 @@ pub(crate) fn dispatch_drop_notice(
     match from_cbor_bytes::<SymbolDropNoticeBatchMsg>(&entry.payload) {
         Ok(batch) => {
             debug!(
-                msg_id = ?entry.msg_id,
+                msg_id = %hex_encode(&entry.msg_id),
                 target = %entry.target,
                 notice_count = batch.notices.len(),
                 "mailbox_poll: dispatching DropNotice batch"
@@ -522,7 +443,7 @@ pub(crate) fn dispatch_drop_notice(
         }
         Err(e) => {
             warn!(
-                msg_id = ?entry.msg_id,
+                msg_id = %hex_encode(&entry.msg_id),
                 target = %entry.target,
                 err = %e,
                 "mailbox_poll: failed to decode SymbolDropNoticeBatchMsg — dropping entry"
@@ -546,7 +467,7 @@ pub(crate) async fn dispatch_delete_request(
     // guard enforces the routing invariant. Mirrors `dispatch_pos_challenge`.
     if entry.target != MailboxAddress::for_master(my_master_pub) {
         warn!(
-            msg_id = ?entry.msg_id,
+            msg_id = %hex_encode(&entry.msg_id),
             entry_target = ?entry.target,
             "mailbox_poll: DeleteRequest not addressed to this node — dropping (routing invariant)"
         );
@@ -557,7 +478,7 @@ pub(crate) async fn dispatch_delete_request(
         Some(s) => s,
         None => {
             warn!(
-                msg_id = ?entry.msg_id,
+                msg_id = %hex_encode(&entry.msg_id),
                 target = %entry.target,
                 "mailbox_poll: DeleteRequest has no sender — cannot authenticate, dropping"
             );
@@ -570,7 +491,7 @@ pub(crate) async fn dispatch_delete_request(
         .await
     {
         error!(
-            msg_id = ?entry.msg_id,
+            msg_id = %hex_encode(&entry.msg_id),
             owner = %owner_master,
             err = %e,
             "mailbox_poll: DeleteRequest handler error"
@@ -593,7 +514,7 @@ pub(crate) async fn dispatch_revocation(
     // routing invariant. Mirrors `dispatch_pos_challenge`.
     if entry.target != MailboxAddress::for_master(my_master_pub) {
         warn!(
-            msg_id = ?entry.msg_id,
+            msg_id = %hex_encode(&entry.msg_id),
             entry_target = ?entry.target,
             "mailbox_poll: Revocation not addressed to this node — dropping (routing invariant)"
         );
@@ -604,7 +525,7 @@ pub(crate) async fn dispatch_revocation(
         Some(s) => s,
         None => {
             warn!(
-                msg_id = ?entry.msg_id,
+                msg_id = %hex_encode(&entry.msg_id),
                 target = %entry.target,
                 "mailbox_poll: Revocation has no sender — cannot authenticate, dropping"
             );
@@ -617,7 +538,7 @@ pub(crate) async fn dispatch_revocation(
         .await
     {
         error!(
-            msg_id = ?entry.msg_id,
+            msg_id = %hex_encode(&entry.msg_id),
             revoking_master = %revoking_master,
             err = %e,
             "mailbox_poll: Revocation handler error"

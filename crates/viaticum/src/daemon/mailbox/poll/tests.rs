@@ -83,62 +83,22 @@ async fn poll_pos_response_bad_payload_does_not_panic() {
     assert!(rx.try_recv().is_err());
 }
 
-/// SelfPointer with target == my_master_pub is NOT stored in the DB (W-2).
+/// CROWN-1 РС3.1 / AC-16 (mailbox-i37): a SelfPointer polled from the master box —
+/// own-target or foreign-target alike — is dropped: nothing is stored in the mailbox DB
+/// and nothing else happens (the daemon never reads its pointer box; only DR does).
 #[tokio::test]
-async fn poll_self_pointer_own_not_stored_in_db() {
-    use std::sync::{Arc, Mutex};
-    use viaticum_core::system_state::SelfPointer;
-
+async fn self_pointer_in_master_box_is_dropped() {
     let db = Db::open_in_memory().expect("db");
     let my_master = make_identity(0xAA);
-    let current_pointer: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
-
-    // Build a trivial payload (not a real SelfPointer; verify_self_pointer will fail gracefully).
-    let entry = make_entry(MailboxClass::SelfPointer, my_master, vec![0x01]);
-    let now_secs = Timestamp::now().0;
-
-    super::dispatch_self_pointer(&db, &my_master, &current_pointer, entry, now_secs);
-
-    // Mailbox DB should have no entries for my_master.
-    let entries = db
-        .mailbox_list_for_target(&MailboxAddress::for_master(&my_master), now_secs)
-        .expect("list");
-    assert!(
-        entries.is_empty(),
-        "own SelfPointer must NOT be stored in mailbox DB (W-2)"
-    );
-}
-
-/// CS-MBX-3: a SelfPointer whose `target != my_master_pub` arriving in a poll response
-/// is NEVER stored. A poll only returns OUR own mail, so a foreign-target SelfPointer is
-/// a misrouted/hostile postman reply. The old code stored it directly (bypassing the
-/// candidate-set admission gate and signature verification), letting a hostile read-fanout
-/// postman inject arbitrary unverified entries for third-party targets into our DB. The
-/// fix drops it with a warn, writing nothing.
-#[tokio::test]
-async fn poll_does_not_store_foreign_self_pointer() {
-    use std::sync::{Arc, Mutex};
-    use viaticum_core::system_state::SelfPointer;
-
-    let db = Db::open_in_memory().expect("db");
-    let my_master = make_identity(0xAA);
-    let foreign_target = make_identity(0xBB);
-    let current_pointer: Arc<Mutex<Option<SelfPointer>>> = Arc::new(Mutex::new(None));
-
-    let entry = make_entry(MailboxClass::SelfPointer, foreign_target, vec![0x01, 0x02]);
-    let now_secs = Timestamp::now().0;
-
-    super::dispatch_self_pointer(&db, &my_master, &current_pointer, entry, now_secs);
-
-    // Mailbox DB must have NOTHING stored for the foreign target — the foreign-store
-    // path was removed (CS-MBX-3).
-    let entries = db
-        .mailbox_list_for_target(&MailboxAddress::for_master(&foreign_target), now_secs)
-        .expect("list");
-    assert!(
-        entries.is_empty(),
-        "foreign-target SelfPointer must NOT be stored from the poll path (CS-MBX-3)"
-    );
+    let foreign = make_identity(0xBB);
+    for target in [my_master, foreign] {
+        let entry = make_entry(MailboxClass::SelfPointer, target, vec![0x01, 0x02]);
+        super::drop_self_pointer_from_master_box(&entry);
+        let entries = db
+            .mailbox_list_for_target(&MailboxAddress::for_master(&target), 0)
+            .expect("list");
+        assert!(entries.is_empty(), "a polled SelfPointer is never stored");
+    }
 }
 
 /// PosResponse channel full: warn but do not panic (N-5).
@@ -1509,8 +1469,7 @@ async fn pos_challenge_not_addressed_to_us_is_dropped() {
 /// "loud no-op" guard so a future Generic producer cannot be silently dropped.
 #[tokio::test]
 async fn generic_entry_is_ignored_without_effect() {
-    use std::sync::{Arc as StdArc, Mutex as StdMutex};
-    use viaticum_core::system_state::SelfPointer;
+    use std::sync::Arc as StdArc;
 
     let db = Db::open_in_memory().expect("db");
     let sender = StdArc::new(RecordingSender {
@@ -1540,14 +1499,11 @@ async fn generic_entry_is_ignored_without_effect() {
         crate::daemon::processor::ProcessorRevocationHandler::new(db.clone()),
     );
     let my_master = make_identity(0xAA);
-    let current_pointer: Arc<StdMutex<Option<SelfPointer>>> = Arc::new(StdMutex::new(None));
 
     let entry = make_entry(MailboxClass::Generic, my_master, vec![0xDE, 0xAD]);
-    let now_secs = entry.stored_at;
 
     // Must not panic, must not publish, must not forward anything.
     super::dispatch_entry(
-        &db,
         &router,
         &pos_tx,
         &challenge_handler,
@@ -1555,9 +1511,7 @@ async fn generic_entry_is_ignored_without_effect() {
         &delete_handler,
         &revocation_handler,
         &my_master,
-        &current_pointer,
         entry,
-        now_secs,
         1,
     )
     .await;

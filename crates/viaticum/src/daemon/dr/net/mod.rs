@@ -273,7 +273,7 @@ pub(super) async fn dial_and_authenticate_candidates(
 
 /// Rank of an address for dialing: public first, then private (RFC 1918, CGNAT,
 /// link-local, IPv6 ULA), then loopback / unspecified. Non-IP (DNS) counts as public.
-fn addr_rank(addr: &Multiaddr) -> u8 {
+pub(crate) fn addr_rank(addr: &Multiaddr) -> u8 {
     let ip: Option<IpAddr> = addr.iter().find_map(|p| match p {
         Protocol::Ip4(a) => Some(IpAddr::V4(a)),
         Protocol::Ip6(a) => Some(IpAddr::V6(a)),

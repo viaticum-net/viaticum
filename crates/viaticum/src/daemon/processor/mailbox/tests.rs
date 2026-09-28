@@ -19,6 +19,7 @@
 //         fetch_rendezvous_with_valid_proof_returns_entries
 //   AC-10 store_checks_candidate_set_against_entry_target
 //   AC-20 proof_fetch_returns_only_self_pointers
+//   §7.5 п.1 store_rejects_plaintext_self_pointer
 //   AC-22′ store_rejects_self_pointer_more_than_a_day_ahead
 //         store_rejects_already_expired_entry
 //         store_accepts_old_unexpired_self_pointer
@@ -34,7 +35,7 @@ use viaticum_core::db::Db;
 use viaticum_core::db::testutil::test_db;
 use viaticum_core::mailbox::SELF_POINTER_MAX_FUTURE_SKEW_SECS;
 use viaticum_core::mailbox::class_config::{MAX_ENTRY_BYTES, MAX_MAILBOX_BYTES_PER_PEER};
-use viaticum_core::mailbox::seal::RendezvousKeys;
+use viaticum_core::mailbox::seal::{RendezvousKeys, SEALED_PAYLOAD_VERSION};
 use viaticum_core::mailbox::{
     MailboxAddress, MailboxClass, MailboxEngine, MailboxEntry, MailboxRejectReason, sign_store,
 };
@@ -82,9 +83,12 @@ fn make_entry(
     }
 }
 
+/// A SelfPointer entry with the sealed payload version (the bytes are opaque to the
+/// postman, so a fixed body stands in for a real envelope).
 fn pointer_entry(target: MailboxAddress, msg_id: u8, stored_at: u64) -> MailboxEntry {
     MailboxEntry {
         class: MailboxClass::SelfPointer,
+        payload_version: SEALED_PAYLOAD_VERSION,
         payload: b"pointer".to_vec(),
         ..make_entry(target, make_msg_id(msg_id), 0, stored_at, 3600)
     }
@@ -329,6 +333,30 @@ fn store_self_pointer_signed_by_other_key_is_rejected() {
         "got {resp:?}"
     );
     assert!(stored(&db, &target).is_empty());
+}
+
+/// §7.5 п.1 (C3a): a plaintext SelfPointer (`payload_version` 1) is refused even with a
+/// valid store signature by the box key, and nothing is stored. Directed classes are
+/// not judged by this rule until C4.
+#[test]
+fn store_rejects_plaintext_self_pointer() {
+    let db = test_db();
+    let (sk, target) = box_key(17);
+    let mut plain = pointer_entry(target, 1, NOW);
+    plain.payload_version = 1;
+    let resp = store(&db, signed_store_request(&sk, plain), NOW);
+    assert!(
+        is_reject(&resp, MailboxRejectReason::PlaintextPayload),
+        "got {resp:?}"
+    );
+    assert!(stored(&db, &target).is_empty());
+
+    let directed = make_entry(target, make_msg_id(2), 10, NOW, 3600);
+    assert_eq!(directed.payload_version, 1);
+    assert!(matches!(
+        store(&db, make_store_request(directed), NOW),
+        MailboxStoreResponse::Ack { .. }
+    ));
 }
 
 /// A valid signature by the right key, but over an entry addressed to another box:

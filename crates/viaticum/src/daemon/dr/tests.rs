@@ -232,3 +232,78 @@ async fn malformed_catalog_prefix_is_refused_before_anything_is_touched() {
     assert!(err.to_string().ends_with("Nothing was changed."), "{err}");
     assert!(!dir.exists());
 }
+
+// ─── V.17.3 / dr-i48: attempts reach the head of every place ──────────────────
+
+/// Five versions of place A (three different old bases among them, from lagging
+/// postmen) are all fresher than the head of place B. The head of B is still the
+/// second attempt, so a strong base in B is tried before any stale version of A.
+#[test]
+fn dr_tries_both_place_heads_before_stale_bases_from_lagging_postmen() {
+    use std::collections::HashMap;
+    use viaticum_core::system_state::catalog::select_catalog;
+
+    let slot_a = [0xA0u8; 16];
+    let slot_b = [0xB0u8; 16];
+    // Place A: created_at 900, 800, 700, 600, 500 (bases differ by created_at).
+    let a_versions: Vec<_> = [900u64, 800, 700, 600, 500]
+        .iter()
+        .map(|&t| test_pointer(t))
+        .collect();
+    let b_head = test_pointer(100);
+    let b_old = test_pointer(50);
+    let mut slot_of: HashMap<[u8; 64], [u8; 16]> = HashMap::new();
+    for p in &a_versions {
+        slot_of.insert(p.signature, slot_a);
+    }
+    slot_of.insert(b_head.signature, slot_b);
+    slot_of.insert(b_old.signature, slot_b);
+
+    let mut all = a_versions.clone();
+    all.push(b_old.clone());
+    all.push(b_head.clone());
+    let choice = select_catalog(all, None).unwrap();
+    let attempts = super::order_attempts(
+        choice.selected,
+        choice.fallbacks,
+        &slot_of,
+        [slot_a, slot_b],
+    );
+    let times: Vec<u64> = attempts.iter().map(|p| p.created_at.0).collect();
+    assert_eq!(
+        times,
+        vec![900, 100, 800, 700],
+        "head of A, head of B, then the rest freshest first; 4 attempts"
+    );
+}
+
+/// A pointer under a `msg_id` that is neither place (a postman moved it) is never a
+/// head; with one place only, the order is plain freshness.
+#[test]
+fn dr_attempts_ignore_pointers_under_unknown_slots_as_heads() {
+    use std::collections::HashMap;
+    let slot_a = [0xA0u8; 16];
+    let moved = test_pointer(900);
+    let a_head = test_pointer(500);
+    let a_old = test_pointer(400);
+    let mut slot_of: HashMap<[u8; 64], [u8; 16]> = HashMap::new();
+    slot_of.insert(moved.signature, [0xEE; 16]);
+    slot_of.insert(a_head.signature, slot_a);
+    slot_of.insert(a_old.signature, slot_a);
+    let attempts =
+        super::order_attempts(moved, vec![a_head, a_old], &slot_of, [slot_a, [0xB0; 16]]);
+    let times: Vec<u64> = attempts.iter().map(|p| p.created_at.0).collect();
+    assert_eq!(times, vec![500, 900, 400]);
+}
+
+/// V.16.1 п.5: the two places of one history are ONE catalog for DR (grouped by the
+/// signed lineage, not by `msg_id`) — no NeedsChoice.
+#[test]
+fn dr_two_places_of_one_lineage_are_one_catalog() {
+    use viaticum_core::system_state::catalog::{ChoiceReason, select_catalog};
+    let choice = select_catalog(vec![test_pointer(200), test_pointer(100)], None).unwrap();
+    assert_eq!(choice.reason, ChoiceReason::OnlyCatalog);
+    assert_eq!(choice.rows.len(), 1);
+    assert_eq!(choice.rows[0].pointers_seen, 2);
+    assert_eq!(choice.fallbacks.len(), 1);
+}

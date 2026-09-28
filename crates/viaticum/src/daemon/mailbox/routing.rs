@@ -10,15 +10,12 @@
 // which is the right source for a mailbox candidate set (not just currently-connected
 // peers — the whole point is to reach peers that have likely seen the target recently).
 //
-// dr_collect_pointers: the spec calls for "expanding Kademlia batches [100, 300, 1000]".
-// Live Kademlia get_closest_peers is an async DHT walk not readily queryable synchronously.
-// Design choice: use the DB-sourced XOR-ranked list with expanding batch sizes.
-// This is equivalent when the DB is well-populated (post-bootstrap) and degrades
-// gracefully to "try all known peers" when the DB is sparse (early DR run on
-// a fresh node). A future enhancement could add a SwarmHandle::kad_closest_peers()
-// command that drives the Kademlia query internally; deferred as not needed for
-// correctness (spec B-1: Kademlia-lookup is a first-class DR path when addrs are stale
-// or absent, not a requirement for the initial walk implementation).
+// dr_collect_pointers (submodule `dr_walk`): the DB-sourced XOR-ranked list in expanding
+// batches [100, 300, 1000]; DR fills the DB from Kademlia (get_closest_peers of the
+// rendezvous address) before the walk.
+//
+// publish_detailed: per-postman outcome (acks, refusals, errors) and its verdict, so the
+// pointer publisher can name a refusal (CROWN-1 V.3, V.15.3).
 //
 // Avail observation wiring (T-4a §5):
 // Successful MailboxStoreAck / MailboxFetchResponse → positive observation:
@@ -36,8 +33,8 @@ use libp2p::PeerId;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
 use viaticum_core::constants::{
-    AVAIL_EWMA_ALPHA, AVAIL_EWMA_INITIAL, MAILBOX_CANDIDATES_N, MAILBOX_DR_WALK_BATCHES,
-    MAILBOX_READ_FANOUT, MAILBOX_WRITE_FANOUT,
+    AVAIL_EWMA_ALPHA, AVAIL_EWMA_INITIAL, MAILBOX_CANDIDATES_N, MAILBOX_READ_FANOUT,
+    MAILBOX_WRITE_FANOUT,
 };
 use viaticum_core::db::Db;
 use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry, MailboxRejectReason};
@@ -45,25 +42,17 @@ use viaticum_core::messages::{
     MAILBOX_WIRE_VERSION, MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest,
     MailboxStoreResponse, Message,
 };
-use viaticum_core::system_state::{SelfPointer, verify_self_pointer};
 use viaticum_core::trust::compute_combined;
-use viaticum_core::types::{DeviceId, IdentityPub, ewma_contact_observed, from_cbor_bytes};
+use viaticum_core::types::{DeviceId, ewma_contact_observed, hex_encode};
 
 use crate::daemon::mailbox::candidate::KademliaRoutingView;
 use crate::daemon::network::swarm::{SwarmHandle, device_id_to_peer_id};
 
-// ─── DR collection result ─────────────────────────────────────────────────────
+mod dr_walk;
+mod verdict;
 
-/// What `MailboxRouter::dr_collect_pointers` found.
-#[derive(Debug, Clone)]
-pub struct DrWalk {
-    /// Every distinct (by signature) signature-verified SelfPointer of the identity.
-    pub pointers: Vec<SelfPointer>,
-    /// Peers the walk could ask (0 = no peer known at all).
-    pub candidates: usize,
-    /// Peers that answered the fetch.
-    pub responders: usize,
-}
+pub use dr_walk::DrWalk;
+pub use verdict::{PublishOutcome, PublishVerdict};
 
 // ─── Per-request network timeout ─────────────────────────────────────────────
 
@@ -246,27 +235,32 @@ impl MailboxRouter {
 
     // ─── Public API ───────────────────────────────────────────────────────────
 
-    /// Publish an entry to the write-fanout (top-30) of candidates for `entry.target`.
+    /// Publish an entry to the write-fanout (top-30) of candidates for `entry.target`
+    /// and report what every postman answered.
     ///
     /// `target_sig`: signature by the secret key of `entry.target` over
     /// `store_sig_input(&entry)`. Postmen require it for class SelfPointer (only the
     /// box key holder writes a pointer box) and ignore it for directed classes. The
     /// box address comes only from the entry (no second `target`, F3).
     ///
-    /// Returns count of successful Acks.
     /// Avail observation: on Ack, updates avail_ewma + last_avail_sample for the
     /// responding peer in the DB.
-    pub async fn publish(
+    ///
+    /// Logging: a refusal that is our own fault (`Unauthorized`, `PlaintextPayload`)
+    /// is a `warn!` at once; `ClockSkew` / `Superseded` of a SelfPointer are `debug!`
+    /// (the publisher logs the verdict); `ClockSkew` of a directed entry stays `warn!`.
+    pub async fn publish_detailed(
         &self,
         entry: MailboxEntry,
         target_sig: Option<[u8; 64]>,
-    ) -> anyhow::Result<usize> {
+    ) -> PublishOutcome {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
         let target = entry.target;
+        let msg_id = entry.msg_id;
         let ranked = self.build_ranked_candidates(&target);
 
         // Select write-fanout peers.
@@ -290,60 +284,53 @@ impl MailboxRouter {
             }));
         }
 
-        let mut ack_count = 0usize;
+        let mut outcome = PublishOutcome::default();
         for handle in handles {
             match handle.await {
                 Ok((device_id, Ok(MailboxStoreResponse::Ack { .. }))) => {
-                    ack_count += 1;
+                    outcome.acks.push(device_id);
                     self.record_avail_contact(device_id, now_secs);
                 }
                 Ok((device_id, Ok(MailboxStoreResponse::Reject { reason, .. }))) => {
-                    // N1: authorization / clock refusals are our own fault (bad key,
-                    // bad clock) and must be visible to the E2E guards at warn.
-                    if matches!(
-                        reason,
-                        MailboxRejectReason::Unauthorized | MailboxRejectReason::ClockSkew
-                    ) {
-                        warn!(
-                            device = %device_id,
-                            target = %target,
-                            ?class,
-                            ?reason,
-                            "mailbox publish: postman refused the entry — check keys and system clock"
-                        );
-                    } else {
-                        debug!(
-                            device = %device_id,
-                            ?reason,
-                            "mailbox publish: peer rejected store"
-                        );
-                    }
+                    log_store_refusal(device_id, &target, &msg_id, class, &reason);
+                    outcome.rejects.push((device_id, reason));
                 }
                 Ok((device_id, Err(e))) => {
                     debug!(device = %device_id, err = %e, "mailbox publish: store failed");
+                    outcome.errors += 1;
                 }
                 Err(join_err) => {
                     warn!("mailbox publish: task panicked: {join_err}");
+                    outcome.errors += 1;
                 }
             }
         }
 
-        if ack_count == 0 {
+        if outcome.acks.is_empty() {
             warn!(
                 target = %target,
                 peers_tried = write_peers.len(),
+                refused = outcome.rejects.len(),
                 "mailbox publish: 0 acks — entry may not be stored; will retry on next tick"
             );
         } else {
             debug!(
                 target = %target,
-                ack_count,
+                ack_count = outcome.acks.len(),
                 peers_tried = write_peers.len(),
                 "mailbox publish: stored"
             );
         }
+        outcome
+    }
 
-        Ok(ack_count)
+    /// Publish and return the number of Acks (directed producers).
+    pub async fn publish(
+        &self,
+        entry: MailboxEntry,
+        target_sig: Option<[u8; 64]>,
+    ) -> anyhow::Result<usize> {
+        Ok(self.publish_detailed(entry, target_sig).await.acks.len())
     }
 
     /// Poll the box `target` from read-fanout (300) candidates.
@@ -435,139 +422,6 @@ impl MailboxRouter {
         );
 
         Ok(entries)
-    }
-
-    /// DR: collect EVERY signature-verified SelfPointer of `my_master_pub` from the
-    /// candidate set (CS-DR-1).
-    ///
-    /// Candidates are the DB peers ranked by XOR distance to the target (closest first),
-    /// queried in the expanding batches of `MAILBOX_DR_WALK_BATCHES` ([100, 300, 1000]).
-    /// Each peer is asked at most once: batch k sends only to `ranked[prev_len..size]`;
-    /// a batch that adds no new peer ends the walk. There is no early exit on the first
-    /// batch that returned a pointer — a fresher pointer, or another catalog history of
-    /// the same identity, may sit in a later batch. Choosing between the pointers is the
-    /// caller's job (`system_state::catalog::select_catalog`).
-    ///
-    /// Candidates come from `db.list_all_peers()`: on a fresh DR node the caller must
-    /// have run Kademlia stabilization (peers upserted on authentication) first,
-    /// otherwise `candidates == 0`.
-    pub async fn dr_collect_pointers(&self, my_master_pub: &IdentityPub) -> anyhow::Result<DrWalk> {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // CROWN-1 C2: the pointer still lives in the master box (C3 moves it to the
-        // seed-derived rendezvous box); reading our own master box needs no proof.
-        let master_box = MailboxAddress::for_master(my_master_pub);
-        let ranked = self.build_ranked_candidates(&master_box);
-        let max_batch = MAILBOX_DR_WALK_BATCHES.last().copied().unwrap_or(0);
-        let candidates = ranked.len().min(max_batch);
-
-        tracing::info!(
-            ranked_candidates = ranked.len(),
-            candidates,
-            "dr_walk: candidates built from DB"
-        );
-
-        let req = MailboxFetchRequest {
-            v: MAILBOX_WIRE_VERSION,
-            target: master_box,
-            since_stored_at: None,
-            target_proof: None,
-        };
-
-        let mut pointers: Vec<SelfPointer> = Vec::new();
-        let mut seen_sigs: std::collections::HashSet<[u8; 64]> = std::collections::HashSet::new();
-        let mut responders = 0usize;
-        let mut prev_len = 0usize;
-
-        for &batch_size in MAILBOX_DR_WALK_BATCHES {
-            let end = batch_size.min(ranked.len());
-            if end <= prev_len {
-                tracing::info!(
-                    batch_size,
-                    queried = prev_len,
-                    "dr_walk: no new candidates for this batch, walk complete"
-                );
-                break;
-            }
-            let batch: Vec<DeviceId> = ranked[prev_len..end].iter().map(|(d, _)| *d).collect();
-            prev_len = end;
-
-            tracing::info!(
-                batch_size,
-                peers = batch.len(),
-                "dr_walk: sending fetch to batch"
-            );
-
-            let mut handles = Vec::with_capacity(batch.len());
-            for device_id in batch {
-                let sender = Arc::clone(&self.sender);
-                let req_clone = req.clone();
-                handles.push(tokio::spawn(async move {
-                    (device_id, sender.send_fetch(device_id, req_clone).await)
-                }));
-            }
-
-            for handle in handles {
-                match handle.await {
-                    Ok((device_id, Ok(resp))) => {
-                        responders += 1;
-                        tracing::info!(
-                            device = %device_id,
-                            entries = resp.entries.len(),
-                            "dr_walk: fetch response from peer"
-                        );
-                        self.record_avail_contact(device_id, now_secs);
-                        for entry in resp.entries {
-                            if entry.class != MailboxClass::SelfPointer {
-                                continue;
-                            }
-                            match from_cbor_bytes::<SelfPointer>(&entry.payload) {
-                                Ok(pointer) => {
-                                    if verify_self_pointer(&pointer, my_master_pub).is_err() {
-                                        debug!(
-                                            device = %device_id,
-                                            "dr_walk: pointer signature verification failed"
-                                        );
-                                        continue;
-                                    }
-                                    if seen_sigs.insert(pointer.signature) {
-                                        pointers.push(pointer);
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!(
-                                        device = %device_id,
-                                        err = %e,
-                                        "dr_walk: failed to decode SelfPointer payload"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Ok((device_id, Err(e))) => {
-                        tracing::info!(device = %device_id, err = %e, "dr_walk: fetch failed for peer");
-                    }
-                    Err(join_err) => {
-                        warn!("dr_walk: task panicked: {join_err}");
-                    }
-                }
-            }
-        }
-
-        tracing::info!(
-            candidates,
-            responders,
-            pointers = pointers.len(),
-            "dr_walk: collection complete"
-        );
-        Ok(DrWalk {
-            pointers,
-            candidates,
-            responders,
-        })
     }
 
     // ─── Peer selection ───────────────────────────────────────────────────────
@@ -691,6 +545,40 @@ impl MailboxRouter {
                 );
             }
         }
+    }
+}
+
+/// One postman's refusal of a store (see `publish_detailed` for the levels).
+fn log_store_refusal(
+    device_id: DeviceId,
+    target: &MailboxAddress,
+    msg_id: &[u8; 16],
+    class: MailboxClass,
+    reason: &MailboxRejectReason,
+) {
+    let ours = matches!(
+        reason,
+        MailboxRejectReason::Unauthorized | MailboxRejectReason::PlaintextPayload
+    );
+    let directed_clock =
+        class != MailboxClass::SelfPointer && matches!(reason, MailboxRejectReason::ClockSkew);
+    if ours || directed_clock {
+        warn!(
+            device = %device_id,
+            target = %target,
+            msg_id = %hex_encode(msg_id),
+            ?class,
+            ?reason,
+            "mailbox publish: postman refused the entry — check keys and system clock"
+        );
+    } else {
+        debug!(
+            device = %device_id,
+            msg_id = %hex_encode(msg_id),
+            ?class,
+            ?reason,
+            "mailbox publish: peer rejected store"
+        );
     }
 }
 

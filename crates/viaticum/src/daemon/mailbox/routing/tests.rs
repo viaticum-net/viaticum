@@ -24,7 +24,7 @@ use viaticum_core::constants::{
     AVAIL_EWMA_ALPHA, AVAIL_EWMA_INITIAL, INITIAL_TRUST_P, MAILBOX_WRITE_FANOUT,
 };
 use viaticum_core::db::testutil::test_db;
-use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
+use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry, MailboxRejectReason};
 use viaticum_core::messages::{
     MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse,
 };
@@ -35,7 +35,7 @@ use viaticum_core::types::{
     DeviceId, IdentityPub, PeerRecord, SourceBlockId, Timestamp, ewma_contact_observed,
 };
 
-use super::{MailboxNetworkSender, MailboxRouter, dedup_entries};
+use super::{MailboxNetworkSender, MailboxRouter, PublishOutcome, PublishVerdict, dedup_entries};
 use crate::daemon::network::swarm::device_id_to_peer_id;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
@@ -158,7 +158,7 @@ impl MailboxNetworkSender for MockSender {
         } else {
             Ok(MailboxStoreResponse::Reject {
                 msg_id: req.entry.msg_id,
-                reason: viaticum_core::mailbox::MailboxRejectReason::NotInCandidateSet,
+                reason: MailboxRejectReason::NotInCandidateSet,
             })
         }
     }
@@ -650,6 +650,22 @@ async fn publish_records_avail_on_ack() {
 }
 
 // ─── CS-DR-1: DR collects every pointer from every batch ─────────────────────
+//
+// CROWN-1 C3a: the pointers live sealed in the seed-derived rendezvous box; the walk
+// opens them with the phrase's keys and never looks at the local clock.
+
+use viaticum_core::mailbox::seal::{
+    PointerPlace, RendezvousKeys, SEALED_PAYLOAD_VERSION, seal_self_pointer,
+};
+
+/// The keys of one test phrase: the master signing key and the rendezvous keys, both
+/// from the same seed (as in production).
+fn phrase_keys(tag: u8) -> (ed25519_dalek::SigningKey, IdentityPub, RendezvousKeys) {
+    let seed = [tag; 64];
+    let master = viaticum_core::cluster::derive_master_key(&seed).unwrap();
+    let me = viaticum_core::cluster::master_identity(&master);
+    (master, me, RendezvousKeys::derive(&seed))
+}
 
 /// `n` real-key peers in a fresh DB, returned in the XOR order `dr_collect_pointers`
 /// uses for `target` (closest first) — replicates `build_ranked_candidates`.
@@ -657,10 +673,10 @@ fn ranked_peers(
     db: &viaticum_core::db::Db,
     n: usize,
     tag: u8,
-    target: &IdentityPub,
+    target: &MailboxAddress,
 ) -> Vec<DeviceId> {
     use crate::daemon::mailbox::candidate::KademliaRoutingView;
-    let target_key = KademliaRoutingView::target_key(&MailboxAddress::for_master(target));
+    let target_key = KademliaRoutingView::target_key(target);
     let mut ranked: Vec<([u8; 32], DeviceId)> = (0..n)
         .map(|i| {
             let key = viaticum_core::cluster::derive_device_key(
@@ -719,46 +735,56 @@ fn signed_pointer(
     )
 }
 
-fn pointer_entry(target: IdentityPub, p: &SelfPointer, msg: u8) -> MailboxEntry {
-    MailboxEntry {
-        target: MailboxAddress::for_master(&target),
-        msg_id: make_msg_id(msg),
-        class: MailboxClass::SelfPointer,
-        payload_version: 1,
-        payload: viaticum_core::types::to_cbor_bytes(p),
-        expires_at: u64::MAX,
-        stored_at: 1_000_000 + msg as u64,
-        sender: None,
-    }
+/// `p` sealed into place `place` of its history in the rendezvous box.
+fn sealed_entry(rv: &RendezvousKeys, p: &SelfPointer, place: PointerPlace) -> MailboxEntry {
+    seal_self_pointer(
+        rv,
+        &p.catalog.lineage.0,
+        place,
+        &viaticum_core::types::to_cbor_bytes(p),
+        u64::MAX,
+        p.created_at.0,
+    )
+    .unwrap()
+    .entry()
+    .clone()
+}
+
+fn pointers_of(walk: &super::DrWalk) -> Vec<SelfPointer> {
+    walk.pointers.iter().map(|(_, p)| p.clone()).collect()
 }
 
 /// The first batch (100 closest) holds an older pointer, a peer of the second batch
-/// holds a fresher one of the same history. The old walk stopped at batch 1 and
-/// returned the stale pointer; the collection must return both, so the choice gets
-/// the fresh one.
+/// holds a fresher one of the same history. The collection returns both, so the
+/// choice gets the fresh one.
 #[tokio::test]
 async fn dr_walk_prefers_fresher_pointer_in_later_batch() {
     use viaticum_core::constants::MAILBOX_DR_WALK_BATCHES;
     use viaticum_core::system_state::catalog::select_catalog;
 
-    let master = viaticum_core::cluster::derive_master_key(&[0xA1u8; 64]).unwrap();
-    let me = viaticum_core::cluster::master_identity(&master);
+    let (master, me, rv) = phrase_keys(0xA1);
     let db = test_db();
-    let ranked = ranked_peers(&db, 150, 0xA1, &me);
+    let ranked = ranked_peers(&db, 150, 0xA1, &rv.address);
     let first = MAILBOX_DR_WALK_BATCHES[0];
 
     let stale = signed_pointer(&master, 7, 3, 1, 1_000);
     let fresh = signed_pointer(&master, 7, 4, 2, 2_000);
     let mut responses: HashMap<DeviceId, Vec<MailboxEntry>> = HashMap::new();
-    responses.insert(ranked[0], vec![pointer_entry(me, &stale, 1)]);
-    responses.insert(ranked[first + 10], vec![pointer_entry(me, &fresh, 2)]);
+    responses.insert(ranked[0], vec![sealed_entry(&rv, &stale, PointerPlace::A)]);
+    responses.insert(
+        ranked[first + 10],
+        vec![sealed_entry(&rv, &fresh, PointerPlace::A)],
+    );
 
     let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
     let router = MailboxRouter::with_sender(sender.clone(), db);
-    let walk = router.dr_collect_pointers(&me).await.unwrap();
+    let walk = router
+        .dr_collect_pointers(&rv, &me, &gen_device_id())
+        .await
+        .unwrap();
 
     assert_eq!(walk.pointers.len(), 2, "both batches are collected");
-    let choice = select_catalog(walk.pointers, None).unwrap();
+    let choice = select_catalog(pointers_of(&walk), None).unwrap();
     assert_eq!(
         choice.selected.generation, 2,
         "the fresher pointer of batch 2 wins"
@@ -768,14 +794,16 @@ async fn dr_walk_prefers_fresher_pointer_in_later_batch() {
 
 #[tokio::test]
 async fn dr_collect_queries_each_candidate_once() {
-    let master = viaticum_core::cluster::derive_master_key(&[0xA2u8; 64]).unwrap();
-    let me = viaticum_core::cluster::master_identity(&master);
+    let (_master, me, rv) = phrase_keys(0xA2);
     let db = test_db();
-    let ranked = ranked_peers(&db, 150, 0xA2, &me);
+    let ranked = ranked_peers(&db, 150, 0xA2, &rv.address);
 
     let sender = Arc::new(MockSender::new());
     let router = MailboxRouter::with_sender(sender.clone(), db);
-    let walk = router.dr_collect_pointers(&me).await.unwrap();
+    let walk = router
+        .dr_collect_pointers(&rv, &me, &gen_device_id())
+        .await
+        .unwrap();
 
     let calls = sender.fetch_calls();
     let unique: std::collections::HashSet<DeviceId> = calls.iter().copied().collect();
@@ -792,63 +820,78 @@ async fn dr_collect_queries_each_candidate_once() {
 
 #[tokio::test]
 async fn dr_collect_returns_pointers_of_all_lineages() {
-    let master = viaticum_core::cluster::derive_master_key(&[0xA3u8; 64]).unwrap();
-    let me = viaticum_core::cluster::master_identity(&master);
+    let (master, me, rv) = phrase_keys(0xA3);
     let db = test_db();
-    let ranked = ranked_peers(&db, 20, 0xA3, &me);
+    let ranked = ranked_peers(&db, 20, 0xA3, &rv.address);
     let owner = signed_pointer(&master, 1, 3, 5, 1_000);
     let shadow = signed_pointer(&master, 2, 0, 1, 9_000);
     let mut responses: HashMap<DeviceId, Vec<MailboxEntry>> = HashMap::new();
     // The same owner pointer at two postmen (dedup), the shadow's at a third.
-    responses.insert(ranked[0], vec![pointer_entry(me, &owner, 1)]);
-    responses.insert(ranked[1], vec![pointer_entry(me, &owner, 1)]);
-    responses.insert(ranked[2], vec![pointer_entry(me, &shadow, 2)]);
+    let owner_entry = sealed_entry(&rv, &owner, PointerPlace::A);
+    responses.insert(ranked[0], vec![owner_entry.clone()]);
+    responses.insert(ranked[1], vec![owner_entry]);
+    responses.insert(ranked[2], vec![sealed_entry(&rv, &shadow, PointerPlace::A)]);
 
     let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
     let router = MailboxRouter::with_sender(sender, db);
-    let walk = router.dr_collect_pointers(&me).await.unwrap();
+    let walk = router
+        .dr_collect_pointers(&rv, &me, &gen_device_id())
+        .await
+        .unwrap();
 
     assert_eq!(
         walk.pointers.len(),
         2,
         "distinct pointers, deduplicated by signature"
     );
-    let lineages: std::collections::HashSet<CatalogLineageId> =
-        walk.pointers.iter().map(|p| p.catalog.lineage).collect();
+    let lineages: std::collections::HashSet<CatalogLineageId> = walk
+        .pointers
+        .iter()
+        .map(|(_, p)| p.catalog.lineage)
+        .collect();
     assert_eq!(lineages.len(), 2, "both histories are returned");
 }
 
+/// A pointer signed by another master, sealed with THIS phrase's box keys, opens but
+/// does not verify: it is not returned.
 #[tokio::test]
 async fn dr_collect_ignores_pointers_of_another_identity() {
-    let master = viaticum_core::cluster::derive_master_key(&[0xA4u8; 64]).unwrap();
-    let me = viaticum_core::cluster::master_identity(&master);
-    let stranger = viaticum_core::cluster::derive_master_key(&[0xA5u8; 64]).unwrap();
+    let (_master, me, rv) = phrase_keys(0xA4);
+    let (stranger, _, _) = phrase_keys(0xA5);
     let db = test_db();
-    let ranked = ranked_peers(&db, 5, 0xA4, &me);
+    let ranked = ranked_peers(&db, 5, 0xA4, &rv.address);
     let forged = signed_pointer(&stranger, 1, 99, 1, 9_000);
     let mut responses: HashMap<DeviceId, Vec<MailboxEntry>> = HashMap::new();
-    responses.insert(ranked[0], vec![pointer_entry(me, &forged, 1)]);
+    responses.insert(ranked[0], vec![sealed_entry(&rv, &forged, PointerPlace::A)]);
     let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
     let router = MailboxRouter::with_sender(sender, db);
-    let walk = router.dr_collect_pointers(&me).await.unwrap();
+    let walk = router
+        .dr_collect_pointers(&rv, &me, &gen_device_id())
+        .await
+        .unwrap();
     assert!(walk.pointers.is_empty());
     assert_eq!(walk.responders, 5);
 }
 
 #[tokio::test]
 async fn dr_collect_distinguishes_no_candidates_from_no_pointer() {
-    let master = viaticum_core::cluster::derive_master_key(&[0xA6u8; 64]).unwrap();
-    let me = viaticum_core::cluster::master_identity(&master);
+    let (_master, me, rv) = phrase_keys(0xA6);
 
     let empty = MailboxRouter::with_sender(Arc::new(MockSender::new()), test_db());
-    let walk = empty.dr_collect_pointers(&me).await.unwrap();
+    let walk = empty
+        .dr_collect_pointers(&rv, &me, &gen_device_id())
+        .await
+        .unwrap();
     assert_eq!((walk.candidates, walk.responders), (0, 0));
     assert!(walk.pointers.is_empty());
 
     let db = test_db();
-    ranked_peers(&db, 3, 0xA6, &me);
+    ranked_peers(&db, 3, 0xA6, &rv.address);
     let quiet = MailboxRouter::with_sender(Arc::new(MockSender::new()), db);
-    let walk = quiet.dr_collect_pointers(&me).await.unwrap();
+    let walk = quiet
+        .dr_collect_pointers(&rv, &me, &gen_device_id())
+        .await
+        .unwrap();
     assert_eq!((walk.candidates, walk.responders), (3, 3));
     assert!(walk.pointers.is_empty());
 }
@@ -857,29 +900,240 @@ async fn dr_collect_distinguishes_no_candidates_from_no_pointer() {
 #[tokio::test]
 async fn dr_walk_expands_to_next_batch_when_first_misses() {
     use viaticum_core::constants::MAILBOX_DR_WALK_BATCHES;
-    let master = viaticum_core::cluster::derive_master_key(&[0xCDu8; 64]).unwrap();
-    let me = viaticum_core::cluster::master_identity(&master);
+    let (master, me, rv) = phrase_keys(0xCD);
     let db = test_db();
-    let ranked = ranked_peers(&db, 200, 0xF5, &me);
+    let ranked = ranked_peers(&db, 200, 0xF5, &rv.address);
     let first = MAILBOX_DR_WALK_BATCHES[0];
     let p = signed_pointer(&master, 3, 1, 2, 5_000);
+    let entry = sealed_entry(&rv, &p, PointerPlace::A);
     let mut responses: HashMap<DeviceId, Vec<MailboxEntry>> = HashMap::new();
     for d in &ranked[first..] {
-        responses.insert(*d, vec![pointer_entry(me, &p, 9)]);
+        responses.insert(*d, vec![entry.clone()]);
     }
     let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
     let router = MailboxRouter::with_sender(sender.clone(), db);
-    let walk = router.dr_collect_pointers(&me).await.unwrap();
+    let walk = router
+        .dr_collect_pointers(&rv, &me, &gen_device_id())
+        .await
+        .unwrap();
     assert_eq!(walk.pointers.len(), 1);
-    assert_eq!(walk.pointers[0].generation, 2);
+    assert_eq!(walk.pointers[0].1.generation, 2);
     assert!(
         sender.fetch_calls().len() > first,
         "the walk went past batch 1"
     );
 }
 
+/// V.15.2 (mailbox-i39, V.13 п.5): DR does not look at its own clock. A postman serves
+/// an entry with `expires_at = 1`, `stored_at = 1` (1970): the walk still opens it and
+/// returns the pointer.
+#[tokio::test]
+async fn dr_collect_keeps_entries_regardless_of_local_clock() {
+    let (master, me, rv) = phrase_keys(0xB1);
+    let db = test_db();
+    let ranked = ranked_peers(&db, 2, 0xB1, &rv.address);
+    let p = signed_pointer(&master, 4, 2, 1, 1);
+    let old = seal_self_pointer(
+        &rv,
+        &p.catalog.lineage.0,
+        PointerPlace::A,
+        &viaticum_core::types::to_cbor_bytes(&p),
+        1,
+        1,
+    )
+    .unwrap()
+    .entry()
+    .clone();
+    let mut responses: HashMap<DeviceId, Vec<MailboxEntry>> = HashMap::new();
+    responses.insert(ranked[0], vec![old]);
+    let router = MailboxRouter::with_sender(
+        Arc::new(MockSender::new().with_fetch_responses(responses)),
+        db,
+    );
+    let walk = router
+        .dr_collect_pointers(&rv, &me, &gen_device_id())
+        .await
+        .unwrap();
+    assert_eq!(
+        walk.pointers.len(),
+        1,
+        "an expired-by-our-clock entry is kept"
+    );
+    assert_eq!(walk.pointers[0].1.signature, p.signature);
+}
+
+/// V.6 DR row / dr-i47: two versions of ONE place from lagging postmen (same slot, other
+/// contents) are both returned, each with its slot — they become fallbacks.
+#[tokio::test]
+async fn dr_collect_keeps_distinct_versions_of_one_slot() {
+    let (master, me, rv) = phrase_keys(0xB2);
+    let db = test_db();
+    let ranked = ranked_peers(&db, 3, 0xB2, &rv.address);
+    let v1 = signed_pointer(&master, 6, 1, 1, 1_000);
+    let v2 = signed_pointer(&master, 6, 2, 1, 2_000);
+    let mut responses: HashMap<DeviceId, Vec<MailboxEntry>> = HashMap::new();
+    responses.insert(ranked[0], vec![sealed_entry(&rv, &v1, PointerPlace::A)]);
+    responses.insert(ranked[1], vec![sealed_entry(&rv, &v2, PointerPlace::A)]);
+    let router = MailboxRouter::with_sender(
+        Arc::new(MockSender::new().with_fetch_responses(responses)),
+        db,
+    );
+    let walk = router
+        .dr_collect_pointers(&rv, &me, &gen_device_id())
+        .await
+        .unwrap();
+    assert_eq!(walk.pointers.len(), 2);
+    let slot_a = rv.pointer_slot(&[6; 16], PointerPlace::A);
+    assert!(walk.pointers.iter().all(|(slot, _)| *slot == slot_a));
+}
+
+/// V.6 DR row: junk in the box (a v2 SelfPointer that does not open, a plaintext
+/// pointer, a directed class) is skipped with `mailbox: open failed`; the walk goes on
+/// and returns the real pointer from the same answer.
+#[tokio::test]
+async fn dr_collect_logs_open_failed_for_junk_pointer_and_continues() {
+    let (master, me, rv) = phrase_keys(0xB3);
+    let db = test_db();
+    let ranked = ranked_peers(&db, 1, 0xB3, &rv.address);
+    let real = signed_pointer(&master, 8, 5, 3, 3_000);
+    let junk = MailboxEntry {
+        target: rv.address,
+        msg_id: [0xEE; 16],
+        class: MailboxClass::SelfPointer,
+        payload_version: SEALED_PAYLOAD_VERSION,
+        payload: vec![0x5A; 200],
+        expires_at: u64::MAX,
+        stored_at: 9_999,
+        sender: None,
+    };
+    let plaintext = MailboxEntry {
+        payload_version: 1,
+        payload: viaticum_core::types::to_cbor_bytes(&real),
+        msg_id: [0xEF; 16],
+        ..junk.clone()
+    };
+    let mut responses: HashMap<DeviceId, Vec<MailboxEntry>> = HashMap::new();
+    responses.insert(
+        ranked[0],
+        vec![junk, plaintext, sealed_entry(&rv, &real, PointerPlace::B)],
+    );
+    let router = MailboxRouter::with_sender(
+        Arc::new(MockSender::new().with_fetch_responses(responses)),
+        db,
+    );
+    let walk = router
+        .dr_collect_pointers(&rv, &me, &gen_device_id())
+        .await
+        .unwrap();
+    assert_eq!(walk.pointers.len(), 1);
+    assert_eq!(walk.pointers[0].1.signature, real.signature);
+    assert_eq!(
+        walk.pointers[0].0,
+        rv.pointer_slot(&[8; 16], PointerPlace::B)
+    );
+}
+
+/// AC-5′(а): a pointer published years ago and not yet expired is found (no lower
+/// time bound anywhere on the DR path).
+#[tokio::test]
+async fn dr_collect_finds_pointer_published_years_ago() {
+    let (master, me, rv) = phrase_keys(0xB4);
+    let db = test_db();
+    let ranked = ranked_peers(&db, 1, 0xB4, &rv.address);
+    let four_years_ago = Timestamp::now().0 - 4 * 365 * 24 * 3600;
+    let p = signed_pointer(&master, 9, 1, 1, four_years_ago);
+    let mut responses: HashMap<DeviceId, Vec<MailboxEntry>> = HashMap::new();
+    responses.insert(ranked[0], vec![sealed_entry(&rv, &p, PointerPlace::A)]);
+    let router = MailboxRouter::with_sender(
+        Arc::new(MockSender::new().with_fetch_responses(responses)),
+        db,
+    );
+    let walk = router
+        .dr_collect_pointers(&rv, &me, &gen_device_id())
+        .await
+        .unwrap();
+    assert_eq!(walk.pointers.len(), 1);
+}
+
+// ─── Publish verdicts (V.3, V.15.3; mailbox-i42, i49) ────────────────────────
+
+fn outcome(acks: usize, rejects: &[MailboxRejectReason], errors: usize) -> PublishOutcome {
+    PublishOutcome {
+        acks: (0..acks).map(|i| DeviceId([i as u8; 32])).collect(),
+        rejects: rejects
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (DeviceId([0x80 + i as u8; 32]), r.clone()))
+            .collect(),
+        errors,
+    }
+}
+
+#[test]
+fn publish_verdict_all_clock_skew() {
+    use MailboxRejectReason::ClockSkew;
+    assert_eq!(
+        outcome(0, &[ClockSkew, ClockSkew], 3).verdict(),
+        PublishVerdict::AllClockSkew,
+        "network errors do not break 'all refused'"
+    );
+}
+
+#[test]
+fn publish_verdict_all_superseded() {
+    use MailboxRejectReason::Superseded;
+    assert_eq!(
+        outcome(0, &[Superseded, Superseded, Superseded], 0).verdict(),
+        PublishVerdict::AllSuperseded,
+        "Superseded is never counted as an acceptance"
+    );
+}
+
+#[test]
+fn publish_verdict_all_slots_full() {
+    use MailboxRejectReason::QuotaExceeded;
+    assert_eq!(
+        outcome(0, &[QuotaExceeded, QuotaExceeded], 0).verdict(),
+        PublishVerdict::AllSlotsFull
+    );
+}
+
+#[test]
+fn publish_verdict_mixed_refusal() {
+    use MailboxRejectReason::{ClockSkew, NotInCandidateSet, QuotaExceeded, Superseded};
+    assert_eq!(
+        outcome(
+            0,
+            &[
+                ClockSkew,
+                Superseded,
+                Superseded,
+                QuotaExceeded,
+                NotInCandidateSet
+            ],
+            1
+        )
+        .verdict(),
+        PublishVerdict::MixedRefusal {
+            clock: 1,
+            superseded: 2,
+            slots_full: 1,
+            other: 1
+        }
+    );
+}
+
+#[test]
+fn publish_verdict_one_reject_among_acks_is_stored() {
+    assert_eq!(
+        outcome(2, &[MailboxRejectReason::Superseded], 0).verdict(),
+        PublishVerdict::Stored { acks: 2 }
+    );
+    assert_eq!(outcome(0, &[], 4).verdict(), PublishVerdict::NoAck);
+}
+
 // ============================================================
-// CROWN-1 C2: router ↔ REAL postman handlers (InProcessPostmanNet)
+// CROWN-1: router ↔ REAL postman handlers (InProcessPostmanNet)
 // ============================================================
 //
 // These go through `handle_mailbox_store` / `handle_mailbox_fetch` on real redb, so
@@ -887,7 +1141,6 @@ async fn dr_walk_expands_to_next_batch_when_first_misses() {
 // checked against the actual postman rules rather than a mock that acks anything.
 
 use crate::daemon::mailbox::test_postman::InProcessPostmanNet;
-use viaticum_core::mailbox::seal::RendezvousKeys;
 use viaticum_core::mailbox::sign_store;
 
 /// A router whose DB knows `n` postmen, all reachable through one in-process net.
@@ -916,46 +1169,34 @@ fn router_over_postmen(
     (router, net, devices)
 }
 
-fn signed_pointer_entry(master_key: &ed25519_dalek::SigningKey, generation: u32) -> MailboxEntry {
-    let pointer = sign_self_pointer(
-        master_key,
-        generation,
-        BlockRef {
-            block_id: SourceBlockId([0xC2; 32]),
-            encrypted_size: 64,
-            holders: vec![],
-        },
-        vec![],
-        Timestamp::now(),
-        CatalogSummary {
-            lineage: CatalogLineageId([0xC2; 16]),
-            publisher: DeviceId([0xD0; 32]),
-            files: 1,
-        },
-    );
+/// A sealed pointer of history 0xC2, place A, stored now.
+fn sealed_now(master_key: &ed25519_dalek::SigningKey, rv: &RendezvousKeys) -> MailboxEntry {
     let now = Timestamp::now().0;
-    MailboxEntry {
-        target: MailboxAddress::for_master(&viaticum_core::cluster::master_identity(master_key)),
-        msg_id: [generation as u8; 16],
-        class: MailboxClass::SelfPointer,
-        payload_version: 1,
-        payload: viaticum_core::types::to_cbor_bytes(&pointer),
-        expires_at: now + 3600,
-        stored_at: now,
-        sender: None,
-    }
+    let pointer = signed_pointer(master_key, 0xC2, 1, 7, now);
+    seal_self_pointer(
+        rv,
+        &pointer.catalog.lineage.0,
+        PointerPlace::A,
+        &viaticum_core::types::to_cbor_bytes(&pointer),
+        now + 3600,
+        now,
+    )
+    .unwrap()
+    .entry()
+    .clone()
 }
 
-/// C2 layout: the pointer sits in the master box, signed by the master key; every
-/// postman stores it and the DR walk (transport identity = the master) finds it.
+/// C3a layout end to end: the sealed pointer sits in the rendezvous box, signed by the
+/// box key; every real postman stores it and the DR walk (proof bound to the DR
+/// device) opens it.
 #[tokio::test]
 async fn signed_self_pointer_is_stored_by_real_postmen_and_found_by_dr_walk() {
-    let master_key = viaticum_core::cluster::derive_master_key(&[0x21u8; 64]).unwrap();
-    let master = viaticum_core::cluster::master_identity(&master_key);
-    let (router, net, devices) = router_over_postmen(4, master, gen_device_id());
+    let (master_key, master, rv) = phrase_keys(0x21);
+    let dr_device = gen_device_id();
+    let (router, net, devices) = router_over_postmen(4, master, dr_device);
 
-    let entry = signed_pointer_entry(&master_key, 7);
-    let sig = sign_store(&master_key, &entry);
+    let entry = sealed_now(&master_key, &rv);
+    let sig = rv.sign_store(&entry);
     let acks = router.publish(entry.clone(), Some(sig)).await.unwrap();
     assert_eq!(acks, devices.len(), "every postman acks the signed pointer");
     for d in &devices {
@@ -967,20 +1208,23 @@ async fn signed_self_pointer_is_stored_by_real_postmen_and_found_by_dr_walk() {
         assert_eq!(held.len(), 1, "postman {d} stores the pointer");
     }
 
-    let walk = router.dr_collect_pointers(&master).await.unwrap();
-    let generations: Vec<u32> = walk.pointers.iter().map(|p| p.generation).collect();
+    let walk = router
+        .dr_collect_pointers(&rv, &master, &dr_device)
+        .await
+        .unwrap();
+    let generations: Vec<u32> = walk.pointers.iter().map(|(_, p)| p.generation).collect();
     assert_eq!(generations, vec![7]);
 }
 
 /// AC-7 end to end: the same pointer without `target_sig` is refused by every real
-/// postman — publish sees 0 acks and nothing is stored anywhere.
+/// postman — publish sees 0 acks and nothing is stored anywhere. A plaintext pointer
+/// is refused even with a valid signature (§7.5 п.1).
 #[tokio::test]
 async fn unsigned_self_pointer_publish_is_refused_by_real_postmen() {
-    let master_key = viaticum_core::cluster::derive_master_key(&[0x22u8; 64]).unwrap();
-    let master = viaticum_core::cluster::master_identity(&master_key);
+    let (master_key, master, rv) = phrase_keys(0x22);
     let (router, net, devices) = router_over_postmen(3, master, gen_device_id());
 
-    let entry = signed_pointer_entry(&master_key, 1);
+    let entry = sealed_now(&master_key, &rv);
     assert_eq!(router.publish(entry.clone(), None).await.unwrap(), 0);
     // A signature by another key is refused as well.
     let other = viaticum_core::cluster::derive_master_key(&[0x23u8; 64]).unwrap();
@@ -988,6 +1232,17 @@ async fn unsigned_self_pointer_publish_is_refused_by_real_postmen() {
     assert_eq!(
         router.publish(entry.clone(), Some(forged)).await.unwrap(),
         0
+    );
+    let mut plain = entry.clone();
+    plain.payload_version = 1;
+    let out = router
+        .publish_detailed(plain.clone(), Some(rv.sign_store(&plain)))
+        .await;
+    assert!(out.acks.is_empty());
+    assert!(
+        out.rejects
+            .iter()
+            .all(|(_, r)| *r == MailboxRejectReason::PlaintextPayload)
     );
     for d in &devices {
         assert!(
@@ -1008,19 +1263,10 @@ async fn rendezvous_poll_through_real_postmen_needs_proof_and_returns_only_point
     let requester_device = gen_device_id();
     let (router, _net, _devices) =
         router_over_postmen(3, IdentityPub([0x31; 32]), requester_device);
-    let rv = RendezvousKeys::derive(&[0x24u8; 64]);
+    let (master_key, _me, rv) = phrase_keys(0x24);
 
     let now = Timestamp::now().0;
-    let pointer = MailboxEntry {
-        target: rv.address,
-        msg_id: [1; 16],
-        class: MailboxClass::SelfPointer,
-        payload_version: 1,
-        payload: b"pointer".to_vec(),
-        expires_at: now + 3600,
-        stored_at: now,
-        sender: None,
-    };
+    let pointer = sealed_now(&master_key, &rv);
     let sig = rv.sign_store(&pointer);
     assert_eq!(router.publish(pointer, Some(sig)).await.unwrap(), 3);
     for i in 0..5u8 {

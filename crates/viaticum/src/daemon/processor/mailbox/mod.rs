@@ -12,10 +12,9 @@
 //           fetch proof bound to the requester's device (SelfPointer entries only,
 //           AC-9, AC-20); otherwise empty.
 //
-// The plaintext rule (§7.5 п.1, `check_pointer_sealed`: SelfPointer with
-// `payload_version < 2` → PlaintextPayload) is NOT wired here yet: the C2 publisher
-// still sends plaintext pointers to the master box until C3a commit 3 seals them;
-// wiring it earlier would refuse every pointer the daemon publishes.
+// The plaintext rule (§7.5 п.1, `check_pointer_sealed`): a SelfPointer with
+// `payload_version < 2` is refused with PlaintextPayload (C3a commit 3: the publisher
+// seals every pointer into the rendezvous box; C4 extends the rule to every class).
 //
 // `msg_id` is logged as hex everywhere (РС3.8): E2E oracles match it against the slot
 // derived offline from the phrase.
@@ -29,7 +28,7 @@ use viaticum_core::constants::MAILBOX_CANDIDATES_N;
 use viaticum_core::db::Db;
 use viaticum_core::mailbox::{
     MailboxAddress, MailboxClass, MailboxEngine, MailboxError, MailboxRejectReason, Stored,
-    check_entry_clock, verify_fetch_proof, verify_store_sig,
+    check_entry_clock, check_pointer_sealed, verify_fetch_proof, verify_store_sig,
 };
 use viaticum_core::messages::{
     MAILBOX_WIRE_VERSION, MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest,
@@ -46,12 +45,14 @@ use crate::daemon::mailbox::candidate::{KademliaRoutingView, should_store};
 /// 1. Candidate-set: is this node in the top-N closest to `req.entry.target`?
 ///    If not → `Reject { NotInCandidateSet }`. The same field is the storage key, so a
 ///    request cannot pass the check for one address and be stored under another.
-/// 2. `SelfPointer`: `req.target_sig` must verify against `req.entry.target`
+/// 2. Plaintext rule: a `SelfPointer` with `payload_version < 2` →
+///    `Reject { PlaintextPayload }` (`check_pointer_sealed`).
+/// 3. `SelfPointer`: `req.target_sig` must verify against `req.entry.target`
 ///    (`verify_store_sig`, before the `expires_at` clamp) → else `Reject { Unauthorized }`.
 ///    Other classes: `target_sig` ignored (a sender never holds the recipient's key).
-/// 3. Clock: `expires_at <= now`, or a SelfPointer `stored_at` more than
+/// 4. Clock: `expires_at <= now`, or a SelfPointer `stored_at` more than
 ///    `SELF_POINTER_MAX_FUTURE_SKEW_SECS` ahead of `now_secs` → `Reject { ClockSkew }`.
-/// 4. MailboxEngine::store:
+/// 5. MailboxEngine::store:
 ///    - Ok / Err(Duplicate) → `Ack { msg_id }` (duplicate: idempotent, already present;
 ///      for a SelfPointer: the same envelope already holds the slot)
 ///    - Err(Superseded)     → `Reject { Superseded }` (the slot holds a newer pointer,
@@ -61,7 +62,7 @@ use crate::daemon::mailbox::candidate::{KademliaRoutingView, should_store};
 ///      pointer slot beyond the cap)
 ///    - Err(other)          → `Reject { QuotaExceeded }` (DB error treated conservatively)
 ///
-/// The `Unauthorized`, `ClockSkew` and `Superseded` refusals log at `warn!` with fixed
+/// The `PlaintextPayload`, `Unauthorized`, `ClockSkew` and `Superseded` refusals log at `warn!` with fixed
 /// text (N1): the E2E guards grep for them.
 pub fn handle_mailbox_store(
     db: &Db,
@@ -91,7 +92,19 @@ pub fn handle_mailbox_store(
         return reject(MailboxRejectReason::NotInCandidateSet);
     }
 
-    // 2. Write authorization for the pointer box.
+    // 2. Plaintext rule: the pointer box holds sealed envelopes only.
+    if let Err(e) = check_pointer_sealed(entry) {
+        warn!(
+            target = %target,
+            msg_id = %hex_encode(&msg_id),
+            class = ?entry.class,
+            err = %e,
+            "mailbox: store rejected — plaintext payload"
+        );
+        return reject(MailboxRejectReason::PlaintextPayload);
+    }
+
+    // 3. Write authorization for the pointer box.
     if entry.class == MailboxClass::SelfPointer {
         let authorized = req
             .target_sig
@@ -109,7 +122,7 @@ pub fn handle_mailbox_store(
         }
     }
 
-    // 3. Postman clock rule (before the expires_at clamp inside the engine).
+    // 4. Postman clock rule (before the expires_at clamp inside the engine).
     if let Err(e) = check_entry_clock(entry, now_secs) {
         warn!(
             target = %target,
@@ -121,7 +134,7 @@ pub fn handle_mailbox_store(
         return reject(MailboxRejectReason::ClockSkew);
     }
 
-    // 4. Store.
+    // 5. Store.
     let engine = MailboxEngine::new(db.clone());
     match engine.store(entry, now_secs) {
         Ok(stored) => {

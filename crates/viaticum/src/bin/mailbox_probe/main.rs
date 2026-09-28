@@ -27,6 +27,11 @@
 //
 //   peer-x25519 --data-dir D --device HEX --clear
 //       Clears `PeerRecord.x25519_pub` of one peer (S1 step 10, mailbox-i8).
+//
+//   rendezvous --phrase "<words>" [--lineage HEX32] [--place a|b] [--json]
+//       Offline, no data dir, no clock: the phrase's pointer box address (`address`,
+//       `address_short` as the postman logs `target=`) and, with a catalog history,
+//       its two pointer place slots `slot_a`, `slot_b` (`slot` for `--place`).
 
 use std::path::{Path, PathBuf};
 
@@ -39,6 +44,7 @@ use viaticum_core::messages::{SymbolDropNoticeBatchMsg, build_signed_symbol_drop
 use viaticum_core::types::{DeviceId, SourceBlockId, Timestamp, hex_encode, to_cbor_bytes};
 
 mod audit;
+mod rendezvous;
 
 #[derive(Parser, Debug)]
 #[command(about = "Offline postman mailbox audit / injection (E2E instrument)")]
@@ -88,6 +94,18 @@ enum Cmd {
         sign_with: Option<PathBuf>,
         #[arg(long)]
         drop_block: Option<String>,
+    },
+    /// Offline: the pointer box address and place slots of a recovery phrase.
+    Rendezvous {
+        #[arg(long)]
+        phrase: String,
+        #[arg(long)]
+        lineage: Option<String>,
+        #[arg(long)]
+        place: Option<String>,
+        /// Accepted for scripts; the output is always JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Clear the x25519 key of one peer record.
     PeerX25519 {
@@ -276,6 +294,17 @@ fn main() {
                     "expires_at": entry.expires_at,
                 })
             );
+        }
+        Cmd::Rendezvous {
+            phrase,
+            lineage,
+            place,
+            json: _,
+        } => {
+            let lineage = lineage.map(|l| hex16(&l, "--lineage"));
+            let v = rendezvous::rendezvous_json(&phrase, lineage, place.as_deref())
+                .unwrap_or_else(|e| die(e));
+            println!("{v}");
         }
         Cmd::PeerX25519 {
             data_dir,
