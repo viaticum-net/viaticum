@@ -9,17 +9,15 @@
 
 use libp2p::PeerId;
 use viaticum_core::db::testutil::test_db;
+use viaticum_core::mailbox::MailboxAddress;
 use viaticum_core::mailbox::{MailboxClass, MailboxEngine, MailboxEntry};
-use viaticum_core::types::IdentityPub;
-
-use crate::daemon::mailbox::candidate::KademliaRoutingView;
 
 use super::sweep_membership_once;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn make_target(seed: u8) -> IdentityPub {
-    IdentityPub([seed; 32])
+fn make_target(seed: u8) -> MailboxAddress {
+    MailboxAddress([seed; 32])
 }
 
 fn make_msg_id(seed: u8) -> [u8; 16] {
@@ -27,7 +25,7 @@ fn make_msg_id(seed: u8) -> [u8; 16] {
 }
 
 fn make_entry(
-    target: IdentityPub,
+    target: MailboxAddress,
     msg_id: [u8; 16],
     class: MailboxClass,
     payload: Vec<u8>,
@@ -257,43 +255,19 @@ fn sweep_membership_ok_on_empty_db() {
 #[test]
 fn should_store_returns_false_with_enough_closer_peers() {
     let target = make_target(70);
-    let my_peer_id = PeerId::random();
+    // Deterministic: exactly 1000 known peers are closer than us (the previous
+    // rejection sampler returned green without asserting when it ran out of tries).
+    let (my_peer_id, view) =
+        crate::daemon::mailbox::test_postman::view_with_closer_peers(&target, 1000);
 
-    let target_key = KademliaRoutingView::target_key(&target);
-    let my_key = KademliaRoutingView::peer_key(&my_peer_id);
-    let my_dist = KademliaRoutingView::xor_distance(&target_key, &my_key);
-
-    // Generate enough peers closer than us to push us out of top-1000.
-    let mut closer_peers: Vec<PeerId> = Vec::new();
-    let mut attempts = 0usize;
-    while closer_peers.len() < 1001 && attempts < 2_000_000 {
-        let p = PeerId::random();
-        let pk = KademliaRoutingView::peer_key(&p);
-        let dist = KademliaRoutingView::xor_distance(&target_key, &pk);
-        if dist < my_dist {
-            closer_peers.push(p);
-        }
-        attempts += 1;
-    }
-
-    if closer_peers.len() < 1001 {
-        eprintln!(
-            "should_store_returns_false_with_enough_closer_peers: skipped \
-             (not enough closer peers in {attempts} attempts)"
-        );
-        return;
-    }
-
-    let mut all_peers = closer_peers;
-    all_peers.push(my_peer_id);
-    let view = KademliaRoutingView::new(all_peers);
-
-    // With 1001 closer peers, we are at rank=1001 > 1000 → should_store returns false.
     use crate::daemon::mailbox::candidate::should_store;
-    let result = should_store(&view, &target, &my_peer_id, 1000);
     assert!(
-        !result,
-        "should_store must return false when 1001 peers are closer (rank > 1000)"
+        !should_store(&view, &target, &my_peer_id, 1000),
+        "should_store must return false when 1000 peers are closer (rank 1000, top-N = 0..999)"
+    );
+    assert!(
+        should_store(&view, &target, &my_peer_id, 1001),
+        "and true when N admits one more"
     );
 }
 

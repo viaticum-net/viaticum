@@ -9,7 +9,12 @@
 #               the phrase, first making the classic mistakes, then correctly, restores the files
 #               from the network and puts them back one by one.
 # Intent:       dr-i1, dr-i2, dr-i3, dr-i4, dr-i5, dr-i9, dr-i10, dr-i11, dr-i18, dr-i19, dr-i22,
-#               restore-i1 (after DR), dr-i8 (step 9, skeleton: filled by CROWN-1 C4)
+#               restore-i1 (after DR), dr-i8 (step 9, skeleton: filled by CROWN-1 C4);
+#               CROWN-1 C3a: mailbox-i39, i40 (pointer only in the rendezvous box, never in
+#               the master box), mailbox-i56 (a restart's new base takes a place by
+#               strength; two places), V.16.4 (SS blobs outside META retired), dr-i41 /
+#               dr-i49 / dr-i50 (readiness = acks AND every block recoverable, holders seen
+#               within W), dr-i48 (DR tries the head of each place first)
 # Rule:         the owner is created ONLY with plain `init` (random device id). Never
 #               `init --mnemonic` for the owner: it hides the ghost device (dr-i19) and the cert
 #               path (dr-i22).
@@ -32,7 +37,13 @@
 #               in listen_addrs). "--peer goes first" (prepend_seed_addrs) is NOT separately
 #               proven here — a no-op prepend stays green; it is proven by the unit test
 #               restored_db_keeps_seed_addr_from_peer_arg_over_snapshot_addr only.
-# Mutations:    no merge of live peers after restore_db_force → step 6 (node-01 never "auth");
+# Mutations:    pointer into the master box / postman keyed by the master → step 2 (0 lines
+#               target=RADDR, lines target=<master>); `from_device = master` → DR "no
+#               catalog found" (steps 4b, 6); sweep of SS blobs off → step 2b (3 base blobs);
+#               readiness without the acks threshold → step 2a (iff check); order_attempts
+#               by freshness only → BLIND here (every postman holds the heads; unit tests
+#               dr_tries_both_place_heads_*);
+#               no merge of live peers after restore_db_force → step 6 (node-01 never "auth");
 #               no ownership rewrite (dr-i19) → step 8 positive control; DR inherits the
 #               source history → step 6 lineage check; "missing file → Deleted" → step 8
 #               (BLOCK3); status "ready" on a built but unaccepted pointer → unit test only.
@@ -62,9 +73,28 @@
 #     file_block_hex (else FAIL setup, as in local_pack_delete_test)
 #  2. right after start (before the first push tick): status dr_pointer_published_at == 0; then
 #     poll ≤ 300 s until dr_pointer_files == 3 && dr_pointer_acks ≥ 1; ≥ 1 of nodes 01-04 logged
-#     "mailbox: stored SelfPointer entry" with target = the owner's identity at or after that
-#     publication time (dr-i9); L_OWNER = node-00 status .catalog_lineage
-#     — check: status_num, log timestamps on other nodes filtered by target
+#     "mailbox: stored SelfPointer entry" with target = RADDR (the phrase's rendezvous box,
+#     `mailbox-probe rendezvous --phrase M`) at or after that publication time (dr-i9), and
+#     NO such line with target = the owner's master (mailbox-i39); L_OWNER = node-00 status
+#     .catalog_lineage — check: status_num, log timestamps on other nodes filtered by target
+# 2a. dr-i49/dr-i50/dr-i52: one status snapshot every 10 s for W + 60 s (W = 7 d /
+#     TIME_SCALE ≈ 605 s): dr_ready stays true in EVERY snapshot — a new envelope collecting
+#     acks does not blink it (dr-i52), so a single false = FAIL;
+#     in every snapshot dr_ready ⇔ (acks ≥ threshold ∧ blocks_placed == blocks_total > 0) and
+#     acks ≤ the number of postmen that logged a store for RADDR (W4б) — check: api_get | jq
+# 2b. mailbox-i56 / V.16.4: the owner restarts twice (a new base per process); after each
+#     restart wait for a publication of a NEW base (base= not seen before), reading
+#     dr_ready every 5 s meanwhile: it is true in every snapshot — the other place stays
+#     restorable while the new base collects acks (dr-i53; regression guard only: with
+#     live postmen the "new base at 1-2 acks" window does not open here, so the rule
+#     itself is proven by the unit readiness_holds_on_the_other_place_while_a_new_base_
+#     collects_acks — cannot close in E2E) — and at the end status
+#     names dr_restores_state_of > 0 ("DR would restore the catalog as of …"). Then: the
+#     owner's publications used place=A and place=B; the postmen's msg_ids for RADDR are
+#     ⊆ {slot_a, slot_b} (probe, L_OWNER) and one postman holds both; in the owner's
+#     system_state/ exactly 2 base blobs remain of all bases ever built (the displaced one
+#     is retired once its replacement has the threshold acks), total blobs ≤ 2 × 21
+#     — check: grep base=/place=, sp_msg_ids, ls system_state/
 #  3. ADVERSARIAL kill node-00 (its folder = OLD). Folder X = plain `init` (foreign key).
 #     dr with a typo of M into X → exit≠0, error about the phrase; X/identity.key unchanged
 #     (dr-i3) — check: rc, grep, sha256
@@ -74,7 +104,10 @@
 #     status_num 1 peer_count_authenticated ≥ 1
 #  4. ADVERSARIAL empty folder Y: dr --mnemonic M_X → exit≠0 "no catalog found", Y has no
 #     identity.key; then dr M into Y → exit 0, "Identity restored:" == I, Files == 3 (dr-i4,
-#     dr-i2) — check: rc, [ ! -e ], hex compare, FILES_N -eq 3
+#     dr-i2); the DR log names "dr: rendezvous box address=RADDR"; its attempts 1 and 2 are
+#     the heads of places A and B: places {A, B}, bases == the owner's last published base
+#     of that place, the fresher first (dr-i48)
+#     — check: rc, [ ! -e ], hex compare, FILES_N -eq 3, dr_attempt_plan
 #  5. ADVERSARIAL H0 = sha256(OLD/db.redb); dr M into OLD → exit 0; OLD/db.redb.dr-bak == H0;
 #     OLD/identity.key unchanged; second dr into OLD → .dr-bak still H0, .dr-bak.1 exists
 #     (dr-i5). Live half: PRECONDITION node-01 dr_pointer_acks ≥ 1 (a DR that wrongly passed
@@ -113,6 +146,8 @@
 #     by its MASTER (dr-i8). SKELETON ONLY: not implemented until CROWN-1 C4.
 # 10. move restored f3 back → poll files_without_source == 0 (f1 deleted = not live)
 #     (dr-i11) — check: status_num
+# 11. no honest node logged "store rejected — plaintext payload" or "SelfPointer in the
+#     master box — dropped" (mailbox-i39, i40) — check: grep over all node logs
 #
 # Usage:
 #   ./rbuild.sh      # release binary, built on the server
@@ -244,11 +279,12 @@ run_dr() {
     fi
 }
 
-# Epoch seconds of the last "stored SelfPointer entry" line FOR THE OWNER (target = I_00) in
-# node IDX's log (0 = none). Every node publishes its own pointer; only the owner's counts.
+# Epoch seconds of the last "stored SelfPointer entry" line FOR THE OWNER (target = RADDR, the
+# owner's rendezvous box) in node IDX's log (0 = none). Every node publishes its own pointer;
+# only the owner's counts.
 last_pointer_store_epoch() {
     local ts
-    ts=$(plain_log "$1" | grep -a "mailbox: stored SelfPointer entry" | grep -a "target=${I_00:0:16}" \
+    ts=$(plain_log "$1" | grep -a "mailbox: stored SelfPointer entry" | grep -a "target=${RADDR}" \
         | tail -1 | awk '{print $1}' || true)
     [ -n "$ts" ] || { echo 0; return; }
     date -d "$ts" +%s 2>/dev/null || echo 0
@@ -264,6 +300,8 @@ if ! command -v "$BINARY" &>/dev/null; then
     BINARY="./target/release/viaticum"
     [ -x "$BINARY" ] || { echo "ERROR: viaticum binary not found. Run: ./rbuild.sh"; exit 1; }
 fi
+PROBE="$(cd "$(dirname "$(command -v "$BINARY")")" && pwd)/mailbox-probe"
+[ -x "$PROBE" ] || { echo "ERROR: $PROBE not found (cargo build --release -p viaticum --features e2e-tools)"; exit 1; }
 
 # shellcheck source=experiments/e2e_lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/e2e_lib.sh"
@@ -293,6 +331,9 @@ if [ ${#I_00} -eq 64 ] && [ ${#D_OLD} -eq 64 ] && [ "$(echo "$M" | wc -w)" -eq 2
 else
     fail "init output not parsed (I='$I_00' D='$D_OLD')"; exit 1
 fi
+RADDR=$("$PROBE" rendezvous --phrase "$M" --json | jq -r .address_short)
+[ ${#RADDR} -eq 16 ] || { fail "mailbox-probe rendezvous gave no address for M"; exit 1; }
+echo "  rendezvous box of M: $RADDR (offline, from the phrase)"
 
 start_daemon 0 "$TIME_SCALE"
 wait_daemon 0 || { fail "node-00 daemon not responding"; exit 1; }
@@ -366,9 +407,152 @@ for i in "${HOLDERS[@]}"; do
     if [ "$PUB_AT" -gt 0 ] && [ "$e" -ge "$PUB_AT" ]; then POSTMEN_OK=$((POSTMEN_OK + 1)); fi
 done
 if [ "$POSTMEN_OK" -ge 1 ]; then
-    pass "$POSTMEN_OK postman(s) logged storing the owner's SelfPointer (target=${I_00:0:16}) at/after the publication"
+    pass "$POSTMEN_OK postman(s) logged storing the owner's SelfPointer (target=$RADDR, the phrase's rendezvous box) at/after the publication"
 else
-    fail "no postman logged storing the owner's SelfPointer (target=${I_00:0:16}) at/after $PUB_AT"
+    fail "no postman logged storing the owner's SelfPointer (target=$RADDR) at/after $PUB_AT"
+fi
+IN_MASTER_BOX=0
+for i in "${HOLDERS[@]}"; do
+    n=$(plain_log "$i" | grep -a "mailbox: stored SelfPointer entry" | grep -ac "target=${I_00:0:16}" || true)
+    IN_MASTER_BOX=$((IN_MASTER_BOX + ${n:-0}))
+done
+if [ "$POSTMEN_OK" -ge 1 ] && [ "$IN_MASTER_BOX" -eq 0 ]; then
+    pass "0 pointer store lines with target = the owner's master ${I_00:0:16} (mailbox-i39)"
+else
+    fail "$IN_MASTER_BOX pointer store line(s) with target = the owner's master ${I_00:0:16} (postmen OK: $POSTMEN_OK)"
+fi
+
+# ── STEP 2a: READINESS HOLDS LONGER THAN THE HOLDER WINDOW ───────
+echo ""
+W_SECS=$(( 7 * 24 * 3600 / TIME_SCALE ))
+HOLD_SECS=$(( W_SECS + 60 ))
+echo "=== Step 2a: dr_ready holds for ${HOLD_SECS}s > W = ${W_SECS}s, never blinks; ready ⇔ acks ≥ threshold ∧ all blocks placed (dr-i49, dr-i50, dr-i52) ==="
+# One snapshot → "ready acks threshold placed total" (empty when the API is unreachable).
+ready_snapshot() {
+    api_get 0 /api/status | jq -r '"\(.dr_ready) \(.dr_pointer_acks) \(.dr_pointer_ack_threshold) \(.dr_ss_blocks_placed) \(.dr_ss_blocks_total)"' 2>/dev/null || true
+}
+FIRST_READY=0
+for _ in $(seq 1 60); do
+    [ "$(status_num 0 dr_ready)" = "true" ] && { FIRST_READY=1; break; }
+    sleep 5
+done
+if [ "$FIRST_READY" -eq 1 ]; then
+    pass "status: dr_ready (acks $(status_num 0 dr_pointer_acks)/$(status_num 0 dr_pointer_ack_threshold), blocks $(status_num 0 dr_ss_blocks_placed)/$(status_num 0 dr_ss_blocks_total))"
+else
+    fail "dr_ready never true within 300 s (acks $(status_num 0 dr_pointer_acks)/$(status_num 0 dr_pointer_ack_threshold), blocks $(status_num 0 dr_ss_blocks_placed)/$(status_num 0 dr_ss_blocks_total), refusal '$(status_num 0 dr_pointer_refusal)')"
+fi
+T2A=$(date +%s); SAMPLES=0; HOLD_BAD=""; IFF_BAD=""; ACKS_BAD=""
+while [ $(( $(date +%s) - T2A )) -lt "$HOLD_SECS" ]; do
+    read -r rdy acks thr placed total <<< "$(ready_snapshot)"
+    if [ -z "${total:-}" ]; then HOLD_BAD="status unreadable at +$(( $(date +%s) - T2A ))s"; break; fi
+    SAMPLES=$((SAMPLES + 1))
+    exp=false
+    if [ "$acks" -ge "$thr" ] && [ "$total" -gt 0 ] && [ "$placed" -eq "$total" ]; then exp=true; fi
+    [ "$rdy" = "$exp" ] || IFF_BAD="ready=$rdy but acks=$acks threshold=$thr placed=$placed/$total"
+    np=$(sp_postmen_with_store "$RADDR" "${HOLDERS[@]}")
+    [ "$acks" -le "$np" ] || ACKS_BAD="acks=$acks > $np postmen with a store line for $RADDR"
+    if [ "$rdy" != "true" ]; then
+        HOLD_BAD="dr_ready false at +$(( $(date +%s) - T2A ))s (acks=$acks/$thr placed=$placed/$total; dr-i52: no blink)"
+        break
+    fi
+    sleep 10
+done
+if [ -z "$HOLD_BAD" ] && [ "$SAMPLES" -ge $(( HOLD_SECS / 12 )) ]; then
+    pass "dr_ready held for ${HOLD_SECS}s > W over $SAMPLES snapshots (holders stay seen: dr-i50)"
+else
+    fail "readiness hold: ${HOLD_BAD:-only $SAMPLES snapshots}"
+fi
+[ -z "$IFF_BAD" ] && pass "every snapshot: dr_ready ⇔ acks ≥ threshold ∧ blocks placed == total > 0" \
+    || fail "readiness formula broken: $IFF_BAD"
+[ -z "$ACKS_BAD" ] && [ "$SAMPLES" -gt 0 ] && pass "every snapshot: dr_pointer_acks ≤ postmen that logged a store for $RADDR (W4б)" \
+    || fail "acks bound: ${ACKS_BAD:-no snapshots}"
+
+# ── STEP 2b: THE OWNER RESTARTS TWICE — TWO PLACES, BOUNDED SS BLOBS ─
+echo ""
+echo "=== Step 2b: owner restarts twice: a new base per process takes a place by strength (mailbox-i56, V.16.4) ==="
+published_bases() {
+    plain_log 0 | grep -a "SelfPointer published via mailbox" | grep -oE 'base=[0-9a-f]+' | cut -d= -f2 | sort -u || true
+}
+restart_owner_new_base() {
+    local seen from line
+    seen=$(published_bases | tr '\n' ' ')
+    stop_daemon 0
+    from=$(log_line_count 0)
+    start_daemon 0 "$TIME_SCALE"
+    wait_daemon 0 || { fail "node-00 did not restart"; return 1; }
+    for i in "${HOLDERS[@]}"; do run_cli_q "$i" connect "$ADDR_00" > /dev/null; done
+    for _ in $(seq 1 60); do
+        # dr-i53: the other place stays restorable while the new base collects acks.
+        rdy=$(status_num 0 dr_ready)
+        if [ "$rdy" != "true" ] && [ -z "$READY_DROP" ]; then
+            READY_DROP="restart $r: dr_ready=$rdy (acks $(status_num 0 dr_pointer_acks)/$(status_num 0 dr_pointer_ack_threshold), blocks $(status_num 0 dr_ss_blocks_placed)/$(status_num 0 dr_ss_blocks_total))"
+        fi
+        line=$(log_since 0 "$from" | grep -a "SelfPointer published via mailbox" \
+            | grep -oE 'base=[0-9a-f]+.*place=[AB]' | tail -1 || true)
+        NEW_BASE=$(echo "$line" | grep -oE 'base=[0-9a-f]+' | cut -d= -f2 || true)
+        NEW_PLACE=$(echo "$line" | grep -oE 'place=[AB]' | cut -d= -f2 || true)
+        if [ -n "$NEW_BASE" ] && ! echo " $seen " | grep -q " $NEW_BASE "; then return 0; fi
+        sleep 5
+    done
+    NEW_BASE=""; NEW_PLACE=""
+    return 1
+}
+RESTART_OK=1; READY_DROP=""
+for r in 1 2; do
+    if restart_owner_new_base; then
+        echo "  restart $r: new base $NEW_BASE published into place $NEW_PLACE"
+    else
+        RESTART_OK=0; fail "restart $r: no publication of a new base within 300 s"
+    fi
+done
+RESTORES_AT=$(status_num 0 dr_restores_state_of)
+if [ "$RESTART_OK" -eq 1 ] && [ -z "$READY_DROP" ] && [ "$(status_num 0 dr_ready)" = "true" ] \
+    && [ "$RESTORES_AT" -gt 0 ] && [ "$RESTORES_AT" -le "$(date +%s)" ]; then
+    pass "dr_ready held through both restarts, every snapshot (dr-i53); DR restores the catalog as of $RESTORES_AT"
+    run_cli_q 0 status | grep -a "DR would restore" | sed 's/^/    | /' || true
+else
+    fail "readiness through restarts (dr-i53): ${READY_DROP:-dr_ready=$(status_num 0 dr_ready) dr_restores_state_of=$RESTORES_AT}"
+fi
+PLACES_USED=$(plain_log 0 | grep -a "SelfPointer published via mailbox" | grep -oE 'place=[AB]' | sort -u | tr '\n' ' ' || true)
+if [ "$RESTART_OK" -eq 1 ] && [ "$PLACES_USED" = "place=A place=B " ]; then
+    pass "after two restarts the owner has published into both places ($PLACES_USED)"
+else
+    fail "owner's places after restarts: '$PLACES_USED'"
+fi
+SLOTS=$("$PROBE" rendezvous --phrase "$M" --lineage "$L_OWNER" --json)
+SLOT_A=$(echo "$SLOTS" | jq -r .slot_a); SLOT_B=$(echo "$SLOTS" | jq -r .slot_b)
+IDS=$(sp_msg_ids "$RADDR" "${HOLDERS[@]}")
+FOREIGN=""
+for id in $IDS; do [ "$id" = "$SLOT_A" ] || [ "$id" = "$SLOT_B" ] || FOREIGN="$FOREIGN $id"; done
+BOTH_AT=0
+for i in "${HOLDERS[@]}"; do
+    ids_i=$(sp_msg_ids "$RADDR" "$i")
+    echo " $ids_i " | grep -q " $SLOT_A " && echo " $ids_i " | grep -q " $SLOT_B " && BOTH_AT=$((BOTH_AT + 1))
+done
+if [ -n "$IDS" ] && [ -z "$FOREIGN" ] && [ "$BOTH_AT" -ge 1 ]; then
+    pass "postmen stored only the two place slots of the owner's history for $RADDR; $BOTH_AT postman(s) hold both"
+else
+    fail "postman msg_ids for $RADDR: '$IDS' (slot_a $SLOT_A, slot_b $SLOT_B, foreign:${FOREIGN:- none}, both at $BOTH_AT)"
+fi
+ALL_BASES=$(plain_log 0 | grep -aE "system_state push: (base published|compacted to new base)" \
+    | grep -oE 'base=[0-9a-f]+' | cut -d= -f2 | sort -u || true)
+SS_DIR="$(node_dir 0)/system_state"
+base_blobs() {
+    local n=0 b
+    for b in $ALL_BASES; do ls "$SS_DIR"/"$b"*.bin >/dev/null 2>&1 && n=$((n + 1)); done
+    echo "$n"
+}
+BB=0
+for _ in $(seq 1 36); do
+    BB=$(base_blobs)
+    [ "$BB" -eq 2 ] && break
+    sleep 5
+done
+TOTAL_BLOBS=$(find "$SS_DIR" -maxdepth 1 -name '*.bin' 2>/dev/null | wc -l)
+if [ "$BB" -eq 2 ] && [ "$TOTAL_BLOBS" -le 42 ]; then
+    pass "SS blobs: 2 of $(echo "$ALL_BASES" | wc -w) bases ever built remain (the two places), $TOTAL_BLOBS blobs in total (≤ 2 × 21)"
+else
+    fail "SS blobs: $BB base blobs of $(echo "$ALL_BASES" | wc -w) bases remain (want 2), $TOTAL_BLOBS blobs in total"
 fi
 
 # ── STEP 3: MACHINE LOST; TYPO INTO A FOREIGN FOLDER ─────────────
@@ -426,6 +610,26 @@ if [ "$DR_RC" -eq 0 ] && [ "$GOT_I" = "$I_00" ] && [ "${FILES_N:-0}" -eq "$JOURN
     pass "M into Y: exit 0, identity == init's, Files == $FILES_N"
 else
     fail "M into Y: exit $DR_RC identity=${GOT_I:0:16} Files=${FILES_N:-none} ('$DR_ERRLINE')"
+fi
+# The field is ANSI-coloured in the raw log: strip first; count, not -q (pipefail SIGPIPE).
+if [ "$(sed 's/\x1b\[[0-9;]*m//g' "$DR_LOG" | grep -ac "dr: rendezvous box address=$RADDR" || true)" -ge 1 ]; then
+    pass "DR looked in the phrase's rendezvous box $RADDR"
+else
+    fail "DR log has no 'dr: rendezvous box address=$RADDR'"
+fi
+PLAN=$(dr_attempt_plan "$DR_LOG")
+echo "$PLAN" | sed 's/^/    plan: /'
+P1=$(echo "$PLAN" | sed -n 1p); P2=$(echo "$PLAN" | sed -n 2p)
+HEAD_A=$(last_published_base 0 A); HEAD_B=$(last_published_base 0 B)
+PL1=$(echo "$P1" | awk '{print $2}'); PL2=$(echo "$P2" | awk '{print $2}')
+B1=$(echo "$P1" | awk '{print $4}'); B2=$(echo "$P2" | awk '{print $4}')
+C1=$(echo "$P1" | awk '{print $3}'); C2=$(echo "$P2" | awk '{print $3}')
+head_of() { [ "$1" = A ] && echo "$HEAD_A" || echo "$HEAD_B"; }
+if [ -n "$P2" ] && [ "$PL1$PL2" = "AB" -o "$PL1$PL2" = "BA" ] \
+    && [ "$B1" = "$(head_of "$PL1")" ] && [ "$B2" = "$(head_of "$PL2")" ] && [ "$C1" -ge "$C2" ]; then
+    pass "DR attempts 1-2 are the heads of places $PL1 ($B1) and $PL2 ($B2), fresher first (dr-i48)"
+else
+    fail "DR attempt plan: 1='$P1' 2='$P2'; owner's last bases A=$HEAD_A B=$HEAD_B"
 fi
 
 # ── STEP 5: DR INTO THE OLD FOLDER, TWICE; INTO A LIVE NODE ───────
@@ -668,6 +872,16 @@ for _ in $(seq 1 60); do
 done
 if [ "$OK10" -eq 1 ]; then pass "files_without_source == 0 (f1 deleted = not live, f2 and f3 in place)"
 else fail "files_without_source == $(status_num 0 files_without_source) after putting f3 back (want 0)"; fi
+
+# ── STEP 11: HONEST NODES NEVER HIT THE POINTER GUARDS ───────────
+echo ""
+echo "=== Step 11: no plaintext-pointer refusal, no pointer in a master box (mailbox-i39, i40) ==="
+NEG=$(honest_mailbox_negatives 0 "${HOLDERS[@]}")
+if [ -z "$NEG" ] && [ "$POSTMEN_OK" -ge 1 ]; then
+    pass "0 'store rejected — plaintext payload' and 0 'SelfPointer in the master box' lines on all nodes"
+else
+    fail "pointer guards hit on honest nodes: $(echo "$NEG" | head -3)"
+fi
 
 # ── RESULTS ─────────────────────────────────────────────────────
 echo ""

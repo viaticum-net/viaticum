@@ -4,6 +4,7 @@
 //! Consumed by `web_api` handlers. Previously also consumed by `cli_server`
 //! (Unix socket) — removed in the macOS port HTTP-unification work.
 
+use viaticum_core::system_state::catalog::{RefusalKind, WaitingReason};
 use viaticum_core::trust::compute_combined;
 use viaticum_core::types::{
     FileRecord, FileVersion, LocalState, PlacementStatus, SourceBlockStatus, Timestamp, hex_encode,
@@ -277,7 +278,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         ),
         staging.bytes,
     );
-    let mut dr = dr_readiness(&state.db);
+    let mut dr = dr_readiness(&state.db, Timestamp::now().0, state.time_scale);
     dr.files_without_source = state.missing_sources.get(&state.db).await;
 
     CliResponse::Status(Box::new(StatusData {
@@ -318,10 +319,19 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         dr_pointer_acks: dr.acks,
         catalog_lineage: dr.lineage,
         files_without_source: dr.files_without_source,
+        dr_ready: dr.ready,
+        dr_pointer_ack_threshold: dr.threshold,
+        dr_ss_blocks_placed: dr.blocks_placed,
+        dr_ss_blocks_total: dr.blocks_total,
+        dr_pointer_refusal: dr.refusal,
+        dr_waiting_since: dr.waiting_since,
+        dr_waiting: dr.waiting,
+        dr_restores_state_of: dr.restores_state_of,
     }))
 }
 
-/// Status fields about DR readiness (dr-i9) and missing sources (dr-i11).
+/// Status fields about DR readiness (dr-i9, dr-i39, dr-i41, dr-i49; mailbox-i49, i54)
+/// and missing sources (dr-i11).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct DrReadiness {
     pub(crate) published_at: u64,
@@ -329,22 +339,54 @@ pub(crate) struct DrReadiness {
     pub(crate) acks: u32,
     pub(crate) lineage: String,
     pub(crate) files_without_source: u32,
+    pub(crate) ready: bool,
+    pub(crate) threshold: u32,
+    pub(crate) blocks_placed: u32,
+    pub(crate) blocks_total: u32,
+    /// Words: why friends refused the pointer of the newest base ("" = no refusal).
+    pub(crate) refusal: String,
+    pub(crate) waiting_since: u64,
+    /// Words: why the newest changes are not in the network yet ("" = they are).
+    pub(crate) waiting: String,
+    /// dr-i53: `created_at` of the catalog state DR restores; 0 = not ready.
+    pub(crate) restores_state_of: u64,
 }
 
-/// Read-only: the last ACCEPTED pointer publication (never a pointer only built) and
-/// this DB's history id (not minted here). A DB read error leaves the corresponding
-/// fields at their "unknown" zero. `files_without_source` is filled by the caller from
-/// the background-counted `MissingSourceCache` (one stat per file is too slow inline).
-pub(crate) fn dr_readiness(db: &viaticum_core::db::Db) -> DrReadiness {
+/// Read-only: the pointer places in META (never a pointer only built, dr-i9) and this
+/// DB's history id (not minted here). A DB read error leaves the corresponding fields at
+/// their "unknown" zero. `files_without_source` is filled by the caller from the
+/// background-counted `MissingSourceCache` (one stat per file is too slow inline).
+pub(crate) fn dr_readiness(
+    db: &viaticum_core::db::Db,
+    now_secs: u64,
+    time_scale: u64,
+) -> DrReadiness {
     let mut r = DrReadiness::default();
-    match db.last_pointer_publication() {
-        Ok(Some(p)) => {
-            r.published_at = p.created_at.0;
-            r.files = p.files;
-            r.acks = p.acks;
+    let known_peers = db.list_all_peers().map(|p| p.len()).unwrap_or(0);
+    match crate::daemon::system_state::strength::pointer_readiness(
+        db,
+        known_peers,
+        now_secs,
+        time_scale,
+    ) {
+        Ok(p) => {
+            if let Some((at, files, acks)) = p.accepted {
+                r.published_at = at;
+                r.files = files;
+                r.acks = acks;
+            }
+            r.ready = p.ready;
+            r.restores_state_of = p.restores_state_of.unwrap_or(0);
+            r.threshold = p.threshold;
+            r.blocks_placed = p.blocks_placed;
+            r.blocks_total = p.blocks_total;
+            r.refusal = p.refusal.map(refusal_words).unwrap_or_default();
+            if let Some(w) = p.waiting {
+                r.waiting_since = w.since;
+                r.waiting = waiting_words(w.reason).to_string();
+            }
         }
-        Ok(None) => {}
-        Err(e) => tracing::warn!(error = %e, "status: cannot read the last pointer publication"),
+        Err(e) => tracing::warn!(error = %e, "status: cannot read the pointer places"),
     }
     match db.catalog_lineage() {
         Ok(Some(l)) => r.lineage = l.to_hex(),
@@ -352,6 +394,49 @@ pub(crate) fn dr_readiness(db: &viaticum_core::db::Db) -> DrReadiness {
         Err(e) => tracing::warn!(error = %e, "status: cannot read the catalog history id"),
     }
     r
+}
+
+/// The refusal of the pointer in words (CROWN-1 V.15.3, V.16.4 п.9 / NOTE-C).
+pub(crate) fn refusal_words(kind: RefusalKind) -> String {
+    match kind {
+        RefusalKind::ClockSkew => {
+            "DR: not ready — friends refused the recovery pointer: this computer's clock looks wrong"
+                .to_string()
+        }
+        RefusalKind::SlotsFull => "DR: not ready — this recovery phrase already has 64 installations \
+             stored at friends; there is no room for this one"
+            .to_string(),
+        RefusalKind::Superseded => {
+            "DR: friends hold a pointer newer than this computer's clock — the clock went back"
+                .to_string()
+        }
+        RefusalKind::Mixed {
+            clock,
+            superseded,
+            slots_full,
+            other,
+        } => {
+            let mut s = format!(
+                "DR: not ready — friends refused the pointer ({clock} clock, {superseded} newer \
+                 pointer held, {slots_full} full"
+            );
+            if other > 0 {
+                s.push_str(&format!(", {other} other"));
+            }
+            s.push(')');
+            s
+        }
+        RefusalKind::NoAck => "DR: not ready — no friend answered the last pointer publication".to_string(),
+    }
+}
+
+/// Why the newest catalog changes wait (mailbox-i54).
+pub(crate) fn waiting_words(reason: WaitingReason) -> &'static str {
+    match reason {
+        WaitingReason::BlocksNotPlaced => "catalog blocks not placed",
+        WaitingReason::Refused => "friends refused",
+        WaitingReason::NoAck => "no friend answered",
+    }
 }
 
 // ── Files ─────────────────────────────────────────────────────────────────────
@@ -831,7 +916,7 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
             Ok(payload) => {
                 // Build storage-relationship target-master set.
                 use std::collections::HashSet;
-                use viaticum_core::mailbox::{MailboxClass, MailboxEntry};
+                use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
                 use viaticum_core::types::IdentityPub;
 
                 let my_master: IdentityPub =
@@ -917,7 +1002,7 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
                     for target_master in &target_masters {
                         let msg_id: [u8; 16] = rand::random();
                         let entry = MailboxEntry {
-                            target: *target_master,
+                            target: MailboxAddress::for_master(target_master),
                             msg_id,
                             class: MailboxClass::Revocation,
                             payload_version: 1,
@@ -926,7 +1011,7 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
                             stored_at: now_secs,
                             sender: Some(my_master),
                         };
-                        match mailbox_router.publish(target_master, entry).await {
+                        match mailbox_router.publish(entry, None).await {
                             Ok(0) => {
                                 zero_ack_targets += 1;
                                 tracing::warn!(

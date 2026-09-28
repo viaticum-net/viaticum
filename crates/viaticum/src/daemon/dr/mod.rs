@@ -19,10 +19,13 @@
 //   3. Db::create_from_file on the claimed staging file
 //   4. SwarmHandle with the seed peers as Kademlia bootstrap peers
 //   5. wait_for_kad_bootstrap_stable: authenticated peers upserted to the staging DB
-//   6. get_closest_peers(dr_lookup_key(master)) — the PREIMAGE (F12) → dial them
-//   7. MailboxRouter::dr_collect_pointers: every valid pointer from every batch
-//      (CS-DR-1); select_catalog: one history → it, several → the user chooses with
-//      --catalog (spec B2 slice B2.2a)
+//   6. RendezvousKeys from the seed (CROWN-1 C3a: one permanent box, no clock);
+//      get_closest_peers(dr_lookup_key(rendezvous address)) — the PREIMAGE (F12) → dial
+//   7. MailboxRouter::dr_collect_pointers: every valid pointer of every place from every
+//      batch (CS-DR-1), opened with the seed-derived seal key; select_catalog: one
+//      history → it, several → the user chooses with --catalog (spec B2 slice B2.2a);
+//      attempts: the freshest pointer of each of the history's two places first, then
+//      the rest (V.17.3)
 //   8. dial the pointer's holders (one dial each, all at once), fetch base + diffs,
 //      apply_diffs; the lost device becomes this DR's device in every file record
 //      (dr-i19); restore into the staging DB and merge the peers learned live back
@@ -31,11 +34,14 @@
 //   9. commit (dr/commit, synchronous): old db.redb → .dr-bak[.N], staging → db.redb,
 //      key last. A signal during the commit is only queued: the commit completes.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use viaticum_core::constants::DR_KAD_STABILIZE_TIMEOUT_SECS;
+use viaticum_core::mailbox::MailboxAddress;
+use viaticum_core::mailbox::seal::{PointerPlace, RendezvousKeys};
 use viaticum_core::system_state::catalog::{
     CatalogSelectError, check_catalog_prefix, select_catalog,
 };
@@ -53,6 +59,8 @@ mod commit;
 mod net;
 mod preflight;
 mod restored;
+
+pub(crate) use net::addr_rank;
 
 #[cfg(test)]
 mod tests;
@@ -130,11 +138,11 @@ fn dr_failed(reason: impl std::fmt::Display) -> DrError {
     }
 }
 
-/// Kademlia lookup key for the identity's postmen: the PREIMAGE `master_pub` (F12,
-/// AC-18). libp2p-kad hashes the key it is given; postmen are ranked by
-/// `SHA256(master_pub)` (`KademliaRoutingView::target_key`), so passing that hash would
-/// walk towards `SHA256(SHA256(master_pub))`.
-pub(crate) fn dr_lookup_key(target: &IdentityPub) -> Vec<u8> {
+/// Kademlia lookup key for the postmen of a mailbox address: the PREIMAGE `address.0`
+/// (F12, AC-18). libp2p-kad hashes the key it is given; postmen are ranked by
+/// `SHA256(address.0)` (`KademliaRoutingView::target_key`), so passing that hash would
+/// walk towards `SHA256(SHA256(address.0))`.
+pub(crate) fn dr_lookup_key(target: &MailboxAddress) -> Vec<u8> {
     target.0.to_vec()
 }
 
@@ -299,7 +307,13 @@ async fn recover_into_staging(
         identity_pub: my_master_pub,
         cluster_master_pub: my_master_pub,
         device_cert,
-        x25519_pub: None,
+        // F11: the DR node announces the same x25519 key as the daemon of this phrase.
+        x25519_pub: Some(
+            x25519_dalek::PublicKey::from(&viaticum_core::cluster::derive_x25519_secret(
+                &keyfile.seed,
+            ))
+            .to_bytes(),
+        ),
         listen_port: 0,
         cert_timeout_secs: net::AUTH_TIMEOUT_SECS,
         kademlia_bootstrap_peers: seed_multiaddrs.clone(),
@@ -323,9 +337,12 @@ async fn recover_into_staging(
     .await;
     println!("Bootstrap stabilization: {kad_peers} peer(s) authenticated.");
 
-    // ── 6. The identity's postmen via Kademlia (F12: pass the preimage) ───────
-    match swarm_handle
-        .get_closest_peers(dr_lookup_key(&my_master_pub))
+    // ── 6. The pointer box's postmen via Kademlia (F12: pass the preimage) ────
+    // CROWN-1 C3a: the box and every key come from the phrase only (no clock).
+    let rv = RendezvousKeys::derive(&keyfile.seed);
+    tracing::info!(address = %rv.address, "dr: rendezvous box");
+    let closest = match swarm_handle
+        .get_closest_peers(dr_lookup_key(&rv.address))
         .await
     {
         Ok(closest) => {
@@ -333,14 +350,18 @@ async fn recover_into_staging(
                 count = closest.len(),
                 "dr: get_closest_peers returned candidate peers"
             );
-            net::dial_and_authenticate_candidates(&swarm_handle, &mut event_rx, &db, closest).await;
+            closest
         }
         Err(e) => {
             tracing::warn!(
-                "dr: get_closest_peers failed: {e}; proceeding with bootstrap-authenticated peers"
+                "dr: get_closest_peers failed: {e}; proceeding with the authenticated peers"
             );
+            Vec::new()
         }
-    }
+    };
+    // Also on a failed lookup: it upserts the peers that authenticated after the
+    // stabilization wait stopped, so the walk asks every postman DR reached (dr-i1).
+    net::dial_and_authenticate_candidates(&swarm_handle, &mut event_rx, &db, closest).await;
     if db
         .list_all_peers()
         .map_err(|e| dr_failed(format!("recovery database: {e}")))?
@@ -354,7 +375,7 @@ async fn recover_into_staging(
     let router = Arc::new(MailboxRouter::new(Arc::clone(&swarm_handle), db.clone()));
     println!("Searching for SelfPointer via mailbox...");
     let walk = router
-        .dr_collect_pointers(&my_master_pub)
+        .dr_collect_pointers(&rv, &my_master_pub, &device_id)
         .await
         .map_err(|e| dr_failed(format!("pointer search: {e}")))?;
     println!(
@@ -376,7 +397,13 @@ async fn recover_into_staging(
             responders: Some(walk.responders),
         });
     }
-    let choice = match select_catalog(walk.pointers, requested_catalog.as_deref()) {
+    let slot_of: HashMap<[u8; 64], [u8; 16]> = walk
+        .pointers
+        .iter()
+        .map(|(msg_id, p)| (p.signature, *msg_id))
+        .collect();
+    let pointers: Vec<SelfPointer> = walk.pointers.into_iter().map(|(_, p)| p).collect();
+    let choice = match select_catalog(pointers, requested_catalog.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             if !e.rows().is_empty() {
@@ -400,11 +427,14 @@ async fn recover_into_staging(
     }
     let rows = choice.rows;
     let source_lineage = choice.selected.catalog.lineage;
-    // dr-i35: the head first, then older pointers of the SAME history.
-    let attempts: Vec<SelfPointer> = std::iter::once(choice.selected)
-        .chain(choice.fallbacks)
-        .take(MAX_POINTER_ATTEMPTS)
-        .collect();
+    // dr-i35 / V.17.3: the freshest pointer of each place of the history first, then
+    // older pointers of the SAME history.
+    let place_slots = [
+        rv.pointer_slot(&source_lineage.0, PointerPlace::A),
+        rv.pointer_slot(&source_lineage.0, PointerPlace::B),
+    ];
+    let attempts = order_attempts(choice.selected, choice.fallbacks, &slot_of, place_slots);
+    log_attempt_plan(&attempts, &slot_of, place_slots);
 
     // ── 8. Holders, blocks, state ─────────────────────────────────────────────
     let dr_key = crate::daemon::system_state::identity_key_bytes_from_seed(&keyfile.seed)
@@ -490,9 +520,82 @@ async fn recover_into_staging(
     // Everything holding the staging DB (router, db) and the swarm drops here.
 }
 
+/// The place (`A`, `B`, or `-` for an unknown `msg_id`) whose slot `p` was opened from.
+pub(crate) fn attempt_place(
+    p: &SelfPointer,
+    slot_of: &HashMap<[u8; 64], [u8; 16]>,
+    place_slots: [[u8; 16]; 2],
+) -> &'static str {
+    match slot_of.get(&p.signature) {
+        Some(s) if *s == place_slots[0] => "A",
+        Some(s) if *s == place_slots[1] => "B",
+        _ => "-",
+    }
+}
+
+/// One line per planned attempt, in order (dr-i48 observable in E2E):
+/// `dr: attempt i/N place=A|B|- created_at=… base=…`.
+fn log_attempt_plan(
+    attempts: &[SelfPointer],
+    slot_of: &HashMap<[u8; 64], [u8; 16]>,
+    place_slots: [[u8; 16]; 2],
+) {
+    let n = attempts.len();
+    for (i, p) in attempts.iter().enumerate() {
+        tracing::info!(
+            "dr: attempt {}/{} place={} created_at={} base={}",
+            i + 1,
+            n,
+            attempt_place(p, slot_of, place_slots),
+            p.created_at.0,
+            hex_encode(&p.base.block_id.0[..8])
+        );
+    }
+}
+
 /// dr-i35: at most this many pointers of the chosen history are tried (each costs a
 /// holder dial and a fetch).
 const MAX_POINTER_ATTEMPTS: usize = 4;
+
+/// The order in which DR tries the pointers of the chosen history (V.17.3, dr-i48):
+/// the head (freshest pointer) of place A and of place B first, fresher head first;
+/// then every other pointer, freshest first; at most `MAX_POINTER_ATTEMPTS`.
+///
+/// `selected` + `fallbacks` come from `select_catalog` (freshest first). `slot_of` maps
+/// a pointer signature to the `msg_id` of the entry it was opened from; `place_slots` are
+/// the history's two slots. Older versions of one place held by lagging postmen (other
+/// bases included) can never push the other place's head out of the attempts: the head
+/// of every place is at most the second attempt. A pointer under an unknown `msg_id`
+/// (a postman moved it) is not a head of any place.
+pub(crate) fn order_attempts(
+    selected: SelfPointer,
+    fallbacks: Vec<SelfPointer>,
+    slot_of: &HashMap<[u8; 64], [u8; 16]>,
+    place_slots: [[u8; 16]; 2],
+) -> Vec<SelfPointer> {
+    let all: Vec<SelfPointer> = std::iter::once(selected).chain(fallbacks).collect();
+    let mut head_idx: Vec<usize> = Vec::with_capacity(2);
+    for slot in place_slots {
+        if let Some(i) = all
+            .iter()
+            .position(|p| slot_of.get(&p.signature) == Some(&slot))
+        {
+            head_idx.push(i);
+        }
+    }
+    // `all` is freshest first, so the smaller index is the fresher head.
+    head_idx.sort_unstable();
+    head_idx.dedup();
+    let mut attempts: Vec<SelfPointer> = head_idx.iter().map(|&i| all[i].clone()).collect();
+    attempts.extend(
+        all.into_iter()
+            .enumerate()
+            .filter(|(i, _)| !head_idx.contains(i))
+            .map(|(_, p)| p),
+    );
+    attempts.truncate(MAX_POINTER_ATTEMPTS);
+    attempts
+}
 
 /// dr-i35: try the pointers in order (the head first, then older pointers of the same
 /// history) until one's state can be fetched. Returns the index of the pointer that

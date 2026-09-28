@@ -1,12 +1,13 @@
 // Mailbox: unified store-and-forward primitive for async P2P messaging.
 // T-1: types + redb storage + TTL/cleanup.
 //
-// Design: each MailboxEntry is addressed to a target (owner master_pub).
-// Postman nodes store entries on behalf of the target (write-fanout),
-// target nodes poll for their own entries (read-fanout).
-// See A2 spec §2.2 for full design.
+// Design: each MailboxEntry is addressed to a `MailboxAddress` (an Ed25519 public
+// key; the box belongs to whoever holds the matching secret key). Directed mail goes
+// to the recipient's master box (address = master_pub). Postman nodes store entries
+// on behalf of the address (write-fanout); the key holder polls them (read-fanout).
+// See A2 spec §2.2 and CROWN-1 spec §7.1 / §7.5.
 
-use crate::db::{Db, DbError};
+use crate::db::{Db, DbError, SelfPointerStore};
 use crate::types::{DeviceId, IdentityPub, hex_encode};
 
 pub mod seal;
@@ -43,8 +44,18 @@ pub mod class_config {
     pub const REVOCATION_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
     /// Hard cap per entry: 256 KB.
     pub const MAX_ENTRY_BYTES: usize = 256 * 1024;
-    /// Global mailbox quota per target: 100 MB.
+    /// Global mailbox quota per target: 100 MB. Counts every class EXCEPT
+    /// SelfPointer (pointers are bounded by their slot cap below, so junk cannot starve
+    /// the crown and the owner's pointers cannot block the owner's directed mail).
     pub const MAX_MAILBOX_BYTES_PER_PEER: u64 = 100 * 1024 * 1024;
+    /// Distinct SelfPointer slots a postman keeps per address: one slot per pointer
+    /// place of a catalog history, two places per history (CROWN-1 C3a V.16), so 128
+    /// slots = 64 installations of one phrase. A new slot beyond this is refused;
+    /// nothing is ever evicted to make room (a dormant history must outlive any number
+    /// of shadow publications, dr-i6, dr-i42, mailbox-i50).
+    pub const MAX_POINTER_SLOTS_PER_ADDRESS: usize = 128;
+    const _: () =
+        assert!(MAX_POINTER_SLOTS_PER_ADDRESS as u64 * MAX_ENTRY_BYTES as u64 <= 32 * 1024 * 1024);
 
     // P1-5: pin each named TTL to its intended value at compile time. These guard
     // the source-of-truth constants themselves: `MailboxClass::default_ttl_secs`
@@ -197,8 +208,10 @@ fn default_payload_version() -> u8 {
 /// entries with unknown version (not error), to tolerate future format evolution.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MailboxEntry {
-    /// Target (owner) identity this entry is addressed to.
-    pub target: IdentityPub,
+    /// Box this entry is addressed to. Directed mail: the recipient's master key
+    /// (`MailboxAddress::for_master`). The postman's candidate-set check, write
+    /// authorization and storage key all use this one field (AC-10).
+    pub target: MailboxAddress,
     /// Unique 16-byte message identifier (random, from sender).
     pub msg_id: [u8; 16],
     /// Message class (determines TTL, priority).
@@ -233,10 +246,7 @@ impl MailboxEntry {
 
 /// Mailbox address: an Ed25519 public key. The box belongs to whoever holds the
 /// matching secret key. Directed boxes use the recipient's master key; the DR
-/// pointer box uses a seed-derived per-epoch rendezvous key (see [`seal`]).
-///
-/// CROWN-1 slice C1 introduces the type; `MailboxEntry.target` still carries an
-/// `IdentityPub` with the same 32 bytes until slice C2 retypes it.
+/// pointer box uses a permanent seed-derived rendezvous key (see [`seal`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct MailboxAddress(pub [u8; 32]);
 
@@ -297,7 +307,8 @@ pub fn sign_store(signing_key: &ed25519_dalek::SigningKey, entry: &MailboxEntry)
 /// (`verify_strict`). `Unauthorized` if the target is not a valid key or the
 /// signature does not verify.
 pub fn verify_store_sig(entry: &MailboxEntry, sig: &[u8; 64]) -> Result<(), MailboxError> {
-    let key = MailboxAddress(entry.target.0)
+    let key = entry
+        .target
         .verifying_key()
         .ok_or(MailboxError::Unauthorized)?;
     let sig = ed25519_dalek::Signature::from_bytes(sig);
@@ -352,6 +363,19 @@ pub enum MailboxRejectReason {
     QuotaExceeded,
     EntryTooLarge,
     Duplicate,
+    /// CROWN-1 C2: a SelfPointer store without a valid `target_sig` (signature by
+    /// the secret key of `entry.target`).
+    Unauthorized,
+    /// CROWN-1 (mailbox-i42): `expires_at <= now`, or a SelfPointer whose `stored_at`
+    /// is more than `SELF_POINTER_MAX_FUTURE_SKEW_SECS` ahead of the postman's clock.
+    ClockSkew,
+    /// Review N5: the request's wire version `v` is not `MAILBOX_WIRE_VERSION`.
+    UnsupportedWireVersion,
+    /// CROWN-1 C3a: a SelfPointer with `payload_version` < 2 (C4: every class).
+    PlaintextPayload,
+    /// CROWN-1 C3a (mailbox-i42): the postman holds a pointer in this slot that is
+    /// newer, or as new with another payload.
+    Superseded,
 }
 
 // ============================================================
@@ -366,18 +390,74 @@ pub enum MailboxError {
     #[error("entry too large: {size} > {max}")]
     TooLarge { size: usize, max: usize },
     #[error("quota exceeded for target {target}")]
-    QuotaExceeded { target: IdentityPub },
+    QuotaExceeded { target: MailboxAddress },
     #[error("not in candidate set for target")]
     NotInCandidateSet,
     #[error("duplicate msg_id")]
     Duplicate,
     #[error("unauthorized write to mailbox address")]
     Unauthorized,
+    #[error("clock skew: expires_at {expires_at}, stored_at {stored_at}, postman now {now}")]
+    ClockSkew {
+        expires_at: u64,
+        stored_at: u64,
+        now: u64,
+    },
+    #[error("plaintext payload rejected (payload_version {0})")]
+    PlaintextPayload(u8),
+    #[error("superseded: slot holds stored_at {held}, incoming {incoming}")]
+    Superseded { held: u64, incoming: u64 },
+}
+
+/// A SelfPointer may be at most this far AHEAD of the postman's clock. Bounds how long
+/// a publisher whose clock ran ahead can freeze its slot after the clock is fixed
+/// (mailbox-i42). There is no past bound: an old but unexpired pointer is harmless,
+/// the slot ordering handles it.
+pub const SELF_POINTER_MAX_FUTURE_SKEW_SECS: u64 = 24 * 3600;
+
+/// Postman plaintext rule for the pointer box (CROWN-1 §7.5 п.1, C3a): a SelfPointer
+/// must be sealed (`payload_version` ≥ `seal::SEALED_PAYLOAD_VERSION`). Directed
+/// classes are not judged here until C4 seals them. Pure.
+pub fn check_pointer_sealed(entry: &MailboxEntry) -> Result<(), MailboxError> {
+    if entry.class == MailboxClass::SelfPointer
+        && entry.payload_version < seal::SEALED_PAYLOAD_VERSION
+    {
+        return Err(MailboxError::PlaintextPayload(entry.payload_version));
+    }
+    Ok(())
+}
+
+/// Postman clock rule (mailbox-i42, AC-22′), checked BEFORE the `expires_at` clamp:
+/// an entry that is already expired by the postman's clock is refused (acking it
+/// would tell the sender "stored" while the entry is invisible at once), and a
+/// SelfPointer whose `stored_at` is more than `SELF_POINTER_MAX_FUTURE_SKEW_SECS`
+/// ahead of the postman's clock is refused (it would freeze its slot: every honest
+/// later publication would be older and `Superseded`). No past bound. Pure.
+pub fn check_entry_clock(entry: &MailboxEntry, now_secs: u64) -> Result<(), MailboxError> {
+    let skewed_pointer = entry.class == MailboxClass::SelfPointer
+        && entry.stored_at > now_secs.saturating_add(SELF_POINTER_MAX_FUTURE_SKEW_SECS);
+    if entry.expires_at <= now_secs || skewed_pointer {
+        return Err(MailboxError::ClockSkew {
+            expires_at: entry.expires_at,
+            stored_at: entry.stored_at,
+            now: now_secs,
+        });
+    }
+    Ok(())
 }
 
 // ============================================================
 // MailboxEngine: high-level operations on top of Db
 // ============================================================
+
+/// What `MailboxEngine::store` did with an accepted entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    /// A new entry (directed mail, or a SelfPointer in an empty slot).
+    New,
+    /// A SelfPointer replaced the older pointer of its slot.
+    Replaced { previous_stored_at: u64 },
+}
 
 /// High-level mailbox operations. Wraps Db for quota/size validation.
 pub struct MailboxEngine {
@@ -389,11 +469,22 @@ impl MailboxEngine {
         MailboxEngine { db }
     }
 
-    /// Store an entry, enforcing size cap and per-target quota.
+    /// Store an entry, enforcing the size cap, the directed quota and the pointer
+    /// slot rule.
     ///
     /// Returns `MailboxError::TooLarge` if serialized entry exceeds MAX_ENTRY_BYTES.
-    /// Returns `MailboxError::QuotaExceeded` if target is already at MAX_MAILBOX_BYTES_PER_PEER.
-    /// Returns `MailboxError::Duplicate` if msg_id already stored for this target+class.
+    /// Directed classes: `QuotaExceeded` over MAX_MAILBOX_BYTES_PER_PEER (SelfPointer
+    /// bytes are not counted); `Duplicate` if msg_id already stored for this
+    /// target+class.
+    /// SelfPointer (CROWN-1 C3a, mailbox-i50): the slot `(target, msg_id)` holds one
+    /// pointer — see `Db::mailbox_put_self_pointer`. A newer pointer replaces the
+    /// held one (`Ok(Replaced)`); the same envelope again → `Duplicate`; an older one,
+    /// or an equal-time one with another payload → `Superseded`; a new slot beyond
+    /// MAX_POINTER_SLOTS_PER_ADDRESS → `QuotaExceeded` (nothing evicted).
+    ///
+    /// Authorization (`target_sig`), the plaintext rule and the clock rule are NOT
+    /// checked here: the postman handler does that before calling `store`; the engine
+    /// is plain storage.
     ///
     /// CS-POS-2: `expires_at` is sender-controlled. A signed challenge with
     /// `expires_at = u64::MAX` would otherwise be stored forever (the sweep only
@@ -403,7 +494,17 @@ impl MailboxEngine {
     /// is safe under time-scale acceleration: the publisher already scales the TTL DOWN,
     /// so a scaled `expires_at` is always below the raw cap and `min()` leaves it
     /// unchanged — the clamp only caps the MAXIMUM, never shortens a legitimate entry.
-    pub fn store(&self, entry: &MailboxEntry, now_secs: u64) -> Result<(), MailboxError> {
+    pub fn store(&self, entry: &MailboxEntry, now_secs: u64) -> Result<Stored, MailboxError> {
+        self.store_with_slot_cap(entry, now_secs, class_config::MAX_POINTER_SLOTS_PER_ADDRESS)
+    }
+
+    /// `store` with an explicit SelfPointer slot cap (tests pass a small one).
+    pub(crate) fn store_with_slot_cap(
+        &self,
+        entry: &MailboxEntry,
+        now_secs: u64,
+        slot_cap: usize,
+    ) -> Result<Stored, MailboxError> {
         let mut entry = entry.clone();
         let max_expires_at = now_secs.saturating_add(entry.class.default_ttl_secs());
         entry.expires_at = entry.expires_at.min(max_expires_at);
@@ -417,8 +518,31 @@ impl MailboxEngine {
             });
         }
 
-        let current_bytes = self.db.mailbox_bytes_for_target(&entry.target)?;
-        if current_bytes.saturating_add(size as u64) > class_config::MAX_MAILBOX_BYTES_PER_PEER {
+        if entry.class == MailboxClass::SelfPointer {
+            // Slot check, replacement and insert in one write transaction (mailbox-i31).
+            return match self.db.mailbox_put_self_pointer(entry, slot_cap)? {
+                SelfPointerStore::Stored => Ok(Stored::New),
+                SelfPointerStore::Replaced { previous_stored_at } => {
+                    Ok(Stored::Replaced { previous_stored_at })
+                }
+                SelfPointerStore::Duplicate => Err(MailboxError::Duplicate),
+                SelfPointerStore::Superseded { held_stored_at } => Err(MailboxError::Superseded {
+                    held: held_stored_at,
+                    incoming: entry.stored_at,
+                }),
+                SelfPointerStore::SlotsFull => Err(MailboxError::QuotaExceeded {
+                    target: entry.target,
+                }),
+            };
+        }
+
+        // Directed quota: everything stored for this address minus its pointers.
+        let total = self.db.mailbox_bytes_for_target(&entry.target)?;
+        let pointers = self
+            .db
+            .mailbox_self_pointer_bytes_for_target(&entry.target)?;
+        let directed = total.saturating_sub(pointers);
+        if directed.saturating_add(size as u64) > class_config::MAX_MAILBOX_BYTES_PER_PEER {
             return Err(MailboxError::QuotaExceeded {
                 target: entry.target,
             });
@@ -433,13 +557,13 @@ impl MailboxEngine {
                 DbError::Duplicate => MailboxError::Duplicate,
                 other => MailboxError::Db(other),
             })?;
-        Ok(())
+        Ok(Stored::New)
     }
 
     /// Fetch all non-expired entries for a target.
     pub fn fetch(
         &self,
-        target: &IdentityPub,
+        target: &MailboxAddress,
         now_secs: u64,
     ) -> Result<Vec<MailboxEntry>, MailboxError> {
         Ok(self.db.mailbox_list_for_target(target, now_secs)?)
@@ -448,7 +572,7 @@ impl MailboxEngine {
     /// Delete one entry.
     pub fn delete(
         &self,
-        target: &IdentityPub,
+        target: &MailboxAddress,
         msg_id: [u8; 16],
         class: MailboxClass,
     ) -> Result<(), MailboxError> {

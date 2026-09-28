@@ -11,7 +11,7 @@ SERVER="${VIATICUM_SERVER:-your-user@your-server}"
 REMOTE_DIR="projects/$(basename "$SCRIPT_DIR")"
 LOCAL=""
 if [ "${1:-}" = "--local" ]; then LOCAL=1; shift; fi
-ARGS="${@:---release -p viaticum}"
+ARGS="${@:---release -p viaticum --features e2e-tools}"
 
 # Server probe: 3 tries, 5 s each. A single failed 2-second probe used to fall
 # through to a silent LOCAL build (2026-09-27: ~30 min and 7.8 GB on the laptop).

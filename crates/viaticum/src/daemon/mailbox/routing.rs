@@ -1,23 +1,22 @@
 // Mailbox routing helper: sender-side fanout for publish and poll.
 //
 // T-4: MailboxRouter publishes entries to write-fanout candidates and polls
-// from read-fanout candidates. Candidate set = top-N peers by XOR(SHA256(target_pub),
+// from read-fanout candidates. Candidate set = top-N peers by XOR(SHA256(address),
 // SHA256(peer_id)), ranked by combined_trust × avail_ewma for write-fanout.
+// CROWN-1 C2: the address is a `MailboxAddress` taken from the entry itself.
 //
 // Candidate sourcing: peers known from DB (list_all_peers) converted to PeerId
 // via device_id_to_peer_id. This covers all historically authenticated peers,
 // which is the right source for a mailbox candidate set (not just currently-connected
 // peers — the whole point is to reach peers that have likely seen the target recently).
 //
-// dr_collect_pointers: the spec calls for "expanding Kademlia batches [100, 300, 1000]".
-// Live Kademlia get_closest_peers is an async DHT walk not readily queryable synchronously.
-// Design choice: use the DB-sourced XOR-ranked list with expanding batch sizes.
-// This is equivalent when the DB is well-populated (post-bootstrap) and degrades
-// gracefully to "try all known peers" when the DB is sparse (early DR run on
-// a fresh node). A future enhancement could add a SwarmHandle::kad_closest_peers()
-// command that drives the Kademlia query internally; deferred as not needed for
-// correctness (spec B-1: Kademlia-lookup is a first-class DR path when addrs are stale
-// or absent, not a requirement for the initial walk implementation).
+// dr_collect_pointers (submodule `dr_walk`): the DB-sourced XOR-ranked list in expanding
+// batches [100, 300, 1000]; DR fills the DB from Kademlia (get_closest_peers of the
+// rendezvous address) before the walk.
+//
+// publish_detailed: per-postman outcome (acks, refusals, errors) and its verdict, so the
+// pointer publisher can name a refusal (CROWN-1 V.3, V.15.3). It returns at the needed
+// number of acks, not after the slowest postman (mailbox-i60, submodule `fanout`).
 //
 // Avail observation wiring (T-4a §5):
 // Successful MailboxStoreAck / MailboxFetchResponse → positive observation:
@@ -35,33 +34,28 @@ use libp2p::PeerId;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
 use viaticum_core::constants::{
-    AVAIL_EWMA_ALPHA, AVAIL_EWMA_INITIAL, MAILBOX_CANDIDATES_N, MAILBOX_DR_WALK_BATCHES,
-    MAILBOX_READ_FANOUT, MAILBOX_WRITE_FANOUT,
+    AVAIL_EWMA_INITIAL, MAILBOX_CANDIDATES_N, MAILBOX_READ_FANOUT, MAILBOX_WRITE_FANOUT,
 };
 use viaticum_core::db::Db;
-use viaticum_core::mailbox::MailboxClass;
+use viaticum_core::mailbox::{MailboxAddress, MailboxEntry};
 use viaticum_core::messages::{
-    MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse, Message,
+    MAILBOX_WIRE_VERSION, MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest,
+    MailboxStoreResponse, Message,
 };
-use viaticum_core::system_state::{SelfPointer, verify_self_pointer};
 use viaticum_core::trust::compute_combined;
-use viaticum_core::types::{DeviceId, IdentityPub, ewma_contact_observed, from_cbor_bytes};
+use viaticum_core::types::DeviceId;
 
 use crate::daemon::mailbox::candidate::KademliaRoutingView;
 use crate::daemon::network::swarm::{SwarmHandle, device_id_to_peer_id};
 
-// ─── DR collection result ─────────────────────────────────────────────────────
+mod dr_walk;
+mod fanout;
+mod verdict;
 
-/// What `MailboxRouter::dr_collect_pointers` found.
-#[derive(Debug, Clone)]
-pub struct DrWalk {
-    /// Every distinct (by signature) signature-verified SelfPointer of the identity.
-    pub pointers: Vec<SelfPointer>,
-    /// Peers the walk could ask (0 = no peer known at all).
-    pub candidates: usize,
-    /// Peers that answered the fetch.
-    pub responders: usize,
-}
+use fanout::{record_avail_contact, store_fanout, unix_now};
+
+pub use dr_walk::DrWalk;
+pub use verdict::{PublishOutcome, PublishVerdict};
 
 // ─── Per-request network timeout ─────────────────────────────────────────────
 
@@ -202,7 +196,7 @@ impl MailboxRouter {
     ///
     /// Source: all peers in DB. PeerId derived deterministically from DeviceId
     /// via device_id_to_peer_id (Ed25519 pubkey → libp2p PeerId).
-    fn build_ranked_candidates(&self, target: &IdentityPub) -> Vec<(DeviceId, PeerId)> {
+    fn build_ranked_candidates(&self, target: &MailboxAddress) -> Vec<(DeviceId, PeerId)> {
         let peers = match self.db.list_all_peers() {
             Ok(p) => p,
             Err(e) => {
@@ -244,99 +238,81 @@ impl MailboxRouter {
 
     // ─── Public API ───────────────────────────────────────────────────────────
 
-    /// Publish an entry to the write-fanout (top-30) of candidates for `target`.
+    /// Publish an entry to the write-fanout (top-30) of candidates for `entry.target`
+    /// and report what the postmen answered by the time it returned.
     ///
-    /// Returns count of successful Acks.
-    /// Avail observation: on Ack, updates avail_ewma + last_avail_sample for the
-    /// responding peer in the DB.
-    pub async fn publish(
+    /// mailbox-i60: returns as soon as `need` postmen acked (directed classes and PoS:
+    /// 1, the W-3 gate; a SelfPointer: the dr-i39 threshold), or when every postman
+    /// answered, or after 15 s, whichever comes first. The stores still reach every
+    /// postman; a late Ack records its contact (avail, `last_seen`) from the postman's
+    /// own task, a late refusal or error is only logged (see `fanout`).
+    ///
+    /// `target_sig`: signature by the secret key of `entry.target` over
+    /// `store_sig_input(&entry)`. Postmen require it for class SelfPointer (only the
+    /// box key holder writes a pointer box) and ignore it for directed classes. The
+    /// box address comes only from the entry (no second `target`, F3).
+    pub async fn publish_detailed(
         &self,
-        target: &IdentityPub,
-        entry: viaticum_core::mailbox::MailboxEntry,
-    ) -> anyhow::Result<usize> {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let ranked = self.build_ranked_candidates(target);
-
-        // Select write-fanout peers.
-        let write_peers = self.select_write_peers_from_ranked(&ranked, target, now_secs);
-
+        entry: MailboxEntry,
+        target_sig: Option<[u8; 64]>,
+        need: usize,
+    ) -> PublishOutcome {
+        let target = entry.target;
+        let ranked = self.build_ranked_candidates(&target);
+        let write_peers = self.select_write_peers_from_ranked(&ranked, &target, unix_now());
         let req = MailboxStoreRequest {
-            v: 1,
-            target: *target,
-            entry: entry.clone(),
+            v: MAILBOX_WIRE_VERSION,
+            entry,
+            target_sig,
         };
+        let outcome = store_fanout(&self.sender, &self.db, &write_peers, req, need).await;
 
-        // Send in parallel, collect results.
-        let mut handles = Vec::with_capacity(write_peers.len());
-        for device_id in &write_peers {
-            let sender = Arc::clone(&self.sender);
-            let req_clone = req.clone();
-            let dev = *device_id;
-            handles.push(tokio::spawn(async move {
-                (dev, sender.send_store(dev, req_clone).await)
-            }));
-        }
-
-        let mut ack_count = 0usize;
-        for handle in handles {
-            match handle.await {
-                Ok((device_id, Ok(MailboxStoreResponse::Ack { .. }))) => {
-                    ack_count += 1;
-                    self.record_avail_contact(device_id, now_secs);
-                }
-                Ok((device_id, Ok(MailboxStoreResponse::Reject { reason, .. }))) => {
-                    debug!(
-                        device = %device_id,
-                        ?reason,
-                        "mailbox publish: peer rejected store"
-                    );
-                }
-                Ok((device_id, Err(e))) => {
-                    debug!(device = %device_id, err = %e, "mailbox publish: store failed");
-                }
-                Err(join_err) => {
-                    warn!("mailbox publish: task panicked: {join_err}");
-                }
-            }
-        }
-
-        if ack_count == 0 {
+        if outcome.acks.is_empty() {
             warn!(
                 target = %target,
                 peers_tried = write_peers.len(),
+                refused = outcome.rejects.len(),
+                no_answer_in_time = outcome.pending,
                 "mailbox publish: 0 acks — entry may not be stored; will retry on next tick"
             );
         } else {
             debug!(
                 target = %target,
-                ack_count,
+                ack_count = outcome.acks.len(),
+                still_answering = outcome.pending,
                 peers_tried = write_peers.len(),
                 "mailbox publish: stored"
             );
         }
-
-        Ok(ack_count)
+        outcome
     }
 
-    /// Poll entries addressed to `my_master_pub` from read-fanout (300) candidates.
+    /// Publish and return the number of Acks (directed producers): returns at the
+    /// first Ack (mailbox-i60), so the count is ≥ 1 on success, not the fanout size.
+    pub async fn publish(
+        &self,
+        entry: MailboxEntry,
+        target_sig: Option<[u8; 64]>,
+    ) -> anyhow::Result<usize> {
+        Ok(self.publish_detailed(entry, target_sig, 1).await.acks.len())
+    }
+
+    /// Poll the box `target` from read-fanout (300) candidates.
+    ///
+    /// `proof` is `None` for our own master box (the postman checks the transport
+    /// identity); a pointer box needs a fetch proof bound to our device, and then the
+    /// postman serves only SelfPointer entries.
     ///
     /// Returns unique non-expired entries, deduped by msg_id (most-recent wins on dup).
     /// Avail observation: on successful FetchResponse, updates avail_ewma for the responding peer.
     pub async fn poll(
         &self,
-        my_master_pub: &IdentityPub,
+        target: &MailboxAddress,
+        proof: Option<[u8; 64]>,
         since_stored_at: Option<u64>,
-    ) -> anyhow::Result<Vec<viaticum_core::mailbox::MailboxEntry>> {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let ranked = self.build_ranked_candidates(my_master_pub);
+    ) -> anyhow::Result<Vec<MailboxEntry>> {
+        let now_secs = unix_now();
+        let ranked = self.build_ranked_candidates(target);
 
         // Read-fanout: top-300 closest peers.
         let read_peers: Vec<DeviceId> = ranked
@@ -346,9 +322,10 @@ impl MailboxRouter {
             .collect();
 
         let req = MailboxFetchRequest {
-            v: 1,
-            target: *my_master_pub,
+            v: MAILBOX_WIRE_VERSION,
+            target: *target,
             since_stored_at,
+            target_proof: proof,
         };
 
         // Send in parallel to all read-fanout peers.
@@ -364,12 +341,12 @@ impl MailboxRouter {
 
         // Collect all responses; dedup by msg_id.
         // Last writer (by stored_at) wins on duplicate msg_id from different peers.
-        let mut by_msg_id: HashMap<[u8; 16], viaticum_core::mailbox::MailboxEntry> = HashMap::new();
+        let mut by_msg_id: HashMap<[u8; 16], MailboxEntry> = HashMap::new();
 
         for handle in handles {
             match handle.await {
                 Ok((device_id, Ok(resp))) => {
-                    self.record_avail_contact(device_id, now_secs);
+                    record_avail_contact(&self.db, device_id, now_secs);
                     for entry in resp.entries {
                         // Skip expired entries (should not happen; postman filters them,
                         // but be defensive against clock skew).
@@ -398,142 +375,13 @@ impl MailboxRouter {
 
         let entries: Vec<_> = by_msg_id.into_values().collect();
         debug!(
-            my_master = %my_master_pub,
+            target = %target,
             entry_count = entries.len(),
             peers_tried = read_peers.len(),
             "mailbox poll: collected entries"
         );
 
         Ok(entries)
-    }
-
-    /// DR: collect EVERY signature-verified SelfPointer of `my_master_pub` from the
-    /// candidate set (CS-DR-1).
-    ///
-    /// Candidates are the DB peers ranked by XOR distance to the target (closest first),
-    /// queried in the expanding batches of `MAILBOX_DR_WALK_BATCHES` ([100, 300, 1000]).
-    /// Each peer is asked at most once: batch k sends only to `ranked[prev_len..size]`;
-    /// a batch that adds no new peer ends the walk. There is no early exit on the first
-    /// batch that returned a pointer — a fresher pointer, or another catalog history of
-    /// the same identity, may sit in a later batch. Choosing between the pointers is the
-    /// caller's job (`system_state::catalog::select_catalog`).
-    ///
-    /// Candidates come from `db.list_all_peers()`: on a fresh DR node the caller must
-    /// have run Kademlia stabilization (peers upserted on authentication) first,
-    /// otherwise `candidates == 0`.
-    pub async fn dr_collect_pointers(&self, my_master_pub: &IdentityPub) -> anyhow::Result<DrWalk> {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let ranked = self.build_ranked_candidates(my_master_pub);
-        let max_batch = MAILBOX_DR_WALK_BATCHES.last().copied().unwrap_or(0);
-        let candidates = ranked.len().min(max_batch);
-
-        tracing::info!(
-            ranked_candidates = ranked.len(),
-            candidates,
-            "dr_walk: candidates built from DB"
-        );
-
-        let req = MailboxFetchRequest {
-            v: 1,
-            target: *my_master_pub,
-            since_stored_at: None,
-        };
-
-        let mut pointers: Vec<SelfPointer> = Vec::new();
-        let mut seen_sigs: std::collections::HashSet<[u8; 64]> = std::collections::HashSet::new();
-        let mut responders = 0usize;
-        let mut prev_len = 0usize;
-
-        for &batch_size in MAILBOX_DR_WALK_BATCHES {
-            let end = batch_size.min(ranked.len());
-            if end <= prev_len {
-                tracing::info!(
-                    batch_size,
-                    queried = prev_len,
-                    "dr_walk: no new candidates for this batch, walk complete"
-                );
-                break;
-            }
-            let batch: Vec<DeviceId> = ranked[prev_len..end].iter().map(|(d, _)| *d).collect();
-            prev_len = end;
-
-            tracing::info!(
-                batch_size,
-                peers = batch.len(),
-                "dr_walk: sending fetch to batch"
-            );
-
-            let mut handles = Vec::with_capacity(batch.len());
-            for device_id in batch {
-                let sender = Arc::clone(&self.sender);
-                let req_clone = req.clone();
-                handles.push(tokio::spawn(async move {
-                    (device_id, sender.send_fetch(device_id, req_clone).await)
-                }));
-            }
-
-            for handle in handles {
-                match handle.await {
-                    Ok((device_id, Ok(resp))) => {
-                        responders += 1;
-                        tracing::info!(
-                            device = %device_id,
-                            entries = resp.entries.len(),
-                            "dr_walk: fetch response from peer"
-                        );
-                        self.record_avail_contact(device_id, now_secs);
-                        for entry in resp.entries {
-                            if entry.class != MailboxClass::SelfPointer {
-                                continue;
-                            }
-                            match from_cbor_bytes::<SelfPointer>(&entry.payload) {
-                                Ok(pointer) => {
-                                    if verify_self_pointer(&pointer, my_master_pub).is_err() {
-                                        debug!(
-                                            device = %device_id,
-                                            "dr_walk: pointer signature verification failed"
-                                        );
-                                        continue;
-                                    }
-                                    if seen_sigs.insert(pointer.signature) {
-                                        pointers.push(pointer);
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!(
-                                        device = %device_id,
-                                        err = %e,
-                                        "dr_walk: failed to decode SelfPointer payload"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Ok((device_id, Err(e))) => {
-                        tracing::info!(device = %device_id, err = %e, "dr_walk: fetch failed for peer");
-                    }
-                    Err(join_err) => {
-                        warn!("dr_walk: task panicked: {join_err}");
-                    }
-                }
-            }
-        }
-
-        tracing::info!(
-            candidates,
-            responders,
-            pointers = pointers.len(),
-            "dr_walk: collection complete"
-        );
-        Ok(DrWalk {
-            pointers,
-            candidates,
-            responders,
-        })
     }
 
     // ─── Peer selection ───────────────────────────────────────────────────────
@@ -557,7 +405,7 @@ impl MailboxRouter {
     pub fn select_write_peers(
         &self,
         candidates: &[PeerId],
-        _target_pub: &IdentityPub,
+        _target: &MailboxAddress,
         _now_secs: u64,
     ) -> Vec<DeviceId> {
         // Load peer records for trust + avail lookup.
@@ -617,7 +465,7 @@ impl MailboxRouter {
     fn select_write_peers_from_ranked(
         &self,
         ranked: &[(DeviceId, PeerId)],
-        target_pub: &IdentityPub,
+        target: &MailboxAddress,
         now_secs: u64,
     ) -> Vec<DeviceId> {
         let candidate_peer_ids: Vec<PeerId> = ranked
@@ -625,38 +473,7 @@ impl MailboxRouter {
             .take(self.candidates_n)
             .map(|(_, pid)| *pid)
             .collect();
-        self.select_write_peers(&candidate_peer_ids, target_pub, now_secs)
-    }
-
-    /// Apply a positive avail observation for `device_id` in the DB.
-    ///
-    /// Called after a successful MailboxStoreAck or MailboxFetchResponse.
-    /// Non-fatal: logs warning on DB error.
-    fn record_avail_contact(&self, device_id: DeviceId, now_secs: u64) {
-        match self.db.get_peer(&device_id) {
-            Ok(Some(mut record)) => {
-                record.avail_ewma = ewma_contact_observed(record.avail_ewma, AVAIL_EWMA_ALPHA);
-                record.last_avail_sample = now_secs;
-                if let Err(e) = self.db.upsert_peer(&record) {
-                    warn!(
-                        device = %device_id,
-                        err = %e,
-                        "mailbox router: failed to persist avail_ewma contact observation"
-                    );
-                }
-            }
-            Ok(None) => {
-                // Peer not in DB (unusual — they were a candidate). No-op.
-                debug!(device = %device_id, "mailbox router: avail contact for unknown peer");
-            }
-            Err(e) => {
-                warn!(
-                    device = %device_id,
-                    err = %e,
-                    "mailbox router: failed to load peer for avail update"
-                );
-            }
-        }
+        self.select_write_peers(&candidate_peer_ids, target, now_secs)
     }
 }
 
@@ -679,10 +496,8 @@ fn peer_id_to_device_id_best_effort(peer_id: &PeerId) -> Option<DeviceId> {
 
 /// Deduplicate a slice of entries by msg_id, keeping the one with highest stored_at.
 /// Exposed for unit testing.
-pub fn dedup_entries(
-    entries: Vec<viaticum_core::mailbox::MailboxEntry>,
-) -> Vec<viaticum_core::mailbox::MailboxEntry> {
-    let mut by_msg_id: HashMap<[u8; 16], viaticum_core::mailbox::MailboxEntry> = HashMap::new();
+pub fn dedup_entries(entries: Vec<MailboxEntry>) -> Vec<MailboxEntry> {
+    let mut by_msg_id: HashMap<[u8; 16], MailboxEntry> = HashMap::new();
     for entry in entries {
         by_msg_id
             .entry(entry.msg_id)

@@ -3,14 +3,15 @@
 // Two periodic tasks for maintaining the local mailbox store:
 //
 // 1. `run_mailbox_ttl_sweep` — remove TTL-expired entries of ALL classes every
-//    MAILBOX_SWEEP_INTERVAL_SECS. This is the ONLY eviction path for high-trust
-//    (SelfPointer) entries; without it, SelfPointers would accumulate indefinitely.
+//    MAILBOX_SWEEP_INTERVAL_SECS. Together with the monotone per-address pointer
+//    budget at store time (CROWN-1 Q5/N5, `MailboxEngine::store`) this is how
+//    high-trust (SelfPointer) entries leave.
 //
 // 2. `run_mailbox_self_cleanup` — for each target stored in our mailbox, check
 //    whether we are still in the candidate set for that target. If NOT, delete all
 //    non-high-trust entries for that target. High-trust (SelfPointer) entries are
 //    exempt from membership-based eviction (AC-6 / Bug-D): they are removed only
-//    by the TTL sweep above.
+//    by the TTL sweep above or by the pointer budget.
 //
 // Routing view sourcing: `run_mailbox_self_cleanup` builds a `KademliaRoutingView`
 // per sweep from `db.list_all_peers()` + the node's own peer_id (both available
@@ -54,7 +55,9 @@ pub(crate) fn sweep_interval_secs(time_scale: u64) -> u64 {
 /// Run the periodic mailbox TTL sweep.
 ///
 /// Removes all entries whose `expires_at < now_secs`, including high-trust
-/// SelfPointer entries. This is the ONLY eviction path for SelfPointers.
+/// SelfPointer entries. SelfPointers leave only by this TTL sweep or by the
+/// monotone per-address pointer budget at store time (CROWN-1 Q5/N5,
+/// `MailboxEngine::store`); never by membership cleanup.
 ///
 /// Interval: `sweep_interval_secs(time_scale)` — MAILBOX_SWEEP_INTERVAL_SECS
 /// (6 hours) in production, divided by `time_scale` under acceleration. First sweep

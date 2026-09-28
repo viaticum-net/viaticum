@@ -940,7 +940,10 @@ async fn revocation_published_only_to_storage_relationship_peers() {
 
     // Drain all mailbox store requests.
     let stored = sender.stored.lock().await;
-    let targets: std::collections::HashSet<_> = stored.iter().map(|r| r.entry.target).collect();
+    let targets: std::collections::HashSet<_> = stored
+        .iter()
+        .map(|r| IdentityPub(r.entry.target.0))
+        .collect();
 
     // Must include H1's master and O1's master.
     assert!(
@@ -1091,7 +1094,10 @@ async fn revocation_dedup_peer_is_holder_and_owner() {
 
     // Collect unique targets published to.
     let stored = sender.stored.lock().await;
-    let targets: Vec<_> = stored.iter().map(|r| r.entry.target).collect();
+    let targets: Vec<_> = stored
+        .iter()
+        .map(|r| IdentityPub(r.entry.target.0))
+        .collect();
     let target_count = targets.iter().filter(|&&t| t == p_master).count();
 
     // The router may send to multiple postman devices but with same target in each publish call.
@@ -1767,8 +1773,14 @@ fn status_ignores_files_deleted_everywhere() {
 #[test]
 fn status_reports_not_ready_and_mints_nothing_on_a_fresh_db() {
     let db = Db::open_in_memory().unwrap();
-    let r = super::dr_readiness(&db);
-    assert_eq!(r, super::DrReadiness::default());
+    let r = super::dr_readiness(&db, 1_800_000_000, 1);
+    assert_eq!(
+        r,
+        super::DrReadiness {
+            threshold: 1,
+            ..super::DrReadiness::default()
+        }
+    );
     assert_eq!(
         db.catalog_lineage().unwrap(),
         None,
@@ -1776,21 +1788,40 @@ fn status_reports_not_ready_and_mints_nothing_on_a_fresh_db() {
     );
 }
 
+/// A pointer place record acked by `acks` postmen, for the status tests.
+fn place_record(
+    base: viaticum_core::types::SourceBlockId,
+    at: u64,
+    acks: usize,
+) -> viaticum_core::system_state::catalog::PlacePublication {
+    viaticum_core::system_state::catalog::PlacePublication {
+        place: viaticum_core::mailbox::seal::PointerPlace::A,
+        base,
+        diffs: vec![],
+        generation: 3,
+        created_at: viaticum_core::types::Timestamp(at),
+        files: 4,
+        acks: (0..acks).map(|i| DeviceId([0xE0 + i as u8; 32])).collect(),
+        entry_cbor: vec![],
+        target_sig: [0; 64],
+        last_refusal: None,
+        to_retire: vec![],
+        reached: None,
+    }
+}
+
 #[tokio::test]
 async fn status_reports_dr_pointer_from_last_publication() {
-    use viaticum_core::system_state::catalog::PointerPublication;
+    use viaticum_core::system_state::catalog::PointerPublications;
     let state = make_test_state().await;
     let lineage = state.db.get_or_create_catalog_lineage().unwrap();
-    state
-        .db
-        .record_pointer_publication(&PointerPublication {
-            lineage,
-            created_at: viaticum_core::types::Timestamp(1_790_000_000),
-            generation: 3,
-            files: 4,
-            acks: 2,
-        })
-        .unwrap();
+    let mut meta = PointerPublications::new(lineage);
+    meta.current = Some(place_record(
+        viaticum_core::types::SourceBlockId([7; 32]),
+        1_790_000_000,
+        2,
+    ));
+    state.db.put_pointer_publications(&meta).unwrap();
     let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
         panic!("expected Status");
     };
@@ -1798,4 +1829,172 @@ async fn status_reports_dr_pointer_from_last_publication() {
     assert_eq!(data.dr_pointer_files, 4);
     assert_eq!(data.dr_pointer_acks, 2);
     assert_eq!(data.catalog_lineage, lineage.to_hex());
+    assert!(!data.dr_ready, "the catalog block has no holder");
+    assert_eq!((data.dr_ss_blocks_placed, data.dr_ss_blocks_total), (0, 1));
+}
+
+/// mailbox-i49: the refusal of the newest base's place is in `status` in words; an
+/// unacked record is not reported as published.
+#[tokio::test]
+async fn status_shows_last_refusal_reason() {
+    use viaticum_core::system_state::catalog::{PointerPublications, PointerRefusal, RefusalKind};
+    let state = make_test_state().await;
+    let lineage = state.db.get_or_create_catalog_lineage().unwrap();
+    for (kind, words) in [
+        (RefusalKind::ClockSkew, "this computer's clock looks wrong"),
+        (RefusalKind::SlotsFull, "already has 64 installations"),
+        (
+            RefusalKind::Superseded,
+            "friends hold a pointer newer than this computer's clock — the clock went back",
+        ),
+        (
+            RefusalKind::Mixed {
+                clock: 1,
+                superseded: 2,
+                slots_full: 3,
+                other: 0,
+            },
+            "(1 clock, 2 newer pointer held, 3 full)",
+        ),
+    ] {
+        let mut meta = PointerPublications::new(lineage);
+        let mut rec = place_record(
+            viaticum_core::types::SourceBlockId([7; 32]),
+            1_790_000_000,
+            0,
+        );
+        rec.last_refusal = Some(PointerRefusal { at: 1, kind });
+        meta.current = Some(rec);
+        state.db.put_pointer_publications(&meta).unwrap();
+        let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+            panic!("expected Status");
+        };
+        assert!(
+            data.dr_pointer_refusal.contains(words),
+            "{kind:?}: {}",
+            data.dr_pointer_refusal
+        );
+        assert_eq!(data.dr_pointer_published_at, 0, "no postman accepted it");
+    }
+}
+
+/// An SS block held by `holders` peers seen now (strength = holders; k_eff = 4).
+fn held_ss_block(db: &Db, id: u8, holders: u8) -> viaticum_core::types::SourceBlockId {
+    use viaticum_core::types::{
+        FileId, PeerRecord, PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus,
+        SourceBlockType, SymbolPlacement, Timestamp,
+    };
+    let block_id = SourceBlockId([id; 32]);
+    db.upsert_source_block(&SourceBlockRecord {
+        block_id,
+        k: 1,
+        t: 64,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(1),
+        encrypted_size: Some(64),
+        n: Some(12),
+        overhead: Some(3.0),
+        drop_notice_sent_at: None,
+        importance: 1.0,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.99,
+    })
+    .unwrap();
+    for h in 0..holders {
+        let device = DeviceId([0xA0 + h; 32]);
+        db.upsert_peer(&PeerRecord {
+            device_id: device,
+            master_identity: IdentityPub(device.0),
+            trust_p: 0.5,
+            trust_i: 0.0,
+            trust_s: 1.0,
+            bytes_we_store_for_peer: 0,
+            bytes_peer_stores_for_us: 0,
+            first_seen: Timestamp(1),
+            last_seen: Timestamp::now(),
+            revoked_device_pub_keys: vec![],
+            addrs: vec![],
+            x25519_pub: None,
+            avail_ewma: 0.5,
+            last_avail_sample: 0,
+        })
+        .unwrap();
+        db.upsert_placement(&SymbolPlacement {
+            source_block_id: block_id,
+            holder_id: device,
+            file_id: FileId(0),
+            esi_ranges: vec![(u32::from(h) * 4, 4)],
+            binding_seed: [0; 32],
+            status: PlacementStatus::Alive,
+            last_verified: None,
+            placed_at: Timestamp(1),
+            consecutive_misses: 0,
+        })
+        .unwrap();
+    }
+    block_id
+}
+
+/// dr-i53: a new base with 1 ack in place B does not make status "not ready" while
+/// place A is restorable; status names the date of the catalog state DR restores
+/// (place A's pointer), in the JSON field and in the CLI line.
+#[tokio::test]
+async fn status_names_the_date_dr_would_restore() {
+    use viaticum_core::mailbox::seal::PointerPlace;
+    use viaticum_core::system_state::catalog::PointerPublications;
+    let state = make_test_state().await;
+    let lineage = state.db.get_or_create_catalog_lineage().unwrap();
+    let old = held_ss_block(&state.db, 7, 3); // 3 known peers → threshold 2
+    let new = held_ss_block(&state.db, 8, 3);
+    let mut meta = PointerPublications::new(lineage);
+    meta.other = Some(place_record(old, 1_790_000_000, 3));
+    let mut newer = place_record(new, 1_790_100_000, 1);
+    newer.place = PointerPlace::B;
+    meta.current = Some(newer);
+    state.db.put_pointer_publications(&meta).unwrap();
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert!(data.dr_ready, "place A is restorable");
+    assert_eq!(data.dr_restores_state_of, 1_790_000_000);
+    assert_eq!(data.dr_pointer_published_at, 1_790_000_000);
+    let rendered = crate::cli::output::render_status(&data);
+    assert!(
+        rendered.contains(&format!(
+            "DR would restore the catalog as of {} or newer",
+            super::unix_secs_to_iso(1_790_000_000, true)
+        )),
+        "got: {rendered}"
+    );
+
+    // Nothing restorable (the new base short of the threshold, place A gone): no date.
+    meta.other = None;
+    state.db.put_pointer_publications(&meta).unwrap();
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert!(!data.dr_ready);
+    assert_eq!(data.dr_restores_state_of, 0);
+    assert!(!crate::cli::output::render_status(&data).contains("DR would restore"));
+}
+
+/// mailbox-i54: the wait is in `status` with its start and reason.
+#[tokio::test]
+async fn status_shows_waiting_since_and_reason() {
+    use viaticum_core::system_state::catalog::{PointerPublications, Waiting, WaitingReason};
+    let state = make_test_state().await;
+    let lineage = state.db.get_or_create_catalog_lineage().unwrap();
+    let mut meta = PointerPublications::new(lineage);
+    meta.waiting = Some(Waiting {
+        since: 1_790_000_123,
+        reason: WaitingReason::BlocksNotPlaced,
+    });
+    state.db.put_pointer_publications(&meta).unwrap();
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert_eq!(data.dr_waiting_since, 1_790_000_123);
+    assert_eq!(data.dr_waiting, "catalog blocks not placed");
 }

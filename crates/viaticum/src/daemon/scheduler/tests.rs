@@ -688,7 +688,7 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
     // Target = holder master (falls back to IdentityPub(holder_id.0) when no master mapping).
     assert_eq!(
         delete_req.entry.target,
-        viaticum_core::types::IdentityPub(holder_id.0),
+        viaticum_core::mailbox::MailboxAddress(holder_id.0),
         "delete_published_via_mailbox_not_relay: entry target must be holder master"
     );
 
@@ -1132,7 +1132,7 @@ impl MailboxNetworkSender for SelectiveMailboxSender {
         _device: DeviceId,
         req: viaticum_core::messages::MailboxStoreRequest,
     ) -> anyhow::Result<viaticum_core::messages::MailboxStoreResponse> {
-        let target = req.entry.target;
+        let target = viaticum_core::types::IdentityPub(req.entry.target.0);
         let msg_id = req.entry.msg_id;
         self.captured.lock().unwrap().push(req);
         if self.fail_targets.lock().unwrap().contains(&target) {
@@ -1272,7 +1272,7 @@ async fn delete_sent_to_every_holder_of_multi_holder_block() {
         .captured_requests()
         .iter()
         .filter(|r| r.entry.class == viaticum_core::mailbox::MailboxClass::DeleteRequest)
-        .map(|r| r.entry.target)
+        .map(|r| IdentityPub(r.entry.target.0))
         .collect();
     for (_device_id, master) in &holders {
         assert!(
@@ -1362,7 +1362,7 @@ async fn multi_holder_delete_retries_only_unacked_holder() {
             .iter()
             .filter(|r| {
                 r.entry.class == viaticum_core::mailbox::MailboxClass::DeleteRequest
-                    && r.entry.target == target
+                    && r.entry.target == viaticum_core::mailbox::MailboxAddress::for_master(&target)
             })
             .count()
     };
@@ -1493,7 +1493,7 @@ async fn delete_republish_uses_stable_msg_id_for_dedup() {
         .iter()
         .filter(|r| {
             r.entry.class == viaticum_core::mailbox::MailboxClass::DeleteRequest
-                && r.entry.target == master
+                && r.entry.target == viaticum_core::mailbox::MailboxAddress::for_master(&master)
         })
         .map(|r| r.entry.msg_id)
         .collect();
@@ -2217,7 +2217,7 @@ async fn scheduler_issues_challenge_via_mailbox_not_relay() {
     // Entry target = holder's master (which is IdentityPub(holder_id.0) since no device cert in DB).
     assert_eq!(
         pos_req.entry.target,
-        viaticum_core::types::IdentityPub(holder_id.0),
+        viaticum_core::mailbox::MailboxAddress(holder_id.0),
         "PosChallenge entry target must be holder's master pub"
     );
 
@@ -3094,7 +3094,7 @@ async fn ss_blocks_excluded_from_due_challenges_via_existing_ss_block_id_set() {
     // The normal block's holder must have received a challenge.
     let normal_challenged = requests
         .iter()
-        .any(|r| r.target == viaticum_core::types::IdentityPub(normal_holder.0));
+        .any(|r| r.entry.target == viaticum_core::mailbox::MailboxAddress(normal_holder.0));
     assert!(
         normal_challenged,
         "normal block holder must be challenged via mailbox"
@@ -3103,7 +3103,7 @@ async fn ss_blocks_excluded_from_due_challenges_via_existing_ss_block_id_set() {
     // The SS block's holder must NOT have received a challenge.
     let ss_challenged = requests
         .iter()
-        .any(|r| r.target == viaticum_core::types::IdentityPub(ss_holder.0));
+        .any(|r| r.entry.target == viaticum_core::mailbox::MailboxAddress(ss_holder.0));
     assert!(
         !ss_challenged,
         "SS block holder must NOT be challenged (SS blocks excluded via ss_block_id_set)"

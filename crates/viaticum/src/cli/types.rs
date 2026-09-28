@@ -173,6 +173,34 @@ pub struct StatusData {
     /// re-protected until they are back).
     #[serde(default)]
     pub files_without_source: u32,
+    /// dr-i39 / dr-i41: the accepted pointer has `dr_pointer_ack_threshold` acks and
+    /// every catalog block it names is recoverable (owner's estimate, holders seen
+    /// within 7 days).
+    #[serde(default)]
+    pub dr_ready: bool,
+    /// Distinct friends that must hold the pointer (3; half of a circle below 6).
+    #[serde(default)]
+    pub dr_pointer_ack_threshold: u32,
+    /// Catalog (SystemState) blocks of the accepted pointer that are recoverable.
+    #[serde(default)]
+    pub dr_ss_blocks_placed: u32,
+    /// Catalog blocks the accepted pointer names (base + diffs).
+    #[serde(default)]
+    pub dr_ss_blocks_total: u32,
+    /// mailbox-i49: why friends refused the newest pointer, in words ("" = no refusal).
+    #[serde(default)]
+    pub dr_pointer_refusal: String,
+    /// mailbox-i54: unix secs since the newest catalog changes wait to enter the
+    /// network; 0 = they are in.
+    #[serde(default)]
+    pub dr_waiting_since: u64,
+    /// Why they wait, in words ("" = not waiting).
+    #[serde(default)]
+    pub dr_waiting: String,
+    /// dr-i53: unix secs — the date of the catalog state DR from the phrase would
+    /// restore (the newest restorable pointer place); 0 = DR not ready.
+    #[serde(default)]
+    pub dr_restores_state_of: u64,
 }
 
 /// Peer summary shown in `viaticum status`.
