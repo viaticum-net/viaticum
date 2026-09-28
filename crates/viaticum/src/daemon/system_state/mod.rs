@@ -150,6 +150,9 @@ pub async fn run_periodic_push(
     );
     let period = Duration::from_secs(clamped);
     let mut ticker = tokio::time::interval(period);
+    // A process stopped (SIGSTOP, suspend) owes no burst of missed pushes: one tick on
+    // wake-up, then the period (a burst builds a diff per tick, mailbox-i62).
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick fires immediately; skip it so we don't publish on startup
     // before the node has had time to learn its peers / place blocks.
     ticker.tick().await;

@@ -762,6 +762,51 @@ async fn clock_refused_envelope_is_resealed_not_reoffered() {
     assert_eq!(cur.acks.len(), 3);
 }
 
+/// mailbox-i62: two changes of the pointer within one second (a burst of ticks after
+/// SIGCONT) must not put two different envelopes with one `stored_at` into a place —
+/// the postmen keep the first and refuse the second as `Superseded` (equal time), the
+/// refused one is re-offered as is, and status says "the clock went back". The second
+/// change waits for the next second and is then accepted by every postman.
+#[tokio::test]
+async fn second_change_in_the_same_second_waits_for_the_next_second() {
+    let f = fx(3);
+    let b1 = f.block(1, 3);
+    let t = now();
+    f.tick(1, &b1, &[], t).await;
+    let first = f.meta().current.unwrap();
+    assert_eq!(first.acks.len(), 3);
+    let d1 = f.block(2, 3);
+    let n = f.sent().len();
+    f.tick(1, &b1, &[d1], t).await; // the same second
+    let cur = f.meta().current.unwrap();
+    assert!(
+        f.sent()
+            .iter()
+            .skip(n)
+            .all(|(_, e)| to_cbor_bytes(e) == first.entry_cbor),
+        "no second envelope sealed at the same stored_at"
+    );
+    assert_eq!(
+        cur.entry_cbor, first.entry_cbor,
+        "the place keeps its envelope"
+    );
+    assert_eq!(
+        cur.last_refusal, None,
+        "no Superseded, no 'the clock went back'"
+    );
+    f.tick(1, &b1, &[d1], t + 1).await;
+    let cur = f.meta().current.unwrap();
+    assert_eq!(cur.diffs, vec![d1]);
+    assert_eq!(cur.acks.len(), 3, "every postman took the change");
+    assert_eq!(cur.last_refusal, None);
+    for i in 0..3 {
+        let held = f.held_at(i);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].stored_at, t + 1);
+        assert_eq!(f.opened(&held[0]).diffs.len(), 1);
+    }
+}
+
 /// P1-3 / PL-3: the envelope's TTL is scaled by time_scale (5 years / ts).
 #[tokio::test]
 async fn published_pointer_ttl_scales_with_time_scale() {

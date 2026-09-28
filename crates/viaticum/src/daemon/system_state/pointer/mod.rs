@@ -13,6 +13,9 @@
 //        by generation); the record it displaces goes to the new record's `to_retire`;
 //      the record is written to META BEFORE the envelope is sent (a crash after the
 //      send leaves it known, never retired by the startup sweep);
+//      mailbox-i62: never a second envelope into a place within the second its last
+//      one was sealed (`stored_at` has second granularity: the postmen would hold the
+//      first and refuse the second as `Superseded`); the change waits one tick;
 //   2b. every other record whose envelope was stored a refresh interval ago gets the
 //      SAME signed pointer re-sealed with a new expiry (mailbox-i58); META is written
 //      before any send and a failed write skips the whole tick (mailbox-i59);
@@ -136,7 +139,12 @@ impl PointerPublisher<'_> {
                     }
                 },
             };
-            if let Some(record) = self.seal_record(&pointer, running.base, place, now_secs) {
+            if sealed_this_second(&meta, place, now_secs) {
+                debug!(
+                    place = ?place,
+                    "system_state push: this place got an envelope this second; the new one waits for the next tick (mailbox-i62)"
+                );
+            } else if let Some(record) = self.seal_record(&pointer, running.base, place, now_secs) {
                 install(&mut meta, record, running.base, threshold);
                 fresh = Some(pointer);
             }
@@ -555,6 +563,17 @@ fn refusal_of(verdict: PublishVerdict) -> Option<RefusalKind> {
         }),
         PublishVerdict::NoAck => Some(RefusalKind::NoAck),
     }
+}
+
+/// mailbox-i62: the envelope `place` holds in META was sealed at `now_secs`. A second,
+/// different envelope with the same `stored_at` would be refused by every postman that
+/// holds the first (`Superseded`, equal time) and would sit refused, re-offered as is,
+/// until the next change. Only equality: a `stored_at` ahead of the clock is a clock
+/// that went back (or an envelope refused as clock skew, i57) and is not held up here.
+fn sealed_this_second(meta: &PointerPublications, place: PointerPlace, now_secs: u64) -> bool {
+    meta.in_place(place)
+        .and_then(envelope)
+        .is_some_and(|(e, _)| e.stored_at == now_secs)
 }
 
 /// The record's envelope as sent (decoded from META).
