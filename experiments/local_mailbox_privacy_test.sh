@@ -370,10 +370,19 @@ if nonempty_sp "pointer no identifying bytes"; then
     [ -z "$SP_HITS" ] && pass "no node key / block id / multiaddr / history / publisher bytes in any SelfPointer" \
     || fail "identifying bytes in SelfPointer entries: $SP_HITS"
 fi
-SP_SENDER=$(jq '[.entries[] | select(.class=="SelfPointer" and .sender_key)] | length' "$AUDIT")
+# Spec §7.6: the pointer header has sender = None from C3; the `sender` field itself leaves
+# MailboxEntry in C4 (with the directed classes). So c3a: no pointer NAMES a sender (the
+# value is null — publisher bytes are also searched as needles above); c4: no key at all.
+SP_SENDER_SET=$(jq '[.entries[] | select(.class=="SelfPointer" and .sender_non_null)] | length' "$AUDIT")
+SP_SENDER_KEY=$(jq '[.entries[] | select(.class=="SelfPointer" and .sender_key)] | length' "$AUDIT")
 if nonempty_sp "pointer no sender"; then
-    [ "$SP_SENDER" -eq 0 ] && pass "no SelfPointer carries a sender field" \
-    || fail "$SP_SENDER SelfPointer entries carry a sender field (mailbox-i6)"
+    if [ "$S1_STAGE" = c3a ]; then
+        [ "$SP_SENDER_SET" -eq 0 ] && pass "no SelfPointer names a sender (sender = null in $SP_SENDER_KEY/$N_SP; the header field goes in C4)" \
+        || fail "$SP_SENDER_SET SelfPointer entries name a sender (mailbox-i6, spec §7.6: None from C3)"
+    else
+        [ "$SP_SENDER_KEY" -eq 0 ] && pass "no SelfPointer carries a sender field (C4)" \
+        || fail "$SP_SENDER_KEY SelfPointer entries carry a sender field (mailbox-i6)"
+    fi
 fi
 SP_ADDRESSED=$(jq -r '[.entries[] | select(.class=="SelfPointer" and (.target_is|length>0)) | .target_is[]] | unique | join(",")' "$AUDIT")
 if nonempty_sp "pointer box unlinkable"; then
@@ -514,7 +523,10 @@ if [ "$DR_RC" -eq 0 ] && [ "$GOT_I" = "${MASTER[0]}" ] && [ "${FILES_N:-0}" -eq 
 else
     fail "DR A: exit $DR_RC identity=${GOT_I:0:16} (A ${MASTER[0]:0:16}) Files=${FILES_N:-none} rows=$ROWS selected=$SEL: $(plain_dr | grep -a '^error:' | tail -1)"
 fi
-plain_dr | grep -aq "dr: rendezvous box address=$RA16" && pass "DR A asked A's rendezvous box $RA16" \
+# grep -c, not -q: under pipefail an early-exiting grep -q SIGPIPEs sed (exit 141) and a
+# present line reads as missing.
+RBOX_A=$(plain_dr | grep -ac "dr: rendezvous box address=$RA16" || true)
+[ "$RBOX_A" -ge 1 ] && pass "DR A asked A's rendezvous box $RA16" \
     || fail "DR A log has no 'dr: rendezvous box address=$RA16'"
 OF_D=$(plain_dr | grep -a "mailbox: open failed" | grep -ac "msg_id=$MSG_D" || true)
 OF_F=$(plain_dr | grep -a "mailbox: open failed" | grep -ac "msg_id=$SLOT_CUR_A" || true)

@@ -77,9 +77,9 @@
 #     `mailbox-probe rendezvous --phrase M`) at or after that publication time (dr-i9), and
 #     NO such line with target = the owner's master (mailbox-i39); L_OWNER = node-00 status
 #     .catalog_lineage — check: status_num, log timestamps on other nodes filtered by target
-# 2a. dr-i49/dr-i50: one status snapshot every 10 s for W + 60 s (W = 7 d / TIME_SCALE ≈
-#     605 s): dr_ready stays true (a false sample is re-read after 2 s; false twice = FAIL,
-#     true on re-read = a sub-second flicker while a new envelope collects acks → ROUGH, N5);
+# 2a. dr-i49/dr-i50/dr-i52: one status snapshot every 10 s for W + 60 s (W = 7 d /
+#     TIME_SCALE ≈ 605 s): dr_ready stays true in EVERY snapshot — a new envelope collecting
+#     acks does not blink it (dr-i52), so a single false = FAIL;
 #     in every snapshot dr_ready ⇔ (acks ≥ threshold ∧ blocks_placed == blocks_total > 0) and
 #     acks ≤ the number of postmen that logged a store for RADDR (W4б) — check: api_get | jq
 # 2b. mailbox-i56 / V.16.4: the owner restarts twice (a new base per process); after each
@@ -420,7 +420,7 @@ fi
 echo ""
 W_SECS=$(( 7 * 24 * 3600 / TIME_SCALE ))
 HOLD_SECS=$(( W_SECS + 60 ))
-echo "=== Step 2a: dr_ready holds for ${HOLD_SECS}s > W = ${W_SECS}s; ready ⇔ acks ≥ threshold ∧ all blocks placed (dr-i49, dr-i50) ==="
+echo "=== Step 2a: dr_ready holds for ${HOLD_SECS}s > W = ${W_SECS}s, never blinks; ready ⇔ acks ≥ threshold ∧ all blocks placed (dr-i49, dr-i50, dr-i52) ==="
 # One snapshot → "ready acks threshold placed total" (empty when the API is unreachable).
 ready_snapshot() {
     api_get 0 /api/status | jq -r '"\(.dr_ready) \(.dr_pointer_acks) \(.dr_pointer_ack_threshold) \(.dr_ss_blocks_placed) \(.dr_ss_blocks_total)"' 2>/dev/null || true
@@ -435,7 +435,7 @@ if [ "$FIRST_READY" -eq 1 ]; then
 else
     fail "dr_ready never true within 300 s (acks $(status_num 0 dr_pointer_acks)/$(status_num 0 dr_pointer_ack_threshold), blocks $(status_num 0 dr_ss_blocks_placed)/$(status_num 0 dr_ss_blocks_total), refusal '$(status_num 0 dr_pointer_refusal)')"
 fi
-T2A=$(date +%s); SAMPLES=0; FLICKER=0; HOLD_BAD=""; IFF_BAD=""; ACKS_BAD=""
+T2A=$(date +%s); SAMPLES=0; HOLD_BAD=""; IFF_BAD=""; ACKS_BAD=""
 while [ $(( $(date +%s) - T2A )) -lt "$HOLD_SECS" ]; do
     read -r rdy acks thr placed total <<< "$(ready_snapshot)"
     if [ -z "${total:-}" ]; then HOLD_BAD="status unreadable at +$(( $(date +%s) - T2A ))s"; break; fi
@@ -446,14 +446,8 @@ while [ $(( $(date +%s) - T2A )) -lt "$HOLD_SECS" ]; do
     np=$(sp_postmen_with_store "$RADDR" "${HOLDERS[@]}")
     [ "$acks" -le "$np" ] || ACKS_BAD="acks=$acks > $np postmen with a store line for $RADDR"
     if [ "$rdy" != "true" ]; then
-        sleep 2
-        read -r rdy2 acks2 thr2 placed2 total2 <<< "$(ready_snapshot)"
-        if [ "${rdy2:-}" != "true" ]; then
-            HOLD_BAD="dr_ready false twice at +$(( $(date +%s) - T2A ))s (acks=${acks2:-?}/${thr2:-?} placed=${placed2:-?}/${total2:-?})"
-            break
-        fi
-        FLICKER=$((FLICKER + 1))
-        echo "  flicker at +$(( $(date +%s) - T2A ))s: ready=false (acks=$acks placed=$placed/$total), true 2 s later"
+        HOLD_BAD="dr_ready false at +$(( $(date +%s) - T2A ))s (acks=$acks/$thr placed=$placed/$total; dr-i52: no blink)"
+        break
     fi
     sleep 10
 done
@@ -461,10 +455,6 @@ if [ -z "$HOLD_BAD" ] && [ "$SAMPLES" -ge $(( HOLD_SECS / 12 )) ]; then
     pass "dr_ready held for ${HOLD_SECS}s > W over $SAMPLES snapshots (holders stay seen: dr-i50)"
 else
     fail "readiness hold: ${HOLD_BAD:-only $SAMPLES snapshots}"
-fi
-if [ "$FLICKER" -gt 0 ]; then
-    echo "  ROUGH: dr_ready read false $FLICKER time(s) for < 2 s (a new envelope restarts its acks, review N5)"
-    ROUGH=1
 fi
 [ -z "$IFF_BAD" ] && pass "every snapshot: dr_ready ⇔ acks ≥ threshold ∧ blocks placed == total > 0" \
     || fail "readiness formula broken: $IFF_BAD"
@@ -602,7 +592,8 @@ if [ "$DR_RC" -eq 0 ] && [ "$GOT_I" = "$I_00" ] && [ "${FILES_N:-0}" -eq "$JOURN
 else
     fail "M into Y: exit $DR_RC identity=${GOT_I:0:16} Files=${FILES_N:-none} ('$DR_ERRLINE')"
 fi
-if grep -aq "dr: rendezvous box address=$RADDR" "$DR_LOG"; then
+# The field is ANSI-coloured in the raw log: strip first; count, not -q (pipefail SIGPIPE).
+if [ "$(sed 's/\x1b\[[0-9;]*m//g' "$DR_LOG" | grep -ac "dr: rendezvous box address=$RADDR" || true)" -ge 1 ]; then
     pass "DR looked in the phrase's rendezvous box $RADDR"
 else
     fail "DR log has no 'dr: rendezvous box address=$RADDR'"

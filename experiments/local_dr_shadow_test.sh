@@ -494,7 +494,8 @@ if [ "$ROWS" -eq 2 ] && echo "$ROW_OWNER" | grep -q " files=3 " && echo "$ROW_S"
 else
     fail "table: $ROWS rows; owner row '$ROW_OWNER'; shadow row '$ROW_S'"
 fi
-if grep -aq "dr: rendezvous box address=$RADDR" "$DR_LOG"; then
+# The field is ANSI-coloured in the raw log: strip first; count, not -q (pipefail SIGPIPE).
+if [ "$(sed 's/\x1b\[[0-9;]*m//g' "$DR_LOG" | grep -ac "dr: rendezvous box address=$RADDR" || true)" -ge 1 ]; then
     pass "DR looked in the phrase's rendezvous box $RADDR"
 else
     fail "DR log has no 'dr: rendezvous box address=$RADDR'"
