@@ -9,7 +9,7 @@
 
 use libp2p::PeerId;
 use sha2::{Digest, Sha256};
-use viaticum_core::types::IdentityPub;
+use viaticum_core::mailbox::MailboxAddress;
 
 // ============================================================
 // KademliaRoutingView
@@ -30,17 +30,17 @@ impl KademliaRoutingView {
         KademliaRoutingView { known_peers }
     }
 
-    /// Compute the Kademlia target key for a mailbox target identity.
+    /// Compute the Kademlia target key for a mailbox address.
     ///
-    /// target_key = SHA256(target_pub.0)
-    /// Stable across restarts. This is the point in the Kademlia key space where
-    /// postmen are ranked. It is NOT what DR passes to `get_closest_peers`: libp2p-kad
-    /// hashes the key it is given (`kbucket::Key::new` = SHA256 of the preimage), so DR
-    /// passes the PREIMAGE `target_pub.0` (`dr::dr_lookup_key`, F12) and libp2p arrives
-    /// at this same key. Passing this hash would walk to SHA256(SHA256(target_pub)).
-    pub fn target_key(target_pub: &IdentityPub) -> [u8; 32] {
+    /// target_key = SHA256(address.0). Stable across restarts. This is the point in the
+    /// Kademlia key space where postmen are ranked. It is NOT what DR passes to
+    /// `get_closest_peers`: libp2p-kad hashes the key it is given (`kbucket::Key::new` =
+    /// SHA256 of the preimage), so DR passes the PREIMAGE `address.0` (`dr::dr_lookup_key`,
+    /// F12 / AC-18) and libp2p arrives at this same key. Passing this hash would walk to
+    /// SHA256(SHA256(address)).
+    pub fn target_key(target: &MailboxAddress) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(target_pub.0);
+        hasher.update(target.0);
         hasher.finalize().into()
     }
 
@@ -75,7 +75,7 @@ impl KademliaRoutingView {
 // should_store
 // ============================================================
 
-/// Check whether this node should store mailbox entries for `target_pub`.
+/// Check whether this node should store mailbox entries for the address `target`.
 ///
 /// Uses the local Kademlia routing table snapshot to compute XOR distances and
 /// determine whether `my_peer_id` falls within the top-N closest peers known.
@@ -86,12 +86,12 @@ impl KademliaRoutingView {
 ///
 /// # Arguments
 /// * `routing_table` — snapshot of known peers (from swarm / DB)
-/// * `target_pub`    — mailbox target identity (owner's master public key)
+/// * `target`        — mailbox address (directed: the recipient's master key)
 /// * `my_peer_id`    — this node's libp2p PeerId
 /// * `candidates_n`  — top-N threshold (typically `MAILBOX_CANDIDATES_N = 1000`)
 pub fn should_store(
     routing_table: &KademliaRoutingView,
-    target_pub: &IdentityPub,
+    target: &MailboxAddress,
     my_peer_id: &PeerId,
     candidates_n: usize,
 ) -> bool {
@@ -102,7 +102,7 @@ pub fn should_store(
         return true;
     }
 
-    let target_key = KademliaRoutingView::target_key(target_pub);
+    let target_key = KademliaRoutingView::target_key(target);
     let my_key = KademliaRoutingView::peer_key(my_peer_id);
     let my_dist = KademliaRoutingView::xor_distance(&target_key, &my_key);
 

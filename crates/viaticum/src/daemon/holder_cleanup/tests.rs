@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use tempfile::TempDir;
 use viaticum_core::db::Db;
-use viaticum_core::mailbox::MailboxRejectReason;
+use viaticum_core::mailbox::{MailboxAddress, MailboxRejectReason};
 use viaticum_core::messages::{
     MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse,
     SymbolDropNoticeBatchMsg,
@@ -283,7 +283,7 @@ async fn cleanup_expired_deletes_files_and_publishes_drop_notice() {
     );
     let drop_req = mailbox_reqs
         .iter()
-        .find(|r| r.entry.target == owner)
+        .find(|r| r.entry.target == MailboxAddress::for_master(&owner))
         .expect("mailbox DropNotice must target the owner");
     assert_eq!(
         drop_req.entry.class,
@@ -344,7 +344,9 @@ async fn cleanup_expired_tolerates_missing_files() {
         !mailbox_reqs.is_empty(),
         "cleanup_expired must publish an immediate-drop DropNotice via mailbox even when files absent"
     );
-    let drop_req = mailbox_reqs.iter().find(|r| r.entry.target == owner);
+    let drop_req = mailbox_reqs
+        .iter()
+        .find(|r| r.entry.target == MailboxAddress::for_master(&owner));
     assert!(
         drop_req.is_some(),
         "mailbox DropNotice must target the owner"
@@ -492,7 +494,7 @@ async fn drop_notice_published_to_mailbox_on_eviction() {
     // T-13a: immediate-drop DropNotice for owner_a (was immediately evicted).
     let immediate_req = mailbox_reqs
         .iter()
-        .find(|req| req.entry.target == owner_a)
+        .find(|req| req.entry.target == MailboxAddress::for_master(&owner_a))
         .expect("a MailboxStoreRequest targeting owner_a (immediate eviction) should exist");
     assert_eq!(
         immediate_req.entry.class,
@@ -508,7 +510,7 @@ async fn drop_notice_published_to_mailbox_on_eviction() {
     // Find the advance DropNotice entry for owner_b.
     let drop_notice_req = mailbox_reqs
         .iter()
-        .find(|req| req.entry.target == owner_b)
+        .find(|req| req.entry.target == MailboxAddress::for_master(&owner_b))
         .expect("a MailboxStoreRequest targeting owner_b (buffer zone) should exist");
 
     assert_eq!(
@@ -606,7 +608,7 @@ async fn drop_notice_has_correct_ttl() {
     let reqs = sender.drain().await;
     let drop_req = reqs
         .iter()
-        .find(|r| r.entry.target == owner)
+        .find(|r| r.entry.target == MailboxAddress::for_master(&owner))
         .expect("DropNotice mailbox entry for buffer-zone owner expected");
 
     let ttl_actual = drop_req
@@ -677,7 +679,11 @@ async fn mass_eviction_batches_into_single_mailbox_entry() {
 
     // All entries should target the same owner.
     for req in &reqs {
-        assert_eq!(req.entry.target, owner, "all entries should target owner");
+        assert_eq!(
+            req.entry.target,
+            MailboxAddress::for_master(&owner),
+            "all entries should target owner"
+        );
     }
 
     // Decode the batch payloads and count total notices.
@@ -759,8 +765,14 @@ async fn drop_notices_for_different_owners_go_to_separate_entries() {
 
     // Should have entries for owner_a and owner_b (may be 1 or 2 each if chunked,
     // but with tiny notices all fit in one each).
-    let reqs_a: Vec<_> = reqs.iter().filter(|r| r.entry.target == owner_a).collect();
-    let reqs_b: Vec<_> = reqs.iter().filter(|r| r.entry.target == owner_b).collect();
+    let reqs_a: Vec<_> = reqs
+        .iter()
+        .filter(|r| r.entry.target == MailboxAddress::for_master(&owner_a))
+        .collect();
+    let reqs_b: Vec<_> = reqs
+        .iter()
+        .filter(|r| r.entry.target == MailboxAddress::for_master(&owner_b))
+        .collect();
 
     assert!(!reqs_a.is_empty(), "owner_a must have a mailbox entry");
     assert!(!reqs_b.is_empty(), "owner_b must have a mailbox entry");
@@ -786,10 +798,18 @@ async fn drop_notices_for_different_owners_go_to_separate_entries() {
 
     // Each entry targets the right owner exclusively.
     for r in &reqs_a {
-        assert_eq!(r.entry.target, owner_a, "entry targeting owner_a");
+        assert_eq!(
+            r.entry.target,
+            MailboxAddress::for_master(&owner_a),
+            "entry targeting owner_a"
+        );
     }
     for r in &reqs_b {
-        assert_eq!(r.entry.target, owner_b, "entry targeting owner_b");
+        assert_eq!(
+            r.entry.target,
+            MailboxAddress::for_master(&owner_b),
+            "entry targeting owner_b"
+        );
     }
 }
 
@@ -952,7 +972,7 @@ async fn holder_pressure_sets_drop_notice_sent_at_on_first_send() {
     let mailbox_reqs = sender.drain().await;
     let drop_notice_found = mailbox_reqs
         .iter()
-        .any(|r| r.entry.target == holding_b.owner_id);
+        .any(|r| r.entry.target == MailboxAddress::for_master(&holding_b.owner_id));
     assert!(
         drop_notice_found,
         "check_pressure must publish DropNotice via mailbox for the buffer-zone holding"

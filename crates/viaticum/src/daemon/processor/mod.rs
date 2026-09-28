@@ -503,13 +503,16 @@ impl Processor {
                 // Build routing view from known peers in the DB.
                 let routing_view = self.build_routing_view();
                 let my_peer_id = self.swarm.peer_id;
-                let resp = mailbox::handle_mailbox_store(&self.db, &routing_view, &my_peer_id, req);
+                let now = Timestamp::now().0;
+                let resp =
+                    mailbox::handle_mailbox_store(&self.db, &routing_view, &my_peer_id, req, now);
                 self.swarm
                     .respond_logged(response_channel, Message::MailboxStoreResponse(resp));
             }
             Message::MailboxFetchRequest(req) => {
                 let now = Timestamp::now().0;
-                let resp = mailbox::handle_mailbox_fetch(&self.db, req, from_master, now);
+                let resp =
+                    mailbox::handle_mailbox_fetch(&self.db, req, from_master, from_device, now);
                 self.swarm
                     .respond_logged(response_channel, Message::MailboxFetchResponse(resp));
             }

@@ -22,7 +22,7 @@ use viaticum_core::constants::{
 };
 use viaticum_core::db::Db;
 use viaticum_core::deletion::{DeletionAction, DeletionEngine};
-use viaticum_core::mailbox::{DeleteRequestPayload, MailboxClass, MailboxEntry};
+use viaticum_core::mailbox::{DeleteRequestPayload, MailboxAddress, MailboxClass, MailboxEntry};
 use viaticum_core::messages::{PosHashResponseMsg, to_cbor};
 use viaticum_core::pair_ledger::{
     AccrualStats, LossCause, PairLedgerError, PairLedgerRecorder, TickReport, tick_interval_secs,
@@ -830,7 +830,7 @@ impl Scheduler {
                 );
                 let expires_at = now.0 + ttl_secs;
                 let entry = MailboxEntry {
-                    target: holder_master,
+                    target: MailboxAddress::for_master(&holder_master),
                     msg_id: challenge_id,
                     class: MailboxClass::PosChallenge,
                     payload_version: 1,
@@ -844,7 +844,7 @@ impl Scheduler {
                 // W-3: publish via mailbox and gate pending-challenge creation on ≥1 Ack.
                 // If 0 acks returned, the challenge is treated as unsent — retry on next tick.
                 // MAILBOX_STORE_TIMEOUT_SECS is the per-peer request timeout (enforced in routing.rs).
-                match self.mailbox_router.publish(&holder_master, entry).await {
+                match self.mailbox_router.publish(entry, None).await {
                     Ok(0) => {
                         warn!(
                             block_id = %block_id,
@@ -1141,7 +1141,7 @@ impl Scheduler {
                             self.config.time_scale,
                         );
                         let entry = MailboxEntry {
-                            target: holder_master,
+                            target: MailboxAddress::for_master(&holder_master),
                             msg_id,
                             class: MailboxClass::DeleteRequest,
                             payload_version: 1,
@@ -1151,7 +1151,7 @@ impl Scheduler {
                             // sender = owner master so holder knows who owns the block
                             sender: Some(self.my_master_pub),
                         };
-                        match self.mailbox_router.publish(&holder_master, entry).await {
+                        match self.mailbox_router.publish(entry, None).await {
                             Ok(0) => warn!(
                                 block_id = %source_block_id,
                                 holder = %holder_master,

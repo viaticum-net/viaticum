@@ -550,3 +550,115 @@ fn distinct_states_yield_distinct_base_blocks() {
         "different snapshots must be different content-addressed blocks"
     );
 }
+
+// ─── AC-27′ / N2: the pointer's size is bounded by construction (V.3, V.15.7) ──
+
+/// Ten Alive holders, each with ten addresses: the block ref keeps the five with the
+/// highest `combined_trust × avail_ewma` (ties by holder id) and four addresses each,
+/// public before private before loopback.
+#[test]
+fn block_ref_keeps_at_most_5_holders_and_4_addrs() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let state = snapshot_db(&db).unwrap();
+    let base_id = publish_base_block(&db, dir.path(), &dr_key(), 1, &state).unwrap();
+    for i in 0..10u8 {
+        let holder = DeviceId([0x10 + i; 32]);
+        db.upsert_placement(&alive_placement(base_id, holder))
+            .unwrap();
+        let mut peer = peer_with_addrs(
+            holder,
+            (0..10u8)
+                .map(|j| {
+                    if j < 5 {
+                        format!("/ip4/127.0.0.{}/tcp/9000", j + 1)
+                    } else {
+                        format!("/ip4/8.8.8.{j}/tcp/9000")
+                    }
+                })
+                .collect(),
+        );
+        peer.trust_p = 0.1 * f64::from(i);
+        peer.trust_s = 1.0;
+        peer.avail_ewma = 1.0;
+        db.upsert_peer(&peer).unwrap();
+    }
+    let bref = block_ref_from_placements(&db, &base_id).unwrap();
+    assert_eq!(bref.holders.len(), POINTER_MAX_HOLDERS_PER_BLOCK);
+    let kept: Vec<u8> = bref.holders.iter().map(|h| h.holder_id.0[0]).collect();
+    assert_eq!(
+        kept,
+        vec![0x19, 0x18, 0x17, 0x16, 0x15],
+        "highest trust × avail first"
+    );
+    for h in &bref.holders {
+        assert_eq!(h.addrs.len(), POINTER_MAX_ADDRS_PER_HINT);
+        assert!(
+            h.addrs.iter().all(|a| a.starts_with("/ip4/8.8.8.")),
+            "public addresses first: {:?}",
+            h.addrs
+        );
+    }
+}
+
+/// N2: an address string longer than 256 bytes never enters a hint.
+#[test]
+fn block_ref_drops_addresses_longer_than_256_bytes() {
+    let long = format!("/dns4/{}.example/tcp/1", "a".repeat(300));
+    let short = "/ip4/1.2.3.4/tcp/9000".to_string();
+    let got = hint_addrs(&[long.clone(), short.clone()]);
+    assert_eq!(got, vec![short]);
+    assert!(long.len() > POINTER_MAX_ADDR_LEN);
+}
+
+/// AC-27′: 20 diffs, 10 holders per block, each with 10 addresses of 10 KB: the pointer
+/// still seals (`BodyTooLarge` is impossible by construction).
+#[test]
+fn pointer_size_bounded_by_construction() {
+    use viaticum_core::mailbox::seal::{PointerPlace, RendezvousKeys, seal_self_pointer};
+    let db = Db::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let state = snapshot_db(&db).unwrap();
+    let base_id = publish_base_block(&db, dir.path(), &dr_key(), 1, &state).unwrap();
+    let mut ids = vec![base_id];
+    for g in 0..20u32 {
+        let diffs = vec![DiffOp::FileDeleted(FileId(u64::from(g)))];
+        ids.push(publish_diff_block(&db, dir.path(), &dr_key(), 1, &diffs).unwrap());
+    }
+    for (b, id) in ids.iter().enumerate() {
+        for i in 0..10u8 {
+            let holder = DeviceId([i; 32]);
+            let mut p = alive_placement(*id, holder);
+            p.esi_ranges = vec![(u32::from(i) * 100 + b as u32, 12)];
+            db.upsert_placement(&p).unwrap();
+            let addrs = (0..10)
+                .map(|j| format!("/dns4/{}{j}/tcp/1", "h".repeat(10_000)))
+                .chain((0..10).map(|j| format!("/ip4/10.0.{j}.1/tcp/9000/p2p/{}", "Q".repeat(46))))
+                .collect();
+            db.upsert_peer(&peer_with_addrs(holder, addrs)).unwrap();
+        }
+    }
+    let master = viaticum_core::cluster::derive_master_key(&[9u8; 32]).unwrap();
+    let files: Vec<u32> = (0..=20).collect();
+    let pointer = build_pointer(
+        &db,
+        &master,
+        1,
+        &base_id,
+        &ids[1..],
+        Timestamp(5000),
+        test_pc(&files),
+    )
+    .unwrap();
+    assert_eq!(pointer.diffs.len(), 20);
+    assert!(
+        pointer
+            .diffs
+            .iter()
+            .all(|d| d.holders.len() == POINTER_MAX_HOLDERS_PER_BLOCK)
+    );
+    let cbor = viaticum_core::types::to_cbor_bytes(&pointer);
+    let rv = RendezvousKeys::derive(&[1u8; 64]);
+    seal_self_pointer(&rv, &TEST_LINEAGE.0, PointerPlace::A, &cbor, 10, 1)
+        .unwrap_or_else(|e| panic!("{} bytes do not seal: {e}", cbor.len()));
+}

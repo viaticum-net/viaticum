@@ -287,6 +287,14 @@ fn make_status_zero_peers() -> StatusData {
         dr_pointer_acks: 0,
         catalog_lineage: String::new(),
         files_without_source: 0,
+        dr_ready: false,
+        dr_pointer_ack_threshold: 0,
+        dr_ss_blocks_placed: 0,
+        dr_ss_blocks_total: 0,
+        dr_pointer_refusal: String::new(),
+        dr_waiting_since: 0,
+        dr_waiting: String::new(),
+        dr_restores_state_of: 0,
     }
 }
 
@@ -455,6 +463,14 @@ fn format_status_top_peers_printed() {
         dr_pointer_acks: 0,
         catalog_lineage: String::new(),
         files_without_source: 0,
+        dr_ready: false,
+        dr_pointer_ack_threshold: 0,
+        dr_ss_blocks_placed: 0,
+        dr_ss_blocks_total: 0,
+        dr_pointer_refusal: String::new(),
+        dr_waiting_since: 0,
+        dr_waiting: String::new(),
+        dr_restores_state_of: 0,
     };
     let rendered = output::render_status(&data);
     assert!(rendered.contains("a1b2c3d4"), "got: {rendered}");
@@ -904,6 +920,14 @@ fn cli_response_roundtrips_cbor() {
             dr_pointer_acks: 0,
             catalog_lineage: String::new(),
             files_without_source: 0,
+            dr_ready: false,
+            dr_pointer_ack_threshold: 0,
+            dr_ss_blocks_placed: 0,
+            dr_ss_blocks_total: 0,
+            dr_pointer_refusal: String::new(),
+            dr_waiting_since: 0,
+            dr_waiting: String::new(),
+            dr_restores_state_of: 0,
         })),
         CliResponse::DeviceList(vec![]),
         CliResponse::Error("oops".into()),
@@ -1554,6 +1578,7 @@ fn status_render_says_dr_ready_with_time_files_and_acks() {
     data.dr_pointer_published_at = 1_790_000_000;
     data.dr_pointer_files = 3;
     data.dr_pointer_acks = 2;
+    data.dr_ready = true;
     let rendered = output::render_status(&data);
     assert!(
         rendered.contains("DR:             ready: recovery pointer published 2026-09-21T"),
@@ -1563,6 +1588,52 @@ fn status_render_says_dr_ready_with_time_files_and_acks() {
         rendered.contains("3 files, accepted by 2 peer(s)"),
         "got: {rendered}"
     );
+}
+
+/// dr-i39 / dr-i41: an accepted pointer below the threshold, with catalog blocks not
+/// stored yet, is NOT READY in words, with the counts.
+#[test]
+fn status_render_says_not_ready_with_acks_needed_and_unplaced_catalog_blocks() {
+    let mut data = make_status_zero_peers();
+    data.dr_pointer_published_at = 1_790_000_000;
+    data.dr_pointer_files = 3;
+    data.dr_pointer_acks = 1;
+    data.dr_pointer_ack_threshold = 3;
+    data.dr_ss_blocks_placed = 1;
+    data.dr_ss_blocks_total = 2;
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("DR:             NOT READY"),
+        "got: {rendered}"
+    );
+    assert!(
+        rendered.contains("accepted by 1 of the 3 friends needed"),
+        "got: {rendered}"
+    );
+    assert!(
+        rendered.contains("the catalog blocks are not stored at friends yet (1 of 2)"),
+        "got: {rendered}"
+    );
+}
+
+/// mailbox-i49 / i54: the refusal and the wait are printed as the daemon worded them.
+#[test]
+fn status_render_prints_refusal_and_waiting_lines() {
+    let mut data = make_status_zero_peers();
+    data.dr_pointer_refusal =
+        "DR: friends hold a pointer newer than this computer's clock — the clock went back"
+            .to_string();
+    data.dr_waiting_since = 1_790_000_000;
+    data.dr_waiting = "friends refused".to_string();
+    let rendered = output::render_status(&data);
+    assert!(rendered.contains("the clock went back"), "got: {rendered}");
+    assert!(
+        rendered.contains(
+            "the newest catalog changes are not in the network yet (waiting since 2026-09-21T"
+        ),
+        "got: {rendered}"
+    );
+    assert!(rendered.contains(": friends refused)"), "got: {rendered}");
 }
 
 #[test]

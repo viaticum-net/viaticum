@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use viaticum_core::cluster::master_identity;
 use viaticum_core::db::Db;
-use viaticum_core::mailbox::{MailboxClass, MailboxEntry, class_config};
+use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry, class_config};
 use viaticum_core::messages::{SymbolDropNoticeBatchMsg, build_signed_symbol_drop_notice, to_cbor};
 use viaticum_core::types::{HoldingRecord, HoldingStatus, IdentityPub, Timestamp, hex_encode};
 
@@ -203,7 +203,7 @@ async fn report_missing_holding(
         let mut msg_id = [0u8; 16];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
         let entry = MailboxEntry {
-            target: holding.owner_id,
+            target: MailboxAddress::for_master(&holding.owner_id),
             msg_id,
             class: MailboxClass::DropNotice,
             payload_version: 1,
@@ -212,7 +212,7 @@ async fn report_missing_holding(
             stored_at: now_secs,
             sender: Some(holder_master_pub),
         };
-        match mailbox_router.publish(&holding.owner_id, entry).await {
+        match mailbox_router.publish(entry, None).await {
             Ok(0) => {
                 warn!(
                     block_id = %holding.source_block_id,

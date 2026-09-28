@@ -19,7 +19,7 @@ use viaticum_core::cluster::master_identity;
 use viaticum_core::constants::{KI, KP, S_CLAMP_MAX, S_CLAMP_MIN};
 use viaticum_core::db::Db;
 use viaticum_core::four_r_holder::FourRParams;
-use viaticum_core::mailbox::{MailboxClass, MailboxEntry, class_config};
+use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry, class_config};
 use viaticum_core::messages::{
     SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, build_signed_symbol_drop_notice, to_cbor,
 };
@@ -569,7 +569,7 @@ async fn publish_drop_notices_via_mailbox(
             rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
 
             let entry = MailboxEntry {
-                target: *owner_id,
+                target: MailboxAddress::for_master(owner_id),
                 msg_id,
                 class: MailboxClass::DropNotice,
                 payload_version: 1,
@@ -580,7 +580,7 @@ async fn publish_drop_notices_via_mailbox(
             };
 
             // W-4: best-effort publish — retry once on 0 acks.
-            let ack_count = match mailbox_router.publish(owner_id, entry.clone()).await {
+            let ack_count = match mailbox_router.publish(entry.clone(), None).await {
                 Ok(n) => n,
                 Err(e) => {
                     warn!(
@@ -600,7 +600,7 @@ async fn publish_drop_notices_via_mailbox(
                     msg_id: retry_msg_id,
                     ..entry
                 };
-                match mailbox_router.publish(owner_id, retry_entry).await {
+                match mailbox_router.publish(retry_entry, None).await {
                     Ok(0) => {
                         // W-4 documented known limitation: notice may be lost.
                         // Owner detects via next PoS miss (N-6: notice TTL = 14d).
@@ -751,7 +751,7 @@ async fn post_symbol_dropped_via_mailbox(
     rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut msg_id);
 
     let entry = MailboxEntry {
-        target: owner_id,
+        target: MailboxAddress::for_master(&owner_id),
         msg_id,
         class: MailboxClass::DropNotice,
         payload_version: 1,
@@ -761,7 +761,7 @@ async fn post_symbol_dropped_via_mailbox(
         sender: Some(holder_master_pub),
     };
 
-    match mailbox_router.publish(&owner_id, entry).await {
+    match mailbox_router.publish(entry, None).await {
         Ok(0) => {
             warn!(
                 block_id = %source_block_id,

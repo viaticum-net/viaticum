@@ -1238,5 +1238,26 @@ pub mod sig_serde {
     }
 }
 
+/// Serde helper for optional `[u8; 64]` signature fields. Use with
+/// `#[serde(default, with = "crate::types::opt_sig_serde")]`: `None` encodes as CBOR
+/// null, `Some` as the 64-byte sequence (same shape as `sig_serde`).
+pub mod opt_sig_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(sig: &Option<[u8; 64]>, s: S) -> Result<S::Ok, S::Error> {
+        sig.as_ref().map(|b| b.as_slice()).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 64]>, D::Error> {
+        let v: Option<Vec<u8>> = Option::deserialize(d)?;
+        v.map(|bytes| {
+            bytes
+                .try_into()
+                .map_err(|_| serde::de::Error::custom("expected 64-byte signature"))
+        })
+        .transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests;

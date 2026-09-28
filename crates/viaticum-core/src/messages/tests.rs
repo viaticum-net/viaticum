@@ -577,20 +577,21 @@ fn all_message_variants() -> Vec<Message> {
         }),
         Message::Ack(AckMsg { v: 1 }),
         Message::MailboxFetchRequest(MailboxFetchRequest {
-            v: 1,
-            target: make_identity_pub(0x10),
+            v: 2,
+            target: crate::mailbox::MailboxAddress([0x10; 32]),
             since_stored_at: None,
+            target_proof: Some([0x42; 64]),
         }),
         Message::MailboxFetchResponse(MailboxFetchResponse {
-            v: 1,
+            v: 2,
             entries: vec![],
             served_msg_ids: vec![],
         }),
         Message::MailboxStoreRequest(MailboxStoreRequest {
-            v: 1,
-            target: make_identity_pub(0x11),
+            v: 2,
+            target_sig: Some([0x43; 64]),
             entry: crate::mailbox::MailboxEntry {
-                target: make_identity_pub(0x11),
+                target: crate::mailbox::MailboxAddress([0x11; 32]),
                 msg_id: [0xABu8; 16],
                 class: crate::mailbox::MailboxClass::PosChallenge,
                 payload_version: 1,
@@ -820,7 +821,7 @@ fn unknown_message_variant_from_cbor_does_not_close_stream() {
     }
 }
 
-// ─── MSG-12: all 24 live message variants have v == 1 ────────────────────────
+// ─── MSG-12: all 24 live message variants have v == 1 (mailbox: v == 2, CROWN-1 C2) ─
 
 #[test]
 fn all_messages_have_version_one() {
@@ -858,16 +859,22 @@ fn all_messages_have_version_one() {
             Message::MailboxStoreRequest(m) => m.v,
             Message::MailboxStoreResponse(_) => {
                 // MailboxStoreResponse is an enum (not a struct), does not have a top-level v field.
-                // All instances produced by all_message_variants use v=1 semantics.
                 1
             }
             // Unknown is a decode-only sentinel; it is never in all_message_variants().
             Message::Unknown => unreachable!("Unknown must not appear in all_message_variants"),
         };
+        // CROWN-1 C2 changed the mailbox request/response fields: those are v = 2.
+        let expected = match msg {
+            Message::MailboxFetchRequest(_)
+            | Message::MailboxFetchResponse(_)
+            | Message::MailboxStoreRequest(_) => 2,
+            _ => 1,
+        };
         assert_eq!(
             v,
-            1,
-            "message variant {:?} has v={v}, expected 1",
+            expected,
+            "message variant {:?} has v={v}, expected {expected}",
             std::mem::discriminant(msg)
         );
     }
@@ -1866,4 +1873,45 @@ fn pos_hash_response_cbor_roundtrip_preserves_sig() {
     assert_eq!(decoded.sig, msg.sig, "sig must survive CBOR roundtrip");
     super::verify_pos_hash_response(&decoded, &holder)
         .expect("sig must verify after CBOR roundtrip");
+}
+
+// ─── CROWN-1 C2: optional signature fields ───────────────────────────────────
+
+#[test]
+fn mailbox_store_request_without_target_sig_roundtrips_as_none() {
+    let req = MailboxStoreRequest {
+        v: 2,
+        target_sig: None,
+        entry: crate::mailbox::MailboxEntry {
+            target: crate::mailbox::MailboxAddress([0x11; 32]),
+            msg_id: [1; 16],
+            class: crate::mailbox::MailboxClass::DropNotice,
+            payload_version: 1,
+            payload: vec![9],
+            expires_at: 10,
+            stored_at: 5,
+            sender: None,
+        },
+    };
+    let msg = Message::MailboxStoreRequest(req.clone());
+    let back: Message = from_cbor(&to_cbor(&msg).unwrap()).unwrap();
+    assert_eq!(back, msg);
+}
+
+#[test]
+fn mailbox_fetch_request_rejects_short_target_proof() {
+    #[derive(serde::Serialize)]
+    struct Forged {
+        v: u8,
+        target: crate::mailbox::MailboxAddress,
+        since_stored_at: Option<u64>,
+        target_proof: Option<Vec<u8>>,
+    }
+    let bytes = crate::types::to_cbor_bytes(&Forged {
+        v: 2,
+        target: crate::mailbox::MailboxAddress([1; 32]),
+        since_stored_at: None,
+        target_proof: Some(vec![7; 63]),
+    });
+    assert!(crate::types::from_cbor_bytes::<MailboxFetchRequest>(&bytes).is_err());
 }

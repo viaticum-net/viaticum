@@ -49,9 +49,9 @@ if [ -z "$LOCAL" ] && server_up; then
     ssh "$SERVER" "source ~/.cargo/env && cd ~/$REMOTE_DIR && \
         cargo fmt --all --check && \
         if command -v cargo-nextest >/dev/null; then \
-            cargo nextest run --no-fail-fast $ARGS $SIM_FILTER && cargo test --doc $ARGS; \
-        else cargo test $ARGS; fi && \
-        cargo clippy --workspace --all-targets -- -D warnings"
+            cargo nextest run --no-fail-fast $ARGS --features viaticum/e2e-tools $SIM_FILTER && cargo test --doc $ARGS; \
+        else cargo test $ARGS --features viaticum/e2e-tools; fi && \
+        cargo clippy --workspace --all-targets --features viaticum/e2e-tools -- -D warnings"
     echo "=== Done (remote) ==="
 elif [ -z "$LOCAL" ]; then
     echo "=== Build server $SERVER unreachable (3 tries) — NOT testing locally. Retry, or pass --local explicitly. ===" >&2
@@ -59,7 +59,7 @@ elif [ -z "$LOCAL" ]; then
 else
     echo "=== --local: testing on this machine ==="
     cargo fmt --all --check
-    cargo test $ARGS
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo test $ARGS --features viaticum/e2e-tools
+    cargo clippy --workspace --all-targets --features viaticum/e2e-tools -- -D warnings
     echo "=== Done (local) ==="
 fi

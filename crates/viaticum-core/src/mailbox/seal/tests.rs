@@ -1,8 +1,10 @@
 // Unit tests for the CROWN-1 crypto core (slice C1).
 //
-// Known-answer vectors (`*_matches_known_vector`) were computed independently with
-// Python `cryptography` 46 (HKDF-SHA256, X25519, Ed25519, ChaCha20Poly1305) from the
-// byte layouts of spec §7.2-§7.3, not by running this code.
+// Known-answer vectors (`*_matches_known_vector`, the rendezvous address, seal key,
+// slot key and slots) were computed independently with Python `cryptography` 46
+// (HKDF-SHA256, X25519, Ed25519, ChaCha20Poly1305) from the byte layouts of spec
+// §7.2-§7.3 and V.3 / V.16.3 (C3a: permanent address, `-v2` info strings, pointer
+// places A = 0, B = 1), not by running this code.
 
 use std::collections::HashSet;
 
@@ -33,20 +35,14 @@ fn other_seed() -> [u8; 64] {
     [0xA5; 64]
 }
 
-/// A plausible "now" (2026-09) and its epoch.
+/// A plausible "now" (2026-09).
 const NOW: u64 = 1_790_000_000;
 
-fn now_epoch() -> RendezvousEpoch {
-    RendezvousEpoch::at(NOW)
-}
+/// The vector catalog history id.
+const LINEAGE: [u8; 16] = [0x11; 16];
 
-/// The whole DR window `[e - LOOKBACK, e + FORWARD]` around `NOW`.
-fn dr_window() -> Vec<RendezvousEpoch> {
-    let e = now_epoch().0;
-    (e - crate::constants::RENDEZVOUS_DR_LOOKBACK_EPOCHS
-        ..=e + crate::constants::RENDEZVOUS_DR_FORWARD_EPOCHS)
-        .map(RendezvousEpoch)
-        .collect()
+fn keys() -> RendezvousKeys {
+    RendezvousKeys::derive(&seed())
 }
 
 fn recipient() -> (StaticSecret, [u8; 32]) {
@@ -70,7 +66,8 @@ fn seal_to(recipient_pub: &[u8; 32], class: MailboxClass, body: &[u8]) -> Sealed
 }
 
 fn seal_pointer(keys: &RendezvousKeys, pointer: &[u8]) -> SealedMailboxEntry {
-    seal_self_pointer(keys, [0x02; 16], pointer, NOW + 3600, NOW).expect("seal_self_pointer")
+    seal_self_pointer(keys, &LINEAGE, PointerPlace::A, pointer, NOW + 3600, NOW)
+        .expect("seal_self_pointer")
 }
 
 /// Small-order Curve25519 u-coordinates (0, 1, and the order-8 point).
@@ -86,114 +83,171 @@ fn low_order_points() -> Vec<[u8; 32]> {
 }
 
 // ============================================================
-// Rendezvous epoch
+// AC-6′: the rendezvous address comes from the seed, not from master_pub, and does
+// not depend on time
 // ============================================================
 
 #[test]
-fn rendezvous_epoch_at_boundaries() {
-    assert_eq!(RendezvousEpoch::at(0), RendezvousEpoch(0));
-    assert_eq!(
-        RendezvousEpoch::at(RENDEZVOUS_EPOCH_SECS - 1),
-        RendezvousEpoch(0)
-    );
-    assert_eq!(
-        RendezvousEpoch::at(RENDEZVOUS_EPOCH_SECS),
-        RendezvousEpoch(1)
-    );
-    assert_eq!(
-        RendezvousEpoch::at(691 * RENDEZVOUS_EPOCH_SECS + 5),
-        RendezvousEpoch(691)
-    );
-    assert_eq!(RendezvousEpoch(0).prev(), None);
-    assert_eq!(RendezvousEpoch(5).prev(), Some(RendezvousEpoch(4)));
-    assert_eq!(RendezvousEpoch(5).next(), RendezvousEpoch(6));
-    assert_eq!(RendezvousEpoch(u64::MAX).next(), RendezvousEpoch(u64::MAX));
-}
-
-// ============================================================
-// AC-6: the rendezvous address comes from the seed, not from master_pub
-// ============================================================
-
-#[test]
-fn rendezvous_address_is_deterministic_for_seed_and_epoch() {
-    let a = RendezvousKeys::derive(&seed(), RendezvousEpoch(691));
-    let b = RendezvousKeys::derive(&seed(), RendezvousEpoch(691));
+fn rendezvous_address_is_deterministic_for_seed() {
+    let a = keys();
+    let b = RendezvousKeys::derive(&seed());
     assert_eq!(a.address, b.address);
     assert_eq!(*a.seal_key, *b.seal_key);
-    // Known-answer vectors (Python, spec §7.2 layout).
-    assert_eq!(
-        hex_encode(
-            &RendezvousKeys::derive(&seed(), RendezvousEpoch(0))
-                .address
-                .0
-        ),
-        "381db64e314da2a02f39d14ab7e08755808a78dfde5af1814970cc783eeef1a7"
-    );
+    assert_eq!(*a.slot_key, *b.slot_key);
+    // Known-answer vectors (Python, V.3 layout: salt = b"", info `-v2`).
     assert_eq!(
         hex_encode(&a.address.0),
-        "53186efdc2eaf96d669f59adb931bd3b6cad7c4c11ba5b86404ce55fb1765f22"
+        "b2c4728e16571377ce30ec5e638cf6f47bac854bea7b7df2b95aa45bc2bb27f8"
     );
     assert_eq!(
         hex_encode(&a.seal_key[..]),
-        "c4c8776dfefb420bc005f0264dd5bd2a44212919895f4f0a074ff2ea9dbc2ede"
+        "63aca38146e3c8040c290661f82649e41ad0099bee8780d0a3c2a4b9ad6c0d0c"
+    );
+    assert_eq!(
+        hex_encode(&a.slot_key[..]),
+        "36586fee8d280a92f8cd04d1b2928804a9713f1913299e8321b77b8adf61e737"
+    );
+    assert_eq!(
+        hex_encode(&RendezvousKeys::derive(&other_seed()).address.0),
+        "944d6931b188ca4c1c45424c8a05aacc8cae664f42ba5d321a734e5d8794638b"
     );
 }
 
 #[test]
-fn rendezvous_address_changes_every_epoch() {
-    let window = dr_window();
-    let expected = crate::constants::RENDEZVOUS_DR_LOOKBACK_EPOCHS
-        + crate::constants::RENDEZVOUS_DR_FORWARD_EPOCHS
-        + 1;
-    assert_eq!(window.len() as u64, expected);
-    let keys: Vec<_> = window
-        .iter()
-        .map(|e| RendezvousKeys::derive(&seed(), *e))
-        .collect();
-    let addresses: HashSet<[u8; 32]> = keys.iter().map(|k| k.address.0).collect();
-    let seal_keys: HashSet<[u8; 32]> = keys.iter().map(|k| *k.seal_key).collect();
-    assert_eq!(
-        addresses.len(),
-        window.len(),
-        "one distinct address per epoch"
-    );
-    assert_eq!(
-        seal_keys.len(),
-        window.len(),
-        "one distinct seal key per epoch"
-    );
-}
-
-#[test]
-fn rendezvous_address_differs_from_master_address_in_every_epoch() {
+fn rendezvous_address_differs_from_master_address_and_its_hash() {
     let master = master_identity(&derive_master_key(&seed()).unwrap());
     let master_box = MailboxAddress::for_master(&master);
     let master_hash: [u8; 32] = sha2::Sha256::digest(master.0).into();
-    for e in dr_window() {
-        let keys = RendezvousKeys::derive(&seed(), e);
-        assert_ne!(keys.address, master_box, "epoch {}", e.0);
-        assert_ne!(keys.address.0, master_hash, "epoch {}", e.0);
-    }
+    let k = keys();
+    assert_ne!(k.address, master_box);
+    assert_ne!(k.address.0, master_hash);
 }
 
 /// The derivation's secret input is the seed: two masters get different addresses,
-/// and the same formula keyed by public data (master_pub, or a hash of master_pub
-/// and the epoch) does not reproduce the address.
+/// and the same formula keyed by public data (master_pub, or its hash) does not
+/// reproduce the address.
 #[test]
 fn rendezvous_derivation_is_keyed_by_seed_not_by_master_pub() {
-    let e = now_epoch();
-    let keys = RendezvousKeys::derive(&seed(), e);
-    let other = RendezvousKeys::derive(&other_seed(), e);
-    assert_ne!(keys.address, other.address);
+    let k = keys();
+    let other = RendezvousKeys::derive(&other_seed());
+    assert_ne!(k.address, other.address);
 
     let master = master_identity(&derive_master_key(&seed()).unwrap());
-    let from_pub = RendezvousKeys::derive(&master.0, e);
-    assert_ne!(keys.address, from_pub.address);
-    let mut h = sha2::Sha256::new();
-    h.update(master.0);
-    h.update(e.0.to_be_bytes());
-    let hashed: [u8; 32] = h.finalize().into();
-    assert_ne!(keys.address.0, hashed);
+    let from_pub = RendezvousKeys::derive(&master.0);
+    assert_ne!(k.address, from_pub.address);
+    let hashed: [u8; 32] = sha2::Sha256::digest(master.0).into();
+    assert_ne!(k.address, RendezvousKeys::derive(&hashed).address);
+}
+
+// ============================================================
+// AC-30: pointer slots (one per place of a catalog history)
+// ============================================================
+
+#[test]
+fn pointer_slot_matches_known_vector() {
+    let k = keys();
+    assert_eq!(
+        hex_encode(&k.pointer_slot(&LINEAGE, PointerPlace::A)),
+        "c1acefa4762e183c5a16f8a6f411d4f8"
+    );
+    assert_eq!(
+        hex_encode(&k.pointer_slot(&LINEAGE, PointerPlace::B)),
+        "311e34feec1c435504645cc5dc6e19ae"
+    );
+}
+
+#[test]
+fn pointer_slot_is_deterministic_per_seed_and_lineage() {
+    for place in [PointerPlace::A, PointerPlace::B] {
+        assert_eq!(
+            keys().pointer_slot(&LINEAGE, place),
+            RendezvousKeys::derive(&seed()).pointer_slot(&LINEAGE, place)
+        );
+    }
+}
+
+#[test]
+fn pointer_slot_differs_between_lineages_and_between_seeds() {
+    let k = keys();
+    let other = RendezvousKeys::derive(&other_seed());
+    let mut seen = HashSet::new();
+    for lineage in [[0x11u8; 16], [0x12; 16], [0; 16], [0xFF; 16]] {
+        for place in [PointerPlace::A, PointerPlace::B] {
+            assert!(seen.insert(k.pointer_slot(&lineage, place)));
+            assert!(seen.insert(other.pointer_slot(&lineage, place)));
+        }
+    }
+}
+
+#[test]
+fn pointer_slot_differs_between_places_of_one_lineage() {
+    let k = keys();
+    assert_ne!(
+        k.pointer_slot(&LINEAGE, PointerPlace::A),
+        k.pointer_slot(&LINEAGE, PointerPlace::B)
+    );
+    assert_eq!(PointerPlace::A.other(), PointerPlace::B);
+    assert_eq!(PointerPlace::B.other(), PointerPlace::A);
+}
+
+/// The postman must not be able to read the lineage off the slot (S1 needles, V.7).
+#[test]
+fn pointer_slot_is_not_the_lineage_bytes() {
+    let k = keys();
+    for lineage in [[0x11u8; 16], [0; 16], std::array::from_fn(|i| i as u8)] {
+        for place in [PointerPlace::A, PointerPlace::B] {
+            let slot = k.pointer_slot(&lineage, place);
+            assert_ne!(slot, lineage);
+            assert_ne!(slot[..8], lineage[..8]);
+        }
+    }
+}
+
+/// Mutation guard (V.7): a random `msg_id`, or `msg_id = lineage`, makes this red.
+#[test]
+fn seal_self_pointer_uses_the_place_slot_as_msg_id() {
+    let k = keys();
+    for place in [PointerPlace::A, PointerPlace::B] {
+        for _ in 0..3 {
+            let sealed =
+                seal_self_pointer(&k, &LINEAGE, place, b"pointer", NOW + 3600, NOW).unwrap();
+            assert_eq!(sealed.entry().msg_id, k.pointer_slot(&LINEAGE, place));
+            assert_eq!(sealed.target(), k.address);
+            // The slot is covered by the store signature (V.13 п.1).
+            verify_store_sig(sealed.entry(), &sealed.target_sig().unwrap()).unwrap();
+        }
+    }
+    // Another seed's box for the same lineage: another address and another slot.
+    let other = RendezvousKeys::derive(&other_seed());
+    let theirs =
+        seal_self_pointer(&other, &LINEAGE, PointerPlace::A, b"p", NOW + 3600, NOW).unwrap();
+    assert_ne!(
+        theirs.entry().msg_id,
+        k.pointer_slot(&LINEAGE, PointerPlace::A)
+    );
+    assert_ne!(theirs.target(), k.address);
+}
+
+/// A sibling device (same mnemonic, P6) derives the same box, keys and slots.
+#[test]
+fn siblings_derive_identical_rendezvous_keys_and_slots() {
+    let laptop = RendezvousKeys::derive(&seed());
+    // A separate copy of the phrase's seed, as restored on another machine.
+    let sibling_seed: [u8; 64] = seed();
+    let sibling = RendezvousKeys::derive(&sibling_seed);
+    assert_eq!(laptop.address, sibling.address);
+    assert_eq!(*laptop.seal_key, *sibling.seal_key);
+    for place in [PointerPlace::A, PointerPlace::B] {
+        assert_eq!(
+            laptop.pointer_slot(&LINEAGE, place),
+            sibling.pointer_slot(&LINEAGE, place)
+        );
+    }
+    let sealed = seal_pointer(&laptop, b"pointer");
+    assert_eq!(
+        open_self_pointer(&sibling, sealed.entry()).unwrap(),
+        b"pointer"
+    );
 }
 
 // ============================================================
@@ -221,34 +275,33 @@ fn new_keys_are_distinct_from_existing_seed_derivations() {
         okm
     };
     existing.push(dr);
-
-    let mut new: Vec<[u8; 32]> = Vec::new();
-    for e in [0u64, 1, 2, 691] {
-        existing.push(
-            derive_epoch_key(&s, EpochCounter(e as u32))
-                .unwrap()
-                .key_bytes,
-        );
-        let k = RendezvousKeys::derive(&s, RendezvousEpoch(e));
-        new.push(k.signing_key.to_bytes());
-        new.push(k.address.0);
-        new.push(*k.seal_key);
+    for e in [0u32, 1, 2, 691] {
+        existing.push(derive_epoch_key(&s, EpochCounter(e)).unwrap().key_bytes);
     }
+
+    let k = RendezvousKeys::derive(&s);
+    let new: Vec<[u8; 32]> = vec![
+        k.signing_key.to_bytes(),
+        k.address.0,
+        *k.seal_key,
+        *k.slot_key,
+    ];
 
     let mut all: HashSet<[u8; 32]> = existing.iter().copied().collect();
     assert_eq!(all.len(), existing.len(), "existing derivations collide");
-    for k in &new {
-        assert!(all.insert(*k), "new key {} collides", hex_encode(k));
+    for key in &new {
+        assert!(all.insert(*key), "new key {} collides", hex_encode(key));
     }
 }
 
 #[test]
 fn rendezvous_keys_debug_does_not_print_secrets() {
-    let keys = RendezvousKeys::derive(&seed(), RendezvousEpoch(691));
+    let keys = keys();
     let dbg = format!("{keys:?}");
     assert!(!dbg.contains(&hex_encode(&keys.seal_key[..])));
+    assert!(!dbg.contains(&hex_encode(&keys.slot_key[..])));
     assert!(!dbg.contains(&hex_encode(&keys.signing_key.to_bytes())));
-    assert!(!dbg.contains("seal_key") && !dbg.contains("signing_key"));
+    assert!(!dbg.contains("seal_key") && !dbg.contains("signing_key") && !dbg.contains("slot_key"));
 }
 
 // ============================================================
@@ -287,15 +340,15 @@ fn directed_raw_matches_known_vector() {
 
 #[test]
 fn self_raw_matches_known_vector() {
-    let keys = RendezvousKeys::derive(&seed(), RendezvousEpoch(691));
+    let keys = keys();
     let aad = aad(2, MailboxClass::SelfPointer, &keys.address.0);
     let pt = b"viaticum self-seal test vector";
     let payload = seal_self_raw(&keys.seal_key, [7; 12], &aad, pt);
     assert_eq!(
         hex_encode(&payload),
         "070707070707070707070707\
-         2478cb5e08eb7320c889222b54163836a2fa21f975974b7c56b0db502067da84\
-         db9a11355339ee9a727ec9478f53"
+         0f86160180f3bbfd3f3077b0308e9165f5fdfde8e0376774cfab147e22f01285\
+         a778e696e7ee661dbca139328797"
     );
     assert_eq!(open_self_raw(&keys.seal_key, &aad, &payload).unwrap(), pt);
 }
@@ -334,7 +387,7 @@ fn directed_envelope_matches_known_vector() {
 
 #[test]
 fn self_seal_roundtrip() {
-    let keys = RendezvousKeys::derive(&seed(), now_epoch());
+    let keys = keys();
     let sealed = seal_pointer(&keys, b"cbor(self pointer)");
     assert_eq!(sealed.target(), keys.address);
     let entry = sealed.entry();
@@ -342,7 +395,7 @@ fn self_seal_roundtrip() {
     assert_eq!(entry.payload_version, SEALED_PAYLOAD_VERSION);
     assert_eq!(entry.sender, None);
     // A DR machine re-derives the keys from the seed alone and opens it.
-    let dr_keys = RendezvousKeys::derive(&seed(), now_epoch());
+    let dr_keys = RendezvousKeys::derive(&seed());
     assert_eq!(
         open_self_pointer(&dr_keys, entry).unwrap(),
         b"cbor(self pointer)"
@@ -351,24 +404,11 @@ fn self_seal_roundtrip() {
 
 #[test]
 fn self_seal_open_fails_with_other_seed() {
-    let keys = RendezvousKeys::derive(&seed(), now_epoch());
+    let keys = keys();
     let sealed = seal_pointer(&keys, b"pointer");
-    let other = RendezvousKeys::derive(&other_seed(), now_epoch());
+    let other = RendezvousKeys::derive(&other_seed());
     assert!(matches!(
         open_self_pointer(&other, sealed.entry()),
-        Err(SealError::Open)
-    ));
-}
-
-#[test]
-fn self_seal_open_fails_when_moved_to_other_epoch_box() {
-    let e = now_epoch();
-    let sealed = seal_pointer(&RendezvousKeys::derive(&seed(), e), b"pointer");
-    let next = RendezvousKeys::derive(&seed(), e.next());
-    let mut moved = sealed.entry().clone();
-    moved.target = IdentityPub(next.address.0);
-    assert!(matches!(
-        open_self_pointer(&next, &moved),
         Err(SealError::Open)
     ));
 }
@@ -376,9 +416,9 @@ fn self_seal_open_fails_when_moved_to_other_epoch_box() {
 /// Same key, different box: only the AAD binding catches this.
 #[test]
 fn self_seal_open_fails_when_target_is_changed() {
-    let keys = RendezvousKeys::derive(&seed(), now_epoch());
+    let keys = keys();
     let mut moved = seal_pointer(&keys, b"pointer").entry().clone();
-    moved.target = IdentityPub([0x44; 32]);
+    moved.target = MailboxAddress([0x44; 32]);
     assert!(matches!(
         open_self_pointer(&keys, &moved),
         Err(SealError::Open)
@@ -387,7 +427,7 @@ fn self_seal_open_fails_when_target_is_changed() {
 
 #[test]
 fn self_seal_uses_fresh_nonce_per_call() {
-    let keys = RendezvousKeys::derive(&seed(), now_epoch());
+    let keys = keys();
     let a = seal_pointer(&keys, b"pointer");
     let b = seal_pointer(&keys, b"pointer");
     assert_ne!(a.entry().payload[..12], b.entry().payload[..12]);
@@ -395,7 +435,7 @@ fn self_seal_uses_fresh_nonce_per_call() {
 
 #[test]
 fn open_self_pointer_rejects_directed_class_and_old_version() {
-    let keys = RendezvousKeys::derive(&seed(), now_epoch());
+    let keys = keys();
     let mut entry = seal_pointer(&keys, b"pointer").entry().clone();
     entry.class = MailboxClass::PosChallenge;
     assert!(matches!(
@@ -466,7 +506,7 @@ fn directed_open_fails_when_target_is_changed() {
     let mut entry = seal_to(&r_pub, MailboxClass::PosResponse, b"response")
         .entry()
         .clone();
-    entry.target = IdentityPub([0x12; 32]);
+    entry.target = MailboxAddress([0x12; 32]);
     assert!(matches!(open_directed(&r_sk, &entry), Err(SealError::Open)));
 }
 
@@ -633,8 +673,16 @@ fn max_body_sealed_fits_entry_cap() {
     );
     assert_eq!(open_directed(&r_sk, sealed.entry()).unwrap().body, body);
 
-    let keys = RendezvousKeys::derive(&seed(), now_epoch());
-    let pointer = seal_self_pointer(&keys, [0xFF; 16], &body, u64::MAX, u64::MAX).unwrap();
+    let keys = keys();
+    let pointer = seal_self_pointer(
+        &keys,
+        &[0xFF; 16],
+        PointerPlace::B,
+        &body,
+        u64::MAX,
+        u64::MAX,
+    )
+    .unwrap();
     assert!(pointer.entry().serialized_size() <= class_config::MAX_ENTRY_BYTES);
 
     let engine = MailboxEngine::new(test_db());
@@ -663,9 +711,9 @@ fn seal_rejects_body_over_budget() {
         Err(SealError::BodyTooLarge { size, max })
             if size == MAX_SEALED_BODY_BYTES + 1 && max == MAX_SEALED_BODY_BYTES
     ));
-    let keys = RendezvousKeys::derive(&seed(), now_epoch());
+    let keys = keys();
     assert!(matches!(
-        seal_self_pointer(&keys, [0; 16], &body, NOW + 1, NOW),
+        seal_self_pointer(&keys, &[0; 16], PointerPlace::A, &body, NOW + 1, NOW),
         Err(SealError::BodyTooLarge { .. })
     ));
 }
@@ -676,7 +724,7 @@ fn seal_rejects_body_over_budget() {
 
 #[test]
 fn store_sig_roundtrip() {
-    let keys = RendezvousKeys::derive(&seed(), now_epoch());
+    let keys = keys();
     let sealed = seal_pointer(&keys, b"pointer");
     let sig = sealed
         .target_sig()
@@ -685,13 +733,13 @@ fn store_sig_roundtrip() {
     // Master box (C2): the same rule with the master key.
     let master = derive_master_key(&seed()).unwrap();
     let mut entry = sealed.entry().clone();
-    entry.target = master_identity(&master);
+    entry.target = MailboxAddress::for_master(&master_identity(&master));
     verify_store_sig(&entry, &sign_store(&master, &entry)).unwrap();
 }
 
 #[test]
 fn store_sig_fails_when_payload_changes() {
-    let keys = RendezvousKeys::derive(&seed(), now_epoch());
+    let keys = keys();
     let sealed = seal_pointer(&keys, b"pointer");
     let sig = sealed.target_sig().unwrap();
     let mut entry = sealed.entry().clone();
@@ -706,17 +754,13 @@ type Mutator = fn(&mut MailboxEntry);
 
 #[test]
 fn store_sig_fails_when_any_signed_header_field_changes() {
-    let keys = RendezvousKeys::derive(&seed(), now_epoch());
+    let keys = keys();
     let sealed = seal_pointer(&keys, b"pointer");
     let sig = sealed.target_sig().unwrap();
     let base = sealed.entry().clone();
     let mutations: [(&str, Mutator); 6] = [
         ("target", |e| {
-            e.target = IdentityPub(
-                RendezvousKeys::derive(&seed(), RendezvousEpoch(1))
-                    .address
-                    .0,
-            )
+            e.target = RendezvousKeys::derive(&other_seed()).address
         }),
         ("class", |e| e.class = MailboxClass::Generic),
         ("msg_id", |e| e.msg_id[0] ^= 1),
@@ -735,12 +779,11 @@ fn store_sig_fails_when_any_signed_header_field_changes() {
 }
 
 #[test]
-fn store_sig_by_other_epoch_key_is_unauthorized() {
-    let e = now_epoch();
-    let keys = RendezvousKeys::derive(&seed(), e);
+fn store_sig_by_other_seed_key_is_unauthorized() {
+    let keys = keys();
     let sealed = seal_pointer(&keys, b"pointer");
-    let prev = RendezvousKeys::derive(&seed(), e.prev().unwrap());
-    let forged = prev.sign_store(sealed.entry());
+    let other = RendezvousKeys::derive(&other_seed());
+    let forged = other.sign_store(sealed.entry());
     assert!(matches!(
         verify_store_sig(sealed.entry(), &forged),
         Err(MailboxError::Unauthorized)
@@ -757,9 +800,9 @@ fn small_order_address_forgery_is_rejected() {
     identity_point[0] = 1;
     let mut trivial_sig = [0u8; 64];
     trivial_sig[0] = 1;
-    let keys = RendezvousKeys::derive(&seed(), now_epoch());
+    let keys = keys();
     let mut entry = seal_pointer(&keys, b"pointer").entry().clone();
-    entry.target = IdentityPub(identity_point);
+    entry.target = MailboxAddress(identity_point);
     let addr = MailboxAddress(identity_point);
     let vk = addr.verifying_key().expect("identity is a valid encoding");
     assert!(
@@ -779,13 +822,13 @@ fn small_order_address_forgery_is_rejected() {
 
 #[test]
 fn fetch_proof_bound_to_requester_device() {
-    let keys = RendezvousKeys::derive(&seed(), now_epoch());
+    let keys = keys();
     let dev_a = DeviceId([0xAA; 32]);
     let dev_b = DeviceId([0xBB; 32]);
     let proof = keys.fetch_proof(&dev_a);
     assert!(verify_fetch_proof(&keys.address, &dev_a, &proof));
     assert!(!verify_fetch_proof(&keys.address, &dev_b, &proof));
-    let other_box = RendezvousKeys::derive(&seed(), now_epoch().next()).address;
+    let other_box = RendezvousKeys::derive(&other_seed()).address;
     assert!(!verify_fetch_proof(&other_box, &dev_a, &proof));
     // A store signature is not a fetch proof (domain separation).
     let sealed = seal_pointer(&keys, b"pointer");

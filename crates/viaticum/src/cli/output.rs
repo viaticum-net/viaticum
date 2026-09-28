@@ -127,21 +127,55 @@ pub fn render_status(data: &StatusData) -> String {
     out
 }
 
-/// The DR readiness (dr-i9) and missing-source (dr-i11) lines of `status`.
+/// The DR readiness (dr-i9, dr-i39, dr-i41; mailbox-i49, i54) and missing-source
+/// (dr-i11) lines of `status`.
 pub fn render_dr_readiness(data: &StatusData) -> String {
+    let iso = |t| crate::daemon::dispatch::unix_secs_to_iso(t, true);
     let mut out = String::new();
-    if data.dr_pointer_published_at > 0 {
-        out.push_str(&format!(
-            "  DR:             ready: recovery pointer published {}, {} files, accepted by {} peer(s)\n",
-            crate::daemon::dispatch::unix_secs_to_iso(data.dr_pointer_published_at, true),
-            data.dr_pointer_files,
-            data.dr_pointer_acks
-        ));
-    } else {
+    if data.dr_pointer_published_at == 0 {
         out.push_str(
             "  DR:             NOT READY: this node has not published its recovery pointer yet \
              (first one ~12 h after install)\n",
         );
+    } else if data.dr_ready {
+        out.push_str(&format!(
+            "  DR:             ready: recovery pointer published {}, {} files, accepted by {} peer(s)\n",
+            iso(data.dr_pointer_published_at),
+            data.dr_pointer_files,
+            data.dr_pointer_acks
+        ));
+        if data.dr_restores_state_of > 0 {
+            out.push_str(&format!(
+                "                  DR would restore the catalog as of {} or newer\n",
+                iso(data.dr_restores_state_of)
+            ));
+        }
+    } else {
+        out.push_str(&format!(
+            "  DR:             NOT READY: recovery pointer published {}, {} files, accepted by {} of \
+             the {} friends needed\n",
+            iso(data.dr_pointer_published_at),
+            data.dr_pointer_files,
+            data.dr_pointer_acks,
+            data.dr_pointer_ack_threshold
+        ));
+        if data.dr_ss_blocks_placed < data.dr_ss_blocks_total {
+            out.push_str(&format!(
+                "                  the catalog blocks are not stored at friends yet ({} of {}): \
+                 friends have no room yet; a newcomer enters the network gradually\n",
+                data.dr_ss_blocks_placed, data.dr_ss_blocks_total
+            ));
+        }
+    }
+    if !data.dr_pointer_refusal.is_empty() {
+        out.push_str(&format!("  {}\n", data.dr_pointer_refusal));
+    }
+    if data.dr_waiting_since > 0 {
+        out.push_str(&format!(
+            "  DR: the newest catalog changes are not in the network yet (waiting since {}: {})\n",
+            iso(data.dr_waiting_since),
+            data.dr_waiting
+        ));
     }
     if data.files_without_source > 0 {
         out.push_str(&format!(
