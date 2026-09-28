@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use viaticum_core::db::Db;
 use viaticum_core::erasure::Symbol;
 use viaticum_core::messages::{Message, SymbolTransferMsg, build_symbol_offer};
-use viaticum_core::types::{HoldingRecord, HoldingStatus, IdentityPub, Timestamp};
+use viaticum_core::types::{DeviceId, HoldingRecord, HoldingStatus, IdentityPub, Timestamp};
 
 use super::{make_block_id, make_processor_with_quota};
 use crate::daemon::four_r_log::tests::capture_dispatch;
@@ -82,6 +82,7 @@ fn a_transfer_landing_before_the_offer_shadow_reads_still_leaves_the_block_notif
     let reply = {
         let _shadow_ctx = shadow_rt.enter();
         p.handle_symbol_offer_inner(
+            DeviceId(owner.0),
             owner,
             build_symbol_offer([7; 16], blk, vec![(0, 2)], 0.5, Timestamp::now(), &key),
         )
@@ -99,6 +100,7 @@ fn a_transfer_landing_before_the_offer_shadow_reads_still_leaves_the_block_notif
     // The owner's transfer lands through the real receive path: ESI 1 merged into the record.
     io_rt
         .block_on(p.handle_symbol_transfer(
+            DeviceId(owner.0),
             owner,
             SymbolTransferMsg {
                 v: 1,
