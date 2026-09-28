@@ -13,8 +13,6 @@ mod tests;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
-use hkdf::Hkdf;
-use sha2::Sha256;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -462,15 +460,13 @@ impl DaemonHandle {
             // identity, not necessarily this node's own derived master.
             let device_cert = own_membership.device_cert.clone();
             let cluster_master_pub = own_membership.cluster_master_pub;
-            let x25519_pub = {
-                let hk = Hkdf::<Sha256>::new(Some(b""), &keyfile.seed);
-                let mut okm = [0u8; 32];
-                hk.expand(b"viaticum-x25519", &mut okm)
-                    .expect("HKDF expand cannot fail with valid length");
-                let secret = x25519_dalek::StaticSecret::from(okm);
-                let pub_key = x25519_dalek::PublicKey::from(&secret);
-                Some(pub_key.to_bytes())
-            };
+            // The x25519 key of this phrase (the same one DR announces, F11).
+            let x25519_pub = Some(
+                x25519_dalek::PublicKey::from(&viaticum_core::cluster::derive_x25519_secret(
+                    &keyfile.seed,
+                ))
+                .to_bytes(),
+            );
             // Parse kademlia_bootstrap_peers from config strings → Multiaddr.
             // AppConfig::validate() already checked basic syntax; full parse here.
             let kademlia_bootstrap_peers: Vec<libp2p::Multiaddr> = app_config
@@ -1114,21 +1110,13 @@ impl DaemonHandle {
             tokio::spawn(async move { scheduler.run(pos_response_rx, cancel_scheduler).await }),
         ));
 
-        // ── T-8: Shared current_pointer handle ───────────────────────────────
-        // Shared between run_mailbox_poll (W-2: restart-recovery) and run_periodic_push
-        // (republish tracking). std::sync::Mutex: critical sections are tiny and must
-        // not be held across .await.
-        let current_pointer: std::sync::Arc<
-            std::sync::Mutex<Option<viaticum_core::system_state::SelfPointer>>,
-        > = std::sync::Arc::new(std::sync::Mutex::new(None));
-
         // ── T-6/T-7/T-13b-1: Mailbox poll task ─────────────────────────────
         // Polls this node's mailbox every MAILBOX_POLL_INTERVAL_SECS.
         // Started alongside other periodic tasks (T-9 will add explicit Kademlia stabilize wait).
         //
         // T-6:     PosResponder handles PosChallenge entries from mailbox.
         // T-7:     ProcessorDropHandler handles DropNotice batch entries (db only).
-        // T-8:     current_pointer shared handle passed in for W-2 dispatch (restart-recovery).
+        // CROWN-1 C3a: pointers live in the rendezvous box, which only DR reads (РС3.1).
         // T-13b-1: ProcessorDeleteHandler handles DeleteRequest entries (Delete/CancelDelete).
         // T-13b-2: ProcessorRevocationHandler handles Revocation entries (device revocation).
         // No Arc<Processor> wrap needed: all handlers are standalone structs built from clones.
@@ -1158,17 +1146,14 @@ impl DaemonHandle {
             // Only requires db — mirrors the relay-board revocation_broadcast handler.
             let revocation_handler = ProcessorRevocationHandler::new(db.clone());
 
-            let poll_db = db.clone();
             let poll_router = std::sync::Arc::clone(&mailbox_router);
             let poll_pos_tx = pos_response_tx.clone();
             let poll_identity = identity_pub;
-            let poll_current_pointer = std::sync::Arc::clone(&current_pointer);
             let poll_cancel = cancel.clone();
             tasks.push((
                 "mailbox_poll",
                 tokio::spawn(async move {
                     run_mailbox_poll(
-                        poll_db,
                         poll_router,
                         poll_pos_tx,
                         std::sync::Arc::new(pos_handler),
@@ -1176,7 +1161,6 @@ impl DaemonHandle {
                         std::sync::Arc::new(delete_handler),
                         std::sync::Arc::new(revocation_handler),
                         poll_identity,
-                        poll_current_pointer,
                         time_scale,
                         poll_cancel,
                     )
@@ -1252,7 +1236,8 @@ impl DaemonHandle {
 
         // ── System state periodic push (T-8) ────────────────────────────────
         // T-8: pointer is published via mailbox instead of push-to-all.
-        // Passes mailbox_router, identity_pub (my_master_pub), and current_pointer handle.
+        // The pointer is sealed with keys derived from the seed inside the task
+        // (RendezvousKeys); its place state lives in META (CROWN-1 C3a).
         // Uses SwarmHandle (ε.2+); the swarm is always up here.
         {
             let ss_db = db.clone();
@@ -1262,10 +1247,8 @@ impl DaemonHandle {
             let ss_data_dir = cfg.data_dir.clone();
             let ss_interval = (6 * 3600 / time_scale).max(60);
             let ss_mailbox_router = std::sync::Arc::clone(&mailbox_router);
-            let ss_my_master_pub = identity_pub;
             // Spec B2 (dr-i19): pointers name the device that published them.
             let ss_publisher = device_id;
-            let ss_current_pointer = std::sync::Arc::clone(&current_pointer);
             let cancel_ss = cancel.clone();
             tasks.push((
                 "system_state_push",
@@ -1280,9 +1263,7 @@ impl DaemonHandle {
                         time_scale,
                         cancel_ss,
                         ss_mailbox_router,
-                        ss_my_master_pub,
                         ss_publisher,
-                        ss_current_pointer,
                     )
                     .await
                     {

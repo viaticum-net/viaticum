@@ -9,7 +9,7 @@
 //   run_periodic_push       — tokio task: push blob to all known peers via swarm on interval
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use hkdf::Hkdf;
@@ -19,13 +19,13 @@ use viaticum_core::db::Db;
 use viaticum_core::mailbox::seal::RendezvousKeys;
 use viaticum_core::system_state::catalog::live_file_count;
 use viaticum_core::system_state::{
-    SelfPointer, SystemState, diff_states, pack_system_state, restore_db, snapshot_db,
+    SystemState, diff_states, pack_system_state, restore_db, snapshot_db,
 };
 // Re-exported so tests (and callers) can check the current format version.
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 pub use viaticum_core::system_state::SYSTEM_STATE_VERSION;
-use viaticum_core::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp};
+use viaticum_core::types::{DeviceId, SourceBlockId, Timestamp};
 
 use crate::daemon::mailbox::routing::{MailboxRouter, PublishVerdict};
 use crate::daemon::network::swarm::SwarmHandle;
@@ -106,8 +106,7 @@ pub fn decrypt_and_restore(db: &Db, blob: &[u8], seed: &[u8]) -> anyhow::Result<
 ///
 /// The daemon never reads its own pointer box (РС3.1): only DR does
 /// (`mailbox_router.dr_collect_pointers`). A restart builds a new base; it goes to the
-/// weaker of the two places. `_current_pointer` is unused since C3a; it goes with the
-/// handle wiring.
+/// weaker of the two places.
 ///
 /// Catalog history (spec B2): every pointer carries this DB's history id (minted here on
 /// first use, never inherited), the publishing device (`publisher` = this daemon's
@@ -126,9 +125,7 @@ pub async fn run_periodic_push(
     time_scale: u64,
     cancel: CancellationToken,
     mailbox_router: Arc<MailboxRouter>,
-    _my_master_pub: IdentityPub,
     publisher: DeviceId,
-    _current_pointer: Arc<Mutex<Option<SelfPointer>>>,
 ) -> anyhow::Result<()> {
     let clamped = interval_secs.max(60);
     let dr_key = identity_key_bytes_from_seed(&seed)?;

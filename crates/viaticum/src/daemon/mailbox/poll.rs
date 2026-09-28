@@ -15,19 +15,17 @@
 //   Revocation     → RevocationMailboxHandler::handle_revocation (T-13b-2: device revocation)
 //   Generic/other  → ignore
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use viaticum_core::constants::MAILBOX_POLL_INTERVAL_SECS;
-use viaticum_core::db::Db;
 use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
 use viaticum_core::messages::{
     PosHashResponseMsg, SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, to_cbor,
 };
-use viaticum_core::system_state::SelfPointer;
 use viaticum_core::types::{IdentityPub, from_cbor_bytes, hex_encode};
 
 use super::routing::MailboxRouter;
@@ -53,8 +51,6 @@ pub(crate) fn poll_interval_secs(time_scale: u64) -> u64 {
 /// Dispatches entries to the appropriate handlers.
 ///
 /// Parameters:
-/// - `_db`: unused since CROWN-1 C3a (it served the own-pointer arm); goes with the
-///   handle wiring of the next commit
 /// - `router`: the MailboxRouter used to poll and publish responses
 /// - `pos_response_tx`: bounded channel (capacity 256) to scheduler for PosResponse entries
 /// - `challenge_handler`: called with (owner_master, challenge_payload_bytes) to process a
@@ -63,14 +59,11 @@ pub(crate) fn poll_interval_secs(time_scale: u64) -> u64 {
 /// - `delete_handler`: called for each DeleteRequest entry (T-13b-1)
 /// - `revocation_handler`: called for each Revocation entry (T-13b-2)
 /// - `my_master_pub`: this node's master identity (its master box is polled)
-/// - `_current_pointer`: unused since CROWN-1 C3a (the daemon does not read its pointer
-///   box, РС3.1); the parameter goes with the handle wiring of the next commit.
 /// - `time_scale`: time-acceleration factor; the poll cadence is divided by it
 ///   (see `poll_interval_secs`). Production passes 1.
 /// - `cancel`: cancellation token
 #[allow(clippy::too_many_arguments)]
 pub async fn run_mailbox_poll(
-    _db: Db,
     router: Arc<MailboxRouter>,
     pos_response_tx: mpsc::Sender<PosHashResponseMsg>,
     challenge_handler: Arc<dyn PosMailboxChallengeHandler>,
@@ -78,7 +71,6 @@ pub async fn run_mailbox_poll(
     delete_handler: Arc<dyn DeleteMailboxHandler>,
     revocation_handler: Arc<dyn RevocationMailboxHandler>,
     my_master_pub: IdentityPub,
-    _current_pointer: Arc<Mutex<Option<SelfPointer>>>,
     time_scale: u64,
     cancel: CancellationToken,
 ) {
