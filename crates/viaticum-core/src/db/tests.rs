@@ -4502,3 +4502,45 @@ fn record_pointer_publication_roundtrip() {
     db.record_pointer_publication(&second).unwrap();
     assert_eq!(db.last_pointer_publication().unwrap(), Some(second));
 }
+
+/// CROWN-1 V.16.3: the two pointer places (with their envelopes) survive a write/read
+/// as one record; nothing before the first write.
+#[test]
+fn pointer_publications_roundtrip() {
+    use crate::mailbox::seal::PointerPlace;
+    use crate::system_state::catalog::{
+        PlacePublication, PointerPublications, PointerRefusal, RefusalKind, RetiredPointer,
+    };
+    let db = test_db();
+    assert_eq!(db.pointer_publications().unwrap(), None);
+    let record = PlacePublication {
+        place: PointerPlace::B,
+        base: SourceBlockId([1; 32]),
+        diffs: vec![SourceBlockId([2; 32])],
+        generation: 3,
+        created_at: Timestamp(77),
+        files: 5,
+        acks: vec![DeviceId([9; 32])],
+        entry_cbor: vec![0xA5; 40],
+        target_sig: [0x3C; 64],
+        last_refusal: Some(PointerRefusal {
+            at: 70,
+            kind: RefusalKind::Mixed {
+                clock: 1,
+                superseded: 2,
+                slots_full: 0,
+                other: 1,
+            },
+        }),
+        to_retire: vec![RetiredPointer {
+            base: SourceBlockId([4; 32]),
+            diffs: vec![],
+        }],
+    };
+    let mut meta = PointerPublications::new(crate::system_state::CatalogLineageId([6; 16]));
+    meta.current = Some(record.clone());
+    db.put_pointer_publications(&meta).unwrap();
+    assert_eq!(db.pointer_publications().unwrap(), Some(meta.clone()));
+    assert_eq!(meta.in_place(PointerPlace::B), Some(&record));
+    assert_eq!(meta.in_place(PointerPlace::A), None);
+}

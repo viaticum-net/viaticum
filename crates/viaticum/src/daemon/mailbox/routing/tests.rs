@@ -649,6 +649,29 @@ async fn publish_records_avail_on_ack() {
     );
 }
 
+/// CROWN-1 V.17.1: a postman's answer is a contact — its `last_seen` moves to now, so
+/// a holder on a long-lived connection (no re-authentication) keeps counting for the
+/// strength of an SS base.
+#[tokio::test]
+async fn contact_on_ack_refreshes_last_seen() {
+    let key = viaticum_core::cluster::derive_device_key(&[0x78u8; 64], &[0x01u8; 32]).unwrap();
+    let device_id = DeviceId(key.verifying_key().to_bytes());
+    let db = test_db();
+    let mut record = make_peer_record(device_id, INITIAL_TRUST_P, 0.0, 0.3);
+    record.last_seen = Timestamp(1_000);
+    db.upsert_peer(&record).unwrap();
+    let router = MailboxRouter::with_sender(Arc::new(MockSender::new()), db.clone());
+    let before = Timestamp::now().0;
+    let entry = make_entry(
+        make_identity(78),
+        make_msg_id(51),
+        before,
+        MailboxClass::PosChallenge,
+    );
+    assert_eq!(router.publish(entry, None).await.unwrap(), 1);
+    assert!(db.get_peer(&device_id).unwrap().unwrap().last_seen.0 >= before);
+}
+
 // ─── CS-DR-1: DR collects every pointer from every batch ─────────────────────
 //
 // CROWN-1 C3a: the pointers live sealed in the seed-derived rendezvous box; the walk

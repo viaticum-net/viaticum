@@ -100,6 +100,10 @@ const META_KEY_CATALOG_LINEAGE: &str = "catalog_lineage_v1";
 /// (CBOR `PointerPublication`, dr-i9).
 const META_KEY_POINTER_PUBLICATION: &str = "pointer_publication_v1";
 
+/// Meta key: the two pointer places of this history (CBOR `PointerPublications`,
+/// CROWN-1 V.16.3). Not part of the SystemState snapshot.
+const META_KEY_POINTER_PUBLICATIONS: &str = "pointer_publication_v2";
+
 // --- Indices ---
 
 /// file → holders index. Key = (FileId u64 BE[8] || holder DeviceId[32]) = [u8;40].
@@ -535,6 +539,32 @@ impl Db {
         {
             let mut table = tx.open_table(META)?;
             table.insert(META_KEY_POINTER_PUBLICATION, to_cbor_bytes(p).as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The pointer places of this history (CROWN-1 V.16.3), if any was ever written.
+    pub fn pointer_publications(
+        &self,
+    ) -> Result<Option<crate::system_state::catalog::PointerPublications>, DbError> {
+        let tx = self.inner.begin_read()?;
+        let table = tx.open_table(META)?;
+        match table.get(META_KEY_POINTER_PUBLICATIONS)? {
+            Some(v) => Ok(Some(from_cbor_bytes(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Replace the pointer places record (one write transaction, whole record).
+    pub fn put_pointer_publications(
+        &self,
+        p: &crate::system_state::catalog::PointerPublications,
+    ) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(META)?;
+            table.insert(META_KEY_POINTER_PUBLICATIONS, to_cbor_bytes(p).as_slice())?;
         }
         tx.commit()?;
         Ok(())

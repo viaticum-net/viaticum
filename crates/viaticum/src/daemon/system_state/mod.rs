@@ -16,25 +16,24 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use viaticum_core::constants::MAILBOX_POINTER_REPUBLISH_SECS;
 use viaticum_core::db::Db;
-use viaticum_core::mailbox::class_config;
-use viaticum_core::mailbox::seal::{PointerPlace, RendezvousKeys, seal_self_pointer};
-use viaticum_core::system_state::catalog::{PointerPublication, live_file_count};
+use viaticum_core::mailbox::seal::RendezvousKeys;
+use viaticum_core::system_state::catalog::live_file_count;
 use viaticum_core::system_state::{
     SelfPointer, SystemState, diff_states, pack_system_state, restore_db, snapshot_db,
 };
 // Re-exported so tests (and callers) can check the current format version.
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 pub use viaticum_core::system_state::SYSTEM_STATE_VERSION;
-use viaticum_core::types::{
-    DeviceId, IdentityPub, SourceBlockId, Timestamp, hex_encode, to_cbor_bytes,
-};
+use viaticum_core::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp};
 
 use crate::daemon::mailbox::routing::{MailboxRouter, PublishVerdict};
 use crate::daemon::network::swarm::SwarmHandle;
 
 pub mod block;
+mod pointer;
 pub mod publish;
+pub(crate) mod strength;
 
 #[cfg(test)]
 mod tests;
@@ -97,25 +96,23 @@ pub fn decrypt_and_restore(db: &Db, blob: &[u8], seed: &[u8]) -> anyhow::Result<
 ///
 /// The SelfPointer is sealed with the seed-derived rendezvous keys and stored in the
 /// permanent rendezvous box (CROWN-1 C3a: `RendezvousKeys::derive(seed)`, `msg_id` =
-/// the history's pointer place slot, store signature by the box key), class=SelfPointer,
-/// TTL = 5 years / time_scale. Republish policy:
-///   - Publish when (a) the pointer structurally changed (generation or block_ids differ), OR
-///   - (b) the refresh interval elapsed (`MAILBOX_POINTER_REPUBLISH_SECS / time_scale`).
-///   - Skip otherwise.
+/// the slot of one of the history's two pointer places, store signature by the box
+/// key), class=SelfPointer, TTL = 5 years / time_scale. Which place, when to seal a new
+/// envelope, re-offers and retirement of displaced bases: `pointer::PointerPublisher`
+/// (state in META, survives restarts). On start every SS block outside META is retired.
 ///
 /// Block publishing pipeline is unchanged: the base/diff blocks are placed via the
 /// existing publish_base_block / publish_diff_block path.
 ///
 /// The daemon never reads its own pointer box (РС3.1): only DR does
-/// (`mailbox_router.dr_collect_pointers`). A restart builds a new base and publishes it.
-/// `_current_pointer` is unused since C3a; it goes with the handle wiring.
+/// (`mailbox_router.dr_collect_pointers`). A restart builds a new base; it goes to the
+/// weaker of the two places. `_current_pointer` is unused since C3a; it goes with the
+/// handle wiring.
 ///
 /// Catalog history (spec B2): every pointer carries this DB's history id (minted here on
 /// first use, never inherited), the publishing device (`publisher` = this daemon's
 /// device, so DR can move ownership of restored files to its own device, dr-i19) and
-/// the live file count of the state it restores. A publication accepted by ≥ 1 postman
-/// is recorded in the DB (`Db::record_pointer_publication`, dr-i9: `status` shows DR
-/// readiness from it).
+/// the live file count of the state it restores.
 ///
 /// The minimum interval is clamped to 60 seconds.
 #[allow(clippy::too_many_arguments)]
@@ -140,6 +137,16 @@ pub async fn run_periodic_push(
         error!(error = %e, "system_state push: cannot read or mint the catalog history id");
         anyhow::anyhow!("catalog history id: {e}")
     })?;
+    let publisher_ctx = pointer::PointerPublisher {
+        db: &db,
+        router: &mailbox_router,
+        master_key: &master_key,
+        rv: &rv,
+        data_dir: &data_dir,
+        time_scale,
+    };
+    // V.16.4 п.6: SS blocks of earlier processes that no pointer place refers to.
+    publisher_ctx.startup_sweep();
     info!(
         interval_secs = clamped,
         "system_state periodic push (SS-as-block): started"
@@ -163,11 +170,6 @@ pub async fn run_periodic_push(
     // Live file count after the base and after each diff (len == diff_ids.len() + 1
     // once a base exists): the pointer's catalog.files for any listed prefix.
     let mut files_after: Vec<u32> = Vec::new();
-
-    // Republish tracking. Structural key: (generation, base_block_id, diff_block_ids).
-    // A restart starts empty: the new base is published (РС3.1: no pointer re-learning).
-    let mut last_pointer_struct_key: Option<PointerStructKey> = None;
-    let mut last_publish_at = 0u64;
 
     loop {
         tokio::select! {
@@ -212,23 +214,9 @@ pub async fn run_periodic_push(
                     let next_gen = generation + 1;
                     match publish::publish_base_block(&db, &data_dir, &dr_key, next_gen, &state) {
                         Ok(new_base) => {
-                            // Bug-G / T-10 rotation ordering: retire the old base and diffs
-                            // *before* publishing the new pointer. This is safe because:
-                            //   1. The old SelfPointer is still live in mailboxes (5y TTL) and
-                            //      points to the old block's HolderHints — DR can still fetch
-                            //      from those holders (retire only removes local metadata, not
-                            //      the remote holders' stored symbols).
-                            //   2. The new pointer is only published once `build_pointer_for_placed`
-                            //      returns Some (guarded below) — so we never publish a pointer
-                            //      that references an unplaced block.
-                            // No DropNotice is sent here — old holders keep their symbols until
-                            // the scheduled holder_cleanup pass (T-7).
-                            if let Some(old) = base_id {
-                                publish::retire_ss_block(&db, &data_dir, &old);
-                            }
-                            for d in &diff_ids {
-                                publish::retire_ss_block(&db, &data_dir, d);
-                            }
+                            // The old base stays while a pointer place refers to it (it
+                            // may be the strong one, dr-i48); its unpublished diffs and an
+                            // unpublished base are retired by the sweep of this tick.
                             base_id = Some(new_base);
                             generation = next_gen;
                             diff_ids.clear();
@@ -263,29 +251,22 @@ pub async fn run_periodic_push(
             None => continue,
         };
 
-        // 3+4. Build pointer (placed-prefix guard) and conditionally publish via mailbox.
-        let now_secs = Timestamp::now().0;
-        let (new_key, new_publish_at) = publish_pointer_step(
-            &db,
-            &mailbox_router,
-            &master_key,
-            &rv,
-            generation,
-            &base,
-            &diff_ids,
-            publish::PointerCatalog {
-                lineage,
-                publisher,
-                files_after: &files_after,
-            },
-            last_pointer_struct_key.as_ref(),
-            last_publish_at,
-            now_secs,
-            time_scale,
-        )
-        .await;
-        last_pointer_struct_key = new_key;
-        last_publish_at = new_publish_at;
+        // 3+4. The pointer of the running base into its place; re-offers; retirement.
+        publisher_ctx
+            .tick(
+                pointer::RunningState {
+                    generation,
+                    base: &base,
+                    diffs: &diff_ids,
+                    catalog: publish::PointerCatalog {
+                        lineage,
+                        publisher,
+                        files_after: &files_after,
+                    },
+                },
+                Timestamp::now().0,
+            )
+            .await;
     }
 
     Ok(())
@@ -294,134 +275,6 @@ pub async fn run_periodic_push(
 /// Rebuild the base (and discard accumulated diffs) once this many diff blocks
 /// pile up — keeps DR's apply chain short and bounds retained-blob count.
 const DIFF_COMPACTION_THRESHOLD: usize = 20;
-
-/// Structural key type for pointer change-detection.
-///
-/// Tuple of (generation, base_block_id_bytes, diff_block_id_bytes_vec).
-/// Created_at and signature are excluded — only structural identity matters.
-pub(crate) type PointerStructKey = (u32, [u8; 32], Vec<[u8; 32]>);
-
-/// One periodic-push step: build the current pointer (placed-prefix guard), decide
-/// whether to (re)publish, seal it into the rendezvous box and publish it.
-///
-/// Returns the updated `(last_pointer_struct_key, last_publish_at)`. Pure of swarm.
-/// If `build_pointer_for_placed` returns `None` (base not yet placed), the function
-/// returns the inputs unchanged.
-///
-/// dr-i9: a publication acked by ≥ 1 postman is recorded in the DB
-/// (`record_pointer_publication`); a refusal or 0 acks record nothing and are logged
-/// by verdict (V.3).
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn publish_pointer_step(
-    db: &Db,
-    mailbox_router: &MailboxRouter,
-    master_key: &ed25519_dalek::SigningKey,
-    rv: &RendezvousKeys,
-    generation: u32,
-    base_id: &SourceBlockId,
-    diff_ids: &[SourceBlockId],
-    catalog: publish::PointerCatalog<'_>,
-    last_key: Option<&PointerStructKey>,
-    last_publish_at: u64,
-    now_secs: u64,
-    time_scale: u64,
-) -> (Option<PointerStructKey>, u64) {
-    let unchanged = (last_key.cloned(), last_publish_at);
-    let pointer = match publish::build_pointer_for_placed(
-        db,
-        master_key,
-        generation,
-        base_id,
-        diff_ids,
-        Timestamp(now_secs),
-        catalog,
-    ) {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            debug!("system_state push: base not placed yet, skipping pointer");
-            return unchanged;
-        }
-        Err(e) => {
-            error!(error = %e, "system_state push: build_pointer failed");
-            return unchanged;
-        }
-    };
-
-    if !should_republish(&pointer, last_key, last_publish_at, now_secs, time_scale) {
-        debug!(
-            generation,
-            base = %base_id,
-            "system_state push: pointer unchanged within the refresh interval — skipping mailbox publish"
-        );
-        return unchanged;
-    }
-
-    let blob = to_cbor_bytes(&pointer);
-    let expires_at = now_secs
-        + viaticum_core::mailbox::scaled_ttl_secs(
-            class_config::SELF_POINTER_TTL.as_secs(),
-            time_scale,
-        );
-    let place = PointerPlace::A;
-    let sealed = match seal_self_pointer(
-        rv,
-        &pointer.catalog.lineage.0,
-        place,
-        &blob,
-        expires_at,
-        now_secs,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            // Impossible by construction (≤ 5 holders, ≤ 4 short addresses, ≤ 20 diffs);
-            // skip the tick rather than publish anything else.
-            error!(error = %e, pointer_bytes = blob.len(), "system_state push: cannot seal the pointer");
-            return unchanged;
-        }
-    };
-
-    let outcome = mailbox_router
-        .publish_detailed(sealed.entry().clone(), sealed.target_sig())
-        .await;
-    match outcome.verdict() {
-        PublishVerdict::Stored { acks } => {
-            debug!(
-                address = %hex_encode(&rv.address.0),
-                slot = %hex_encode(&sealed.entry().msg_id),
-                "system_state push: pointer box"
-            );
-            info!(
-                generation,
-                base = %base_id,
-                diffs = pointer.diffs.len(),
-                pointer_bytes = blob.len(),
-                base_holders = pointer.base.holders.len(),
-                ack_count = acks,
-                catalog_files = pointer.catalog.files,
-                lineage = %pointer.catalog.lineage,
-                place = ?place,
-                "system_state push: SelfPointer published via mailbox"
-            );
-            // dr-i9: status reports DR readiness from this record, never from a pointer
-            // that no postman accepted.
-            let publication = PointerPublication {
-                lineage: pointer.catalog.lineage,
-                created_at: pointer.created_at,
-                generation: pointer.generation,
-                files: pointer.catalog.files,
-                acks: acks.try_into().unwrap_or(u32::MAX),
-            };
-            if let Err(e) = db.record_pointer_publication(&publication) {
-                warn!(error = %e, "system_state push: cannot record the pointer publication");
-            }
-            (Some(pointer_struct_key(&pointer)), now_secs)
-        }
-        verdict => {
-            log_refusal(verdict, generation, base_id);
-            unchanged
-        }
-    }
-}
 
 /// The publisher's line for a publication no postman acked (V.3, V.15.3).
 pub(crate) fn log_refusal(verdict: PublishVerdict, generation: u32, base_id: &SourceBlockId) {
@@ -462,38 +315,6 @@ pub(crate) fn log_refusal(verdict: PublishVerdict, generation: u32, base_id: &So
             "system_state push: SelfPointer mailbox publish got 0 acks — will retry on next tick"
         ),
     }
-}
-
-/// Structural identity of a SelfPointer for republish-change detection.
-///
-/// We compare (generation, base.block_id, diff block_ids). Holder lists are NOT
-/// part of the key: they change as placement progresses but the pointer is still
-/// the "same" logical pointer. Created_at is also excluded (it's a timestamp, not
-/// structural identity). A change in generation, base_id, or diff_ids means we
-/// must republish.
-pub(crate) fn pointer_struct_key(p: &SelfPointer) -> (u32, [u8; 32], Vec<[u8; 32]>) {
-    let diff_keys: Vec<[u8; 32]> = p.diffs.iter().map(|d| d.block_id.0).collect();
-    (p.generation, p.base.block_id.0, diff_keys)
-}
-
-/// Republish decision: should we publish the pointer now?
-///
-/// Returns `true` when:
-///   (a) structural change — generation, base_block_id, or diff_block_ids changed, OR
-///   (b) refresh — `pointer_refresh_interval_secs(time_scale)` elapsed since the last
-///       publication (AC-24′, mailbox-i41: every cadence scales, TTL / refresh = 60).
-pub(crate) fn should_republish(
-    pointer: &SelfPointer,
-    last_struct_key: Option<&PointerStructKey>,
-    last_publish_at: u64,
-    now_secs: u64,
-    time_scale: u64,
-) -> bool {
-    let current_key = pointer_struct_key(pointer);
-    let changed = last_struct_key != Some(&current_key);
-    let refresh_due =
-        now_secs.saturating_sub(last_publish_at) >= pointer_refresh_interval_secs(time_scale);
-    changed || refresh_due
 }
 
 /// The pointer refresh interval: 30 days / time_scale (`scaled_ttl_secs`), the same

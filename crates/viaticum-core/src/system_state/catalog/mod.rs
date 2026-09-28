@@ -16,8 +16,9 @@
 //! no silent wrong choice by construction; the price is one extra step when several
 //! histories exist. Whether some cases can be decided automatically is open (B2.2b).
 
+use crate::mailbox::seal::PointerPlace;
 use crate::system_state::SelfPointer;
-use crate::types::{DeviceId, FileRecord, LocalState, Timestamp, hex_encode};
+use crate::types::{DeviceId, FileRecord, LocalState, SourceBlockId, Timestamp, hex_encode};
 
 #[cfg(test)]
 mod tests;
@@ -114,6 +115,133 @@ pub struct PointerPublication {
     pub generation: u32,
     pub files: u32,
     pub acks: u32,
+}
+
+/// One place of this history's pointer at the postmen, as the owner last sealed it
+/// (CROWN-1 V.16.3, mailbox-i50..i56). Written to META BEFORE the envelope is sent.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PlacePublication {
+    /// Which of the two places; never derived from `generation`.
+    pub place: PointerPlace,
+    /// The base block of the pointer.
+    pub base: SourceBlockId,
+    /// The diff blocks the pointer lists (its placed prefix).
+    pub diffs: Vec<SourceBlockId>,
+    pub generation: u32,
+    /// The pointer's `created_at` (= the envelope's `stored_at`).
+    pub created_at: Timestamp,
+    /// Live files of the state the pointer restores.
+    pub files: u32,
+    /// Distinct postmen that acked THIS envelope, accumulated over re-offers (≤ 64).
+    pub acks: Vec<DeviceId>,
+    /// CBOR of the sealed `MailboxEntry` as sent: re-offered byte-identical, also after
+    /// a restart (mailbox-i47, i53).
+    #[serde(with = "serde_bytes")]
+    pub entry_cbor: Vec<u8>,
+    /// Store signature of the envelope by the rendezvous box key.
+    #[serde(with = "crate::types::sig_serde")]
+    pub target_sig: [u8; 64],
+    /// The last publication of this envelope that no postman acked (V.15.3, V.17.4);
+    /// cleared by an ack.
+    pub last_refusal: Option<PointerRefusal>,
+    /// Bases (with their diffs) displaced out of THIS place, retired once this record
+    /// has the dr-i39 number of acks (V.17.2). At most one waits: when a second one
+    /// would join, the older is retired at once (its place was replaced twice).
+    pub to_retire: Vec<RetiredPointer>,
+}
+
+/// A base and its diffs displaced out of a place, waiting to be retired locally.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RetiredPointer {
+    pub base: SourceBlockId,
+    pub diffs: Vec<SourceBlockId>,
+}
+
+/// Why no postman acked a publication (V.15.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RefusalKind {
+    /// Every refusal was a clock skew: this computer's clock looks wrong.
+    ClockSkew,
+    /// Every refusal was "a newer pointer is held": the clock went back.
+    Superseded,
+    /// Every refusal was "no free place": 64 installations of this phrase.
+    SlotsFull,
+    /// Refusals of different reasons.
+    Mixed {
+        clock: u32,
+        superseded: u32,
+        slots_full: u32,
+        other: u32,
+    },
+    /// Nobody answered.
+    NoAck,
+}
+
+/// The last refused publication of one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PointerRefusal {
+    /// Unix secs of the refused attempt.
+    pub at: u64,
+    pub kind: RefusalKind,
+}
+
+/// Why the newest catalog state is not in any accepted pointer (mailbox-i54).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WaitingReason {
+    /// The catalog blocks (base or newest diffs) have no live holder yet.
+    BlocksNotPlaced,
+    /// Postmen refused the pointer (see the place's `last_refusal`).
+    Refused,
+    /// No postman answered.
+    NoAck,
+}
+
+/// Since when the newest catalog state waits to enter the network, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Waiting {
+    pub since: u64,
+    pub reason: WaitingReason,
+}
+
+/// META of this history's pointer places (`pointer_publication_v2`, V.16.3): one record
+/// per place, the newest base in `current`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PointerPublications {
+    pub lineage: CatalogLineageId,
+    /// The place of the newest base (diff pointers of it replace this record).
+    pub current: Option<PlacePublication>,
+    /// The other place: the previous base, or a stronger older one.
+    pub other: Option<PlacePublication>,
+    /// Set while the newest catalog state is in no accepted pointer (mailbox-i54).
+    pub waiting: Option<Waiting>,
+}
+
+impl PointerPublications {
+    /// No place used yet.
+    pub fn new(lineage: CatalogLineageId) -> Self {
+        PointerPublications {
+            lineage,
+            current: None,
+            other: None,
+            waiting: None,
+        }
+    }
+
+    /// The record in `place`, if any.
+    pub fn in_place(&self, place: PointerPlace) -> Option<&PlacePublication> {
+        [self.current.as_ref(), self.other.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|r| r.place == place)
+    }
+
+    /// The newest record at least one postman acked: `current` if acked, else `other`.
+    pub fn newest_accepted(&self) -> Option<&PlacePublication> {
+        [self.current.as_ref(), self.other.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|r| !r.acks.is_empty())
+    }
 }
 
 /// One history as DR lists it: its head (freshest pointer).

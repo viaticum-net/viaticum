@@ -43,7 +43,7 @@ use viaticum_core::messages::{
     MailboxStoreResponse, Message,
 };
 use viaticum_core::trust::compute_combined;
-use viaticum_core::types::{DeviceId, ewma_contact_observed, hex_encode};
+use viaticum_core::types::{DeviceId, Timestamp, ewma_contact_observed, hex_encode};
 
 use crate::daemon::mailbox::candidate::KademliaRoutingView;
 use crate::daemon::network::swarm::{SwarmHandle, device_id_to_peer_id};
@@ -518,13 +518,18 @@ impl MailboxRouter {
 
     /// Apply a positive avail observation for `device_id` in the DB.
     ///
-    /// Called after a successful MailboxStoreAck or MailboxFetchResponse.
+    /// Called after a successful MailboxStoreAck or MailboxFetchResponse. The peer
+    /// answered, so it is also SEEN now: `last_seen` moves forward (CROWN-1 V.17.1 —
+    /// the strength of an SS base counts only holders seen within 7 days / time_scale;
+    /// without this, a holder on a long-lived connection would look gone, because
+    /// `last_seen` otherwise moves only at (re)authentication).
     /// Non-fatal: logs warning on DB error.
     fn record_avail_contact(&self, device_id: DeviceId, now_secs: u64) {
         match self.db.get_peer(&device_id) {
             Ok(Some(mut record)) => {
                 record.avail_ewma = ewma_contact_observed(record.avail_ewma, AVAIL_EWMA_ALPHA);
                 record.last_avail_sample = now_secs;
+                record.last_seen = Timestamp(record.last_seen.0.max(now_secs));
                 if let Err(e) = self.db.upsert_peer(&record) {
                     warn!(
                         device = %device_id,
