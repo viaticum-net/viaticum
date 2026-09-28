@@ -83,7 +83,10 @@
 #     in every snapshot dr_ready ⇔ (acks ≥ threshold ∧ blocks_placed == blocks_total > 0) and
 #     acks ≤ the number of postmen that logged a store for RADDR (W4б) — check: api_get | jq
 # 2b. mailbox-i56 / V.16.4: the owner restarts twice (a new base per process); after each
-#     restart wait for a publication of a NEW base (base= not seen before). Then: the
+#     restart wait for a publication of a NEW base (base= not seen before), reading
+#     dr_ready every 5 s meanwhile: it is true in every snapshot — the other place stays
+#     restorable while the new base collects acks (dr-i53) — and at the end status
+#     names dr_restores_state_of > 0 ("DR would restore the catalog as of …"). Then: the
 #     owner's publications used place=A and place=B; the postmen's msg_ids for RADDR are
 #     ⊆ {slot_a, slot_b} (probe, L_OWNER) and one postman holds both; in the owner's
 #     system_state/ exactly 2 base blobs remain of all bases ever built (the displaced one
@@ -476,6 +479,11 @@ restart_owner_new_base() {
     wait_daemon 0 || { fail "node-00 did not restart"; return 1; }
     for i in "${HOLDERS[@]}"; do run_cli_q "$i" connect "$ADDR_00" > /dev/null; done
     for _ in $(seq 1 60); do
+        # dr-i53: the other place stays restorable while the new base collects acks.
+        rdy=$(status_num 0 dr_ready)
+        if [ "$rdy" != "true" ] && [ -z "$READY_DROP" ]; then
+            READY_DROP="restart $r: dr_ready=$rdy (acks $(status_num 0 dr_pointer_acks)/$(status_num 0 dr_pointer_ack_threshold), blocks $(status_num 0 dr_ss_blocks_placed)/$(status_num 0 dr_ss_blocks_total))"
+        fi
         line=$(log_since 0 "$from" | grep -a "SelfPointer published via mailbox" \
             | grep -oE 'base=[0-9a-f]+.*place=[AB]' | tail -1 || true)
         NEW_BASE=$(echo "$line" | grep -oE 'base=[0-9a-f]+' | cut -d= -f2 || true)
@@ -486,7 +494,7 @@ restart_owner_new_base() {
     NEW_BASE=""; NEW_PLACE=""
     return 1
 }
-RESTART_OK=1
+RESTART_OK=1; READY_DROP=""
 for r in 1 2; do
     if restart_owner_new_base; then
         echo "  restart $r: new base $NEW_BASE published into place $NEW_PLACE"
@@ -494,6 +502,14 @@ for r in 1 2; do
         RESTART_OK=0; fail "restart $r: no publication of a new base within 300 s"
     fi
 done
+RESTORES_AT=$(status_num 0 dr_restores_state_of)
+if [ "$RESTART_OK" -eq 1 ] && [ -z "$READY_DROP" ] && [ "$(status_num 0 dr_ready)" = "true" ] \
+    && [ "$RESTORES_AT" -gt 0 ] && [ "$RESTORES_AT" -le "$(date +%s)" ]; then
+    pass "dr_ready held through both restarts, every snapshot (dr-i53); DR restores the catalog as of $RESTORES_AT"
+    run_cli_q 0 status | grep -a "DR would restore" | sed 's/^/    | /' || true
+else
+    fail "readiness through restarts (dr-i53): ${READY_DROP:-dr_ready=$(status_num 0 dr_ready) dr_restores_state_of=$RESTORES_AT}"
+fi
 PLACES_USED=$(plain_log 0 | grep -a "SelfPointer published via mailbox" | grep -oE 'place=[AB]' | sort -u | tr '\n' ' ' || true)
 if [ "$RESTART_OK" -eq 1 ] && [ "$PLACES_USED" = "place=A place=B " ]; then
     pass "after two restarts the owner has published into both places ($PLACES_USED)"
