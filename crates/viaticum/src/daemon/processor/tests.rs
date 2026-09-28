@@ -195,13 +195,20 @@ fn insert_accepted_offer(
 ) {
     let offer = AcceptedOffer {
         owner_id,
+        from_device: sender_device(owner_id),
         source_block_id: block_id,
         esi_ranges,
         importance,
         accepted_at: Timestamp::now(),
     };
     let mut map = processor.accepted_offers.lock().unwrap();
-    map.insert((owner_id, block_id), offer);
+    map.insert((sender_device(owner_id), block_id), offer);
+}
+
+/// The sending device the single-device tests use for `owner`: the offer map is keyed by the
+/// sending device (backup-i19), the holding by the master.
+fn sender_device(owner: IdentityPub) -> DeviceId {
+    DeviceId(owner.0)
 }
 
 fn make_symbol_placement(
@@ -426,7 +433,7 @@ async fn handle_symbol_transfer_writes_files_to_disk() {
     };
 
     processor
-        .handle_symbol_transfer(owner, transfer)
+        .handle_symbol_transfer(sender_device(owner), owner, transfer)
         .await
         .expect("handle_symbol_transfer failed");
 
@@ -465,7 +472,7 @@ async fn handle_symbol_transfer_creates_holding_record_in_db() {
     };
 
     processor
-        .handle_symbol_transfer(owner, transfer)
+        .handle_symbol_transfer(sender_device(owner), owner, transfer)
         .await
         .unwrap();
 
@@ -489,6 +496,7 @@ async fn handle_symbol_transfer_merges_with_existing_holding() {
     insert_accepted_offer(&processor, owner, block_id, vec![(0, 1)], 0.5);
     processor
         .handle_symbol_transfer(
+            sender_device(owner),
             owner,
             SymbolTransferMsg {
                 v: 1,
@@ -507,6 +515,7 @@ async fn handle_symbol_transfer_merges_with_existing_holding() {
     insert_accepted_offer(&processor, owner, block_id, vec![(1, 1)], 0.5);
     processor
         .handle_symbol_transfer(
+            sender_device(owner),
             owner,
             SymbolTransferMsg {
                 v: 1,
@@ -666,9 +675,10 @@ async fn prune_expired_accepted_offers_drops_stale_keeps_fresh() {
     {
         let mut m = map.lock().unwrap();
         m.insert(
-            (owner_old, block_a),
+            (DeviceId(owner_old.0), block_a),
             AcceptedOffer {
                 owner_id: owner_old,
+                from_device: DeviceId(owner_old.0),
                 source_block_id: block_a,
                 esi_ranges: vec![(0, 3)],
                 importance: 0.5,
@@ -676,9 +686,10 @@ async fn prune_expired_accepted_offers_drops_stale_keeps_fresh() {
             },
         );
         m.insert(
-            (owner_new, block_b),
+            (DeviceId(owner_new.0), block_b),
             AcceptedOffer {
                 owner_id: owner_new,
+                from_device: DeviceId(owner_new.0),
                 source_block_id: block_b,
                 esi_ranges: vec![(0, 3)],
                 importance: 0.5,
@@ -691,8 +702,8 @@ async fn prune_expired_accepted_offers_drops_stale_keeps_fresh() {
     assert_eq!(evicted, 1, "exactly one stale offer must be evicted");
 
     let m = map.lock().unwrap();
-    assert!(m.contains_key(&(owner_new, block_b)));
-    assert!(!m.contains_key(&(owner_old, block_a)));
+    assert!(m.contains_key(&(DeviceId(owner_new.0), block_b)));
+    assert!(!m.contains_key(&(DeviceId(owner_old.0), block_a)));
 }
 
 // ─── decide_symbol_offer ──────────────────────────────────────────────────────
@@ -2623,7 +2634,7 @@ async fn transfer_without_offer_rejected() {
 
     // Must return Ok (silent reject, not an error).
     processor
-        .handle_symbol_transfer(owner, transfer)
+        .handle_symbol_transfer(sender_device(owner), owner, transfer)
         .await
         .expect("transfer without offer must not propagate error");
 
@@ -2688,7 +2699,7 @@ async fn offer_accepted_stored_in_map() {
     // The map must have the entry.
     let map = processor.accepted_offers.lock().unwrap();
     let entry = map
-        .get(&(owner, block_id))
+        .get(&(sender_device(owner), block_id))
         .expect("accepted_offer must be stored");
     assert_eq!(entry.esi_ranges, esi_ranges);
     assert_eq!(entry.importance, importance);
@@ -2738,7 +2749,7 @@ async fn transfer_stored_after_valid_offer() {
     };
 
     processor
-        .handle_symbol_transfer(owner, transfer)
+        .handle_symbol_transfer(sender_device(owner), owner, transfer)
         .await
         .expect("handle_symbol_transfer failed");
 
@@ -2757,7 +2768,7 @@ async fn transfer_stored_after_valid_offer() {
     // Offer must be consumed once the full accepted range has been delivered.
     let map = processor.accepted_offers.lock().unwrap();
     assert!(
-        map.get(&(owner, block_id)).is_none(),
+        map.get(&(sender_device(owner), block_id)).is_none(),
         "AcceptedOffer must be removed after all ESIs delivered"
     );
 }
@@ -2784,6 +2795,7 @@ async fn transfer_partial_keeps_offer_and_second_transfer_completes_it() {
     // First chunk: ESI 0..2.
     processor
         .handle_symbol_transfer(
+            sender_device(owner),
             owner,
             SymbolTransferMsg {
                 v: 1,
@@ -2812,7 +2824,7 @@ async fn transfer_partial_keeps_offer_and_second_transfer_completes_it() {
     {
         let map = processor.accepted_offers.lock().unwrap();
         let entry = map
-            .get(&(owner, block_id))
+            .get(&(sender_device(owner), block_id))
             .expect("offer must remain after partial transfer");
         assert_eq!(entry.esi_ranges, vec![(3u32, 2u32)]);
     }
@@ -2820,6 +2832,7 @@ async fn transfer_partial_keeps_offer_and_second_transfer_completes_it() {
     // Second chunk: ESI 3..4 finishes the placement.
     processor
         .handle_symbol_transfer(
+            sender_device(owner),
             owner,
             SymbolTransferMsg {
                 v: 1,
@@ -2846,7 +2859,7 @@ async fn transfer_partial_keeps_offer_and_second_transfer_completes_it() {
             .accepted_offers
             .lock()
             .unwrap()
-            .get(&(owner, block_id))
+            .get(&(sender_device(owner), block_id))
             .is_none()
     );
     let holding = db
@@ -2888,7 +2901,7 @@ async fn transfer_rejected_esi_out_of_range() {
     };
 
     processor
-        .handle_symbol_transfer(owner, transfer)
+        .handle_symbol_transfer(sender_device(owner), owner, transfer)
         .await
         .expect("must return Ok even when ESI out of range");
 
@@ -2910,7 +2923,7 @@ async fn transfer_rejected_esi_out_of_range() {
     // Offer must be consumed (removed from map after first validation attempt).
     let map = processor.accepted_offers.lock().unwrap();
     assert!(
-        map.get(&(owner, block_id)).is_none(),
+        map.get(&(sender_device(owner), block_id)).is_none(),
         "AcceptedOffer must be consumed even when ESI validation fails"
     );
 }
@@ -2982,6 +2995,7 @@ async fn expired_accepted_offer_rejected() {
     // now() will be >> SYMBOL_OFFER_EXPIRY_SECS after epoch 0.
     let expired_offer = AcceptedOffer {
         owner_id: owner,
+        from_device: sender_device(owner),
         source_block_id: block_id,
         esi_ranges: vec![(0u32, 100u32)],
         importance: 0.5,
@@ -2989,7 +3003,7 @@ async fn expired_accepted_offer_rejected() {
     };
     {
         let mut map = processor.accepted_offers.lock().unwrap();
-        map.insert((owner, block_id), expired_offer);
+        map.insert((sender_device(owner), block_id), expired_offer);
     }
 
     // Verify the offer is indeed expired.
@@ -3010,7 +3024,7 @@ async fn expired_accepted_offer_rejected() {
     };
 
     processor
-        .handle_symbol_transfer(owner, transfer)
+        .handle_symbol_transfer(sender_device(owner), owner, transfer)
         .await
         .expect("expired offer must not propagate error");
 
@@ -3032,7 +3046,7 @@ async fn expired_accepted_offer_rejected() {
     // Offer must be removed from the map (lazy cleanup).
     let map = processor.accepted_offers.lock().unwrap();
     assert!(
-        map.get(&(owner, block_id)).is_none(),
+        map.get(&(sender_device(owner), block_id)).is_none(),
         "expired offer must be removed from map on access"
     );
 }
@@ -4650,3 +4664,5 @@ mod drop_notice_dedup;
 mod four_r_shadow;
 // W-A (review round 2): the offer's own record read on the REAL offer path (`key_before`).
 mod four_r_shadow_wedge;
+// R1-u-H1 (backup-i19): the SymbolTransfer reply matches the holder's disk; offers per device.
+mod symbol_transfer_reply;

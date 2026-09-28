@@ -12,7 +12,7 @@ use viaticum_core::db::Db;
 use viaticum_core::four_r_holder::{FourRParams, HolderAdmit, HolderReject, OfferIn};
 use viaticum_core::messages::{Message, RejectReason, build_symbol_offer};
 use viaticum_core::types::{
-    FourRPhaseRecord, HoldingRecord, HoldingStatus, IdentityPub, PairLedger, Timestamp,
+    DeviceId, FourRPhaseRecord, HoldingRecord, HoldingStatus, IdentityPub, PairLedger, Timestamp,
 };
 
 use super::super::offer_shadow::{OfferShadowJob, OfferSnapshot, run_offer_shadow};
@@ -150,9 +150,9 @@ async fn the_offer_shadow_never_changes_the_reply() {
             )
         };
         p.set_four_r(FourRParams::default());
-        let a = reply_shape(&p.handle_symbol_offer_inner(owner, mk(1)));
+        let a = reply_shape(&p.handle_symbol_offer_inner(DeviceId(owner.0), owner, mk(1)));
         p.set_four_r(aggressive.clone());
-        let b = reply_shape(&p.handle_symbol_offer_inner(owner, mk(2)));
+        let b = reply_shape(&p.handle_symbol_offer_inner(DeviceId(owner.0), owner, mk(2)));
         let want = p.decide_symbol_offer(offer_bytes).unwrap();
         assert_eq!(
             a, b,
@@ -169,6 +169,7 @@ async fn the_offer_shadow_never_changes_the_reply() {
     // An accepted case too: room again.
     db.delete_holding(&make_block_id(0x70), &whale).unwrap();
     let r = p.handle_symbol_offer_inner(
+        DeviceId(owner.0),
         owner,
         build_symbol_offer(
             [9; 16],
@@ -194,6 +195,7 @@ async fn a_busy_shadow_slot_does_not_delay_the_reply_and_counts_a_skip() {
     let held = p.shadow_offer_slot.clone().try_acquire_owned().unwrap();
     let t0 = std::time::Instant::now();
     let r = p.handle_symbol_offer_inner(
+        DeviceId(owner.0),
         owner,
         build_symbol_offer(
             [1; 16],
@@ -210,6 +212,7 @@ async fn a_busy_shadow_slot_does_not_delay_the_reply_and_counts_a_skip() {
     drop(held);
 
     let _ = p.handle_symbol_offer_inner(
+        DeviceId(owner.0),
         owner,
         build_symbol_offer(
             [2; 16],

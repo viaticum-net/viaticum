@@ -12,7 +12,7 @@ use viaticum_core::messages::{
 };
 use viaticum_core::types::{
     DeviceId, HoldingRecord, HoldingStatus, IdentityPub, PlacementStatus, SignedLetterClass,
-    SymbolPlacement, Timestamp, hex_encode,
+    SourceBlockId, SymbolPlacement, Timestamp, hex_encode,
 };
 
 use super::offer_shadow::OfferSnapshot;
@@ -887,21 +887,109 @@ impl RevocationMailboxHandler for ProcessorRevocationHandler {
     }
 }
 
+/// Why a SymbolTransfer was not stored (holder side). The reply is `Ack`, never `SymbolStored`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferNotStored {
+    NoOffer,
+    OfferExpired,
+    EsiOutsideOffer,
+    OversizedSymbol,
+    Empty,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferResult {
+    /// Every ESI of the chunk is on this holder's disk now (written now or already held).
+    Stored,
+    NotStored(TransferNotStored),
+}
+
 impl Processor {
     /// Store received symbols on disk and record a HoldingRecord in the DB.
     ///
     /// File layout: `{holdings_dir}/{block_id_hex}/{esi}.bin`
     ///
-    /// Requires a prior accepted offer in `accepted_offers` for `(owner_id, block_id)`.
-    /// If no offer is found: silently rejects (does not store anything).
-    /// If the offer is expired: removes and silently rejects.
-    /// If any ESI is outside the accepted ranges: rejects (offer consumed).
+    /// Returns `Stored` only if EVERY ESI of the chunk is on disk afterwards: written now, or
+    /// already held (in the owner's `HoldingRecord` for this block AND `{esi}.bin` exists) — a
+    /// resend of a chunk whose reply was lost is answered truthfully (backup-i19).
+    ///
+    /// ESIs not already held require an accepted offer for `(from_device, block_id)`. The
+    /// holding itself is per master (`owner_id`).
+    /// If no offer is found: nothing stored. If the offer is expired: removed, nothing stored.
+    /// If any ESI is neither held nor in the offer's remaining ranges: offer removed.
     pub(crate) async fn handle_symbol_transfer(
         &self,
+        from_device: DeviceId,
         owner_id: IdentityPub,
         transfer: SymbolTransferMsg,
-    ) -> Result<(), ProcessorError> {
+    ) -> Result<TransferResult, ProcessorError> {
         let block_id = transfer.source_block_id;
+        let key = (from_device, block_id);
+
+        if transfer.symbols.is_empty() {
+            debug!(
+                block_id = %block_id,
+                owner = %owner_id,
+                "processor: SymbolTransfer with no symbols, ignored"
+            );
+            return Ok(TransferResult::NotStored(TransferNotStored::Empty));
+        }
+
+        // Reject oversized symbols: expected size is SYMBOL_SIZE (65535 bytes).
+        // Without this check, a malicious peer could write up to MAX_MESSAGE_SIZE
+        // per symbol, bypassing quota accounting.
+        if let Some(symbol) = transfer
+            .symbols
+            .iter()
+            .find(|s| s.data.len() > SYMBOL_SIZE as usize)
+        {
+            warn!(
+                block_id = %block_id,
+                owner = %owner_id,
+                esi = symbol.esi,
+                size = symbol.data.len(),
+                expected = SYMBOL_SIZE,
+                "processor: SymbolTransfer rejected — oversized symbol"
+            );
+            self.accepted_offers.lock().unwrap().remove(&key);
+            return Ok(TransferResult::NotStored(
+                TransferNotStored::OversizedSymbol,
+            ));
+        }
+
+        let block_hex = hex_encode(&block_id.0);
+        let block_dir = self.holdings_dir.join(&block_hex);
+
+        // ── Already held: in the owner's ACTIVE record AND the file exists ───
+        // A record in any other status is on its way out (MarkedForDelete is swept after the
+        // cooldown; Silent is never set by the daemon): its symbols are not "held", the chunk
+        // goes through the offer path and the merge below makes the record Active again.
+        let held_esis = match self.db.get_holding(&block_id, &owner_id)? {
+            Some(rec) if rec.status == HoldingStatus::Active => ranges_to_esi_list(&rec.esi_ranges),
+            _ => Vec::new(),
+        };
+        let mut already_held: Vec<u32> = Vec::new();
+        for symbol in &transfer.symbols {
+            if held_esis.contains(&symbol.esi)
+                && tokio::fs::try_exists(block_dir.join(format!("{}.bin", symbol.esi))).await?
+            {
+                already_held.push(symbol.esi);
+            }
+        }
+        if transfer
+            .symbols
+            .iter()
+            .all(|s| already_held.contains(&s.esi))
+        {
+            debug!(
+                block_id = %block_id,
+                owner = %owner_id,
+                symbols = transfer.symbols.len(),
+                "processor: SymbolTransfer — every symbol already held"
+            );
+            self.subtract_from_offer(key, &transfer);
+            return Ok(TransferResult::Stored);
+        }
 
         // ── Offer lookup + validation ─────────────────────────────────────────
         // The offer entry persists across multiple SymbolTransfer messages for
@@ -911,15 +999,15 @@ impl Processor {
         // the offer only when all expected ESIs have arrived or the expiry fires.
         let (importance, accepted_esi_ranges) = {
             let map = self.accepted_offers.lock().unwrap();
-            let key = (owner_id, block_id);
             match map.get(&key) {
                 None => {
                     warn!(
                         block_id = %block_id,
                         owner = %owner_id,
+                        device = %from_device,
                         "processor: SymbolTransfer rejected — no accepted offer"
                     );
-                    return Ok(());
+                    return Ok(TransferResult::NotStored(TransferNotStored::NoOffer));
                 }
                 Some(entry) => {
                     let now = Timestamp::now().0;
@@ -933,7 +1021,7 @@ impl Processor {
                         );
                         drop(map);
                         self.accepted_offers.lock().unwrap().remove(&key);
-                        return Ok(());
+                        return Ok(TransferResult::NotStored(TransferNotStored::OfferExpired));
                     }
                     (entry.importance, entry.esi_ranges.clone())
                 }
@@ -941,13 +1029,15 @@ impl Processor {
         };
 
         // ── ESI range validation ──────────────────────────────────────────────
-        // A sender that attempts to store an ESI outside the accepted ranges is
-        // treated as misbehaving: we reject the whole transfer and drop the offer.
+        // A sender that attempts to store an ESI that is neither held nor in the
+        // offer's remaining ranges is treated as misbehaving: we reject the whole
+        // transfer and drop the offer.
         for symbol in &transfer.symbols {
             let esi = symbol.esi;
-            let in_range = accepted_esi_ranges
-                .iter()
-                .any(|&(start, count)| esi >= start && esi < start + count);
+            let in_range = already_held.contains(&esi)
+                || accepted_esi_ranges
+                    .iter()
+                    .any(|&(start, count)| esi >= start && esi < start + count);
             if !in_range {
                 warn!(
                     block_id = %block_id,
@@ -955,55 +1045,27 @@ impl Processor {
                     esi,
                     "processor: SymbolTransfer rejected — ESI out of accepted range"
                 );
-                self.accepted_offers
-                    .lock()
-                    .unwrap()
-                    .remove(&(owner_id, block_id));
-                return Ok(());
+                self.accepted_offers.lock().unwrap().remove(&key);
+                return Ok(TransferResult::NotStored(
+                    TransferNotStored::EsiOutsideOffer,
+                ));
             }
         }
 
         // ── Write symbols to disk ─────────────────────────────────────────────
-        let block_hex = hex_encode(&block_id.0);
-        let block_dir = self.holdings_dir.join(&block_hex);
-
         tokio::fs::create_dir_all(&block_dir).await?;
 
         let mut received_esis: Vec<u32> = Vec::with_capacity(transfer.symbols.len());
         let mut total_bytes: u64 = 0;
 
         for symbol in &transfer.symbols {
-            // Reject oversized symbols: expected size is SYMBOL_SIZE (65535 bytes).
-            // Without this check, a malicious peer could write up to MAX_MESSAGE_SIZE
-            // per symbol, bypassing quota accounting.
-            if symbol.data.len() > SYMBOL_SIZE as usize {
-                warn!(
-                    block_id = %block_id,
-                    owner = %owner_id,
-                    esi = symbol.esi,
-                    size = symbol.data.len(),
-                    expected = SYMBOL_SIZE,
-                    "processor: SymbolTransfer rejected — oversized symbol"
-                );
-                self.accepted_offers
-                    .lock()
-                    .unwrap()
-                    .remove(&(owner_id, block_id));
-                return Ok(());
+            if already_held.contains(&symbol.esi) {
+                continue;
             }
             let sym_path = block_dir.join(format!("{}.bin", symbol.esi));
             tokio::fs::write(&sym_path, &symbol.data).await?;
             received_esis.push(symbol.esi);
             total_bytes += symbol.data.len() as u64;
-        }
-
-        if received_esis.is_empty() {
-            debug!(
-                block_id = %block_id,
-                owner = %owner_id,
-                "processor: SymbolTransfer with no symbols, ignored"
-            );
-            return Ok(());
         }
 
         received_esis.sort_unstable();
@@ -1015,6 +1077,9 @@ impl Processor {
                 let mut all_esis = ranges_to_esi_list(&existing.esi_ranges);
                 let mut new_bytes: u64 = 0;
                 for symbol in &transfer.symbols {
+                    if !received_esis.contains(&symbol.esi) {
+                        continue;
+                    }
                     if !all_esis.contains(&symbol.esi) {
                         new_bytes += symbol.data.len() as u64;
                         all_esis.push(symbol.esi);
@@ -1047,20 +1112,7 @@ impl Processor {
         // Subtract received ESIs from the offer's remaining ranges. The offer
         // is dropped when fully covered; otherwise we keep it so a follow-up
         // chunk for the same placement can still find and validate against it.
-        {
-            let mut map = self.accepted_offers.lock().unwrap();
-            let key = (owner_id, block_id);
-            if let Some(entry) = map.get_mut(&key) {
-                let mut remaining = ranges_to_esi_list(&entry.esi_ranges);
-                remaining.retain(|e| !received_esis.contains(e));
-                if remaining.is_empty() {
-                    map.remove(&key);
-                } else {
-                    remaining.sort_unstable();
-                    entry.esi_ranges = esi_list_to_ranges(&remaining);
-                }
-            }
-        }
+        self.subtract_from_offer(key, &transfer);
 
         // Refresh trust_s for all devices of this peer's master identity.
         for did in self
@@ -1085,10 +1137,23 @@ impl Processor {
             "processor: stored symbols for block"
         );
 
-        // In the libp2p path an Ack is sent via ResponseChannel in dispatch_libp2p.
-        // The BackupCoordinator (sender side) handles the lack of ack gracefully.
+        Ok(TransferResult::Stored)
+    }
 
-        Ok(())
+    /// Remove the chunk's ESIs from the offer's remaining ranges, if the offer exists; drop the
+    /// offer once nothing remains.
+    fn subtract_from_offer(&self, key: (DeviceId, SourceBlockId), transfer: &SymbolTransferMsg) {
+        let mut map = self.accepted_offers.lock().unwrap();
+        if let Some(entry) = map.get_mut(&key) {
+            let mut remaining = ranges_to_esi_list(&entry.esi_ranges);
+            remaining.retain(|e| !transfer.symbols.iter().any(|s| s.esi == *e));
+            if remaining.is_empty() {
+                map.remove(&key);
+            } else {
+                remaining.sort_unstable();
+                entry.esi_ranges = esi_list_to_ranges(&remaining);
+            }
+        }
     }
 
     /// The raw numbers the OLD offer rule decides on, read once (В-0b): the held bytes and the
@@ -1163,6 +1228,7 @@ impl Processor {
     /// Called from dispatch_libp2p; reply is sent via ResponseChannel by caller.
     pub(crate) fn handle_symbol_offer_inner(
         &self,
+        from_device: DeviceId,
         owner_id: IdentityPub,
         offer: SymbolOfferMsg,
     ) -> viaticum_core::messages::Message {
@@ -1242,12 +1308,13 @@ impl Processor {
             {
                 let accepted_offer = AcceptedOffer {
                     owner_id,
+                    from_device,
                     source_block_id: offer.source_block_id,
                     esi_ranges: offer.esi_ranges.clone(),
                     importance: offer.importance,
                     accepted_at: Timestamp::now(),
                 };
-                let key = (owner_id, offer.source_block_id);
+                let key = (from_device, offer.source_block_id);
                 let mut map = self.accepted_offers.lock().unwrap();
                 map.insert(key, accepted_offer);
             }
