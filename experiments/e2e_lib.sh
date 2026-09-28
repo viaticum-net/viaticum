@@ -409,3 +409,55 @@ last_published_base() {
         | grep -a "SelfPointer published via mailbox" | grep -a "place=$2" | tail -1 \
         | grep -oE 'base=[0-9a-f]+' | cut -d= -f2 || true
 }
+
+# ── Scale measurements (СТ-0, local_pos_scale_test) ─────────────────────────
+#
+# Times are the `events` times (seconds since T_BASE, from the log's own timestamps).
+
+# events_grep FILE PATTERN KEY... : `events` over only the lines that contain PATTERN
+# (pre-filtered with grep -F, so a multi-GB log costs one grep). The line field counts
+# the filtered lines, not the file's; use times, not line numbers, with it.
+events_grep() {
+    local file="$1" pat="$2"; shift 2
+    events <(grep -aF -- "$pat" "$file" 2>/dev/null || true) "$pat" "$@"
+}
+
+# in_window A B : keep the `events` lines whose time (field 1) is in [A, B].
+in_window() { awk -v a="$1" -v b="$2" '($1 + 0) >= a && ($1 + 0) <= b'; }
+
+# p95 : the 95th percentile (nearest rank) of the numbers on stdin; "" when there are none.
+p95() {
+    sort -n | awk '{ v[NR] = $1 }
+        END { if (NR) { i = int(NR * 0.95); if (i < NR * 0.95) i++; if (i < 1) i = 1; print v[i] } }'
+}
+
+# max_gap : the largest difference between consecutive numbers on stdin (sorted first);
+# 0 for fewer than two numbers.
+max_gap() {
+    sort -n | awk 'NR > 1 && $1 - p > g { g = $1 - p } { p = $1 } END { printf "%.1f\n", g + 0 }'
+}
+
+# proc_rchar PID : bytes the process has read so far (`rchar` of /proc/PID/io; "" when
+# the process is gone or unreadable). Counts every read(2) incl. page-cache hits, which
+# is what a re-read of the same symbols costs the holder.
+proc_rchar() { awk '/^rchar:/ { print $2 }' "/proc/$1/io" 2>/dev/null || true; }
+
+# block_bytes_on IDX HEX16 : bytes of the symbol files node IDX holds, on its own disk,
+# for the block whose id starts with HEX16 (holdings/{block_hex}/{esi}.bin).
+block_bytes_on() {
+    local d total=0 s
+    for d in "$(node_dir "$1")"/holdings/"$2"*; do
+        [ -d "$d" ] || continue
+        s=$(find "$d" -maxdepth 1 -type f -name '*.bin' -printf '%s\n' 2>/dev/null \
+            | awk '{ t += $1 } END { print t + 0 }')
+        total=$((total + s))
+    done
+    echo "$total"
+}
+
+# sleep_until T : sleep until `events` time T (seconds since T_BASE); no-op if past.
+sleep_until() {
+    local d=$(( $1 - ( $(date -u +%s) - T_BASE ) ))
+    [ "$d" -gt 0 ] && sleep "$d"
+    return 0
+}

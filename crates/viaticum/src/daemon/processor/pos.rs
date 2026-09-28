@@ -84,6 +84,7 @@ impl PosResponder {
                 warn!(
                     block_id = %block_id,
                     challenger = %owner_id,
+                    challenge_id = %hex_encode(&challenge.challenge_id),
                     "processor: PosHashChallenge from non-owner, sending nack"
                 );
                 return Ok(Message::PosHashNack(build_pos_hash_nack(
@@ -132,8 +133,9 @@ impl PosResponder {
         }
         // CS-POS-4: an empty/zero esi_ranges (requested == 0) passes the `requested > held`
         // check below (0 <= held) but would then feed `compute_chain_hash` an empty input →
-        // `ChainHashEmptyInput` Err on EVERY poll until the entry's TTL (~168 re-serves) from
-        // one signed junk challenge. A legitimate challenge always covers ≥1 ESI, so reject
+        // `ChainHashEmptyInput` Err, and a handler error is not remembered by the poll (pos-i5),
+        // so it would recur on every poll until the entry's TTL from one signed junk
+        // challenge. A legitimate challenge always covers ≥1 ESI, so reject
         // it here as malformed — same clean-drop treatment as the oversized case (no Nack, no
         // response, surfaced as `OversizedChallenge` which the poll handler drops cleanly).
         if requested == 0 {
@@ -187,6 +189,7 @@ impl PosResponder {
                     warn!(
                         block_id = %block_id,
                         esi,
+                        challenge_id = %hex_encode(&challenge.challenge_id),
                         "processor: PosHashChallenge — symbol missing, sending nack"
                     );
                     return Ok(Message::PosHashNack(build_pos_hash_nack(
@@ -210,7 +213,14 @@ impl PosResponder {
         let chain_hash = compute_chain_hash(&challenge.challenge_id, &refs)
             .map_err(ProcessorError::PosVerify)?;
 
-        debug!(block_id = %block_id, "processor: PosHashChallenge — responding with chain hash");
+        // pos-i5: on the mailbox path this line comes once per challenge (the poll keeps
+        // the answer in memory); the scenario counts it per `challenge_id`.
+        debug!(
+            block_id = %block_id,
+            challenge_id = %hex_encode(&challenge.challenge_id),
+            owner = %owner_id,
+            "processor: PosHashChallenge — responding with chain hash"
+        );
         // CS-ID-1 / P1-1: sign the response with our master key so the owner can verify it
         // came from the challenged holder (not a positioned postman forging a wrong hash).
         Ok(Message::PosHashResponse(build_pos_hash_response(
