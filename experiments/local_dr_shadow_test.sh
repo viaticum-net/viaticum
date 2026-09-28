@@ -51,9 +51,12 @@
 # 1b. ADVERSARIAL (dr-i49, dr-i50): wait for dr_ready; SIGSTOP every node whose holdings hold
 #     the owner's current SS base; at W/2 (W = 7 d / TIME_SCALE ≈ 605 s) dr_ready is still
 #     true and blocks placed == total; within W + 180 s blocks placed < total and dr_ready
-#     false; SIGCONT; dr_ready true again within 240 s
-#     — check: holders_of_prefix, status snapshots. Mutation "strength without last_seen" →
-#     placed stays == total → RED here.
+#     false; SIGCONT; dr_ready true again within 240 s; within 180 s ≥ 1 woken node logs
+#     "SelfPointer published via mailbox", and since SIGCONT no node logs a "superseded"
+#     refusal with held_stored_at == incoming_stored_at nor "the system clock went back"
+#     (mailbox-i62: a wake-up burst sealed several envelopes into one place in one second)
+#     — check: holders_of_prefix, status snapshots, grep. Mutation "strength without
+#     last_seen" → placed stays == total → RED here.
 #  2. kill node-00 (machine lost).
 #  3. ADVERSARIAL (dr-i6) folder S: `init --mnemonic M` → stdout names `viaticum dr`; daemon on S
 #     (empty watch dir), connect to node-01; poll ≤ 300 s until S dr_pointer_published_at > 0 &&
@@ -322,6 +325,8 @@ if [ -n "$FROZEN" ]; then
         fi
         sleep 10
     done
+    declare -A CONT_FROM
+    for i in 0 "${HOLDERS[@]}"; do CONT_FROM[$i]=$(log_line_count "$i"); done
     for i in $FROZEN; do kill -CONT "${NODE_PID[$i]}" 2>/dev/null || true; done
     if [ -n "$DROPPED" ]; then
         pass "holders silent > W: readiness dropped $DROPPED"
@@ -339,6 +344,37 @@ if [ -n "$FROZEN" ]; then
         fail "dr_ready not back within 240 s after SIGCONT (blocks $(status_num 0 dr_ss_blocks_placed)/$(status_num 0 dr_ss_blocks_total))"
     fi
     wait_auth_peers 1 3 90 || fail "after SIGCONT node-01 has $(status_num 1 peer_count_authenticated) authenticated peers (want ≥ 3)"
+    # mailbox-i62: woken publishers never put two envelopes with one stored_at into a
+    # place. Positive evidence first: a woken node published its pointer after SIGCONT.
+    WOKE_PUB=0
+    for _ in $(seq 1 36); do
+        WOKE_PUB=0
+        for i in $FROZEN; do
+            n=$(log_since "$i" "${CONT_FROM[$i]}" | grep -ac "SelfPointer published via mailbox" || true)
+            [ "${n:-0}" -gt 0 ] && WOKE_PUB=$((WOKE_PUB + 1))
+        done
+        [ "$WOKE_PUB" -gt 0 ] && break
+        sleep 5
+    done
+    EQ_SUP=0; CLOCK_BACK=0
+    for i in 0 "${HOLDERS[@]}"; do
+        n=$(log_since "$i" "${CONT_FROM[$i]}" | awk '/store rejected — superseded/ {
+                h = ""; x = ""
+                for (k = 1; k <= NF; k++) {
+                    if ($k ~ /^held_stored_at=/) h = substr($k, 16)
+                    if ($k ~ /^incoming_stored_at=/) x = substr($k, 20)
+                }
+                if (h != "" && h == x) c++
+            } END { print c + 0 }' || true)
+        EQ_SUP=$((EQ_SUP + ${n:-0}))
+        n=$(log_since "$i" "${CONT_FROM[$i]}" | grep -ac "the system clock went back" || true)
+        CLOCK_BACK=$((CLOCK_BACK + ${n:-0}))
+    done
+    if [ "$WOKE_PUB" -gt 0 ] && [ "$EQ_SUP" -eq 0 ] && [ "$CLOCK_BACK" -eq 0 ]; then
+        pass "after SIGCONT $WOKE_PUB woken node(s) published their pointer; 0 equal-time 'superseded' refusals, 0 'clock went back' (mailbox-i62)"
+    else
+        fail "after SIGCONT: woken publishers $WOKE_PUB (want ≥ 1), equal-time superseded $EQ_SUP, 'clock went back' $CLOCK_BACK (want 0, 0) (mailbox-i62)"
+    fi
 fi
 
 # ── STEP 2: MACHINE LOST ─────────────────────────────────────────
