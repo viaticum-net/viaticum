@@ -85,7 +85,10 @@
 # 2b. mailbox-i56 / V.16.4: the owner restarts twice (a new base per process); after each
 #     restart wait for a publication of a NEW base (base= not seen before), reading
 #     dr_ready every 5 s meanwhile: it is true in every snapshot — the other place stays
-#     restorable while the new base collects acks (dr-i53) — and at the end status
+#     restorable while the new base collects acks (dr-i53; regression guard only: with
+#     live postmen the "new base at 1-2 acks" window does not open here, so the rule
+#     itself is proven by the unit readiness_holds_on_the_other_place_while_a_new_base_
+#     collects_acks — cannot close in E2E) — and at the end status
 #     names dr_restores_state_of > 0 ("DR would restore the catalog as of …"). Then: the
 #     owner's publications used place=A and place=B; the postmen's msg_ids for RADDR are
 #     ⊆ {slot_a, slot_b} (probe, L_OWNER) and one postman holds both; in the owner's
