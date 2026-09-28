@@ -168,12 +168,13 @@ pub(crate) fn sweep_ss_ledger(
     Ok(retired)
 }
 
-/// What `status` says about DR readiness (dr-i9, dr-i39, dr-i41, dr-i49; mailbox-i49,
-/// i54), read from META only.
+/// What `status` says about DR readiness (dr-i9, dr-i39, dr-i41, dr-i49, dr-i53;
+/// mailbox-i49, i54), read from META only.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct PointerReadiness {
-    /// The newest place at least one postman acked, by its standing envelope
-    /// (dr-i52): its `created_at`, files, acks.
+    /// The place readiness is reported for, by its standing envelope (dr-i52): its
+    /// `created_at`, files, acks. The newest restorable place when there is one
+    /// (dr-i53), else the newest place at least one postman acked.
     pub accepted: Option<(u64, u32, u32)>,
     /// dr-i39 number of acks needed.
     pub threshold: u32,
@@ -181,15 +182,22 @@ pub(crate) struct PointerReadiness {
     /// recoverable by the owner's estimate (strength ≥ 1).
     pub blocks_total: u32,
     pub blocks_placed: u32,
-    /// acks ≥ threshold and every block recoverable.
+    /// dr-i53: at least one place is restorable (its standing envelope has the
+    /// threshold acks and every block recoverable).
     pub ready: bool,
+    /// dr-i53: `created_at` of the catalog state DR restores for sure when ready — the
+    /// newest restorable place. DR tries the fresher head first, so a newer place
+    /// short of the threshold, if DR reaches it, gives a newer state.
+    pub restores_state_of: Option<u64>,
     /// The last refusal of the place of the newest base.
     pub refusal: Option<viaticum_core::system_state::catalog::RefusalKind>,
     pub waiting: Option<viaticum_core::system_state::catalog::Waiting>,
 }
 
 /// DR readiness from META and the owner's placements. `known_peers` sets the dr-i39
-/// threshold. Read-only.
+/// threshold. Read-only. dr-i53: ready when at least one place of the history is
+/// restorable — a new base collecting its first acks in one place does not hide a
+/// restorable state in the other.
 pub(crate) fn pointer_readiness(
     db: &Db,
     known_peers: usize,
@@ -210,27 +218,53 @@ pub(crate) fn pointer_readiness(
         .as_ref()
         .and_then(|c| c.last_refusal)
         .map(|x| x.kind);
-    let accepted = [meta.current.as_ref(), meta.other.as_ref()]
+    // dr-i53: every place by its standing envelope; ready when one is restorable.
+    let mut places = Vec::with_capacity(2);
+    for rec in [meta.current.as_ref(), meta.other.as_ref()]
         .into_iter()
         .flatten()
-        .map(|rec| standing(rec, threshold, now_secs))
-        .find(|st| st.acks > 0);
-    if let Some(acc) = accepted {
-        r.accepted = Some((
-            acc.created_at,
-            acc.files,
-            u32::try_from(acc.acks).unwrap_or(u32::MAX),
-        ));
-        let blocks: Vec<&SourceBlockId> = std::iter::once(acc.base).chain(acc.diffs).collect();
-        r.blocks_total = u32::try_from(blocks.len()).unwrap_or(u32::MAX);
-        for b in blocks {
+    {
+        let st = standing(rec, threshold, now_secs);
+        if st.acks == 0 {
+            continue;
+        }
+        let blocks: Vec<&SourceBlockId> = std::iter::once(st.base).chain(st.diffs).collect();
+        let mut placed = 0usize;
+        for b in &blocks {
             if block_strength(db, b, now_secs, time_scale)? >= 1.0 {
-                r.blocks_placed += 1;
+                placed += 1;
             }
         }
-        r.ready = acc.acks >= threshold && r.blocks_placed == r.blocks_total;
+        places.push(PlaceReadiness {
+            ready: st.acks >= threshold && placed == blocks.len(),
+            total: blocks.len(),
+            placed,
+            st,
+        });
+    }
+    // The newest restorable place; else the newest acked one (`current` first).
+    let shown = places
+        .iter()
+        .filter(|p| p.ready)
+        .max_by_key(|p| p.st.created_at)
+        .or_else(|| places.first());
+    if let Some(p) = shown {
+        let n = |x: usize| u32::try_from(x).unwrap_or(u32::MAX);
+        r.accepted = Some((p.st.created_at, p.st.files, n(p.st.acks)));
+        r.blocks_total = n(p.total);
+        r.blocks_placed = n(p.placed);
+        r.ready = p.ready;
+        r.restores_state_of = p.ready.then_some(p.st.created_at);
     }
     Ok(r)
+}
+
+/// One place judged for readiness (dr-i53).
+struct PlaceReadiness<'a> {
+    st: Standing<'a>,
+    placed: usize,
+    total: usize,
+    ready: bool,
 }
 
 /// The envelope a place stands on for readiness (dr-i52).

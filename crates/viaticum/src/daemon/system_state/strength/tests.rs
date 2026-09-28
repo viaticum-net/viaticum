@@ -238,6 +238,59 @@ fn readiness_stands_on_the_kept_envelope_until_it_expires() {
     assert!(!r.ready);
 }
 
+/// dr-i53: DR is ready while one place is restorable. A new base in the other place
+/// with 1-2 acks does not make it "not ready"; the state DR restores is the ready
+/// place's. Once the new base reaches the threshold it is the newest restorable state.
+/// When no place is restorable, the newest acked place is reported, not ready.
+#[test]
+fn readiness_holds_on_the_other_place_while_a_new_base_collects_acks() {
+    let db = test_db();
+    let old = block_of_strength(&db, 5, 3);
+    let new = block_of_strength(&db, 9, 3);
+    for acks in [1, 2] {
+        db.put_pointer_publications(&meta(
+            Some(record(PointerPlace::B, new, vec![], 200, acks)),
+            Some(record(PointerPlace::A, old, vec![], 100, 3)),
+        ))
+        .unwrap();
+        let r = pointer_readiness(&db, 6, NOW, 1).unwrap();
+        assert!(
+            r.ready,
+            "{acks} ack(s) on the new base: place A is restorable"
+        );
+        assert_eq!(
+            r.restores_state_of,
+            Some(100),
+            "DR restores place A's state"
+        );
+        assert_eq!(r.accepted, Some((100, 1, 3)));
+        assert_eq!((r.blocks_placed, r.blocks_total), (1, 1));
+    }
+    db.put_pointer_publications(&meta(
+        Some(record(PointerPlace::B, new, vec![], 200, 3)),
+        Some(record(PointerPlace::A, old, vec![], 100, 3)),
+    ))
+    .unwrap();
+    let r = pointer_readiness(&db, 6, NOW, 1).unwrap();
+    assert_eq!(
+        (r.ready, r.restores_state_of),
+        (true, Some(200)),
+        "both restorable: the newest"
+    );
+    // Place A's holders gone for more than W: nothing restorable → not ready, and the
+    // newest acked place (B, 2 acks) is what status reports.
+    let gone = ss_record(&db, 0x55);
+    hold(&db, gone, 0x5A, 4, NOW - 8 * DAY);
+    db.put_pointer_publications(&meta(
+        Some(record(PointerPlace::B, new, vec![], 200, 2)),
+        Some(record(PointerPlace::A, gone, vec![], 100, 3)),
+    ))
+    .unwrap();
+    let r = pointer_readiness(&db, 6, NOW, 1).unwrap();
+    assert_eq!((r.ready, r.restores_state_of), (false, None));
+    assert_eq!(r.accepted, Some((200, 1, 2)));
+}
+
 fn peer_template() -> PeerRecord {
     PeerRecord {
         device_id: DeviceId([0; 32]),
