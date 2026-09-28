@@ -35,7 +35,9 @@
 #                    hash`; `PosResponse published` <= 4 + its 0-ack lines; every challenge first
 #                    computed in [W2 start, W2 end - 200 s] has >= 1 `cached=true`; rchar growth
 #                    <= 1.5 x sum(bytes of the block on H's disk per compute line of W2) + 1.5 x R0;
-#                    `mailbox_poll: poll done` elapsed_ms p95 < 4000 (pos-i5)
+#                    `mailbox_poll: poll done` elapsed_ms p95 < 4000; the last `poll done` of W2:
+#                    memo_answered <= 1.5 x live challenges (distinct challenges first computed
+#                    in the last 672 s) — the memory is swept (pos-i5)
 #               4.  W2, O: every challenge issued in W2 to H1..H9 resolved by W2 end + 336 s;
 #                    0 `PoS challenge timed out`; WARN `unknown challenge_id` <= timeouts (= 0);
 #                    deferred_full sum = NOTE (pos-i6)
@@ -45,7 +47,8 @@
 #               7.  H9, 28 cycles over W1..W4: 0 timeouts to H9; >= 1 Pass from H9 on O in every
 #                    online window; in every window H9 computes >= 90 % of its live challenges
 #                    (issued by O to H9 in the 672 s before its start), < 90 % = FAIL "finding:
-#                    the laptop does not keep up"; T_up = NOTE (4r-i113, pos-i5)
+#                    the laptop does not keep up"; T_up = NOTE (4r-i113, pos-i5);
+#                    rchar per online window = NOTE (pos-i5-c, the price of a restart)
 #               7b. W3: H8 SIGSTOP 66 s / SIGCONT 30 s, 7 cycles: issue tick elapsed_ms p95 <= 800;
 #                    ledger gap <= 12 s; 0 timeouts to H8. Known: `poll done` elapsed_ms ~15000
 #                    on every node while H8 is stopped -> ROUGH "known: poll waits for the slowest
@@ -86,8 +89,20 @@
 #     run after that step; later steps print "not run" and do not count.
 #   - The test dir is removed on PASS and kept otherwise.
 #
+# Mutations (step 3 is the СТ-0a proof; which bar reddens):
+#   (a)  memory off (compute on every poll) -> "computed exactly once" (a challenge's compute
+#        count != 1). The rchar bar stays GREEN: it sums the block bytes per compute line,
+#        so more computes raise the bound with the reads; it guards reads outside the
+#        compute path, not the compute count.
+#   (a') re-publish on every poll -> "published <= 4 + 0-acks" (rchar green: mutations differ)
+#   (c)  no quarter-TTL re-publish -> "re-published from memory (cached=true)"
+#   (B1) no sweep at the poll's start -> "memo_answered <= 1.5 x live"
+#
 # Usage:
-#   private/testing/run_e2e.sh pos_scale          # on the build server (release build)
+#   The full run takes 1.5-2 h (STOP_AFTER=4 about 1 h): longer than the 1800 s timeout of
+#   private/testing/run_e2e.sh. Run it directly on the build server (release build), or
+#   through run_e2e.sh only with that timeout raised:
+#   bash experiments/local_pos_scale_test.sh
 #   STOP_AFTER=4 bash experiments/local_pos_scale_test.sh
 
 set -uo pipefail
@@ -119,6 +134,7 @@ MIN_FREE_GIB=20
 BAR_TICK_MS=800
 BAR_LEDGER_GAP=12
 BAR_POLL_MS=4000
+BAR_MEMO_RATIO=1.5
 FIRST_CACHED_MARGIN=200
 ALIVE_MARGIN=60
 STEP8_MARGIN=120
@@ -295,7 +311,7 @@ h_zero_acks() {
     { events_grep "$(node_log "$1")" "PosResponse publish got 0 acks" challenge_id
       events_grep "$(node_log "$1")" "PosResponse publish failed" challenge_id; } | sort -n
 }
-h_polls() { events_grep "$(node_log "$1")" "mailbox_poll: poll done" elapsed_ms entries deferred_full; }
+h_polls() { events_grep "$(node_log "$1")" "mailbox_poll: poll done" elapsed_ms entries deferred_full memo_answered; }
 
 count_in() { in_window "$1" "$2" | awk 'NF' | wc -l | tr -d ' '; }
 
@@ -492,6 +508,9 @@ h9_cycler() {
         t0=$((T_W1 + (c - 1) * H9_CYCLE))
         sleep_until "$t0"
         pid=$(cat "$TEST_DIR/h9.pid")
+        # rchar of the process that is about to die = reads of one online window after a
+        # restart (pos-i5-c: the memory is in RAM, every live challenge is computed again).
+        echo "$c rchar $(now_t) $(proc_rchar "$pid")" >> "$TEST_DIR/h9_cycles.log"
         kill -9 "$pid" 2>/dev/null
         for _ in $(seq 1 25); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
         echo "$c kill $(now_t)" >> "$TEST_DIR/h9_cycles.log"
@@ -571,7 +590,7 @@ for h in "${HS[@]}"; do
     SUMMARY=$({ h_computes "$h" | awk '{ print "C", $1, $3, $4 }'
                 h_published "$h" | awk '{ print "P", $1, $3, $4, $5 }'
                 h_zero_acks "$h" | awk '{ print "Z", $1, $3 }'
-              } | awk -v a="$T_W2" -v b="$T_W3" -v m="$FIRST_CACHED_MARGIN" '
+              } | awk -v a="$T_W2" -v b="$T_W3" -v m="$FIRST_CACHED_MARGIN" -v w="$WEEK" '
         ($2 + 0) > b { next }
         $1 == "C" { nc[$3]++; if (!($3 in tc)) tc[$3] = $2 + 0; if ($2 + 0 >= a) win[$3] = 1 }
         $1 == "P" { np[$3]++; if ($5 == "true") { ca[$3]++; cached++ }; if ($2 + 0 >= a) win[$3] = 1 }
@@ -586,9 +605,10 @@ for h in "${HS[@]}"; do
                     if (ca[c] + 0 < 1) { bk++; if (ex == "") ex = c ":cached=0" }
                 }
             }
-            printf "%d %d %d %d %d %d %s\n", n, bc, bp, el, bk, cached, (ex == "" ? "-" : ex)
+            for (c in tc) if (tc[c] > b - w) live++
+            printf "%d %d %d %d %d %d %d %s\n", n, bc, bp, el, bk, cached, live + 0, (ex == "" ? "-" : ex)
         }')
-    read -r N_CID BAD_C BAD_P ELIG BAD_K N_CACHED EX <<< "$SUMMARY"
+    read -r N_CID BAD_C BAD_P ELIG BAD_K N_CACHED LIVE EX <<< "$SUMMARY"
     # Reads: the block's symbols on H's own disk, per compute line of the window.
     declare -A BB=()
     SUM_B=0
@@ -601,7 +621,8 @@ for h in "${HS[@]}"; do
     D_RCHAR=$(( ${RC_W2E[$h]:-0} - ${RC_W2S[$h]:-0} ))
     BOUND=$(awk -v s="$SUM_B" -v r="${R0[$h]}" 'BEGIN { printf "%.0f", 1.5 * s + 1.5 * r }')
     POLL95=$(h_polls "$h" | in_window "$T_W2" "$T_W3" | awk '$3 != "-" { print $3 }' | p95)
-    info "node-0$h: challenges=$N_CID bad_computes=$BAD_C bad_published=$BAD_P eligible=$ELIG no_cached=$BAD_K cached_lines=$N_CACHED rchar=$D_RCHAR bound=$BOUND poll_p95=${POLL95:-none} ex=$EX"
+    MEMO=$(h_polls "$h" | in_window "$T_W2" "$T_W3" | awk '$6 != "-" { v = $6 } END { print v }')
+    info "node-0$h: challenges=$N_CID bad_computes=$BAD_C bad_published=$BAD_P eligible=$ELIG no_cached=$BAD_K cached_lines=$N_CACHED rchar=$D_RCHAR bound=$BOUND poll_p95=${POLL95:-none} memo=${MEMO:-none} live=$LIVE ex=$EX"
     if [ "$N_CID" -eq 0 ]; then
         fail "node-0$h: no challenge seen in W2 (nothing to judge)"
         continue
@@ -630,6 +651,15 @@ for h in "${HS[@]}"; do
         pass "node-0$h: poll elapsed_ms p95 = $POLL95"
     else
         fail "node-0$h: poll elapsed_ms p95 = $POLL95 >= $BAR_POLL_MS"
+    fi
+    # The memory is swept (B1): at W2 end it holds about the challenges first seen in the
+    # last TTL, not every challenge since start.
+    if [ -z "$MEMO" ] || [ "$LIVE" -eq 0 ]; then
+        fail "node-0$h: memo_answered or live challenges not observed (memo=${MEMO:-none} live=$LIVE)"
+    elif awk -v m="$MEMO" -v l="$LIVE" -v k="$BAR_MEMO_RATIO" 'BEGIN { exit !(m <= k * l) }'; then
+        pass "node-0$h: memo_answered $MEMO <= ${BAR_MEMO_RATIO} x live $LIVE"
+    else
+        fail "node-0$h: memo_answered $MEMO > ${BAR_MEMO_RATIO} x live $LIVE (memory not swept)"
     fi
 done
 stop_point 3
@@ -819,6 +849,9 @@ done <<< "$UPS"
 [ -z "$SLOW" ] && pass "H9 computed >= 90 % of its live challenges in every window" \
     || fail "finding: the laptop does not keep up within the window (cycle:computed/live):$SLOW"
 note "T_up per window (s):$TUPS"
+# pos-i5-c: the price of a restart = rchar of a window (cycle 1 is the first start: skipped).
+RCH9=$(awk '$2 == "rchar" && $1 > 1 && $4 != "" { print $4 }' "$TEST_DIR/h9_cycles.log")
+note "H9 rchar per online window (bytes, cycles 2..): $(echo "$RCH9" | awk 'NF { n++; s += $1; if ($1 > m) m = $1 } END { printf "n=%d mean=%.0f max=%d", n, (n ? s / n : 0), m }')"
 # ── Steps 7a-7c (line A, 4r-i113): appended here by line A ─────────────────
 stop_point 7
 

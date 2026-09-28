@@ -92,62 +92,108 @@ pub async fn run_mailbox_poll(
                 break;
             }
             _ = interval.tick() => {
-                let started = Instant::now();
-                let now_secs = unix_now();
-                let forgotten = pos.answered.forget_expired(now_secs);
-
-                // Poll our own mailbox from read-fanout peers.
-                let entries = match router
-                    .poll(&MailboxAddress::for_master(&my_master_pub), None, None)
-                    .await
-                {
-                    Ok(e) => e,
-                    Err(err) => {
-                        warn!(err = %err, "mailbox_poll: poll failed");
-                        continue;
-                    }
-                };
-
-                let entry_count = entries.len();
-                let mut counts = PollCounts::default();
-                for entry in entries {
-                    dispatch_entry(
-                        &router,
-                        &pos_response_tx,
-                        &mut pos,
-                        &mut counts,
-                        &challenge_handler,
-                        &drop_handler,
-                        &delete_handler,
-                        &revocation_handler,
-                        &my_master_pub,
-                        entry,
-                        time_scale,
-                        now_secs,
-                    )
-                    .await;
-                }
-
-                // One line per poll, the empty ones included (pos-i5 observables).
-                info!(
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    entries = entry_count,
-                    computed = counts.computed,
-                    no_answer = counts.no_answer,
-                    handler_error = counts.handler_error,
-                    republished = counts.republished,
-                    skipped = counts.skipped,
-                    publish_zero_ack = counts.publish_zero_ack,
-                    forwarded = counts.forwarded,
-                    deferred_full = counts.deferred_full,
-                    undecodable = counts.undecodable,
-                    memo_answered = pos.answered.len(),
-                    memo_forgotten = forgotten,
-                    "mailbox_poll: poll done"
-                );
+                poll_once(
+                    &router,
+                    &pos_response_tx,
+                    &mut pos,
+                    &challenge_handler,
+                    &drop_handler,
+                    &delete_handler,
+                    &revocation_handler,
+                    &my_master_pub,
+                    time_scale,
+                    unix_now(),
+                )
+                .await;
             }
         }
     }
+}
+
+/// One poll of our own master box: forget expired PoS memory, fetch, dispatch every
+/// entry, print `mailbox_poll: poll done` (INFO when the poll had entries, DEBUG when
+/// it was empty). Returns the counters (`None` when the fetch failed).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn poll_once(
+    router: &Arc<MailboxRouter>,
+    pos_response_tx: &mpsc::Sender<PosHashResponseMsg>,
+    pos: &mut PosPollState,
+    challenge_handler: &Arc<dyn PosMailboxChallengeHandler>,
+    drop_handler: &Arc<dyn DropNoticeHandler>,
+    delete_handler: &Arc<dyn DeleteMailboxHandler>,
+    revocation_handler: &Arc<dyn RevocationMailboxHandler>,
+    my_master_pub: &IdentityPub,
+    time_scale: u64,
+    now_secs: u64,
+) -> Option<PollCounts> {
+    let started = Instant::now();
+    let forgotten = pos.begin_poll(now_secs);
+
+    // Poll our own mailbox from read-fanout peers.
+    let entries = match router
+        .poll(&MailboxAddress::for_master(my_master_pub), None, None)
+        .await
+    {
+        Ok(e) => e,
+        Err(err) => {
+            warn!(err = %err, "mailbox_poll: poll failed");
+            return None;
+        }
+    };
+
+    let entry_count = entries.len();
+    let mut counts = PollCounts::default();
+    for entry in entries {
+        dispatch_entry(
+            router,
+            pos_response_tx,
+            pos,
+            &mut counts,
+            challenge_handler,
+            drop_handler,
+            delete_handler,
+            revocation_handler,
+            my_master_pub,
+            entry,
+            time_scale,
+            now_secs,
+        )
+        .await;
+    }
+
+    // One line per poll (pos-i5 observables): INFO with entries, DEBUG when empty.
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let memo_answered = pos.answered.len();
+    let memo_refused = pos.answered.refused();
+    if entry_count > 0 {
+        info!(
+            elapsed_ms,
+            entries = entry_count,
+            computed = counts.computed,
+            no_answer = counts.no_answer,
+            handler_error = counts.handler_error,
+            republished = counts.republished,
+            skipped = counts.skipped,
+            publish_zero_ack = counts.publish_zero_ack,
+            forwarded = counts.forwarded,
+            deferred_full = counts.deferred_full,
+            undecodable = counts.undecodable,
+            memo_answered,
+            memo_forgotten = forgotten,
+            memo_refused,
+            "mailbox_poll: poll done"
+        );
+    } else {
+        debug!(
+            elapsed_ms,
+            entries = 0,
+            memo_answered,
+            memo_forgotten = forgotten,
+            memo_refused,
+            "mailbox_poll: poll done"
+        );
+    }
+    Some(counts)
 }
 
 /// Unix seconds now.

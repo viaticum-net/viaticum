@@ -2020,20 +2020,37 @@ async fn lost_response_is_republished_from_cache_after_quarter_ttl() {
         &mut memo,
         &mut counts,
         &my_master,
-        entry,
+        entry.clone(),
         900,
         now + retry,
     )
     .await;
+    // The re-publish is recorded: the very next poll does not publish again.
+    super::dispatch_pos_challenge(
+        &router,
+        &handler,
+        &mut memo,
+        &mut counts,
+        &my_master,
+        entry,
+        900,
+        now + retry + 4,
+    )
+    .await;
 
     let stored = sender.stored.lock().await;
-    assert_eq!(stored.len(), 1, "the response reaches the postman again");
+    assert_eq!(
+        stored.len(),
+        1,
+        "the response reaches the postman again, once"
+    );
     assert_eq!(
         stored[0].entry, first,
         "the same bytes under the same msg_id"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1, "no second compute");
     assert_eq!(counts.republished, 1);
+    assert_eq!(counts.skipped, 1);
 }
 
 /// pos-i5: a challenge the handler gave no answer to is not asked again on every poll,
@@ -2077,7 +2094,7 @@ async fn no_answer_challenge_is_rechecked_once_per_quarter_ttl() {
 }
 
 /// pos-i5 observable: `mailbox_poll: poll done` is printed on every poll, the empty
-/// one included.
+/// one included (at DEBUG; a poll with entries is INFO).
 #[tokio::test]
 async fn poll_done_line_is_printed_for_an_empty_poll() {
     use std::io::Write;
@@ -2108,7 +2125,7 @@ async fn poll_done_line_is_printed_for_an_empty_poll() {
         tracing_subscriber::fmt()
             .with_writer(move || writer.clone())
             .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
+            .with_max_level(tracing::Level::DEBUG)
             .finish(),
     );
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -2146,6 +2163,187 @@ async fn poll_done_line_is_printed_for_an_empty_poll() {
         .find(|l| l.contains("mailbox_poll: poll done"))
         .unwrap_or_else(|| panic!("no poll done line for an empty poll; logs:\n{logs}"));
     assert!(line.contains("entries=0"), "{line}");
-    assert!(line.contains("computed=0"), "{line}");
     assert!(line.contains("elapsed_ms="), "{line}");
+    assert!(
+        line.contains("DEBUG"),
+        "an empty poll is a DEBUG line (N4): {line}"
+    );
+}
+
+// ─── Fix round 1: the poll's own start forgets, junk and sender-less entries ─────
+
+/// A postman that serves `entries` on the first fetch only, then an empty box.
+struct OneShotFetchSender {
+    entries: tokio::sync::Mutex<Option<Vec<MailboxEntry>>>,
+    stored: tokio::sync::Mutex<Vec<MailboxStoreRequest>>,
+}
+
+#[async_trait::async_trait]
+impl MailboxNetworkSender for OneShotFetchSender {
+    async fn send_store(
+        &self,
+        _device: DeviceId,
+        req: MailboxStoreRequest,
+    ) -> anyhow::Result<MailboxStoreResponse> {
+        let msg_id = req.entry.msg_id;
+        self.stored.lock().await.push(req);
+        Ok(MailboxStoreResponse::Ack { msg_id })
+    }
+
+    async fn send_fetch(
+        &self,
+        _device: DeviceId,
+        _req: MailboxFetchRequest,
+    ) -> anyhow::Result<MailboxFetchResponse> {
+        Ok(MailboxFetchResponse {
+            v: 1,
+            entries: self.entries.lock().await.take().unwrap_or_default(),
+            served_msg_ids: vec![],
+        })
+    }
+}
+
+/// B1: a poll starts by forgetting what expired — the memory of a challenge is gone
+/// one TTL after it was first seen, through the poll path itself.
+#[tokio::test]
+async fn poll_forgets_an_answered_challenge_one_ttl_later() {
+    let db = Db::open_in_memory().expect("db");
+    let my_master = make_identity(0xAA);
+    let sender = Arc::new(OneShotFetchSender {
+        entries: tokio::sync::Mutex::new(Some(vec![challenge_entry(
+            my_master,
+            make_identity(0x42),
+        )])),
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let (pos_tx, _pos_rx) = mpsc::channel::<PosHashResponseMsg>(8);
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let challenge_handler: Arc<dyn super::PosMailboxChallengeHandler> =
+        Arc::new(StubChallengeHandler {
+            response: stub_response([0x33; 16]),
+        });
+    let drop_handler: Arc<dyn super::DropNoticeHandler> =
+        Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx));
+    let delete_handler: Arc<dyn DeleteMailboxHandler> =
+        Arc::new(ProcessorDeleteHandler::new(db.clone()));
+    let revocation_handler: Arc<dyn crate::daemon::processor::RevocationMailboxHandler> = Arc::new(
+        crate::daemon::processor::ProcessorRevocationHandler::new(db.clone()),
+    );
+    let mut pos = PosPollState::new(900);
+    let ttl = pos.answered.ttl_secs();
+    let now = Timestamp::now().0;
+
+    for (at, want) in [(now, 1usize), (now + 4, 1), (now + ttl, 0)] {
+        let counts = super::poll_once(
+            &router,
+            &pos_tx,
+            &mut pos,
+            &challenge_handler,
+            &drop_handler,
+            &delete_handler,
+            &revocation_handler,
+            &my_master,
+            900,
+            at,
+        )
+        .await
+        .expect("poll");
+        assert_eq!(
+            pos.answered.len(),
+            want,
+            "memo_answered at +{} s (counts {counts:?})",
+            at - now
+        );
+    }
+    assert_eq!(
+        sender.stored.lock().await.len(),
+        1,
+        "computed and published once"
+    );
+}
+
+/// B NOTE (3): a PosChallenge without a sender is dropped before the memory — nothing
+/// is remembered (it cannot be answered, and it must not occupy the memory).
+#[tokio::test]
+async fn challenge_without_sender_is_not_remembered() {
+    let db = Db::open_in_memory().expect("db");
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let (handler, calls) = CountingChallengeHandler::wrap(Arc::new(StubChallengeHandler {
+        response: stub_response([0x44; 16]),
+    }));
+    let my_master = make_identity(0xAA);
+    let entry = MailboxEntry {
+        sender: None,
+        ..make_entry(MailboxClass::PosChallenge, my_master, vec![0x00])
+    };
+    let mut memo = AnsweredChallenges::new(900);
+    let mut counts = PollCounts::default();
+    super::dispatch_pos_challenge(
+        &router,
+        &handler,
+        &mut memo,
+        &mut counts,
+        &my_master,
+        entry,
+        900,
+        Timestamp::now().0,
+    )
+    .await;
+    assert!(memo.is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(counts, PollCounts::default());
+    assert!(sender.stored.lock().await.is_empty());
+}
+
+/// B NOTE (4): a junk PosChallenge payload goes through the production handler as a
+/// no-answer: remembered, re-checked once per quarter TTL, not an error on every poll.
+#[tokio::test]
+async fn junk_challenge_payload_is_remembered_as_no_answer() {
+    use crate::daemon::processor::{PosResponder, ProcessorPosHandler};
+
+    let db = Db::open_in_memory().expect("db");
+    let holdings = tempfile::TempDir::new().expect("tempdir");
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let handler: Arc<dyn super::PosMailboxChallengeHandler> =
+        Arc::new(ProcessorPosHandler::new(PosResponder::new(
+            db.clone(),
+            holdings.path().to_path_buf(),
+            ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]),
+        )));
+    let my_master = make_identity(0xAA);
+    let entry = MailboxEntry {
+        sender: Some(make_identity(0x42)),
+        ..make_entry(
+            MailboxClass::PosChallenge,
+            my_master,
+            vec![0xFF, 0x00, 0x13],
+        )
+    };
+    let mut memo = AnsweredChallenges::new(900);
+    let mut counts = PollCounts::default();
+    let now = Timestamp::now().0;
+    for at in [now, now + 4] {
+        super::dispatch_pos_challenge(
+            &router,
+            &handler,
+            &mut memo,
+            &mut counts,
+            &my_master,
+            entry.clone(),
+            900,
+            at,
+        )
+        .await;
+    }
+    assert_eq!(counts.handler_error, 0, "junk is not a handler error");
+    assert_eq!((counts.no_answer, counts.skipped), (1, 1));
+    assert_eq!(memo.len(), 1);
+    assert!(sender.stored.lock().await.is_empty());
 }

@@ -3,7 +3,10 @@
 use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
 use viaticum_core::types::IdentityPub;
 
-use super::{AnsweredChallenges, ChallengeStep, PollCounts, PosPollState, envelope_digest};
+use super::{
+    AnsweredChallenges, ChallengeStep, MAX_REMEMBERED_NO_ANSWERS, MAX_REMEMBERED_RESPONSES,
+    PollCounts, PosPollState, envelope_digest,
+};
 
 /// time_scale 900: TTL 672 s, retry 168 s (the scenario's scale).
 const TS: u64 = 900;
@@ -230,14 +233,15 @@ fn no_answer_is_rechecked_only_after_quarter_ttl() {
 fn recomputed_no_answer_keeps_the_challenge_forget_at() {
     let mut memo = AnsweredChallenges::new(TS);
     let ttl = memo.ttl_secs();
-    let c = challenge(1, vec![1, 2, 3], T0, ttl);
+    // The envelope claims a long life; the memory still counts from first sight.
+    let c = challenge(1, vec![1, 2, 3], T0, 100 * ttl);
     memo.remember_no_answer(&c, T0);
     let later = T0 + memo.retry_secs();
     memo.remember_response(&c, response(9, later, ttl), [1; 16], 1, later);
     assert_eq!(memo.len(), 1);
-    assert_eq!(memo.forget_expired(c.expires_at - 1), 0);
+    assert_eq!(memo.forget_expired(T0 + ttl - 1), 0);
     assert_eq!(
-        memo.forget_expired(c.expires_at),
+        memo.forget_expired(T0 + ttl),
         1,
         "the life of the challenge does not restart on a re-check"
     );
@@ -247,19 +251,19 @@ fn recomputed_no_answer_keeps_the_challenge_forget_at() {
 fn expired_entries_are_forgotten() {
     let mut memo = AnsweredChallenges::new(TS);
     let ttl = memo.ttl_secs();
-    let short = challenge(1, vec![1], T0, 100);
-    let long = challenge(2, vec![2], T0, ttl);
-    memo.remember_response(&short, response(8, T0, ttl), [1; 16], 1, T0);
-    memo.remember_no_answer(&long, T0);
-    assert_eq!(memo.forget_expired(T0 + 99), 0);
-    assert_eq!(memo.forget_expired(T0 + 100), 1);
-    assert_eq!(memo.len(), 1);
+    let first = challenge(1, vec![1], T0, ttl);
+    let second = challenge(2, vec![2], T0 + 100, ttl);
+    memo.remember_response(&first, response(8, T0, ttl), [1; 16], 1, T0);
+    memo.remember_no_answer(&second, T0 + 100);
+    assert_eq!(memo.forget_expired(T0 + ttl - 1), 0);
     assert_eq!(memo.forget_expired(T0 + ttl), 1);
+    assert_eq!(memo.len(), 1);
+    assert_eq!(memo.forget_expired(T0 + ttl + 100), 1);
     assert!(memo.is_empty());
 }
 
 #[test]
-fn forget_at_is_capped_by_first_seen_plus_ttl() {
+fn forget_at_is_first_seen_plus_ttl_even_for_a_long_envelope() {
     let mut memo = AnsweredChallenges::new(TS);
     let ttl = memo.ttl_secs();
     // A challenge entry claiming a life far beyond the class TTL.
@@ -313,4 +317,156 @@ fn restart_memory_is_empty_and_every_live_challenge_is_computed_once() {
         assert_eq!(state.answered.step(&c, T0), ChallengeStep::Compute);
     }
     assert_eq!(PollCounts::default().computed, 0);
+}
+
+// ─── pos-i5-a: unsigned envelope fields do not steer the memory; caps ────────────
+
+#[test]
+fn rotated_msg_id_of_the_same_challenge_is_not_recomputed() {
+    let mut memo = AnsweredChallenges::new(TS);
+    let ttl = memo.ttl_secs();
+    let c = challenge(1, vec![1, 2, 3], T0, ttl);
+    memo.remember_response(&c, response(9, T0, ttl), [1; 16], 1, T0);
+    for id in 2..20u8 {
+        let rotated = MailboxEntry {
+            msg_id: [id; 16],
+            ..c.clone()
+        };
+        assert_eq!(
+            memo.step(&rotated, T0 + 4),
+            ChallengeStep::Skip,
+            "a postman renaming the same challenge gets no second compute"
+        );
+    }
+    assert_eq!(memo.len(), 1);
+}
+
+#[test]
+fn rotated_msg_id_republishes_under_the_response_own_msg_id() {
+    let mut memo = AnsweredChallenges::new(TS);
+    let ttl = memo.ttl_secs();
+    let c = challenge(1, vec![1, 2, 3], T0, ttl);
+    let cached = response(9, T0, ttl);
+    memo.remember_response(&c, cached.clone(), [1; 16], 0, T0);
+    let rotated = MailboxEntry {
+        msg_id: [0x77; 16],
+        ..c
+    };
+    match memo.step(&rotated, T0 + 4) {
+        ChallengeStep::Republish { response, .. } => assert_eq!(response.msg_id, cached.msg_id),
+        other => panic!("expected a re-publish, got {other:?}"),
+    }
+}
+
+#[test]
+fn short_envelope_expires_at_does_not_shorten_the_memory() {
+    let mut memo = AnsweredChallenges::new(TS);
+    let ttl = memo.ttl_secs();
+    // The (unsigned) expires_at says 10 s; the memory keeps the entry a full TTL.
+    let c = challenge(1, vec![1, 2, 3], T0, 10);
+    memo.remember_response(&c, response(9, T0, ttl), [1; 16], 1, T0);
+    assert_eq!(memo.forget_expired(T0 + 11), 0);
+    assert_eq!(memo.step(&c, T0 + 12), ChallengeStep::Skip);
+    assert_eq!(memo.forget_expired(T0 + ttl), 1);
+}
+
+#[test]
+fn memory_does_not_grow_past_the_response_cap() {
+    let mut memo = AnsweredChallenges::with_caps(TS, 3, 3);
+    let ttl = memo.ttl_secs();
+    for id in 0..10u8 {
+        let c = challenge(id, vec![id], T0, ttl);
+        memo.remember_response(&c, response(id, T0, ttl), [id; 16], 1, T0);
+    }
+    assert_eq!(memo.len(), 3, "above the cap nothing is stored");
+    assert_eq!(memo.refused(), 7);
+    // Not remembered = computed as before pos-i5, never silently skipped.
+    let over = challenge(9, vec![9], T0, ttl);
+    assert_eq!(memo.step(&over, T0 + 4), ChallengeStep::Compute);
+}
+
+#[test]
+fn junk_no_answers_do_not_take_the_responses_room() {
+    let mut memo = AnsweredChallenges::with_caps(TS, 3, 2);
+    let ttl = memo.ttl_secs();
+    // A postman floods junk: only the no-answer room fills.
+    for id in 0..50u8 {
+        memo.remember_no_answer(&challenge(id, vec![0xEE, id], T0, ttl), T0);
+    }
+    assert_eq!(memo.len(), 2);
+    // The honest answers are still remembered.
+    let honest = challenge(200, vec![1, 2, 3], T0, ttl);
+    memo.remember_response(&honest, response(9, T0, ttl), [1; 16], 1, T0);
+    assert_eq!(memo.step(&honest, T0 + 4), ChallengeStep::Skip);
+    assert_eq!(memo.len(), 3);
+}
+
+#[test]
+fn forgetting_frees_room_under_the_cap() {
+    let mut memo = AnsweredChallenges::with_caps(TS, 1, 1);
+    let ttl = memo.ttl_secs();
+    let a = challenge(1, vec![1], T0, ttl);
+    let b = challenge(2, vec![2], T0, ttl);
+    memo.remember_response(&a, response(1, T0, ttl), [1; 16], 1, T0);
+    memo.remember_response(&b, response(2, T0, ttl), [2; 16], 1, T0);
+    assert_eq!(memo.len(), 1);
+    memo.forget_expired(T0 + ttl);
+    memo.remember_response(&b, response(2, T0 + ttl, ttl), [2; 16], 1, T0 + ttl);
+    assert_eq!(memo.len(), 1, "the room of the forgotten entry is reused");
+    assert_eq!(memo.step(&b, T0 + ttl + 4), ChallengeStep::Skip);
+}
+
+#[test]
+fn no_answer_turning_into_response_at_a_full_cap_is_dropped_not_kept_stale() {
+    let mut memo = AnsweredChallenges::with_caps(TS, 1, 5);
+    let ttl = memo.ttl_secs();
+    let full = challenge(1, vec![1], T0, ttl);
+    memo.remember_response(&full, response(1, T0, ttl), [1; 16], 1, T0);
+    let c = challenge(2, vec![2], T0, ttl);
+    memo.remember_no_answer(&c, T0);
+    let later = T0 + memo.retry_secs();
+    memo.remember_response(&c, response(2, later, ttl), [2; 16], 1, later);
+    // It cannot be stored as a response and must not stay a stale no-answer (that would
+    // skip the challenge for another quarter TTL while its answer is never published).
+    assert_eq!(memo.step(&c, later + 4), ChallengeStep::Compute);
+    assert_eq!(memo.len(), 1);
+}
+
+#[test]
+fn production_caps_are_the_documented_ones() {
+    assert_eq!(MAX_REMEMBERED_RESPONSES, 200_000);
+    assert_eq!(MAX_REMEMBERED_NO_ANSWERS, 10_000);
+    let mut memo = AnsweredChallenges::new(TS);
+    let ttl = memo.ttl_secs();
+    for i in 0..(MAX_REMEMBERED_NO_ANSWERS as u32 + 100) {
+        let c = challenge(0, i.to_le_bytes().to_vec(), T0, ttl);
+        memo.remember_no_answer(&c, T0);
+    }
+    assert_eq!(memo.len(), MAX_REMEMBERED_NO_ANSWERS);
+    assert_eq!(memo.refused(), 100);
+}
+
+#[test]
+fn begin_poll_forgets_what_expired() {
+    let mut state = PosPollState::new(TS);
+    let ttl = state.answered.ttl_secs();
+    let c = challenge(1, vec![1], T0, ttl);
+    state.answered.remember_no_answer(&c, T0);
+    assert_eq!(state.begin_poll(T0 + ttl - 1), 0);
+    assert_eq!(state.begin_poll(T0 + ttl), 1);
+    assert!(state.answered.is_empty());
+}
+
+#[test]
+fn challenge_seen_after_its_memory_expired_is_computed_once_more_not_every_poll() {
+    // Without a forget in between (a poll that skipped `begin_poll`), an entry past its
+    // forget_at is computed once and remembered afresh, not recomputed on every poll.
+    let mut memo = AnsweredChallenges::new(TS);
+    let ttl = memo.ttl_secs();
+    let c = challenge(1, vec![1, 2, 3], T0, ttl);
+    memo.remember_response(&c, response(9, T0, ttl), [1; 16], 1, T0);
+    let late = T0 + ttl + 4;
+    assert_eq!(memo.step(&c, late), ChallengeStep::Compute);
+    memo.remember_response(&c, response(9, late, ttl), [1; 16], 1, late);
+    assert_eq!(memo.step(&c, late + 4), ChallengeStep::Skip);
 }

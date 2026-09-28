@@ -333,7 +333,18 @@ impl PosMailboxChallengeHandler for ProcessorPosHandler {
                     Err(e) => Err(anyhow::anyhow!("pos challenge handler error: {e}")),
                 }
             }
-            Err(e) => Err(anyhow::anyhow!("failed to decode PosHashChallengeMsg: {e}")),
+            // An undecodable payload is junk (a postman's plant or a broken peer): a clean
+            // drop like an unauthenticated challenge, so the poll remembers it as a
+            // no-answer and re-checks it once per quarter TTL instead of logging an
+            // error on every poll (pos-i5).
+            Err(e) => {
+                warn!(
+                    challenger = %owner_master_pub,
+                    err = %e,
+                    "mailbox PoS: undecodable PosHashChallengeMsg — dropping"
+                );
+                Ok(None)
+            }
         }
     }
 }

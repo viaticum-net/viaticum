@@ -9,18 +9,53 @@
 //! mailbox-i60 the entry reaches every reachable postman of the write fanout anyway.
 //!
 //! RAM only (INV-4): after a restart the memory is empty and every live challenge is
-//! computed once more (pre-registered burst). Pure: no I/O, `now_secs` is passed in.
+//! computed once more (pre-registered burst, pos-i5-c). Pure: no I/O, `now_secs` is
+//! passed in.
+//!
+//! pos-i5-a: nothing a postman controls without a signature steers the memory. The key
+//! is the envelope digest (class, sender, payload), not the `msg_id`; an entry lives
+//! `ttl` from first sight, not until the envelope's `expires_at`; the number of entries
+//! is capped per kind (see `MAX_REMEMBERED_RESPONSES`, `MAX_REMEMBERED_NO_ANSWERS`).
 
 use std::collections::HashMap;
 
+use tracing::warn;
 use viaticum_core::mailbox::class_config::POS_CHALLENGE_TTL;
 use viaticum_core::mailbox::{MailboxEntry, scaled_ttl_secs};
 
-/// blake3 over what the handler's answer depends on besides the `msg_id`: the class,
-/// the claimed sender (the owner whose signature the challenge is checked against) and
-/// the payload. A postman's forgery under the same `msg_id` (another payload, or the
-/// same payload under another sender) is another envelope and gets its own memory entry,
-/// so it can neither borrow nor lock out the honest challenge's answer.
+/// Cap on remembered responses (pos-i5-a).
+///
+/// A response entry exists only for an owner-signed challenge over a block this holder
+/// really holds, so a postman cannot create one. Honest bound: one challenge is alive per
+/// interval, `challenges_per_week` is 1-2 for a placement below 1000 symbols (base 1 ×
+/// volume 1 × (2 − trust)), and the challenge TTL is one week, so live challenges ≤ 2 ×
+/// placements held. A friend with ~100 GB of others' data at ~1 MiB per placement holds
+/// ~100 000 placements → ≤ 200 000 live challenges; a friends-circle node holds thousands.
+/// RAM at the cap: ~450 B per entry (the signed response entry ~300 B + key + map
+/// overhead) ≈ 90 MB, reachable only by a malicious owner flooding signed challenges
+/// for its own blocks (each of which costs a real compute anyway). Above the cap a
+/// response is not remembered: that challenge is computed on every poll, as before pos-i5.
+pub const MAX_REMEMBERED_RESPONSES: usize = 200_000;
+
+/// Cap on remembered no-answers (pos-i5-a).
+///
+/// A no-answer is what a postman's junk becomes (undecodable, unsigned, oversized), so this
+/// is the entry kind a hostile postman can mint without limit. Kept separate and small so
+/// junk never takes the responses' room (then the honest answers stay remembered and the
+/// disk is not re-read). Honest no-answers are Nacks (a block dropped, a volume not mounted
+/// yet, pos-i5-b), a small share of the live challenges. ~100 B per entry ≈ 1 MB at the cap.
+/// Above it junk is re-checked on every poll: a decode or a signature check, no disk read.
+pub const MAX_REMEMBERED_NO_ANSWERS: usize = 10_000;
+
+/// A refusal to remember (cap reached) is logged on the 1st, then every this many.
+pub const MEMO_FULL_WARN_EVERY: u64 = 1_000;
+
+/// blake3 over what the handler's answer depends on: the class, the claimed sender (the
+/// owner whose signature the challenge is checked against) and the payload. It is the
+/// memory key (pos-i5-a): the `msg_id` is not in it, so a postman rotating the `msg_id`
+/// of the same challenge gets no second compute; a forgery (another payload, or the same
+/// payload under another sender) is another envelope and gets its own entry, so it can
+/// neither borrow nor lock out the honest challenge's answer.
 pub fn envelope_digest(entry: &MailboxEntry) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(b"viaticum-pos-memo-envelope-v1");
@@ -45,7 +80,8 @@ pub enum ChallengeStep {
     /// Not in memory (or another envelope, or a no-answer due for a re-check): ask the
     /// handler.
     Compute,
-    /// Publish this remembered response entry as is (0 acks last time, or TTL/4 passed).
+    /// Publish this remembered response entry as is, under its own msg_id (0 acks last
+    /// time, or TTL/4 passed).
     Republish {
         response: MailboxEntry,
         challenge_id: [u8; 16],
@@ -62,41 +98,64 @@ enum Outcome {
         challenge_id: [u8; 16],
         last_acks: usize,
     },
-    /// The handler gave no answer (Nack, unauthenticated or oversized challenge).
+    /// The handler gave no answer (Nack, junk, unauthenticated or oversized challenge).
     NoAnswer,
+}
+
+impl Outcome {
+    fn is_response(&self) -> bool {
+        matches!(self, Outcome::Response { .. })
+    }
 }
 
 #[derive(Debug, Clone)]
 struct Answered {
-    /// The entry is dropped once `now >= forget_at` (the challenge expired).
+    /// First sight + ttl: the entry is dropped once `now >= forget_at`.
     forget_at: u64,
     /// Last compute or publish of this entry.
     last_try_at: u64,
     outcome: Outcome,
 }
 
-type Key = ([u8; 16], [u8; 32]);
-
-fn key_of(challenge: &MailboxEntry) -> Key {
-    (challenge.msg_id, envelope_digest(challenge))
+fn key_of(challenge: &MailboxEntry) -> [u8; 32] {
+    envelope_digest(challenge)
 }
 
 /// The holder's memory of PoS challenges it already answered (pos-i5).
 #[derive(Debug)]
 pub struct AnsweredChallenges {
-    by_envelope: HashMap<Key, Answered>,
+    by_envelope: HashMap<[u8; 32], Answered>,
     ttl_secs: u64,
     retry_secs: u64,
+    max_responses: usize,
+    max_no_answers: usize,
+    responses: usize,
+    no_answers: usize,
+    refused: u64,
 }
 
 impl AnsweredChallenges {
     /// `ttl` = the scaled PoS challenge TTL; `retry` = max(1, ttl / 4).
     pub fn new(time_scale: u64) -> Self {
+        Self::with_caps(
+            time_scale,
+            MAX_REMEMBERED_RESPONSES,
+            MAX_REMEMBERED_NO_ANSWERS,
+        )
+    }
+
+    /// `new` with other caps (tests exercise the cap without 200 000 entries).
+    pub(crate) fn with_caps(time_scale: u64, max_responses: usize, max_no_answers: usize) -> Self {
         let ttl_secs = scaled_ttl_secs(POS_CHALLENGE_TTL.as_secs(), time_scale);
         AnsweredChallenges {
             by_envelope: HashMap::new(),
             ttl_secs,
             retry_secs: (ttl_secs / 4).max(1),
+            max_responses,
+            max_no_answers,
+            responses: 0,
+            no_answers: 0,
+            refused: 0,
         }
     }
 
@@ -185,9 +244,21 @@ impl AnsweredChallenges {
 
     /// Drop entries whose `forget_at` passed; returns how many.
     pub fn forget_expired(&mut self, now_secs: u64) -> usize {
-        let before = self.by_envelope.len();
-        self.by_envelope.retain(|_, a| a.forget_at > now_secs);
-        before - self.by_envelope.len()
+        let (mut responses, mut no_answers) = (0usize, 0usize);
+        self.by_envelope.retain(|_, a| {
+            let keep = a.forget_at > now_secs;
+            if !keep {
+                if a.outcome.is_response() {
+                    responses += 1;
+                } else {
+                    no_answers += 1;
+                }
+            }
+            keep
+        });
+        self.responses -= responses;
+        self.no_answers -= no_answers;
+        responses + no_answers
     }
 
     pub fn len(&self) -> usize {
@@ -198,16 +269,51 @@ impl AnsweredChallenges {
         self.by_envelope.is_empty()
     }
 
-    /// A re-compute of a remembered envelope keeps its `forget_at` (the challenge's
-    /// life does not restart); a new envelope gets
-    /// `min(challenge.expires_at, now + ttl)`.
+    /// Remember refusals since start (a cap was reached).
+    pub fn refused(&self) -> u64 {
+        self.refused
+    }
+
+    /// A re-compute of a remembered envelope keeps its `forget_at` (the challenge's life
+    /// does not restart); a new envelope gets `now + ttl` (the envelope's `expires_at` is
+    /// not signed, pos-i5-a). A new entry of a kind whose cap is reached is not stored
+    /// (and an entry that would change into that kind is dropped): the challenge is then
+    /// computed on every poll, the pre-pos-i5 behaviour.
     fn remember(&mut self, challenge: &MailboxEntry, outcome: Outcome, now_secs: u64) {
-        let forget_at = challenge
-            .expires_at
-            .min(now_secs.saturating_add(self.ttl_secs));
+        let key = key_of(challenge);
+        let is_response = outcome.is_response();
+        let was_response = self.by_envelope.get(&key).map(|a| a.outcome.is_response());
+        if was_response != Some(is_response) {
+            let full = if is_response {
+                self.responses >= self.max_responses
+            } else {
+                self.no_answers >= self.max_no_answers
+            };
+            if full {
+                if let Some(old) = was_response {
+                    self.by_envelope.remove(&key);
+                    self.uncount(old);
+                }
+                self.refuse(is_response);
+                return;
+            }
+            if let Some(old) = was_response {
+                self.uncount(old);
+            }
+            if is_response {
+                self.responses += 1;
+            } else {
+                self.no_answers += 1;
+            }
+        }
+        let forget_at = now_secs.saturating_add(self.ttl_secs);
         self.by_envelope
-            .entry(key_of(challenge))
+            .entry(key)
             .and_modify(|a| {
+                // An entry past its life (not yet forgotten) starts a new one.
+                if a.forget_at <= now_secs {
+                    a.forget_at = forget_at;
+                }
                 a.last_try_at = now_secs;
                 a.outcome = outcome.clone();
             })
@@ -216,6 +322,27 @@ impl AnsweredChallenges {
                 last_try_at: now_secs,
                 outcome,
             });
+    }
+
+    fn uncount(&mut self, was_response: bool) {
+        if was_response {
+            self.responses -= 1;
+        } else {
+            self.no_answers -= 1;
+        }
+    }
+
+    fn refuse(&mut self, is_response: bool) {
+        self.refused += 1;
+        if self.refused % MEMO_FULL_WARN_EVERY == 1 {
+            warn!(
+                kind = if is_response { "response" } else { "no_answer" },
+                responses = self.responses,
+                no_answers = self.no_answers,
+                refused_total = self.refused,
+                "pos_memo: memory cap reached — not remembering this challenge (computed on every poll)"
+            );
+        }
     }
 }
 
@@ -254,6 +381,11 @@ impl PosPollState {
         PosPollState {
             answered: AnsweredChallenges::new(time_scale),
         }
+    }
+
+    /// Start of one poll: forget what expired; returns how many entries were dropped.
+    pub fn begin_poll(&mut self, now_secs: u64) -> usize {
+        self.answered.forget_expired(now_secs)
     }
 }
 
