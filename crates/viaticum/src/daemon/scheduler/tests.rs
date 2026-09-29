@@ -25,6 +25,8 @@ use crate::daemon::scheduler::{
 
 // pos-i6/pos-i7 (СТ-0c): the pending index, the issue tick, the trust memory.
 mod pos_scale;
+// pos-i4: a stale verdict is written neither to the weekly counters nor to trust.
+mod stale_verdict;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 

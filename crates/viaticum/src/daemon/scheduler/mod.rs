@@ -419,13 +419,16 @@ impl Scheduler {
         };
 
         let old_status = placement.status;
+        // A verdict on a placement that holds no symbols (Offered, Accepted, Lost,
+        // Deleting) is stale: its episode is already closed.
+        let stale = !old_status.may_hold_symbols();
         let transition = viaticum_core::pos::apply_pos_outcome(&placement, &outcome);
         let mut updated = placement.clone();
         updated.status = transition.new_status;
         updated.consecutive_misses = transition.new_consecutive_misses;
-        // A verdict on a placement that holds no symbols is stale (pos-i3): leave the
-        // record untouched so a concurrent worker rewrite is not clobbered.
-        if old_status.may_hold_symbols() {
+        // pos-i3: leave the record of a stale verdict untouched so a concurrent worker
+        // rewrite is not clobbered.
+        if !stale {
             if matches!(outcome, viaticum_core::pos::VerifyOutcome::Pass) {
                 updated.last_verified = Some(Timestamp::now());
             }
@@ -458,12 +461,21 @@ impl Scheduler {
                 "scheduler: failed to refresh storage bytes after mailbox PosResponse");
         }
 
+        // pos-i4: a stale verdict is written neither to the weekly PoS counters nor to
+        // trust — no second penalty for a drop already accounted (NotHeld, DropNotice),
+        // no credit for service in a closed episode.
         let scale = self.config.time_scale.max(1);
         let week = crate::daemon::processor::current_week_number_scaled(scale);
-        let pos_outcome = outcome_from_verify(&outcome, week);
-        crate::daemon::processor::record_pos_weekly(&self.db, holder_id, pos_outcome);
-        if let Some((old_p, old_i, new_p, new_i)) =
-            viaticum_core::trust::recalculate_trust(&self.db, &holder_id, week)
+        if !stale {
+            crate::daemon::processor::record_pos_weekly(
+                &self.db,
+                holder_id,
+                outcome_from_verify(&outcome, week),
+            );
+        }
+        if !stale
+            && let Some((old_p, old_i, new_p, new_i)) =
+                viaticum_core::trust::recalculate_trust(&self.db, &holder_id, week)
         {
             let old_combined = compute_combined(old_p, old_i, 1.0);
             let new_combined = compute_combined(new_p, new_i, 1.0);
@@ -488,6 +500,7 @@ impl Scheduler {
             outcome = ?outcome,
             old_status = ?old_status,
             new_status = ?updated.status,
+            stale,
             challenge_id = %hex_encode(&response.challenge_id),
             "scheduler: mailbox PosResponse resolved"
         );
@@ -1081,11 +1094,15 @@ impl Scheduler {
                 );
             }
 
-            // Record timeout as a challenged-but-not-passed event for trust.
-            let week = crate::daemon::processor::current_week_number_scaled(scale);
-            let pos_outcome = outcome_from_verify(&VerifyOutcome::Timeout, week);
-            crate::daemon::processor::record_pos_weekly(&self.db, holder_id, pos_outcome);
-            recalculate_trust(&self.db, &holder_id, week);
+            // Record timeout as a challenged-but-not-passed event for trust — unless the
+            // verdict is stale (pos-i4): the episode is closed, a miss was already
+            // accounted by the drop that closed it.
+            if !stale {
+                let week = crate::daemon::processor::current_week_number_scaled(scale);
+                let pos_outcome = outcome_from_verify(&VerifyOutcome::Timeout, week);
+                crate::daemon::processor::record_pos_weekly(&self.db, holder_id, pos_outcome);
+                recalculate_trust(&self.db, &holder_id, week);
+            }
 
             info!(
                 block_id = %block_id,
