@@ -46,10 +46,13 @@ file_field() {
         | jq -r --arg p "$2" ".[] | select(.path==\$p) | $3" 2>/dev/null || true
 }
 
-# Full hex id of the source block holding the latest version of PATH.
+# Full hex id of the source block holding the latest version of PATH. Empty while that
+# version is still pending: its id is a zero placeholder until the pipeline patches in the
+# real block (a poll that captured the zeros used to wait on a block that never exists).
 file_block_hex() {
     api_get "$1" "/api/versions?path=$(urlencode "$2")" \
-        | jq -r '.[-1].source_block_id_hex // empty' 2>/dev/null || true
+        | jq -r '.[-1] | select(.backed_up_at != "pending")
+                 | .source_block_id_hex // empty | select(test("^0+$") | not)' 2>/dev/null || true
 }
 
 # Poll until owner IDX reports PATH as restorable (>= k_eff symbols on Alive

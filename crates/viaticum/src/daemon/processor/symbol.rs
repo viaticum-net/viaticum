@@ -59,10 +59,14 @@ fn esi_ranges_intersect(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
 
 /// Pick the placement a DropNotice of a holder MASTER is about (Д-DN1-8, review W-1). The notice
 /// names no device but carries its signed `esi_ranges`, and live placements of one block get
-/// disjoint ranges (`work_pipeline::compute_esi_offset`), so:
+/// disjoint ranges (`work_pipeline::offer_plan::esi_cursor`), so:
 ///   1. a placement whose ESIs intersect the notice's — preferring one the notice can still
-///      change if several intersect (a Lost placement's old range may be reused by a later one);
-///   2. else the first placement the notice can change;
+///      change if several intersect (repair never reuses a Lost placement's numbers for a live
+///      block — the cursor counts every row, repair-i8 — so several rows intersect only after a
+///      block was deleted and its content added back);
+///   2. else the first placement the notice can change (a stale notice about a Lost range that
+///      the same holder was since re-placed on with fresh numbers lands here and marks the new
+///      placement Lost — residual door until Р-3, C-SP §3.7, repair-i10 addendum);
 ///   3. else the first found.
 ///
 /// Rule 1 is what keeps "advance notice, then the final notice a week later" on ONE device:
