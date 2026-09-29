@@ -6,7 +6,8 @@
 //
 // Module layout:
 //   mod.rs      -- WorkPipeline struct, public API, run_loop, reset_all_cooldowns
-//   worker.rs   -- run_block_iteration: exclude → allocate → encode → deliver
+//   worker.rs   -- run_block_iteration: plan → encode → deliver
+//   offer_plan/ -- exclude → allocate → ESI ranges per holder (repair-i9) → Offered rows
 //   pool.rs     -- pool snapshot + pool_signature computation
 //   tests.rs    -- all ATDD unit tests
 
@@ -22,6 +23,7 @@ use viaticum_core::types::{DeviceId, SourceBlockId, SourceBlockRecord, Timestamp
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
 
+mod offer_plan;
 mod pool;
 mod worker;
 

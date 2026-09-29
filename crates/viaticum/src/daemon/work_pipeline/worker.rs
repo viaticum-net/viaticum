@@ -20,16 +20,16 @@
 
 use std::sync::{Arc, Mutex};
 
-use viaticum_core::cluster::{ClusterState, esi_namespace_start};
+use viaticum_core::cluster::ClusterState;
 use viaticum_core::constants::DECODE_OVERHEAD;
 use viaticum_core::db::Db;
-use viaticum_core::erasure::{ErasureEncoder, binding_seed};
-use viaticum_core::placement::{HolderCandidate, compute_allocation_with_importance};
+use viaticum_core::erasure::ErasureEncoder;
 use viaticum_core::types::{
     DeviceId, ErasureParams, PlacementStatus, SourceBlockId, SourceBlockRecord, SymbolPlacement,
     Timestamp,
 };
 
+use super::offer_plan::{self, OfferPlan};
 use super::{WorkPipelineConfig, pool::PoolSnapshot};
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
@@ -66,13 +66,16 @@ pub(crate) struct ExcludedHolders {
 ///
 /// Steps:
 ///  1. Compute ErasureParams from block record.
-///  2. Compute esi_offset = sum of alive/offered symbol counts (non-overlapping namespace).
-///  3. Exclude holders that hold or may hold the block (`may_hold_symbols`, repair-i2);
-///     compute allocations via `compute_allocation_with_importance`. Nobody to offer to
-///     → return `encoded = false` WITHOUT reading the source (repair-i4: cheap outcome).
+///  2. `offer_plan::plan_offers`: exclude holders that hold or may hold the block
+///     (`may_hold_symbols`, repair-i2), allocate, assign ESI ranges — a holder with an
+///     `Offered` row (e.g. after `SymbolReject`) gets its own range back, fresh numbers only
+///     for the rest (repair-i9).
+///  3. Nobody to offer to → return `encoded = false` WITHOUT reading the source
+///     (repair-i4: cheap outcome).
 ///  4. Load source blob via `rebuild_source_blob` (re-encodes from source files).
 ///     The allocation never depends on the blob (sizes come from `encrypted_size`).
-///  5. `encode_raw` once (spawn_blocking — CPU-bound ~30s for 128MB).
+///  5. `encode_raw_ranges` once for the union of the plan's ESIs (spawn_blocking —
+///     CPU-bound ~30s for 128MB).
 ///  6. For each allocation: bind symbols inline, send SymbolOffer → SymbolAccept → SymbolTransfer.
 ///     On `SymbolStored`: transition Offered→Alive + recompute cached fields.
 ///  7. Drop raw symbols (no disk spill).
@@ -105,46 +108,34 @@ pub(crate) async fn run_block_iteration(
         n,
     };
 
-    // 2. Compute esi_offset: sum of all alive/offered symbol counts for this block.
-    //    This ensures new ESIs don't overlap with existing placements.
-    let esi_offset = compute_esi_offset(db, &block.block_id, cluster_state, &config.device_id)?;
-
-    // 3. Compute allocations for available candidates. Exclude holders that hold the
-    //    block (Alive) or may still hold it pending a PoS verdict (Uncertain /
-    //    PresumedLost): re-offering to them would overwrite their placement and make a
-    //    silent holder "Alive" without a proof (repair-i2).
-    let excluded = get_existing_holder_ids(db, &block.block_id)?;
-    let candidates: Vec<HolderCandidate> = pool
-        .candidates
-        .iter()
-        .filter(|c| !excluded.ids.contains(&c.device_id))
-        .cloned()
-        .collect();
-
-    if candidates.is_empty() {
-        tracing::info!(
-            block_id = %block.block_id,
-            excluded_alive = excluded.alive,
-            excluded_awaiting_verdict = excluded.awaiting_verdict,
-            pool = pool.candidates.len(),
-            "work_pipeline: no new candidates (every pool peer holds the block or awaits a PoS verdict)"
-        );
-        return Ok(WorkOutcome {
-            acked: 0,
-            failed: 0,
-            encoded: false,
-            offered: 0,
-        });
-    }
-
-    let allocations = match compute_allocation_with_importance(
-        &candidates,
-        block.encrypted_size.unwrap_or(0),
-        block.importance,
-        esi_offset,
-    ) {
-        Ok(a) if !a.is_empty() => a,
-        Ok(_) => {
+    // 2-3. Plan: who gets offers and which ESIs (repair-i2, repair-i9).
+    let namespace_start = offer_plan::namespace_start(cluster_state, &config.device_id);
+    let offers = match offer_plan::plan_offers(db, block, &pool.candidates, namespace_start)? {
+        OfferPlan::Planned { cursor, offers } => {
+            tracing::debug!(
+                block_id = %block.block_id,
+                cursor,
+                holders = offers.len(),
+                "work_pipeline: offer plan"
+            );
+            offers
+        }
+        OfferPlan::NoCandidates(excluded) => {
+            tracing::info!(
+                block_id = %block.block_id,
+                excluded_alive = excluded.alive,
+                excluded_awaiting_verdict = excluded.awaiting_verdict,
+                pool = pool.candidates.len(),
+                "work_pipeline: no new candidates (every pool peer holds the block or awaits a PoS verdict)"
+            );
+            return Ok(WorkOutcome {
+                acked: 0,
+                failed: 0,
+                encoded: false,
+                offered: 0,
+            });
+        }
+        OfferPlan::EmptyAllocation => {
             tracing::info!(
                 block_id = %block.block_id,
                 "work_pipeline: compute_allocation returned empty (too few candidates)"
@@ -156,7 +147,7 @@ pub(crate) async fn run_block_iteration(
                 offered: 0,
             });
         }
-        Err(e) => {
+        OfferPlan::AllocationFailed(e) => {
             tracing::warn!(
                 block_id = %block.block_id,
                 "work_pipeline: compute_allocation failed: {e}"
@@ -184,15 +175,16 @@ pub(crate) async fn run_block_iteration(
             .map_err(|e| anyhow::anyhow!("rebuild_source_blob: {e}"))?,
     };
 
-    // 5. Encode once for all allocations combined.
-    let total_count: u32 = allocations.iter().map(|a| a.symbol_count).sum();
+    // 5. Encode once for the union of every offer's ESIs (ascending, so the delivery
+    //    looks symbols up by ESI with a binary search).
+    let encode_ranges = offer_plan::union_ranges(&offers);
     let source_data_arc = Arc::new(source_data);
     let params_clone = params;
     let encoder_clone = Arc::clone(encoder);
     let source_clone = Arc::clone(&source_data_arc);
 
     let raw_symbols = tokio::task::spawn_blocking(move || {
-        encoder_clone.encode_raw(&source_clone, &params_clone, esi_offset, total_count)
+        encoder_clone.encode_raw_ranges(&source_clone, &params_clone, &encode_ranges)
     })
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))?
@@ -204,58 +196,25 @@ pub(crate) async fn run_block_iteration(
     tracing::debug!(
         block_id = %block.block_id,
         symbols = raw_symbols.len(),
-        esi_offset,
         "work_pipeline: encoded raw symbols"
     );
 
-    // 6. Insert placements as Offered, then deliver to each holder.
-    let now = Timestamp::now();
-    let primary_file_id = resolve_primary_file_id(db, block)?;
-
-    // Insert all Offered placements before delivery (so retries see them).
-    let mut txn = db.write_txn()?;
-    for alloc in &allocations {
-        let seed = binding_seed(&block.block_id, &alloc.device_id);
-        let placement = SymbolPlacement {
-            source_block_id: block.block_id,
-            holder_id: alloc.device_id,
-            file_id: primary_file_id,
-            esi_ranges: vec![alloc.esi_range()],
-            binding_seed: seed,
-            status: PlacementStatus::Offered,
-            last_verified: None,
-            placed_at: now,
-            consecutive_misses: 0,
-        };
-        txn.upsert_placement(&placement)?;
-
-        // Also record in event log.
-        let entry = viaticum_core::types::EventEntry {
-            timestamp: now,
-            device_id: config.device_id,
-            event: viaticum_core::types::Event::SymbolsPlaced {
-                source_block_id: block.block_id,
-                holder_id: alloc.device_id,
-                esi_range: alloc.esi_range(),
-            },
-        };
-        txn.append_event(&entry)?;
-    }
-    txn.commit()?;
-    let offered = allocations.len();
+    // 6. Insert all Offered placements before delivery (so retries see them).
+    offer_plan::record_offers(db, config.device_id, block, &offers, Timestamp::now())?;
+    let offered = offers.len();
 
     // 7. Deliver to each holder (binding applied inline at send time).
     let mut acked = 0usize;
     let mut failed = 0usize;
 
-    for alloc in &allocations {
+    for offer in &offers {
         // Load the Offered placement just inserted.
-        let placement = match db.get_placement(&block.block_id, &alloc.device_id) {
+        let placement = match db.get_placement(&block.block_id, &offer.device_id) {
             Ok(Some(p)) => p,
             Ok(None) => {
                 tracing::warn!(
                     block_id = %block.block_id,
-                    holder = %alloc.device_id,
+                    holder = %offer.device_id,
                     "work_pipeline: placement not found after insert (race?)"
                 );
                 failed += 1;
@@ -264,7 +223,7 @@ pub(crate) async fn run_block_iteration(
             Err(e) => {
                 tracing::error!(
                     block_id = %block.block_id,
-                    holder = %alloc.device_id,
+                    holder = %offer.device_id,
                     "work_pipeline: DB error loading placement: {e}"
                 );
                 failed += 1;
@@ -281,7 +240,6 @@ pub(crate) async fn run_block_iteration(
             block,
             &placement,
             &raw_symbols,
-            esi_offset,
             block.importance,
         )
         .await
@@ -296,7 +254,7 @@ pub(crate) async fn run_block_iteration(
             Err(e) => {
                 tracing::warn!(
                     block_id = %block.block_id,
-                    holder = %alloc.device_id,
+                    holder = %offer.device_id,
                     "work_pipeline: deliver_to_holder_worker failed: {e}"
                 );
                 failed += 1;
@@ -330,7 +288,6 @@ async fn deliver_to_holder_worker(
     block: &SourceBlockRecord,
     placement: &SymbolPlacement,
     raw_symbols: &[viaticum_core::erasure::Symbol],
-    esi_offset: u32,
     importance: f64,
 ) -> anyhow::Result<bool> {
     use viaticum_core::messages::Message;
@@ -359,16 +316,8 @@ async fn deliver_to_holder_worker(
                     backoff.record_accept(&placement.holder_id);
                 }
                 // Holder accepted — send the actual symbols.
-                deliver_transfer_worker(
-                    db,
-                    encoder,
-                    swarm,
-                    &block.block_id,
-                    placement,
-                    raw_symbols,
-                    esi_offset,
-                )
-                .await
+                deliver_transfer_worker(db, encoder, swarm, &block.block_id, placement, raw_symbols)
+                    .await
             }
             Message::SymbolReject(reject) => {
                 if let Some(backoff) = peer_backoff {
@@ -391,16 +340,7 @@ async fn deliver_to_holder_worker(
         }
     } else {
         // No signing key: fall back to direct SymbolTransfer.
-        deliver_transfer_worker(
-            db,
-            encoder,
-            swarm,
-            &block.block_id,
-            placement,
-            raw_symbols,
-            esi_offset,
-        )
-        .await
+        deliver_transfer_worker(db, encoder, swarm, &block.block_id, placement, raw_symbols).await
     }
 }
 
@@ -415,31 +355,34 @@ async fn deliver_transfer_worker(
     block_id: &SourceBlockId,
     placement: &SymbolPlacement,
     raw_symbols: &[viaticum_core::erasure::Symbol],
-    esi_offset: u32,
 ) -> anyhow::Result<bool> {
     use viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES;
     use viaticum_core::erasure::{Symbol, chunk_symbols_by_size};
     use viaticum_core::messages::{Message, SymbolTransferMsg};
 
-    // Bind raw symbols inline at send time — no disk read.
+    // Bind raw symbols inline at send time — no disk read. `raw_symbols` is ascending by
+    // ESI (encoded from `offer_plan::union_ranges`).
     let bound: Vec<Symbol> = placement
         .esi_ranges
         .iter()
         .flat_map(|&(start_esi, count)| {
             (start_esi..start_esi + count).filter_map(|esi| {
-                let idx = esi.checked_sub(esi_offset)? as usize;
-                let raw = raw_symbols.get(idx)?;
-                Some(encoder.apply_binding(raw.clone(), block_id, &placement.holder_id))
+                let idx = raw_symbols.binary_search_by_key(&esi, |s| s.esi).ok()?;
+                Some(encoder.apply_binding(
+                    raw_symbols[idx].clone(),
+                    block_id,
+                    &placement.holder_id,
+                ))
             })
         })
         .collect();
 
     if bound.is_empty() {
         anyhow::bail!(
-            "no raw symbols available for block {} holder {} (esi_offset={}, raw_len={})",
+            "no raw symbols available for block {} holder {} (ranges={:?}, raw_len={})",
             block_id,
             placement.holder_id,
-            esi_offset,
+            placement.esi_ranges,
             raw_symbols.len(),
         );
     }
@@ -555,39 +498,6 @@ async fn deliver_transfer_worker(
     }
 
     Ok(false)
-}
-
-/// Compute the ESI offset for new allocations: sum of alive/offered symbol counts.
-///
-/// Uses the cluster device namespace offset as the base, then adds existing
-/// non-Lost symbol counts to avoid overlapping with existing placements.
-fn compute_esi_offset(
-    db: &Db,
-    block_id: &SourceBlockId,
-    cluster_state: Option<&Arc<Mutex<ClusterState>>>,
-    device_id: &DeviceId,
-) -> anyhow::Result<u32> {
-    // Cluster-based namespace start.
-    let namespace_start: u32 = cluster_state
-        .and_then(|cs| {
-            cs.lock()
-                .ok()
-                .and_then(|guard| guard.get_device(device_id).map(|e| e.device_index))
-        })
-        .map(esi_namespace_start)
-        .unwrap_or(0);
-
-    // Next free ESI = max end of all non-Lost placements.
-    let placements = db.list_placements_for_block(block_id)?;
-    let max_end = placements
-        .iter()
-        .filter(|p| !matches!(p.status, PlacementStatus::Lost | PlacementStatus::Deleting))
-        .flat_map(|p| p.esi_ranges.iter())
-        .map(|(start, count)| start.saturating_add(*count))
-        .max()
-        .unwrap_or(0);
-
-    Ok(max_end.max(namespace_start))
 }
 
 /// T-12 safety net: query the swarm for a holder's identify-received listen addrs

@@ -59,7 +59,7 @@ fn esi_ranges_intersect(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
 
 /// Pick the placement a DropNotice of a holder MASTER is about (Д-DN1-8, review W-1). The notice
 /// names no device but carries its signed `esi_ranges`, and live placements of one block get
-/// disjoint ranges (`work_pipeline::compute_esi_offset`), so:
+/// disjoint ranges (`work_pipeline::offer_plan::esi_cursor`), so:
 ///   1. a placement whose ESIs intersect the notice's — preferring one the notice can still
 ///      change if several intersect (a Lost placement's old range may be reused by a later one);
 ///   2. else the first placement the notice can change;
