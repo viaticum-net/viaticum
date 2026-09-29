@@ -2705,3 +2705,63 @@ async fn poll_forwards_only_pending_responses_once() {
     );
     assert_eq!(pos.forwarded.len(), 1);
 }
+
+/// pos-i6-b: the daemon's poll → scheduler channel takes a poll of 3000 responses to
+/// pending challenges (the old channel of 256 deferred all but 256 of them to later
+/// polls, and a response deferred past its TTL became a false timeout), the scheduler
+/// not reading meanwhile: every one is forwarded once, none deferred.
+#[tokio::test]
+async fn production_channel_forwards_a_3000_response_poll_without_deferring() {
+    const BURST: u16 = 3000;
+    let cids: Vec<[u8; 16]> = (0..BURST)
+        .map(|i| {
+            let mut cid = [0u8; 16];
+            cid[..2].copy_from_slice(&i.to_le_bytes());
+            cid
+        })
+        .collect();
+    let mut index = crate::daemon::scheduler::PendingIndex::default();
+    for (i, cid) in cids.iter().enumerate() {
+        let mut block = [0u8; 32];
+        block[..2].copy_from_slice(&(i as u16).to_le_bytes());
+        let holder_id = DeviceId([7u8; 32]);
+        index.insert(
+            (SourceBlockId(block), holder_id),
+            crate::daemon::scheduler::PendingHashChallenge {
+                source_block_id: SourceBlockId(block),
+                holder_id,
+                esi_ranges: vec![(0, 1)],
+                expected_chain_hash: [0u8; 32],
+                issued_at: Timestamp::now(),
+                challenge_id: *cid,
+                holder_master: IdentityPub(holder_id.0),
+            },
+        );
+    }
+    let entries: Vec<MailboxEntry> = cids
+        .iter()
+        .map(|cid| MailboxEntry {
+            msg_id: *cid,
+            ..make_entry(
+                MailboxClass::PosResponse,
+                make_identity(1),
+                to_cbor(&response_to(*cid)).expect("encode"),
+            )
+        })
+        .collect();
+    let (tx, mut rx) = super::pos_response_channel();
+    let mut pos = PosPollState::new(Arc::new(tokio::sync::Mutex::new(index)), 1);
+    let mut counts = PollCounts::default();
+
+    super::forward_pos_responses(&mut pos, &tx, entries, Timestamp::now().0, &mut counts).await;
+
+    assert_eq!(
+        (counts.forwarded, counts.deferred_full),
+        (u32::from(BURST), 0)
+    );
+    let mut received = std::collections::HashSet::new();
+    while let Ok(r) = rx.try_recv() {
+        assert!(received.insert(r.challenge_id), "one copy of each");
+    }
+    assert_eq!(received.len(), usize::from(BURST));
+}

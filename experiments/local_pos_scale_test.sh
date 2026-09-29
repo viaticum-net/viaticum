@@ -15,8 +15,8 @@
 #               the issue tick stays short, also with a stopped postman (O's log);
 #               DR readiness holds (O's status); the laptop passes every day (O's log).
 # Adversarial:  H9 SIGKILL schedule; H8 SIGSTOP/SIGCONT (sleeping laptop, half-open
-#               connections); H1 restart mid-run (memory lost); O off for 5 min then restart
-#               (everything due at once).
+#               connections); H1 restart mid-run (memory lost); O off for 12 min (about a
+#               scaled week) then restart (everything due at once).
 # Cannot close: T1 at 100k holdings (see СТ-L); healing of a response lost at every postman
 #               (unit only); a world of 30-40; kernel sleep and Wi-Fi; clock jumps; the
 #               laptop's online window is 30 s real = 7.5 scaled h (startup and transport are
@@ -58,8 +58,10 @@
 #                    with entries <= 1.5 x sum(bytes of the blocks of H1's live challenges) +
 #                    1.5 x R0 x (elapsed / week); O: 0 timeouts to H1, WARN unknown <= timeouts
 #                    (pos-i5, pos-i6)
-#               8.  end of W4: O SIGTERM for 300 s (~3 scaled days), start: the first issue tick
-#                    has due >= 0.8 x placements (elapsed_ms = NOTE); then half a week: 0
+#               8.  end of W4: O SIGTERM for 720 s (about a scaled week), start: the first issue
+#                    tick has due >= 0.8 x placements (elapsed_ms = NOTE); T_off shorter than
+#                    one challenge interval + 30 s (604800 / (cpw_min x 900) + 30, cpw_min read
+#                    from O's issue ticks) = FAIL(setup), not a product FAIL; then half a week: 0
 #                    timeouts, every new challenge resolved (+120 s margin), WARN unknown <=
 #                    timeouts, ledger gap <= 12 s outside the first tick (the first = NOTE, K-5)
 #                    (pos-i6, pos-i7)
@@ -67,8 +69,9 @@
 # Pre-registered on the current code (СТ-0a and СТ-0c in):
 #   every step GREEN, except 7b's poll bar: ROUGH "known: poll waits for the slowest postman"
 #   (routing poll, line B's Р-5), not a FAIL. Step 4 is the СТ-0c proof (the owner forwards
-#   only answers to pending challenges, once: no WARN full, no WARN unknown challenge_id),
-#   step 8 its burst door (O back after 3 scaled days), step 2 the issue-tick line.
+#   only answers to pending challenges, once: no WARN unknown challenge_id; deferred_full
+#   = NOTE), step 8 its burst door (O back after about a scaled week), step 2 the issue-tick
+#   line.
 #   Before СТ-0c (СТ-0a only) steps 2, 7b, 8 were RED (no issue-tick line) and step 4 RED
 #   (every live answer forwarded, O's log tens of MB per minute: STOP_AFTER=4).
 #
@@ -100,8 +103,15 @@
 #   (B1) no sweep at the poll's start -> "memo_answered <= 1.5 x live"
 #   (b)  owner forwards every response (no pending filter, M0-b) -> step 4 "WARN unknown
 #        challenge_id <= timeouts" (STOP_AFTER=4)
-#   (b') no "forwarded" memory (M0-b') -> step 8 "WARN unknown <= timeouts" (the burst after
-#        O's absence holds the scheduler for more than a poll period; full run)
+#   (b') no "forwarded" memory (M0-b') -> step 8 "WARN unknown <= timeouts" (full run).
+#        Mechanism: after O's absence every placement is due at once, and the scheduler
+#        works through a backlog of thousands of queued responses, each with redb commits;
+#        a challenge still pending in that backlog gets its response forwarded again by the
+#        next polls, and the second copy lands after the first resolved it. Not only a stall
+#        longer than the poll period: the drain backlog alone makes the copies.
+#        Pre-declared (spec К0-6): a GREEN step 8 under (b') counts as "unit-only" — the
+#        proof of M0-b' is then the unit `second_copy_of_pending_response_is_not_selected`
+#        (pos_memo/forwarded/tests.rs), not this scenario.
 #   (d)  no postman contact in routing poll AND fanout Ack (M0-d) -> step 6 dr_ready
 #
 # Usage:
@@ -144,6 +154,7 @@ BAR_MEMO_RATIO=1.5
 FIRST_CACHED_MARGIN=200
 ALIVE_MARGIN=60
 STEP8_MARGIN=120
+O_OFF=720           # step 8: O off, s (> one challenge interval 672 s at cpw 1, + 30 s)
 
 E2E_BASE="${E2E_BASE:-$HOME/e2e-runs}"
 TEST_DIR="$E2E_BASE/pos-scale-$$"
@@ -307,7 +318,7 @@ o_issues() { events_grep "$(node_log "$O")" "PoS hash challenge issued via mailb
 o_resolved() { events_grep "$(node_log "$O")" "mailbox PosResponse resolved" block_id holder outcome challenge_id; }
 o_timeouts() { events_grep "$(node_log "$O")" "PoS challenge timed out" block_id holder_id challenge_id; }
 o_unknown() { events_grep "$(node_log "$O")" "unknown challenge_id" challenge_id; }
-o_issue_ticks() { events_grep "$(node_log "$O")" "scheduler: PoS issue tick" elapsed_ms due issued; }
+o_issue_ticks() { events_grep "$(node_log "$O")" "scheduler: PoS issue tick" elapsed_ms due issued cpw_min; }
 o_ledger_rows() { events_grep "$(node_log "$O")" "pair-ledger row" master; }
 
 # Holder-side events (the holder's own log).
@@ -682,8 +693,7 @@ TO=$(o_timeouts | count_in "$T_W2" $((T_W3 + HALF)))
 UNK=$(o_unknown | count_in "$T_W2" $((T_W3 + HALF)))
 DEFERRED=$(events_grep "$(node_log "$O")" "mailbox_poll: poll done" deferred_full \
     | in_window "$T_W2" $((T_W3 + HALF)) | awk '$3 != "-" { s += $3 } END { print s + 0 }')
-FULL_WARN=$(events_grep "$(node_log "$O")" "pos_response_tx full" | count_in "$T_W2" $((T_W3 + HALF)))
-note "deferred_full sum = $DEFERRED, 'pos_response_tx full' lines = $FULL_WARN"
+note "deferred_full sum = $DEFERRED"
 if [ "$ISSUED" -eq 0 ]; then
     fail "no challenge issued by O in W2 (nothing to judge)"
 elif [ "$UNRES" -eq 0 ]; then
@@ -863,11 +873,11 @@ note "H9 rchar per online window (bytes, cycles 2..): $(echo "$RCH9" | awk 'NF {
 # ── Steps 7a-7c (line A, 4r-i113): appended here by line A ─────────────────
 stop_point 7
 
-# ── STEP 8: the owner comes back after 3 scaled days ───────────────────────
+# ── STEP 8: the owner comes back after about a scaled week ─────────────────
 CUR_STEP=8
 echo ""
-echo "=== Step 8: O off 300 s, start; the first issue tick, then half a week ==="
-sleep_until $((T_O_KILL + 300))
+echo "=== Step 8: O off ${O_OFF} s, start; the first issue tick, then half a week ==="
+sleep_until $((T_O_KILL + O_OFF))
 start_node "$O"
 T_O_START=$(now_t)
 wait_daemon "$O" || { fail "O did not start again"; finish; }
@@ -881,12 +891,25 @@ T8="$T_O_START"
 if [ -z "$FIRST_TICK" ]; then
     fail "no 'scheduler: PoS issue tick' on O within 180 s of its start (the line comes with СТ-0c)"
 else
-    read -r T8 _ FT_MS FT_DUE _ <<< "$FIRST_TICK"
+    read -r T8 _ FT_MS FT_DUE _ FT_CPW <<< "$FIRST_TICK"
     T8=${T8%.*}
-    note "first issue tick: elapsed_ms=$FT_MS due=$FT_DUE placements=$PLACEMENTS"
-    awk -v d="$FT_DUE" -v p="$PLACEMENTS" 'BEGIN { exit !(p > 0 && d >= 0.8 * p) }' \
-        && pass "first tick due=$FT_DUE >= 0.8 x $PLACEMENTS placements" \
-        || fail "first tick due=$FT_DUE < 0.8 x $PLACEMENTS placements"
+    T_OFF=$((T_O_START - T_O_KILL))
+    # Setup self-check: the bar needs every placement's challenge interval to have passed
+    # while O was off. cpw_min of a tick is over that tick's due entries only, so the first
+    # tick alone would miss placements it did not find due; the ticks of O's last scaled
+    # week before the kill cover every placement.
+    CPW_MIN=$( { o_issue_ticks | in_window $((T_O_KILL - WEEK)) "$T_O_KILL" | awk '{ print $6 }'
+                 echo "$FT_CPW"; } | awk '$1 ~ /^[0-9]+$/ && $1 > 0' | sort -n | head -1)
+    note "first issue tick: elapsed_ms=$FT_MS due=$FT_DUE placements=$PLACEMENTS; T_off=${T_OFF} s cpw_min=${CPW_MIN:-none}"
+    if [ -z "$CPW_MIN" ]; then
+        fail "FAIL(setup): no cpw_min on O's issue ticks (cannot check T_off)"
+    elif [ "$T_OFF" -lt $((604800 / (CPW_MIN * TIME_SCALE) + 30)) ]; then
+        fail "FAIL(setup): T_off ${T_OFF} s < 604800 / (${CPW_MIN} x ${TIME_SCALE}) + 30 s (not every placement due; raise O_OFF)"
+    else
+        awk -v d="$FT_DUE" -v p="$PLACEMENTS" 'BEGIN { exit !(p > 0 && d >= 0.8 * p) }' \
+            && pass "first tick due=$FT_DUE >= 0.8 x $PLACEMENTS placements" \
+            || fail "first tick due=$FT_DUE < 0.8 x $PLACEMENTS placements"
+    fi
 fi
 T8_END=$((T8 + HALF))
 sleep_until $((T8_END + STEP8_MARGIN))

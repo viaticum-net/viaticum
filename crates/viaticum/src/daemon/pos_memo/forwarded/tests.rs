@@ -308,6 +308,28 @@ fn sent_mark_is_forgotten_one_ttl_later() {
     assert!(memo.is_empty());
 }
 
+/// The mark's lifetime is the owner's own clock (first sight + TTL), not the entry's
+/// `expires_at`: that field is not signed, a postman sets it. An envelope stamped to
+/// expire one second after first sight and still served, its challenge still pending,
+/// eight seconds later is in flight, not handed to the scheduler a second time.
+#[test]
+fn sent_mark_outlives_an_entry_expires_at_in_the_past() {
+    let pending = pending_with(&[C1]);
+    let mut memo = ForwardedResponses::new(TS);
+    let short_lived = MailboxEntry {
+        expires_at: T0 + 1,
+        ..honest(C1)
+    };
+    let (first, _) = poll_and_send(&mut memo, &pending, vec![short_lived.clone()], T0);
+    assert_eq!(first, vec![C1]);
+
+    let (again, counts) = poll_and_send(&mut memo, &pending, vec![short_lived], T0 + 8);
+
+    assert!(again.is_empty(), "not re-selected");
+    assert_eq!((counts.selected, counts.in_flight), (0, 1));
+    assert_eq!(memo.len(), 1);
+}
+
 /// Above the cap an envelope is not marked (forwarded again while pending).
 #[test]
 fn sent_marks_are_capped() {

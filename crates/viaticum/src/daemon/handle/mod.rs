@@ -1095,10 +1095,10 @@ impl DaemonHandle {
 
         // T-6: MailboxRouter already built in step 11.5 (early_mailbox_router).
         // Reuse the same Arc here for scheduler + mailbox poll wiring.
-        // pos_response_tx: poll loop → scheduler (bounded 256, try_send; a full channel
-        // defers the response to the next poll, pos-i6).
+        // pos_response_tx: poll loop → scheduler (bounded POS_RESPONSE_CHANNEL_CAP,
+        // try_send; a full channel defers the response to the next poll, pos-i6).
         let (pos_response_tx, pos_response_rx) =
-            mpsc::channel::<viaticum_core::messages::PosHashResponseMsg>(256);
+            crate::daemon::mailbox::poll::pos_response_channel();
 
         // Reuse early_mailbox_router built above (step 11.5). Same instance used in
         // DaemonState.mailbox_router (for dispatch_device_revoke / T-13b-2).

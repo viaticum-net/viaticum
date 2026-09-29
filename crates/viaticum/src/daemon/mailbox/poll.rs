@@ -539,6 +539,38 @@ async fn publish_pos_response(
     }
 }
 
+/// Capacity of the poll → scheduler PosResponse channel (pos-i6-b).
+///
+/// A poll puts at most this many responses into the channel; the rest wait at the
+/// postmen for the next poll. A response lives at the postmen one TTL
+/// (`POS_CHALLENGE_TTL` = 1 week) and the poll runs every `MAILBOX_POLL_INTERVAL_SECS`
+/// (1 h), both divided by the same `time_scale`: 168 polls per TTL, so the owner can
+/// take in at most `168 × POS_RESPONSE_CHANNEL_CAP` responses per TTL (fewer polls once
+/// the poll interval floors at 1 s, `time_scale` > 3600).
+///
+/// The owner receives ≈ placements × cpw responses per week (`pos::challenges_per_week`,
+/// cpw 1..2 for a placement under 1000 symbols). The former 256 capped it at 43 008 per
+/// TTL: 5 376 blocks × 8 placements at cpw 1, ≈ 0.7 TB of 128 MiB blocks (≈ 0.35 TB at
+/// cpw 2) — beyond that honest responses expired at the postmen and became timeouts.
+/// 8192 ⇒ 1 376 256 responses per TTL ≈ 172 000 blocks × 8 at cpw 1 ≈ 21 TiB of
+/// 128 MiB blocks (≈ 10.5 TiB at cpw 2).
+///
+/// Cost: a `PosHashResponseMsg` is fixed-size, no heap (~190 B), and tokio's bounded
+/// channel allocates its slots in blocks of 32 as they fill: ≈ 1.5 MB with the channel
+/// full, nothing extra when it is empty. A longer queue does not delay a response: one
+/// not admitted waits a whole poll period at the postmen instead. The scheduler takes one
+/// response per `select!` turn and holds `pending` only for that response's lookup and
+/// removal, so its timers are not starved by a long queue.
+pub(crate) const POS_RESPONSE_CHANNEL_CAP: usize = 8192;
+
+/// The poll → scheduler PosResponse channel, `POS_RESPONSE_CHANNEL_CAP` deep.
+pub(crate) fn pos_response_channel() -> (
+    mpsc::Sender<PosHashResponseMsg>,
+    mpsc::Receiver<PosHashResponseMsg>,
+) {
+    mpsc::channel(POS_RESPONSE_CHANNEL_CAP)
+}
+
 /// Hand the PosResponse entries of one poll to the scheduler (pos-i6).
 ///
 /// One lock of `pending` covers the selection (no await inside it): only responses to
