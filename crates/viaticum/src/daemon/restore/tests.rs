@@ -370,15 +370,28 @@ fn extract_by_file_id_with_wrong_bytes_falls_back_to_content_hash() {
     assert_eq!(got.as_deref(), Some(&b"content of d2"[..]));
 }
 
-/// No member has the content: `None` (restore reports it as `PackIndexParseFailed`).
+/// No member has the content and none has the record's `file_id`: `None` (restore
+/// reports it as `PackIndexParseFailed`).
 #[test]
 fn extract_fails_when_no_entry_matches_hash() {
     let plaintext = pack_of(&[(1, b"aaa"), (2, b"bbb")]);
     let h = *blake3::hash(b"ccc").as_bytes();
 
-    let got = super::pipeline::extract_member(&plaintext, FileId(1), &h).unwrap();
+    let got = super::pipeline::extract_member(&plaintext, FileId(7), &h).unwrap();
 
     assert!(got.is_none());
+}
+
+/// A catalog from before L1: the version's hash is of other bytes than those packed.
+/// No member has it, so the member packed under the record's `file_id` is returned.
+#[test]
+fn extract_falls_back_to_file_id_member_when_no_member_has_the_hash() {
+    let plaintext = pack_of(&[(1, b"bytes packed at flush"), (2, b"bbb")]);
+    let h_at_enqueue = *blake3::hash(b"bytes seen at enqueue").as_bytes();
+
+    let got = super::pipeline::extract_member(&plaintext, FileId(1), &h_at_enqueue).unwrap();
+
+    assert_eq!(got.as_deref(), Some(&b"bytes packed at flush"[..]));
 }
 
 // ─── Roundtrip tests (backup → restore) ──────────────────────────────────────
