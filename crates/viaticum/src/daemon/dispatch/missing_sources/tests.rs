@@ -14,6 +14,7 @@ fn record(id: u64, path: &std::path::Path, state: LocalState) -> FileRecord {
         devices: vec![(DeviceId([1; 32]), state)],
         versions: vec![],
         first_seen: Timestamp(1),
+        on_disk_confirmed: true,
     }
 }
 

@@ -261,6 +261,7 @@ fn db_stores_and_retrieves_full_records() {
             backed_up_at: Some(t),
         }],
         first_seen: t,
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).expect("upsert_file");
 
@@ -511,6 +512,7 @@ fn full_owner_flow() {
             backed_up_at: None,
         }],
         first_seen: t,
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).expect("upsert_file");
 

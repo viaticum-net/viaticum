@@ -53,7 +53,6 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         epoch_key: TEST_EPOCH_KEY,
         device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
@@ -113,6 +112,7 @@ fn make_record_with_versions(versions: Vec<FileVersion>) -> FileRecord {
         devices: vec![],
         versions,
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     }
 }
 
@@ -249,6 +249,7 @@ fn prefix_restore_finds_multiple_files() {
                 backed_up_at: Some(Timestamp(id * 2000)),
             }],
             first_seen: Timestamp(0),
+            on_disk_confirmed: true,
         }
     };
 
@@ -734,6 +735,7 @@ fn catalog_record(path: &str, id: u64) -> FileRecord {
         devices: vec![],
         versions: vec![make_version(Some(200))],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     }
 }
 
@@ -962,6 +964,7 @@ async fn one_unrecoverable_block_does_not_abort_remaining_blocks() {
             backed_up_at: Some(Timestamp(200)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     })
     .unwrap();
     db.upsert_source_block(&SourceBlockRecord {
@@ -1180,6 +1183,7 @@ async fn path_traversal_from_db_record_is_rejected() {
             backed_up_at: Some(Timestamp(200)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&record).unwrap();
 
@@ -1273,6 +1277,7 @@ fn extract_and_write_file_rejects_path_traversal() {
                 backed_up_at: Some(Timestamp(200)),
             }],
             first_seen: Timestamp(0),
+            on_disk_confirmed: true,
         };
         let version = record.versions[0].clone();
         let plaintext = b"malicious payload";
@@ -1738,6 +1743,7 @@ fn not_backed_up_record(path: &str, id: u64) -> FileRecord {
             backed_up_at: None,
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     }
 }
 

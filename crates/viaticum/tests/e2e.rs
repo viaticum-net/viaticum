@@ -52,7 +52,6 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         epoch_key: EPOCH_KEY,
         device_id: device_a(),
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
@@ -296,7 +295,8 @@ async fn full_lifecycle_e2e() {
     //
     // Device B tries to back up a file with the same content as the already-backed-up
     // new_photo_content (v1 backed up by Device A in Step 2).
-    // The BackupCoordinator with cluster_state must skip it (dedup = 0 new blocks).
+    // The BackupCoordinator must skip it through the shared DB's content index
+    // (dedup = 0 new blocks).
 
     let cluster_state = Arc::new(Mutex::new(init_cluster(db.clone())));
 
@@ -311,7 +311,6 @@ async fn full_lifecycle_e2e() {
             epoch_key: EPOCH_KEY,
             device_id: device_b(),
             mock_holders: test_holders(),
-            cluster_state: Some(Arc::clone(&cluster_state)),
             watch_configs: vec![],
             time_scale: 1,
             mock_offer_budget_gb: None,

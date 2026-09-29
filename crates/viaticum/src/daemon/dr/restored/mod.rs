@@ -32,12 +32,19 @@ pub(crate) struct PreparedState {
 /// dr-i19: the device that published the selected catalog is the lost machine; in every
 /// restored file record it becomes `dr_device` (state kept). Siblings and the cluster
 /// registry are not touched.
+///
+/// dr-i64: no restored record is confirmed on disk — this machine has not seen any of
+/// those files yet, so a recheck must not turn their absence into a deletion. Its own
+/// events and scans confirm what is really there.
 pub(crate) fn prepare_restored_state(
     mut state: SystemState,
     selected: &CatalogSummary,
     dr_device: DeviceId,
 ) -> PreparedState {
     let reassigned = reassign_history_device(&mut state.files, selected.publisher, dr_device);
+    for record in &mut state.files {
+        record.on_disk_confirmed = false;
+    }
     let live_files = live_file_count(&state.files);
     PreparedState {
         state,

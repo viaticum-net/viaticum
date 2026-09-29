@@ -756,6 +756,34 @@ impl Db {
         Ok(())
     }
 
+    /// Test seam (backup-i23): overwrite the PEERS row of `device` with bytes that do not
+    /// decode as a `PeerRecord`, so [`Db::list_all_peers`] answers `Err` — a DB error
+    /// before any block is built (candidate selection).
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn corrupt_peer_row_for_test(&self, device: &DeviceId) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(PEERS)?;
+            table.insert(&device.0, [0xffu8, 0x00, 0x13].as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Test seam (backup-i23): overwrite the FILES row at `path` with bytes that do not
+    /// decode as a `FileRecord`, so [`Db::get_file`] answers `Err` — a DB error inside the
+    /// packing pipeline, not a missing record. CONTENT_INDEX is left as it was.
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn corrupt_file_row_for_test(&self, path: &str) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(FILES)?;
+            table.insert(path, [0xffu8, 0x00, 0x13].as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Access hot cache for read.
     ///
     /// If the lock is poisoned (another thread panicked while holding write access),
@@ -883,35 +911,22 @@ impl Db {
         Ok(paths)
     }
 
-    /// True if any file has a backed-up version with this content hash (B-1 indexed).
-    /// Replaces an O(N) full FILES scan in the import dedup path.
-    pub fn is_content_backed_up(&self, content_hash: &[u8; 32]) -> Result<bool, DbError> {
-        for path in self.paths_for_content_hash(content_hash)? {
-            if let Some(rec) = self.get_file(&path)?
-                && rec
-                    .versions
-                    .iter()
-                    .any(|v| &v.content_hash == content_hash && v.backed_up_at.is_some())
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// First file record holding a version with this content hash (B-1 indexed).
-    pub fn find_file_by_content_hash(
+    /// Every file record holding a version with `content_hash` (B-1 indexed, via
+    /// CONTENT_INDEX), in path order. The caller decides which of them may serve as a
+    /// dedup source (backup-i9: only a backed-up version) or as a rebuild candidate.
+    pub fn files_with_content_hash(
         &self,
         content_hash: &[u8; 32],
-    ) -> Result<Option<FileRecord>, DbError> {
+    ) -> Result<Vec<FileRecord>, DbError> {
+        let mut records = Vec::new();
         for path in self.paths_for_content_hash(content_hash)? {
             if let Some(rec) = self.get_file(&path)?
                 && rec.versions.iter().any(|v| &v.content_hash == content_hash)
             {
-                return Ok(Some(rec));
+                records.push(rec);
             }
         }
-        Ok(None)
+        Ok(records)
     }
 
     /// List files with path starting with prefix.

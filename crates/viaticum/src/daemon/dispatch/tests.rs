@@ -164,6 +164,7 @@ fn insert_file_with_block(
             backed_up_at: if backed_up { Some(Timestamp(1)) } else { None },
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     state.db.upsert_file(&file).unwrap();
 }
@@ -1440,6 +1441,7 @@ fn catalog_file(path: &str, id: u64, backed_up: bool) -> viaticum_core::types::F
             backed_up_at: backed_up.then_some(Ts(20)),
         }],
         first_seen: Ts(0),
+        on_disk_confirmed: true,
     }
 }
 
@@ -1726,6 +1728,7 @@ fn catalog_file_with_states(
             .collect(),
         versions: vec![],
         first_seen: viaticum_core::types::Timestamp(1),
+        on_disk_confirmed: true,
     }
 }
 

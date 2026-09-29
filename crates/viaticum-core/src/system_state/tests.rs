@@ -27,6 +27,7 @@ fn make_file(path: &str, id: u64) -> FileRecord {
         devices: vec![(DeviceId([0u8; 32]), LocalState::Present)],
         versions: vec![],
         first_seen: Timestamp(1000),
+        on_disk_confirmed: false,
     }
 }
 
