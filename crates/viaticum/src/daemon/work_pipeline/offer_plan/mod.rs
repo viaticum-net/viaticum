@@ -81,11 +81,19 @@ pub(crate) fn namespace_start(
         .unwrap_or(0)
 }
 
-/// Next fresh ESI: max end over every non-`Lost`/`Deleting` row, never below the namespace.
+/// Next fresh ESI: max end over EVERY row of the block, whatever its status, never below the
+/// namespace (repair-i8). A `Lost`/`Deleting` row counts too: its holder may still have those
+/// ESIs on disk (a PoS `Fail` leaves the bad bytes there, a DropNotice holds until its
+/// deadline), so its numbers must not come back as "fresh" — to another device, or to the same
+/// one (repair-i10: a device with a `Lost` row gets fresh numbers only; `reusable_own_ranges`
+/// reuses `Offered` rows alone). Before, a `Fail` on the TOP range dropped the cursor onto it,
+/// repair re-offered the same ESIs to the same holder, the holder answered "already held" by
+/// file length and the placement went back to `Alive` with the bad symbol: a Fail→Lost→Alive
+/// loop, never healed. Residual (C-SP K1b): a removed row takes its range out of the cursor —
+/// a persistent `esi_high_water` closes that.
 pub(crate) fn esi_cursor(placements: &[SymbolPlacement], namespace_start: u32) -> u32 {
     placements
         .iter()
-        .filter(|p| !matches!(p.status, PlacementStatus::Lost | PlacementStatus::Deleting))
         .flat_map(|p| p.esi_ranges.iter())
         .map(|(start, count)| start.saturating_add(*count))
         .max()

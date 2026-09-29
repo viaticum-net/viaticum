@@ -241,8 +241,8 @@ fn reoffer_gets_fresh_numbers_when_another_device_row_overlaps_own_range() {
     let a = candidate(1, 0.6);
     let first = tick_all_reject(&db, &block, std::slice::from_ref(&a));
     let own = first[0].esi_ranges.clone();
-    // Another device's row over A's range (a Lost row: it does not raise the cursor, which is
-    // how a fresh range can land on it today).
+    // Another device's row over A's range (a Lost row — rows like this exist from before
+    // repair-i8, when the cursor skipped Lost rows and a fresh range could land on one).
     let z = row(
         &block,
         device(0x2A),
@@ -352,4 +352,82 @@ fn union_ranges_merges_adjacent_and_sorts_across_offers() {
     ];
 
     assert_eq!(union_ranges(&offers), vec![(0, 2), (10, 5)]);
+}
+
+// ─── repair-i8 / repair-i10: Lost and Deleting rows keep their numbers ─────────
+
+/// Five holders of 7 ESIs each over NS..NS+35, all `Alive` except the top one (28..35).
+fn five_rows_top(block: &SourceBlockRecord, top_status: PlacementStatus) -> Vec<SymbolPlacement> {
+    (0..5u8)
+        .map(|i| {
+            let status = if i == 4 {
+                top_status
+            } else {
+                PlacementStatus::Alive
+            };
+            row(
+                block,
+                device(1 + i),
+                status,
+                vec![(NS + 7 * u32::from(i), 7)],
+            )
+        })
+        .collect()
+}
+
+/// repair-i8. Mutation: the cursor skips `Lost`/`Deleting` rows again → the cursor falls to
+/// NS+28, onto numbers the top holder may still have on disk; this test reddens.
+#[test]
+fn esi_cursor_counts_lost_and_deleting_placements() {
+    let db = make_db();
+    let block = block(&db, 5);
+    for status in [PlacementStatus::Lost, PlacementStatus::Deleting] {
+        let rows = five_rows_top(&block, status);
+
+        let next = esi_cursor(&rows, NS);
+
+        assert!(
+            next >= NS + 35,
+            "{status:?} top row 28..35: cursor {} must stay at or above 35",
+            next - NS
+        );
+    }
+}
+
+/// repair-i8, repair-i10 (the Fail→Lost→Alive loop seen in `local_ledger_drop_test`): F's
+/// top-range row went `Lost` after a PoS Fail; repair plans F again — F must get fresh numbers,
+/// none of 28..35 (the holder would call those "already held" by file length and keep the bad
+/// bytes). Mutation: the cursor skips `Lost` rows → F is offered 28..35 again; this test reddens.
+/// Holder side (files rewritten for fresh ESIs) is the ordinary offer path, covered in
+/// `processor/tests/symbol_transfer_reply.rs`.
+#[test]
+fn fail_then_repair_to_same_device_gets_fresh_range() {
+    let db = make_db();
+    let block = block(&db, 5);
+    for r in five_rows_top(&block, PlacementStatus::Lost) {
+        db.upsert_placement(&r).unwrap();
+    }
+    let f = device(5);
+    let lost_range = vec![(NS + 28, 7)];
+    // The whole pool: the four Alive holders are excluded (repair-i2), F is the candidate.
+    let pool: Vec<HolderCandidate> = (1..=5u8).map(|b| candidate(b, 0.6)).collect();
+
+    let offers = tick_all_reject(&db, &block, &pool);
+
+    assert_eq!(offers.len(), 1);
+    assert_eq!(offers[0].device_id, f);
+    assert!(
+        !intersects(&offers[0].esi_ranges, &lost_range),
+        "F's repair offer {:?} must not reuse its Lost range 28..35",
+        offers[0].esi_ranges
+    );
+    assert!(
+        offers[0]
+            .esi_ranges
+            .iter()
+            .all(|&(start, _)| start >= NS + 35)
+    );
+    let rewritten = db.get_placement(&block.block_id, &f).unwrap().unwrap();
+    assert_eq!(rewritten.status, PlacementStatus::Offered);
+    assert_eq!(rewritten.esi_ranges, offers[0].esi_ranges);
 }
