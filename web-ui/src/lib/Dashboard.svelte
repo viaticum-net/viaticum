@@ -134,6 +134,13 @@
           <dt>Warning</dt>
           <dd>{status.quota_note}</dd>
         {/if}
+        <!-- holder-i4: below the reserve at any quota -->
+        {#if status.below_reserve_giving_back_bytes != null}
+          <dt>Disk below reserve</dt>
+          <dd>{status.below_reserve_giving_back_bytes
+            ? `giving back ${formatBytes(status.below_reserve_giving_back_bytes)}`
+            : 'holding nothing for friends, not taking their data'}</dd>
+        {/if}
         <dt>Used</dt>
         <dd>{formatBytes(status.used_bytes)}</dd>
       </dl>

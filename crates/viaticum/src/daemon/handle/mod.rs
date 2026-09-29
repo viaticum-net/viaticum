@@ -1484,15 +1484,18 @@ pub(crate) fn disk_available_bytes(path: &std::path::Path) -> Option<u64> {
 }
 
 /// Free bytes on the filesystem holding `path` via `sysinfo` (no `statvfs` here); `None`
-/// when no mount point matches (unknown — never read as "disk full").
+/// when the path is missing or no mount point matches (unknown — never read as "disk full").
+/// `std::path::absolute`, not `canonicalize`: on Windows the latter returns a verbatim
+/// `\\?\C:\…` path that never `starts_with` the mount point `C:\`.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn disk_available_bytes(path: &std::path::Path) -> Option<u64> {
-    let canonical = std::fs::canonicalize(path).ok()?;
+    std::fs::metadata(path).ok()?;
+    let abs = std::path::absolute(path).ok()?;
     let disks = sysinfo::Disks::new_with_refreshed_list();
     disks
         .list()
         .iter()
-        .filter(|d| canonical.starts_with(d.mount_point()))
+        .filter(|d| abs.starts_with(d.mount_point()))
         .max_by_key(|d| d.mount_point().as_os_str().len())
         .map(|d| d.available_space())
 }

@@ -62,7 +62,54 @@ fn free_below_reserve_is_critical_and_rejects_offers() {
     assert!(should_reject_offers(q, gib(30)));
     let r = evaluate_pressure(q, 0, gib(30), &held, trust, 0);
     assert_eq!(r.pressure, DiskPressure::Hard);
-    assert!(!r.immediate_evictions.is_empty());
+    // holder-i1-a: one tick evicts down to 85 % of the quota (30 − 17 = 13 GiB ⇒ three
+    // 5 GiB holdings), at least the 10 GiB the disk is below the reserve.
+    assert_eq!(r.freed_bytes, gib(15));
+    assert_eq!(r.immediate_evictions.len(), 3);
+}
+
+/// holder-i1-a: free 0, reserve 20 GiB, held 21 × 1 GiB ⇒ Q = 1 GiB; ONE tick gives back at
+/// least 20.15 GiB (used ≤ 0.85·Q), not 0.15·Q per tick.
+#[test]
+fn below_reserve_one_tick_gives_back_the_whole_overshoot() {
+    let held = holdings(21, gib(1));
+    let q = compute_effective_quota(0, Some(0), gib(21), gib(20));
+    assert_eq!(q, Quota::Bytes(gib(1)));
+    let r = evaluate_pressure(q, 0, gib(21), &held, trust, 0);
+    assert_eq!(r.pressure, DiskPressure::Hard);
+    assert!(
+        r.freed_bytes >= gib(20) + gib(1) * 15 / 100,
+        "freed {} B",
+        r.freed_bytes
+    );
+}
+
+/// holder-i1-a: below the reserve, eviction is monotone in held — more held, no less given
+/// back, no cliff between Q = 0 and Q > 0 — and used ends at most 0.85·Q.
+#[test]
+fn below_reserve_eviction_is_monotone_in_held() {
+    let mut last_freed = 0u64;
+    for n in [20u8, 21, 22] {
+        let used = gib(n as u64);
+        let held = holdings(n, gib(1));
+        let q = compute_effective_quota(0, Some(0), used, gib(20));
+        let Quota::Bytes(qb) = q else {
+            panic!("known disk ⇒ Bytes, got {q:?}")
+        };
+        let r = evaluate_pressure(q, 0, used, &held, trust, 0);
+        assert_eq!(r.pressure, DiskPressure::Hard, "held {n} GiB");
+        assert!(
+            r.freed_bytes >= last_freed,
+            "held {n} GiB: freed {}",
+            r.freed_bytes
+        );
+        let left = used - r.freed_bytes;
+        assert!(
+            left as f64 <= 0.85 * qb as f64,
+            "held {n} GiB: {left} B left over Q {qb} B"
+        );
+        last_freed = r.freed_bytes;
+    }
 }
 
 /// holder-i2: the disk could not be read and no soft quota is set — offers refused, nothing

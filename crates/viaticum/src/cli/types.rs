@@ -115,6 +115,10 @@ pub struct StatusData {
     /// "could not read free space on <path>; …" when the free disk could not be read, else "".
     #[serde(default)]
     pub quota_note: String,
+    /// holder-i4: the free disk is below the reserve — `Some(bytes the pressure tick gives
+    /// back)` (friends' data, down to the hard floor), at any quota; `None` otherwise.
+    #[serde(default)]
+    pub below_reserve_giving_back_bytes: Option<u64>,
     /// Bytes currently used for held symbols.
     pub used_bytes: u64,
     /// Total PoS challenges issued (all peers, all weeks).

@@ -435,11 +435,18 @@ async fn check_pressure(
     match result.pressure {
         DiskPressure::Normal => {}
         DiskPressure::Soft => {
-            info!(
-                used_bytes,
-                ?effective_quota,
-                "holder_cleanup: soft disk pressure — not accepting new symbols"
-            );
+            if effective_quota == Quota::Unknown {
+                info!(
+                    used_bytes,
+                    "holder_cleanup: free space unknown — not accepting new symbols"
+                );
+            } else {
+                info!(
+                    used_bytes,
+                    ?effective_quota,
+                    "holder_cleanup: soft disk pressure — not accepting new symbols"
+                );
+            }
         }
         DiskPressure::Hard => {
             info!(

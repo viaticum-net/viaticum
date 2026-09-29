@@ -331,7 +331,8 @@ pub fn compute_effective_quota(
 ///
 /// quota:            effective quota (call compute_effective_quota first).
 ///                   `Bytes(0)` = no room at all (Critical, holder-i1): Hard, every holding
-///                   above the `hard_quota_bytes` floor is evicted.
+///                   above the `hard_quota_bytes` floor is evicted. Hard evicts down to
+///                   85 % of the quota, overshoot included (holder-i1-a).
 ///                   `Unknown` = Soft (holder-i2): offers refused, nothing evicted.
 ///                   `Unlimited` = Normal (tests only).
 /// hard_quota_bytes: eviction floor. Never evict if remaining usage would
@@ -352,21 +353,22 @@ pub fn evaluate_pressure(
     let (deficit_bytes, buffer_bytes) = match quota {
         Quota::Unlimited => return no_eviction(DiskPressure::Normal),
         Quota::Unknown => return no_eviction(DiskPressure::Soft),
-        // Critical (holder-i1): no room at all — evict down to the hard floor.
-        Quota::Bytes(0) => (used_bytes, 0),
         Quota::Bytes(quota_bytes) => {
-            let free_bytes = quota_bytes.saturating_sub(used_bytes);
-            let free_ratio = free_bytes as f64 / quota_bytes as f64;
+            // `Bytes(0)` = Critical (holder-i1): no room at all, free ratio 0 ⇒ Hard.
+            let free_ratio = if quota_bytes == 0 {
+                0.0
+            } else {
+                quota_bytes.saturating_sub(used_bytes) as f64 / quota_bytes as f64
+            };
             if free_ratio >= SOFT_PRESSURE_THRESHOLD {
                 return no_eviction(DiskPressure::Normal);
             }
             if free_ratio >= HARD_PRESSURE_THRESHOLD {
                 return no_eviction(DiskPressure::Soft);
             }
-            // Hard pressure: evict to bring free space back up to SOFT_PRESSURE_THRESHOLD.
-            let target_free_bytes = (SOFT_PRESSURE_THRESHOLD * quota_bytes as f64) as u64;
+            // Hard pressure (holder-i1-a); the hard floor still bounds it below.
             (
-                target_free_bytes.saturating_sub(free_bytes),
+                hard_eviction_deficit(quota_bytes, used_bytes),
                 (0.05 * quota_bytes as f64) as u64,
             )
         }
@@ -453,6 +455,15 @@ pub fn evaluate_pressure(
         drop_notices,
         freed_bytes,
     }
+}
+
+/// Bytes a Hard pressure tick gives back: down to `(1 − SOFT_PRESSURE_THRESHOLD)·quota`,
+/// the WHOLE overshoot included when held is over the quota — the disk below the reserve
+/// is given back in one tick, monotone in held; `quota == 0` ⇒ all of it (holder-i1-a).
+/// Before the hard floor (`evaluate_pressure` never evicts below it).
+pub fn hard_eviction_deficit(quota_bytes: u64, used_bytes: u64) -> u64 {
+    let target_used = ((1.0 - SOFT_PRESSURE_THRESHOLD) * quota_bytes as f64) as u64;
+    used_bytes.saturating_sub(target_used)
 }
 
 /// A pressure result that evicts nothing and sends no notice.

@@ -28,6 +28,14 @@ fn test_jobs() -> RestoreJobs {
 }
 
 async fn make_test_state() -> Arc<DaemonState> {
+    make_test_state_with(std::path::PathBuf::from("/tmp"), 0, 0).await
+}
+
+async fn make_test_state_with(
+    data_dir: std::path::PathBuf,
+    soft_quota_bytes: u64,
+    disk_reserve_bytes: u64,
+) -> Arc<DaemonState> {
     let db = Db::open_in_memory().expect("in-memory db");
     let device_id = DeviceId([0u8; 32]);
 
@@ -46,9 +54,9 @@ async fn make_test_state() -> Arc<DaemonState> {
         cluster_state: None,
         master_key,
         seed: vec![0u8; 64],
-        data_dir: std::path::PathBuf::from("/tmp"),
-        soft_quota_bytes: 0,
-        disk_reserve_bytes: 0,
+        data_dir,
+        soft_quota_bytes,
+        disk_reserve_bytes,
         hard_quota_bytes: 0,
         time_scale: 1,
         swarm_handle: None,
@@ -1997,4 +2005,84 @@ async fn status_shows_waiting_since_and_reason() {
     };
     assert_eq!(data.dr_waiting_since, 1_790_000_123);
     assert_eq!(data.dr_waiting, "catalog blocks not placed");
+}
+
+// ─── F-Q: quota fields of status (holder-i2, holder-i4) ─────────────────────────
+
+async fn status_of(state: &Arc<DaemonState>) -> Box<crate::cli::types::StatusData> {
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, state).await else {
+        panic!("expected Status");
+    };
+    data
+}
+
+/// holder-i2: an unreadable data dir without a soft quota ⇒ `quota_state: unknown` and the
+/// note naming the path; with a soft quota ⇒ `bytes` (the soft quota), the note still said.
+#[tokio::test]
+async fn status_of_an_unreadable_disk_is_unknown_and_names_the_path() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let missing = dir.path().join("gone");
+    let data = status_of(&make_test_state_with(missing.clone(), 0, 0).await).await;
+    assert_eq!(data.quota_state, "unknown");
+    assert!(
+        data.quota_note.contains(&format!(
+            "could not read free space on {}",
+            missing.display()
+        )),
+        "{}",
+        data.quota_note
+    );
+    assert_eq!(data.below_reserve_giving_back_bytes, None);
+
+    let data = status_of(&make_test_state_with(missing, 1000, 0).await).await;
+    assert_eq!(data.quota_state, "bytes");
+    assert_eq!(data.effective_quota_bytes, 1000);
+    assert!(
+        data.quota_note.contains("soft quota"),
+        "{}",
+        data.quota_note
+    );
+}
+
+/// holder-i4: free disk below the reserve ⇒ status says what the tick gives back, also when
+/// the quota is not 0 (held over the gap); a readable disk above the reserve ⇒ nothing.
+#[tokio::test]
+async fn status_below_reserve_says_what_is_given_back_at_any_quota() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let free = crate::daemon::handle::disk_available_bytes(dir.path()).unwrap();
+    // Held is only a DB number here; large, so the disk moving between reads (parallel
+    // tests on the same filesystem) stays small against it.
+    let held = 1024 * 1024 * 1024u64;
+    // reserve = free + held/2 ⇒ Q = free + held − reserve = held/2 > 0, free < reserve.
+    let state = make_test_state_with(dir.path().to_path_buf(), 0, free + held / 2).await;
+    state
+        .db
+        .upsert_holding(&viaticum_core::types::HoldingRecord {
+            source_block_id: viaticum_core::types::SourceBlockId([7; 32]),
+            owner_id: IdentityPub([7; 32]),
+            esi_ranges: vec![(0, 1)],
+            importance: 0.5,
+            total_bytes: held,
+            status: viaticum_core::types::HoldingStatus::Active,
+            received_at: viaticum_core::types::Timestamp(0),
+            delete_requested_at: None,
+            drop_notice_sent_at: None,
+        })
+        .unwrap();
+    let data = status_of(&state).await;
+    assert_eq!(data.quota_state, "bytes");
+    // The disk moves a little between the two reads: Q ≈ held/2, given back ≈ held − 0.85·Q.
+    assert!(data.effective_quota_bytes > 0, "quota is not 0 here");
+    let back = data
+        .below_reserve_giving_back_bytes
+        .expect("below the reserve ⇒ Some");
+    assert!(
+        back >= held / 4,
+        "gives back about the gap and more: {back}"
+    );
+    assert!(back <= held, "never more than held: {back}");
+
+    let data = status_of(&make_test_state_with(dir.path().to_path_buf(), 0, 0).await).await;
+    assert_eq!(data.below_reserve_giving_back_bytes, None);
+    assert!(data.quota_note.is_empty());
 }

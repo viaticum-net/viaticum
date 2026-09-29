@@ -46,24 +46,59 @@ fn disk_available_bytes_is_none_for_missing_path() {
     assert_eq!(disk_available_bytes(&dir.path().join("no/such/dir")), None);
 }
 
-/// holder-i2 / F6: statvfs of the data dir itself reads tmpfs (which the old mount-point
-/// lookup through sysinfo skipped, reporting 0 = "disk full").
+/// holder-i2 / F6: the data dir's OWN filesystem is read. The old sysinfo lookup skipped
+/// tmpfs and fell back to the longest matching mount — usually `/`, the wrong filesystem.
+/// Discriminating: the tmpfs chosen is a different filesystem from `/` whose free space is
+/// more than 64 MiB away from `/`'s, and the result must lie within 1 MiB of the tmpfs's own
+/// `statvfs` read just before and just after. No such mount on this machine ⇒ skipped
+/// loudly, never a silent pass.
 #[cfg(target_os = "linux")]
 #[test]
 fn statvfs_of_data_dir_is_some_on_tmpfs() {
-    // A writable tmpfs mount of this machine (/dev/shm, /run/user/…, /tmp on the server).
+    const MIB: u64 = 1024 * 1024;
+    let free_of = |m: &str| {
+        rustix::fs::statvfs(m)
+            .ok()
+            .map(|st| (st.f_fsid, st.f_bavail.saturating_mul(st.f_frsize)))
+    };
+    let (root_fsid, root_free) = free_of("/").unwrap();
     let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
-    let dir = mounts
+    let mut tmpfs: Vec<&str> = mounts
         .lines()
         .filter_map(|l| {
             let mut f = l.split_whitespace();
             let (_, mount, fstype) = (f.next()?, f.next()?, f.next()?);
             (fstype == "tmpfs").then_some(mount)
         })
-        .find_map(|m| tempfile::tempdir_in(m).ok())
-        .expect("no writable tmpfs mount — cannot check F6");
-    let free = disk_available_bytes(dir.path());
-    assert!(free.is_some_and(|b| b > 0), "tmpfs data dir: {free:?}");
+        .collect();
+    // /dev/shm first: the least written to by parallel tests.
+    tmpfs.sort_by_key(|m| *m != "/dev/shm");
+    let picked = tmpfs.into_iter().find_map(|m| {
+        let (fsid, free) = free_of(m)?;
+        if fsid == root_fsid || free.abs_diff(root_free) <= 64 * MIB {
+            return None;
+        }
+        Some((tempfile::tempdir_in(m).ok()?, m))
+    });
+    let Some((dir, mount)) = picked else {
+        eprintln!(
+            "SKIP statvfs_of_data_dir_is_some_on_tmpfs: no writable tmpfs distinguishable \
+             from / on this machine"
+        );
+        return;
+    };
+    let before = free_of(mount).unwrap().1;
+    let got = disk_available_bytes(dir.path());
+    let after = free_of(mount).unwrap().1;
+    let Some(got) = got else {
+        panic!("tmpfs data dir under {mount}: unreadable");
+    };
+    let (lo, hi) = (before.min(after), before.max(after));
+    assert!(
+        got + MIB >= lo && got <= hi + MIB,
+        "tmpfs data dir under {mount}: got {got} B, its filesystem has {lo}..{hi} B \
+         (/ has {root_free} B)"
+    );
 }
 
 // ============================================================

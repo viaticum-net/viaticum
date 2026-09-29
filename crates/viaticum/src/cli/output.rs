@@ -67,6 +67,16 @@ pub fn render_status(data: &StatusData) -> String {
     if !data.quota_note.is_empty() {
         out.push_str(&format!("  WARNING: {}\n", data.quota_note));
     }
+    // holder-i4
+    match data.below_reserve_giving_back_bytes {
+        Some(0) => out
+            .push_str("  disk below reserve: holding nothing for friends, not taking their data\n"),
+        Some(b) => out.push_str(&format!(
+            "  disk below reserve: giving back {} of friends' data\n",
+            format_bytes(b)
+        )),
+        None => {}
+    }
     // restore-i8: restored files stay until the user moves them out.
     let staging_size = match data.restore_staging_bytes {
         Some(b) => format_bytes(b),

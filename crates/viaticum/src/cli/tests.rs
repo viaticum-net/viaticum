@@ -269,6 +269,7 @@ fn make_status_zero_peers() -> StatusData {
         effective_quota_bytes: 0,
         quota_state: "bytes".into(),
         quota_note: String::new(),
+        below_reserve_giving_back_bytes: None,
         used_bytes: 0,
         pos_total_challenges: 0,
         pos_total_passes: 0,
@@ -407,6 +408,23 @@ fn format_status_zero_quota_is_no_room_not_unlimited() {
     );
 }
 
+/// holder-i4: below the reserve, status says so and how much is given back — at any quota,
+/// not only at 0.
+#[test]
+fn format_status_below_reserve_says_what_is_given_back() {
+    let mut data = make_status_zero_peers();
+    data.effective_quota_bytes = 5 * 1024 * 1024 * 1024;
+    data.below_reserve_giving_back_bytes = Some(3 * 1024 * 1024 * 1024);
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("disk below reserve: giving back 3"),
+        "got: {rendered}"
+    );
+    data.below_reserve_giving_back_bytes = None;
+    let rendered = output::render_status(&data);
+    assert!(!rendered.contains("below reserve"), "got: {rendered}");
+}
+
 /// holder-i2: an unread disk shows `unknown` and the note naming the path.
 #[test]
 fn format_status_unknown_quota_names_the_path() {
@@ -469,6 +487,7 @@ fn format_status_top_peers_printed() {
         effective_quota_bytes: 0,
         quota_state: "bytes".into(),
         quota_note: String::new(),
+        below_reserve_giving_back_bytes: None,
         used_bytes: 0,
         pos_total_challenges: 8,
         pos_total_passes: 7,
@@ -928,6 +947,7 @@ fn cli_response_roundtrips_cbor() {
             effective_quota_bytes: 0,
             quota_state: "bytes".into(),
             quota_note: String::new(),
+            below_reserve_giving_back_bytes: None,
             used_bytes: 1_000_000,
             pos_total_challenges: 0,
             pos_total_passes: 0,

@@ -5,11 +5,15 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use tempfile::TempDir;
 use viaticum_core::budget::{DiskPressure, Quota};
+use viaticum_core::db::Db;
+use viaticum_core::four_r_holder::FourRParams;
 use viaticum_core::types::{HoldingRecord, HoldingStatus, Timestamp};
 
-use super::super::{UnknownDiskWarn, pressure_on_snapshot, unreadable_disk_note};
-use super::{block_id, owner_id};
+use super::super::{UnknownDiskWarn, check_pressure, pressure_on_snapshot, unreadable_disk_note};
+use super::{block_id, holder_master_pub, make_router_and_sender, owner_id, test_key};
+use crate::daemon::four_r_log::tests::capture;
 
 fn holding(b: u8, bytes: u64) -> HoldingRecord {
     HoldingRecord {
@@ -82,4 +86,39 @@ fn unreadable_disk_note_names_the_path_and_the_consequence() {
     assert!(no_soft.contains("not taking friends' data"), "{no_soft}");
     let soft = unreadable_disk_note(p, 1 << 30);
     assert!(soft.contains("soft quota"), "{soft}");
+}
+
+/// holder-i2 wired: the pressure tick over an unreadable data dir WARNs, naming the path —
+/// once for two ticks within a day.
+#[tokio::test]
+async fn check_pressure_on_an_unreadable_disk_warns_once() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let (router, _sender) = make_router_and_sender(&db);
+    let missing = dir.path().join("gone");
+    let mut warn = UnknownDiskWarn::default();
+    let (sink, guard) = capture("viaticum::daemon::holder_cleanup=warn");
+    for _ in 0..2 {
+        check_pressure(
+            &db,
+            dir.path(),
+            &router,
+            holder_master_pub(),
+            0,
+            0,
+            &missing,
+            0,
+            1,
+            &test_key(),
+            &FourRParams::default(),
+            &mut warn,
+        )
+        .await
+        .unwrap();
+    }
+    drop(guard);
+    let text = sink.text();
+    let needle = format!("could not read free space on {}", missing.display());
+    assert_eq!(text.matches(&needle).count(), 1, "{text}");
+    assert!(text.contains("WARN"), "{text}");
 }
