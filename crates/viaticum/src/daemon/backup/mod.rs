@@ -10,7 +10,9 @@
 //   events.rs   -- process_event helpers: handle_deleted, handle_added_or_modified
 //   pipeline.rs -- compress/encrypt/encode/write-symbols inner pipeline
 //   packing.rs  -- PackIndex format: build_plaintext, parse_pack_index
-//   tests.rs    -- all test scenarios
+//   tests.rs    -- test scenarios
+//   tests_current.rs -- L1: a path points at its current content; packing does
+//                       not abort on a vanished or changed file (backup-i9, i23)
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -22,7 +24,9 @@ use viaticum_core::erasure::ErasureEncoder;
 use viaticum_core::placement::HolderCandidate;
 use viaticum_core::types::{DeviceId, FileCategory, FileId, SourceBlockId};
 
-use pipeline::{BlockTypeTag, flush_queue_inner, run_pipeline, update_backed_up_at};
+use pipeline::{
+    BlockTypeTag, ReadAtFlush, flush_queue_inner, read_at_flush, run_pipeline, update_backed_up_at,
+};
 
 pub mod events;
 pub mod packing;
@@ -30,6 +34,8 @@ pub mod pipeline;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_current;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -90,10 +96,6 @@ pub struct BackupConfig {
     pub device_id: DeviceId,
     /// Holder candidates override (tests only). Production code passes `vec![]`.
     pub mock_holders: Vec<HolderCandidate>,
-    /// Optional cluster state for dedup check (multi-device).
-    /// If None: use inline DB scan (single-device backward compat).
-    pub cluster_state:
-        Option<std::sync::Arc<std::sync::Mutex<viaticum_core::cluster::ClusterState>>>,
     /// Per-directory importance overrides from config.
     /// Used to look up the importance of a file when creating a backup event.
     /// When empty, DEFAULT_IMPORTANCE (0.5) is used for all files.
@@ -133,7 +135,6 @@ impl Default for BackupConfig {
             epoch_key: [0u8; 32],
             device_id: DeviceId([0u8; 32]),
             mock_holders: vec![],
-            cluster_state: None,
             watch_configs: vec![],
             time_scale: 1,
             mock_offer_budget_gb: None,
@@ -527,9 +528,17 @@ impl BackupCoordinator {
             return Ok(vec![]);
         }
 
-        let candidates = self.get_candidates(authenticated)?;
+        let candidates = match self.get_candidates(authenticated) {
+            Ok(c) => c,
+            Err(e) => {
+                self.queues.entry(category).or_default().extend(selected);
+                return Err(e);
+            }
+        };
         let mut selected_queue = selected;
 
+        let db = self.db.clone();
+        let in_network = |h: &[u8; 32]| content_in_network(&db, h);
         let results = flush_queue_inner(
             &self.db,
             &self.config,
@@ -538,24 +547,35 @@ impl BackupCoordinator {
             total_all,
             force,
             &candidates,
-        )?;
+            &in_network,
+        );
+        // backup-i23: whatever the flush did not pack (a pipeline error, or the
+        // MIN_BATCH_BYTES skip) stays queued.
+        self.queues
+            .entry(category)
+            .or_default()
+            .append(&mut selected_queue);
 
         // A4: backup no longer offers symbols (the WorkPipeline worker is the sole
         // offerer), so there is no per-holder offer count to tally here. See the
         // doc on `offered_this_cycle`.
 
-        Ok(results)
+        results
     }
 
     /// Flush all categories.
     /// `authenticated`: snapshot of currently-authenticated peer IDs passed through to
     /// `flush_queue` and `get_candidates`. Taken before `block_in_place` in `run()`.
+    ///
+    /// backup-i23: an error in one category is logged and the other categories still
+    /// flush; the first error is returned at the end.
     pub fn flush_all(
         &mut self,
         force: bool,
         authenticated: &std::collections::HashSet<DeviceId>,
     ) -> anyhow::Result<Vec<PipelineResult>> {
         let mut all_results = Vec::new();
+        let mut first_err: Option<anyhow::Error> = None;
         let categories = [
             FileCategory::Photo,
             FileCategory::Document,
@@ -563,15 +583,29 @@ impl BackupCoordinator {
             FileCategory::Other,
         ];
         for cat in categories {
-            let mut results = self.flush_queue(cat, force, authenticated)?;
-            all_results.append(&mut results);
+            match self.flush_queue(cat, force, authenticated) {
+                Ok(mut results) => all_results.append(&mut results),
+                Err(e) => {
+                    tracing::error!(
+                        category = ?cat,
+                        "flush error; files stay queued, other categories go on: {e:#}"
+                    );
+                    first_err.get_or_insert(e);
+                }
+            }
         }
-        Ok(all_results)
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(all_results),
+        }
     }
 
     /// Process one large file (>= source_block_size) into its own source block.
     ///
     /// Uses SourceBlockType::Single. Called directly for large files during process_event.
+    /// The second read follows the flush rule (backup-i23, [`read_at_flush`]): a file
+    /// that vanished, or now holds content already in the network, is skipped
+    /// (`Ok(None)`); a changed one is packed with the hash of the bytes read.
     pub fn process_large_file(
         &mut self,
         path: &str,
@@ -579,9 +613,16 @@ impl BackupCoordinator {
         content_hash: [u8; 32],
         importance: f64,
         candidates: &[HolderCandidate],
-    ) -> anyhow::Result<PipelineResult> {
-        let file_bytes =
-            std::fs::read(path).map_err(|e| anyhow::anyhow!("read large file {}: {e}", path))?;
+    ) -> anyhow::Result<Option<PipelineResult>> {
+        let db = self.db.clone();
+        let in_network = |h: &[u8; 32]| content_in_network(&db, h);
+        let (file_bytes, content_hash) = match read_at_flush(path, &content_hash, &in_network) {
+            ReadAtFlush::Pack {
+                bytes,
+                content_hash,
+            } => (bytes, content_hash),
+            ReadAtFlush::Skip => return Ok(None),
+        };
 
         let qf = QueuedFile {
             path: path.to_string(),
@@ -603,8 +644,8 @@ impl BackupCoordinator {
             &[],
             importance,
         )?;
-        update_backed_up_at(&self.db, &batch, result.source_block_id, result.k, result.t)?;
-        Ok(result)
+        update_backed_up_at(&self.db, &batch, result.source_block_id, result.k, result.t);
+        Ok(Some(result))
     }
 
     /// Snapshot the set of currently-authenticated peer IDs from the swarm.
@@ -684,13 +725,12 @@ impl BackupCoordinator {
                     tracing::debug!("idle flush triggered");
                     let auth_snap = self.snapshot_authenticated_peers().await;
                     let flush_result = tokio::task::block_in_place(|| self.flush_all(true, &auth_snap));
-                    match flush_result {
-                        Ok(_results) => {
-                            // Wave 11b: delivery is the worker's job. Wake it now
-                            // instead of waiting up to 60s (tick_interval).
-                            self.notify_work_pipeline();
-                        }
-                        Err(e) => tracing::error!("idle flush error: {e}"),
+                    // Wave 11b: delivery is the worker's job. Wake it now instead of
+                    // waiting up to 60s (tick_interval) — also after an error, since
+                    // the other categories may have produced blocks (backup-i23).
+                    self.notify_work_pipeline();
+                    if let Err(e) = flush_result {
+                        tracing::error!("idle flush error: {e:#}");
                     }
                     self.persist_cycle_budget();
                 }
@@ -698,11 +738,9 @@ impl BackupCoordinator {
                     tracing::debug!("fallback flush triggered");
                     let auth_snap = self.snapshot_authenticated_peers().await;
                     let flush_result = tokio::task::block_in_place(|| self.flush_all(true, &auth_snap));
-                    match flush_result {
-                        Ok(_results) => {
-                            self.notify_work_pipeline();
-                        }
-                        Err(e) => tracing::error!("fallback flush error: {e}"),
+                    self.notify_work_pipeline();
+                    if let Err(e) = flush_result {
+                        tracing::error!("fallback flush error: {e:#}");
                     }
                     self.persist_cycle_budget();
                 }
@@ -879,3 +917,16 @@ impl BackupCoordinator {
 }
 // Note: deliver_symbols, deliver_to_holder, deliver_to_holder_direct, cleanup_block_dir
 // were removed in Wave 11b. Symbol delivery is now the WorkPipeline worker's responsibility.
+
+/// "Is this content already backed up?" for the flush-time check (backup-i23): a dedup
+/// source exists. A DB error answers "no" (WARN): the file is then packed — traffic,
+/// never a skipped backup.
+fn content_in_network(db: &Db, content_hash: &[u8; 32]) -> bool {
+    match events::select_dedup_source(db, content_hash, None) {
+        Ok(src) => src.is_some(),
+        Err(e) => {
+            tracing::warn!("flush: dedup lookup failed, packing the file: {e:#}");
+            false
+        }
+    }
+}

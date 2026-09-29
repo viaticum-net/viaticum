@@ -667,6 +667,40 @@ fn encode_raw_is_holder_independent() {
     }
 }
 
+/// repair-i9: a plan with non-contiguous ESIs (own range + fresh numbers) is encoded with
+/// one encoder build; every symbol must equal what a per-range `encode_raw` gives.
+#[test]
+fn encode_raw_ranges_equals_encode_raw_per_range_in_range_order() {
+    let enc = encoder();
+    let size = 3 * 65_535usize;
+    let source = test_data(size);
+    let params = ErasureParams::compute(size as u64, 0.5).unwrap();
+    assert_eq!(
+        params.k, 3,
+        "fixture: ranges must span source and repair ESIs"
+    );
+    // Source ESIs (0..3) and repair ESIs (≥ 3), out of order, one empty range.
+    let ranges = [(5u32, 3u32), (1, 2), (9, 0), (0, 1)];
+
+    let together = enc.encode_raw_ranges(&source, &params, &ranges).unwrap();
+
+    let one_by_one: Vec<Symbol> = ranges
+        .iter()
+        .flat_map(|&(start, count)| enc.encode_raw(&source, &params, start, count).unwrap())
+        .collect();
+    let esis: Vec<u32> = together.iter().map(|s| s.esi).collect();
+    assert_eq!(
+        esis,
+        vec![5, 6, 7, 1, 2, 0],
+        "range order, ascending within a range"
+    );
+    assert_eq!(together.len(), one_by_one.len());
+    for (a, b) in together.iter().zip(one_by_one.iter()) {
+        assert_eq!(a.esi, b.esi);
+        assert_eq!(a.data, b.data, "ESI {} bytes differ", a.esi);
+    }
+}
+
 #[test]
 fn encode_deterministic_two_calls() {
     let enc = encoder();

@@ -328,7 +328,7 @@ fn unknown_trust(_: &IdentityPub) -> f64 {
 #[test]
 fn evaluate_pressure_normal() {
     // quota=100 GiB, used=80 GiB → free_ratio=0.20 → Normal
-    let result = evaluate_pressure(gib(100), 0, gib(80), &[], unknown_trust, 0);
+    let result = evaluate_pressure(Quota::Bytes(gib(100)), 0, gib(80), &[], unknown_trust, 0);
     assert_eq!(result.pressure, DiskPressure::Normal);
     assert!(result.immediate_evictions.is_empty());
     assert!(result.drop_notices.is_empty());
@@ -338,7 +338,7 @@ fn evaluate_pressure_normal() {
 #[test]
 fn evaluate_pressure_soft() {
     // quota=100 GiB, used=88 GiB → free_ratio=0.12 → Soft
-    let result = evaluate_pressure(gib(100), 0, gib(88), &[], unknown_trust, 0);
+    let result = evaluate_pressure(Quota::Bytes(gib(100)), 0, gib(88), &[], unknown_trust, 0);
     assert_eq!(result.pressure, DiskPressure::Soft);
     assert!(result.immediate_evictions.is_empty());
     assert!(result.drop_notices.is_empty());
@@ -389,7 +389,14 @@ fn evaluate_pressure_hard_evicts_lowest_priority() {
         }
     };
 
-    let result = evaluate_pressure(gib(100), 0, gib(97), &holdings, trust_fn, now_secs);
+    let result = evaluate_pressure(
+        Quota::Bytes(gib(100)),
+        0,
+        gib(97),
+        &holdings,
+        trust_fn,
+        now_secs,
+    );
     assert_eq!(result.pressure, DiskPressure::Hard);
 
     // Evict order: A (priority=0.05), C (priority=0.25), B (priority=0.81)
@@ -422,13 +429,13 @@ fn evaluate_pressure_hard_evicts_lowest_priority() {
 #[test]
 fn should_reject_offers_above_soft() {
     // quota=100 GiB, used=86 GiB → free_ratio=0.14 < 0.15 → true
-    assert!(should_reject_offers(gib(100), gib(86)));
+    assert!(should_reject_offers(Quota::Bytes(gib(100)), gib(86)));
 }
 
 #[test]
 fn should_reject_offers_unlimited_quota() {
-    // quota=0 → unlimited → false
-    assert!(!should_reject_offers(0, gib(999)));
+    // Only the explicit Unlimited (tests) never rejects; 0 is not "unlimited" (holder-i1).
+    assert!(!should_reject_offers(Quota::Unlimited, gib(999)));
 }
 
 // ============================================================
@@ -437,46 +444,46 @@ fn should_reject_offers_unlimited_quota() {
 
 #[test]
 fn compute_effective_quota_no_soft_cap() {
-    // soft_quota=0 (unlimited), disk_free=100 GiB, reserve=20 GiB → 80 GiB
-    let result = compute_effective_quota(0, gib(100), gib(20));
-    assert_eq!(result, gib(80));
+    // soft_quota=0 (no soft cap), disk_free=100 GiB, reserve=20 GiB → 80 GiB
+    let result = compute_effective_quota(0, Some(gib(100)), 0, gib(20));
+    assert_eq!(result, Quota::Bytes(gib(80)));
 }
 
 #[test]
 fn compute_effective_quota_soft_cap_is_tighter() {
     // soft_quota=50 GiB, disk_free=200 GiB, reserve=20 GiB
     // available_from_disk=180 GiB, effective=min(50,180)=50 GiB
-    let result = compute_effective_quota(gib(50), gib(200), gib(20));
-    assert_eq!(result, gib(50));
+    let result = compute_effective_quota(gib(50), Some(gib(200)), 0, gib(20));
+    assert_eq!(result, Quota::Bytes(gib(50)));
 }
 
 #[test]
 fn compute_effective_quota_disk_free_is_tighter() {
     // soft_quota=100 GiB, disk_free=30 GiB, reserve=20 GiB
     // available_from_disk=10 GiB, effective=min(100,10)=10 GiB
-    let result = compute_effective_quota(gib(100), gib(30), gib(20));
-    assert_eq!(result, gib(10));
+    let result = compute_effective_quota(gib(100), Some(gib(30)), 0, gib(20));
+    assert_eq!(result, Quota::Bytes(gib(10)));
 }
 
 #[test]
 fn compute_effective_quota_disk_critically_full() {
     // soft_quota=0, disk_free=10 GiB, reserve=20 GiB → saturating_sub → 0
-    let result = compute_effective_quota(0, gib(10), gib(20));
-    assert_eq!(result, 0);
+    let result = compute_effective_quota(0, Some(gib(10)), 0, gib(20));
+    assert_eq!(result, Quota::Bytes(0));
 }
 
 #[test]
 fn compute_effective_quota_soft_cap_zero_and_disk_large() {
     // soft_quota=0, disk_free=1000 GiB, reserve=20 GiB → 980 GiB
-    let result = compute_effective_quota(0, gib(1000), gib(20));
-    assert_eq!(result, gib(980));
+    let result = compute_effective_quota(0, Some(gib(1000)), 0, gib(20));
+    assert_eq!(result, Quota::Bytes(gib(980)));
 }
 
 #[test]
 fn compute_effective_quota_exact_reserve_boundary() {
     // soft_quota=0, disk_free=20 GiB, reserve=20 GiB → 20-20=0
-    let result = compute_effective_quota(0, gib(20), gib(20));
-    assert_eq!(result, 0);
+    let result = compute_effective_quota(0, Some(gib(20)), 0, gib(20));
+    assert_eq!(result, Quota::Bytes(0));
 }
 
 // ============================================================
@@ -498,7 +505,14 @@ fn evaluate_pressure_hard_quota_prevents_eviction() {
         Timestamp(now_secs),
     )];
     let trust_fn = |_: &IdentityPub| -> f64 { 0.5 };
-    let result = evaluate_pressure(gib(100), gib(100), gib(97), &holdings, trust_fn, now_secs);
+    let result = evaluate_pressure(
+        Quota::Bytes(gib(100)),
+        gib(100),
+        gib(97),
+        &holdings,
+        trust_fn,
+        now_secs,
+    );
     assert_eq!(result.pressure, DiskPressure::Hard);
     assert!(
         result.immediate_evictions.is_empty(),
@@ -535,7 +549,14 @@ fn evaluate_pressure_hard_quota_partial_eviction() {
         ),
     ];
     let trust_fn = |id: &IdentityPub| -> f64 { if id.0 == [1u8; 32] { 0.5 } else { 0.9 } };
-    let result = evaluate_pressure(gib(100), gib(90), gib(97), &holdings, trust_fn, now_secs);
+    let result = evaluate_pressure(
+        Quota::Bytes(gib(100)),
+        gib(90),
+        gib(97),
+        &holdings,
+        trust_fn,
+        now_secs,
+    );
     assert_eq!(result.pressure, DiskPressure::Hard);
     assert_eq!(
         result.immediate_evictions.len(),
@@ -590,7 +611,14 @@ fn evaluate_pressure_hard_quota_zero_disables_floor() {
             0.5
         }
     };
-    let result = evaluate_pressure(gib(100), 0, gib(97), &holdings, trust_fn, now_secs);
+    let result = evaluate_pressure(
+        Quota::Bytes(gib(100)),
+        0,
+        gib(97),
+        &holdings,
+        trust_fn,
+        now_secs,
+    );
     assert_eq!(result.pressure, DiskPressure::Hard);
     assert_eq!(
         result.immediate_evictions.len(),
@@ -652,7 +680,14 @@ fn eviction_removes_lowest_priority_first() {
     // quota=100 GiB, used=97 GiB → free_ratio=0.03 → Hard
     // deficit = 0.15*100 - 3 = 12 GiB
     // H_low (8 GiB) + H_mid (8 GiB) = 16 GiB ≥ 12 → both evicted, H_high spared
-    let result = evaluate_pressure(gib(100), 0, gib(97), &holdings, trust_fn, now_secs);
+    let result = evaluate_pressure(
+        Quota::Bytes(gib(100)),
+        0,
+        gib(97),
+        &holdings,
+        trust_fn,
+        now_secs,
+    );
     assert_eq!(result.pressure, DiskPressure::Hard);
 
     // H_low must be first (lowest priority evicted first)
@@ -734,7 +769,7 @@ fn evaluate_pressure_hard_produces_drop_notice_for_buffer_zone() {
         }
     };
 
-    let result = evaluate_pressure(1000, 0, 970, &holdings, trust_fn, now_secs);
+    let result = evaluate_pressure(Quota::Bytes(1000), 0, 970, &holdings, trust_fn, now_secs);
 
     assert_eq!(result.pressure, DiskPressure::Hard);
 
@@ -779,11 +814,11 @@ fn evaluate_pressure_hard_produces_drop_notice_for_buffer_zone() {
 
 #[test]
 fn should_reject_offers_with_effective_quota() {
-    // soft_quota=80 GiB, disk_free=50 GiB, reserve=20 GiB
-    // effective = min(80, 30) = 30 GiB
-    // used=26 GiB, free_ratio=(30-26)/30 ≈ 0.133 < 0.15 → true
-    let effective = compute_effective_quota(gib(80), gib(50), gib(20));
-    assert_eq!(effective, gib(30));
+    // soft_quota=80 GiB, disk_free=24 GiB (holdings already on disk), used=26 GiB,
+    // reserve=20 GiB → effective = min(80, 24 + 26 − 20) = 30 GiB
+    // free_ratio=(30-26)/30 ≈ 0.133 < 0.15 → true
+    let effective = compute_effective_quota(gib(80), Some(gib(24)), gib(26), gib(20));
+    assert_eq!(effective, Quota::Bytes(gib(30)));
     assert!(should_reject_offers(effective, gib(26)));
 }
 
@@ -851,3 +886,5 @@ fn earned_gb_negative_input_treated_as_zero() {
     assert_eq!(estimate.earned_gb, 0.0);
     assert!((estimate.total_gb - FREE_TIER_GB).abs() < 1e-9);
 }
+
+mod quota_states;

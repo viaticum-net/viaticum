@@ -4639,6 +4639,7 @@ async fn a_notice_inside_the_owners_delete_cooldown_is_still_the_friends_drop() 
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     let actions = viaticum_core::deletion::DeletionEngine::new().process_cooldowns(
         &[file],
@@ -4666,6 +4667,8 @@ mod four_r_shadow;
 mod four_r_shadow_wedge;
 // R1-u-H1 (backup-i19): the SymbolTransfer reply matches the holder's disk; offers per device.
 mod symbol_transfer_reply;
+// F-Q: the offer rule over the quota states (holder-i1..i3).
+mod quota_states;
 
 // ─── pos-i5-a: a holder answers only a fresh challenge (replay guard) ───────────
 

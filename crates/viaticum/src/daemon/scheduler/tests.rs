@@ -618,6 +618,7 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).unwrap();
 
@@ -1009,6 +1010,7 @@ async fn already_deleting_holder_is_not_republished() {
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).unwrap();
 
@@ -1188,6 +1190,7 @@ fn make_multi_holder_file(
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     }
 }
 
@@ -1592,6 +1595,7 @@ async fn delete_not_marked_sent_when_publish_zero_acks() {
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).unwrap();
 
@@ -1711,7 +1715,7 @@ async fn cleanup_block_removes_db_record() {
     let data_dir = tempfile::TempDir::new().expect("tempdir");
 
     let block_id = make_block_id(0xC1);
-    let holder_id = make_identity(0xC2);
+    let holder_id = make_identity(0xB2);
     let device_id = DeviceId([0xC3u8; 32]);
 
     // File: single device, fully deleted at time 0.
@@ -1732,6 +1736,7 @@ async fn cleanup_block_removes_db_record() {
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).unwrap();
 
@@ -2317,6 +2322,87 @@ async fn pos_challenge_stored_in_mailbox_with_correct_ttl() {
     );
 }
 
+/// repair-i9 made multi-range placements normal (own range + fresh numbers). The owner's
+/// expected PoS hash for a 2-range placement (source and repair ESIs, with a gap) must be the
+/// chain hash of exactly the holder's bound symbols — the union is encoded once
+/// (`encode_raw_ranges`) and every range's symbols must be in it.
+#[tokio::test]
+async fn issue_due_challenges_for_two_range_placement_expects_hash_of_bound_symbols() {
+    use viaticum_core::erasure::ErasureEncoder;
+    use viaticum_core::pos::compute_chain_hash;
+
+    let db = Db::open_in_memory().expect("db open");
+    let data_dir = tempfile::TempDir::new().unwrap();
+    // 0xB2: a byte pattern that is a valid ed25519 key, so the mailbox router can derive a
+    // PeerId and publish (e.g. [0xC2; 32] is not — the challenge would never go out).
+    let holder_id = make_identity(0xB2);
+    let block_id = seed_retained_pos_block(data_dir.path(), &db, 0xB1);
+    let ranges = vec![(2u32, 3u32), (15, 2)];
+    let mut placement = make_placement(block_id, holder_id);
+    placement.esi_ranges = ranges.clone();
+    db.upsert_placement(&placement).unwrap();
+    db.upsert_peer(&make_peer_record(holder_id)).unwrap();
+
+    let recording_sender = Arc::new(RecordingMailboxSender::new());
+    let router = Arc::new(MailboxRouter::with_sender(
+        Arc::clone(&recording_sender) as Arc<dyn MailboxNetworkSender>,
+        db.clone(),
+    ));
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let pending = make_pending_challenges();
+    let scheduler = Scheduler::new(
+        db.clone(),
+        SchedulerConfig {
+            pos_interval_secs: 3600,
+            timeout_check_secs: 3600,
+            time_scale: 1,
+            event_log_retain_rows: 100_000,
+            pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+        },
+        repair_tx,
+        pending.clone(),
+        router,
+        dummy_master_pub(),
+        ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        data_dir.path().to_path_buf(),
+    );
+
+    scheduler
+        .issue_due_challenges()
+        .await
+        .expect("issue_due_challenges");
+
+    let guard = pending.lock().await;
+    let issued = guard
+        .get(&(block_id, holder_id))
+        .expect("challenge issued for the 2-range placement");
+    assert_eq!(issued.esi_ranges, ranges);
+
+    // What the holder stores: each range encoded on its own, bound to the holder.
+    let encoder = RaptorQEncoder::new();
+    let blob = pos_block_bytes(0xB1);
+    let params = make_source_block_record(block_id).erasure_params();
+    let mut bound: Vec<(u32, Vec<u8>)> = ranges
+        .iter()
+        .flat_map(|&(start, count)| encoder.encode_raw(&blob, &params, start, count).unwrap())
+        .map(|raw| {
+            let s = encoder.apply_binding(raw, &block_id, &holder_id);
+            (s.esi, s.data)
+        })
+        .collect();
+    bound.sort_by_key(|(esi, _)| *esi);
+    assert_eq!(bound.len(), 5);
+    let refs: Vec<(u32, &[u8])> = bound.iter().map(|(e, d)| (*e, d.as_slice())).collect();
+    let want = compute_chain_hash(&issued.challenge_id, &refs).unwrap();
+    assert_eq!(
+        issued.expected_chain_hash, want,
+        "expected hash = chain hash of the holder's 5 bound symbols over both ranges"
+    );
+}
+
 // ─── T-6 test: PosResponse via mailbox resolves pending challenge ─────────────
 
 /// Owner side: handle_pos_response_from_mailbox resolves a pending challenge.
@@ -2329,7 +2415,7 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
 
     let db = Db::open_in_memory().expect("db open");
     let block_id = make_block_id(0xC1);
-    let holder_id = make_identity(0xC2);
+    let holder_id = make_identity(0xB2);
     let challenge_id = [0x42u8; 16];
 
     // Insert placement and peer record.

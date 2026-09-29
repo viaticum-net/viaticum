@@ -59,10 +59,14 @@ fn esi_ranges_intersect(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
 
 /// Pick the placement a DropNotice of a holder MASTER is about (Д-DN1-8, review W-1). The notice
 /// names no device but carries its signed `esi_ranges`, and live placements of one block get
-/// disjoint ranges (`work_pipeline::compute_esi_offset`), so:
+/// disjoint ranges (`work_pipeline::offer_plan::esi_cursor`), so:
 ///   1. a placement whose ESIs intersect the notice's — preferring one the notice can still
-///      change if several intersect (a Lost placement's old range may be reused by a later one);
-///   2. else the first placement the notice can change;
+///      change if several intersect (repair never reuses a Lost placement's numbers for a live
+///      block — the cursor counts every row, repair-i8 — so several rows intersect only after a
+///      block was deleted and its content added back);
+///   2. else the first placement the notice can change (a stale notice about a Lost range that
+///      the same holder was since re-placed on with fresh numbers lands here and marks the new
+///      placement Lost — residual door until Р-3, C-SP §3.7, repair-i10 addendum);
 ///   3. else the first found.
 ///
 /// Rule 1 is what keeps "advance notice, then the final notice a week later" on ONE device:
@@ -1181,11 +1185,16 @@ impl Processor {
     ///
     /// Returns `true` = accept, `false` = reject.
     ///
-    /// Three-stage rejection (in order; stages, order and arithmetic unchanged by В-0b):
+    /// Three-stage rejection (in order):
     ///   1. Hard quota: held_bytes >= hard_quota → reject (absolute ceiling)
-    ///   2. Soft pressure: free_ratio < 15% → reject (prevent reaching hard pressure)
+    ///   2. Soft pressure: free_ratio < 15%, no room at all (`Bytes(0)`, holder-i1) or an
+    ///      unknown quota (holder-i2) → reject
     ///   3. Final fill: held_bytes + offer_bytes > effective → reject (would exceed cap)
+    ///
+    /// `held_bytes` of the ONE snapshot is both the quota's `used_holdings` and the rule's
+    /// `used` (holder-i3).
     pub(crate) fn decide_symbol_offer_on(&self, offer_bytes: u64, s: &OfferSnapshot) -> bool {
+        use viaticum_core::budget::Quota;
         let held_bytes = s.held_bytes;
 
         // Hard quota: absolute ceiling — always reject above this.
@@ -1193,11 +1202,12 @@ impl Processor {
             return false;
         }
 
-        // Effective soft quota: min(config_soft_quota, disk_free - reserve).
-        // When soft_quota=0, uses all available disk minus reserve.
+        // Effective quota: min(soft, disk_free + held − reserve); soft alone when the disk
+        // is unreadable; Unknown when neither is known.
         let effective = viaticum_core::budget::compute_effective_quota(
             self.soft_quota_bytes,
             s.disk_free,
+            held_bytes,
             self.disk_reserve_bytes,
         );
 
@@ -1208,10 +1218,11 @@ impl Processor {
             return false;
         }
 
-        if held_bytes + offer_bytes > effective {
-            return false;
+        match effective {
+            Quota::Bytes(n) => held_bytes.saturating_add(offer_bytes) <= n,
+            Quota::Unlimited => true,
+            Quota::Unknown => false,
         }
-        true
     }
 
     /// [`Processor::decide_symbol_offer_on`] over a fresh snapshot (the pre-В-0b API; tests).

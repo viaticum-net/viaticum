@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tempfile::TempDir;
-use viaticum_core::budget::{compute_effective_quota, should_reject_offers};
+use viaticum_core::budget::{Quota, compute_effective_quota, should_reject_offers};
 use viaticum_core::constants::SYMBOL_SIZE;
 use viaticum_core::db::Db;
 use viaticum_core::four_r_holder::{FourRParams, HolderAdmit, HolderReject, OfferIn};
@@ -18,20 +18,28 @@ use viaticum_core::types::{
 use super::super::offer_shadow::{OfferShadowJob, OfferSnapshot, run_offer_shadow};
 use super::{make_block_id, make_processor_with_quota};
 
-/// The pre-В-0b three-stage rule, restated verbatim as the reference (hard ceiling → soft
-/// pressure → final fill), with the snapshot's numbers in place of the reads it used to do.
-fn old_rule(soft: u64, hard: u64, reserve: u64, held: u64, disk_free: u64, offer: u64) -> bool {
+/// The three-stage rule (hard ceiling → soft pressure → final fill), restated as the
+/// reference with the snapshot's numbers; F-Q quota states (holder-i1..i3).
+fn old_rule(
+    soft: u64,
+    hard: u64,
+    reserve: u64,
+    held: u64,
+    disk_free: Option<u64>,
+    offer: u64,
+) -> bool {
     if hard > 0 && held >= hard {
         return false;
     }
-    let effective = compute_effective_quota(soft, disk_free, reserve);
+    let effective = compute_effective_quota(soft, disk_free, held, reserve);
     if should_reject_offers(effective, held) {
         return false;
     }
-    if held + offer > effective {
-        return false;
+    match effective {
+        Quota::Bytes(n) => held + offer <= n,
+        Quota::Unlimited => true,
+        Quota::Unknown => false,
     }
-    true
 }
 
 /// D-3a: over a grid of quota cases, the rule on a snapshot answers exactly as the old
@@ -46,7 +54,7 @@ async fn decide_on_a_snapshot_equals_decide_symbol_offer_for_every_quota_case() 
         for hard in [0u64, 500, 900] {
             for reserve in [0u64, 100] {
                 for held in [0u64, 400, 849, 850, 900, 960, 1000, 5000] {
-                    for disk_free in [0u64, 50, 1100, 1 << 30] {
+                    for disk_free in [None, Some(0u64), Some(50), Some(1100), Some(1 << 30)] {
                         for offer in [1u64, 100, 151, 65_535] {
                             p.soft_quota_bytes = soft;
                             p.hard_quota_bytes = hard;
@@ -59,7 +67,7 @@ async fn decide_on_a_snapshot_equals_decide_symbol_offer_for_every_quota_case() 
                             let want = old_rule(soft, hard, reserve, held, disk_free, offer);
                             assert_eq!(
                                 got, want,
-                                "soft={soft} hard={hard} reserve={reserve} held={held} free={disk_free} offer={offer}"
+                                "soft={soft} hard={hard} reserve={reserve} held={held} free={disk_free:?} offer={offer}"
                             );
                             n += 1;
                             accepts += usize::from(got);
@@ -249,7 +257,7 @@ fn shadow_job(db: &Db, owner: IdentityPub, key_before: Option<HoldingRecord>) ->
         },
         snap: OfferSnapshot {
             held_bytes: 0,
-            disk_free: 1 << 40,
+            disk_free: Some(1 << 40),
         },
         key_before,
         soft: 1 << 30,

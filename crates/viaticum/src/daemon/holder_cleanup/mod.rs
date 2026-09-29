@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use viaticum_core::budget::{DiskPressure, evaluate_pressure};
+use viaticum_core::budget::{
+    DiskPressure, PressureResult, Quota, compute_effective_quota, evaluate_pressure,
+};
 use viaticum_core::cluster::master_identity;
 use viaticum_core::constants::{KI, KP, S_CLAMP_MAX, S_CLAMP_MIN};
 use viaticum_core::db::Db;
@@ -23,7 +25,7 @@ use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry, class_c
 use viaticum_core::messages::{
     SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, build_signed_symbol_drop_notice, to_cbor,
 };
-use viaticum_core::types::{IdentityPub, Timestamp, hex_encode};
+use viaticum_core::types::{HoldingRecord, IdentityPub, Timestamp, hex_encode};
 
 use crate::daemon::mailbox::routing::MailboxRouter;
 
@@ -79,6 +81,7 @@ pub async fn run(
 
     // Derive holder's own master IdentityPub for use as `sender` in mailbox entries.
     let holder_master_pub = master_identity(&master_signing_key);
+    let mut disk_warn = UnknownDiskWarn::default();
 
     loop {
         tokio::select! {
@@ -99,6 +102,7 @@ pub async fn run(
                     time_scale,
                     &master_signing_key,
                     &four_r,
+                    &mut disk_warn,
                 ).await {
                     error!("holder_cleanup: check_pressure error: {e}");
                 }
@@ -283,6 +287,68 @@ async fn cleanup_drop_notices(
     Ok(())
 }
 
+/// holder-i2: the "could not read free space" WARN, at most once per day on the monotonic
+/// clock (a wall-clock jump neither repeats nor silences it).
+#[derive(Debug, Default)]
+pub(crate) struct UnknownDiskWarn {
+    last: Option<std::time::Instant>,
+}
+
+impl UnknownDiskWarn {
+    const PERIOD: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+    /// True — and remembered — when no WARN was given in the last 24 h.
+    pub(crate) fn due(&mut self, now: std::time::Instant) -> bool {
+        match self.last {
+            Some(t) if now.saturating_duration_since(t) < Self::PERIOD => false,
+            _ => {
+                self.last = Some(now);
+                true
+            }
+        }
+    }
+}
+
+/// holder-i2: what the node says when it could not read the free space of its data dir
+/// (daemon WARN and `status`).
+pub(crate) fn unreadable_disk_note(data_dir: &Path, soft_quota_bytes: u64) -> String {
+    let what = if soft_quota_bytes > 0 {
+        "holding friends' data up to the soft quota only"
+    } else {
+        "not taking friends' data (set storage.soft_quota_gb to hold up to a fixed size)"
+    };
+    format!(
+        "could not read free space on {}; {what}",
+        data_dir.display()
+    )
+}
+
+/// One pressure decision over ONE holdings snapshot (holder-i3, line A): `used` is summed
+/// once from `holdings` and is both the quota's `used_holdings` and the pressure's
+/// `used_bytes` — never two reads, or the F7 equilibrium drifts.
+pub(crate) fn pressure_on_snapshot(
+    holdings: &[HoldingRecord],
+    disk_free: Option<u64>,
+    soft_quota_bytes: u64,
+    hard_quota_bytes: u64,
+    disk_reserve_bytes: u64,
+    trust_fn: impl Fn(&IdentityPub) -> f64,
+    now_secs: u64,
+) -> (u64, Quota, PressureResult) {
+    let used_bytes: u64 = holdings.iter().map(|h| h.total_bytes).sum();
+    let quota =
+        compute_effective_quota(soft_quota_bytes, disk_free, used_bytes, disk_reserve_bytes);
+    let result = evaluate_pressure(
+        quota,
+        hard_quota_bytes,
+        used_bytes,
+        holdings,
+        trust_fn,
+        now_secs,
+    );
+    (used_bytes, quota, result)
+}
+
 /// Evaluate disk pressure and evict if necessary.
 ///
 /// T-7: advance DropNotice entries via mailbox, batched per owner.
@@ -303,18 +369,19 @@ async fn check_pressure(
     time_scale: u64,
     master_signing_key: &ed25519_dalek::SigningKey,
     four_r: &FourRParams,
+    disk_warn: &mut UnknownDiskWarn,
 ) -> anyhow::Result<()> {
     let now = Timestamp::now();
     let holdings = db.list_all_holdings()?;
-    let used_bytes: u64 = holdings.iter().map(|h| h.total_bytes).sum();
 
-    // Compute effective quota from config + actual disk space.
+    // Effective quota from config + actual disk space (one read per tick).
     let disk_free = crate::daemon::handle::disk_available_bytes(data_dir);
-    let effective_quota = viaticum_core::budget::compute_effective_quota(
-        soft_quota_bytes,
-        disk_free,
-        disk_reserve_bytes,
-    );
+    if disk_free.is_none() && disk_warn.due(std::time::Instant::now()) {
+        warn!(
+            "holder_cleanup: {}",
+            unreadable_disk_note(data_dir, soft_quota_bytes)
+        );
+    }
 
     let trust_fn = |owner: &IdentityPub| -> f64 {
         // PeerRecord is keyed by DeviceId; look up the first device for this master.
@@ -331,11 +398,12 @@ async fn check_pressure(
         }
     };
 
-    let result = evaluate_pressure(
-        effective_quota,
-        hard_quota_bytes,
-        used_bytes,
+    let (used_bytes, effective_quota, result) = pressure_on_snapshot(
         &holdings,
+        disk_free,
+        soft_quota_bytes,
+        hard_quota_bytes,
+        disk_reserve_bytes,
         trust_fn,
         now.0,
     );
@@ -345,7 +413,8 @@ async fn check_pressure(
         db,
         &holdings,
         shadow::ShadowQuota {
-            disk_free,
+            // F-Q: the shadow keeps its pre-F-Q input (unreadable = 0, `4r-i52`).
+            disk_free: disk_free.unwrap_or(0),
             soft: soft_quota_bytes,
             reserve: disk_reserve_bytes,
             hard: hard_quota_bytes,
@@ -366,15 +435,24 @@ async fn check_pressure(
     match result.pressure {
         DiskPressure::Normal => {}
         DiskPressure::Soft => {
-            info!(
-                used_bytes,
-                effective_quota, "holder_cleanup: soft disk pressure — not accepting new symbols"
-            );
+            if effective_quota == Quota::Unknown {
+                info!(
+                    used_bytes,
+                    "holder_cleanup: free space unknown — not accepting new symbols"
+                );
+            } else {
+                info!(
+                    used_bytes,
+                    ?effective_quota,
+                    "holder_cleanup: soft disk pressure — not accepting new symbols"
+                );
+            }
         }
         DiskPressure::Hard => {
             info!(
                 used_bytes,
-                effective_quota,
+                ?effective_quota,
+                critical = effective_quota == Quota::Bytes(0),
                 evictions = result.immediate_evictions.len(),
                 freed_bytes = result.freed_bytes,
                 "holder_cleanup: hard disk pressure — evicting holdings"

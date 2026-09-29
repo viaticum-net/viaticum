@@ -46,10 +46,13 @@ file_field() {
         | jq -r --arg p "$2" ".[] | select(.path==\$p) | $3" 2>/dev/null || true
 }
 
-# Full hex id of the source block holding the latest version of PATH.
+# Full hex id of the source block holding the latest version of PATH. Empty while that
+# version is still pending: its id is a zero placeholder until the pipeline patches in the
+# real block (a poll that captured the zeros used to wait on a block that never exists).
 file_block_hex() {
     api_get "$1" "/api/versions?path=$(urlencode "$2")" \
-        | jq -r '.[-1].source_block_id_hex // empty' 2>/dev/null || true
+        | jq -r '.[-1] | select(.backed_up_at != "pending")
+                 | .source_block_id_hex // empty | select(test("^0+$") | not)' 2>/dev/null || true
 }
 
 # Poll until owner IDX reports PATH as restorable (>= k_eff symbols on Alive
@@ -105,12 +108,15 @@ wait_auth_peers() {
 # (the finished job, last line; "" if none), RESTORE_ERR (stderr).
 restore_run() {
     local idx="$1" secs="$2"; shift 2
-    local out errf
+    local out errf had_e=0
+    # Restore the CALLER's errexit, not force it on: a scenario without `set -e`
+    # (photo_whale) turned errexit on here and later died silently on a grep miss.
+    [[ $- == *e* ]] && had_e=1
     errf=$(mktemp)
     set +e
     out=$(timeout "$secs" "$BINARY" --data-dir "$(node_dir "$idx")" restore "$@" --json 2>"$errf")
     RESTORE_RC=$?
-    set -e
+    [ "$had_e" -eq 1 ] && set -e
     RESTORE_ERR=$(cat "$errf"); rm -f "$errf"
     RESTORE_FIRST=$(printf '%s\n' "$out" | sed -n '1p')
     RESTORE_LAST=$(printf '%s\n' "$out" | sed -n '2,$p' | tail -1)

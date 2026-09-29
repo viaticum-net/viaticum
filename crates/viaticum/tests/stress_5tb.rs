@@ -197,6 +197,7 @@ fn stress_5tb_metadata_scale() {
                 backed_up_at: Some(NOW),
             }],
             first_seen: NOW,
+            on_disk_confirmed: true,
         };
         db.upsert_file(&record)
             .unwrap_or_else(|e| panic!("upsert_file[{file_idx}]: {e}"));

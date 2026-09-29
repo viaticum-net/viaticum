@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 use tempfile::TempDir;
-use viaticum_core::budget::{DiskPressure, PressureResult, evaluate_pressure};
+use viaticum_core::budget::{DiskPressure, PressureResult, Quota, evaluate_pressure};
 use viaticum_core::db::Db;
 use viaticum_core::four_r::Hysteresis;
 use viaticum_core::four_r_holder::FourRParams;
@@ -71,6 +71,7 @@ async fn run_old_path_with(
         1,
         &test_key(),
         p,
+        &mut super::super::UnknownDiskWarn::default(),
     )
     .await
     .unwrap();
@@ -125,7 +126,7 @@ async fn check_pressure_with_the_shadow_evicts_and_notifies_exactly_as_before() 
     let db = Db::open_in_memory().unwrap();
     let hs = hard_fixture(&db);
     let res = evaluate_pressure(
-        1000,
+        Quota::Bytes(1000),
         0,
         990,
         &hs,
@@ -192,6 +193,7 @@ async fn a_failing_shadow_does_not_stop_the_old_eviction() {
         1,
         &test_key(),
         &FourRParams::default(),
+        &mut super::super::UnknownDiskWarn::default(),
     )
     .await
     .expect("the old path must not fail on a shadow error");

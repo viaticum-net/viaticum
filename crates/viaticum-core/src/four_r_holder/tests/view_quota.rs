@@ -47,7 +47,7 @@ fn default_params_give_vret_equal_to_vdem_for_a_silent_deep_pair() {
 }
 
 /// H-3a (Р-12): holdings are counted once. Disk 100 free, H 30, soft 0, reserve 10 ⇒
-/// Q = 30 + 100 − 10 = 120, φ = 90/120 = 0.75; the old formula subtracts H twice (90).
+/// Q = 30 + 100 − 10 = 120, φ = 90/120 = 0.75; the pre-F-Q formula subtracted H twice (90).
 #[test]
 fn quota_counts_holdings_once() {
     let h = vec![holding(master(1), block(1, 0), 30, 0.5)];
@@ -58,7 +58,11 @@ fn quota_counts_holdings_once() {
     assert_eq!(s.phi_forecast, 0.75);
     assert_eq!(s.free_now_bytes, 90);
     assert!(!s.q_nonpositive && s.measure_valid && !s.disk_free_zero);
-    assert_eq!(crate::budget::compute_effective_quota(0, 100, 10), 90);
+    // F-Q (holder-i3): the old path now counts them once too.
+    assert_eq!(
+        crate::budget::compute_effective_quota(0, Some(100), 30, 10),
+        crate::budget::Quota::Bytes(120)
+    );
     // A soft cap below the disk bound wins.
     let s = quota_state(&QuotaInputs::from_holdings(&h, 100, 60, 10, 0));
     assert_eq!(s.q_bytes, 60);

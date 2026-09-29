@@ -402,22 +402,24 @@ fn initial_staging_status_reports_unavailable_when_probe_cannot_write() {
 
 const MIB: u64 = 1024 * 1024;
 
-/// restore-i21: soft pressure, or free disk at/below the reserve (effective quota
-/// 0, which `should_reject_offers` alone reads as "unlimited"); unknown free space
-/// (no matching mount) is not pressure.
+/// restore-i21: soft pressure, or free disk at/below the reserve (no room: effective quota
+/// `Bytes(0)` or held over it, holder-i1); an unreadable disk is not pressure.
 #[test]
 fn holder_stops_taking_data_covers_soft_pressure_and_below_reserve() {
     let gib = 1024 * MIB;
     // Soft quota 1000 bytes, 950 held: 5 % free < 15 %.
     assert!(holder_stops_taking_data(1000, Some(100 * gib), 0, 950));
     assert!(!holder_stops_taking_data(1000, Some(100 * gib), 0, 100));
-    // No soft quota: quota = free - reserve.
+    // No soft quota: quota = free + held - reserve.
     assert!(!holder_stops_taking_data(0, Some(100 * gib), gib, 10 * gib));
     // Free disk at or below the reserve: the node refuses every offer.
     assert!(holder_stops_taking_data(0, Some(gib), gib, 0));
     assert!(holder_stops_taking_data(0, Some(gib / 2), gib, 0));
-    // Unknown free space (disk_available_bytes would say 0): no claim.
+    assert!(holder_stops_taking_data(0, Some(gib / 2), gib, 10 * gib));
+    // Unreadable disk: no claim (without a soft quota) or the soft quota decides.
     assert!(!holder_stops_taking_data(0, None, gib, 0));
+    assert!(holder_stops_taking_data(1000, None, gib, 950));
+    assert!(!holder_stops_taking_data(1000, None, gib, 100));
 }
 
 /// N6 / N10: the flag needs pressure, a known size and at least 1 MiB of staging.

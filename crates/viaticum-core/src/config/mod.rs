@@ -64,8 +64,9 @@ impl Default for BackupCfg {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct StorageCfg {
-    /// Soft quota in gigabytes. 0 = unlimited (no ceiling).
-    /// effective_quota = min(soft_quota, disk_free - disk_reserve).
+    /// Soft quota in gigabytes. 0 = no soft cap: the free disk bounds the quota.
+    /// effective_quota = min(soft_quota, disk_free + held − disk_reserve)
+    /// (`budget::compute_effective_quota`); unreadable disk ⇒ the soft quota alone.
     /// Default: 0.
     pub soft_quota_gb: f64,
 
@@ -845,7 +846,7 @@ pub fn source_block_size_bytes(cfg: &AppConfig) -> u64 {
     cfg.backup.source_block_size_mb * 1_048_576
 }
 
-/// Convert storage.soft_quota_gb → bytes. 0.0 maps to 0 (unlimited sentinel).
+/// Convert storage.soft_quota_gb → bytes. 0.0 maps to 0 (no soft cap).
 pub fn soft_quota_bytes(cfg: &AppConfig) -> u64 {
     if cfg.storage.soft_quota_gb == 0.0 {
         return 0;

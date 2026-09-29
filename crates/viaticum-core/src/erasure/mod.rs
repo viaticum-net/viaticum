@@ -135,6 +135,17 @@ pub trait ErasureEncoder: Send + Sync {
         count: u32,
     ) -> Result<Vec<Symbol>, ErasureError>;
 
+    /// Encode raw (unbound) symbols for several `(start_esi, count)` ranges with ONE encoder
+    /// build — the build is the costly part, so a plan whose ESIs are not contiguous (a
+    /// holder re-offered its own range plus fresh numbers, repair-i9) still encodes once.
+    /// Symbols come back in the order of `ranges`, each range in ascending ESI.
+    fn encode_raw_ranges(
+        &self,
+        source_block: &[u8],
+        params: &ErasureParams,
+        ranges: &[(u32, u32)],
+    ) -> Result<Vec<Symbol>, ErasureError>;
+
     /// Apply per-holder binding to a raw symbol.
     /// XORs the symbol data with the binding keystream derived from (block_id, holder_id, esi).
     fn apply_binding(
@@ -247,6 +258,15 @@ impl ErasureEncoder for RaptorQEncoder {
         start_esi: u32,
         count: u32,
     ) -> Result<Vec<Symbol>, ErasureError> {
+        self.encode_raw_ranges(source_block, params, &[(start_esi, count)])
+    }
+
+    fn encode_raw_ranges(
+        &self,
+        source_block: &[u8],
+        params: &ErasureParams,
+        ranges: &[(u32, u32)],
+    ) -> Result<Vec<Symbol>, ErasureError> {
         if source_block.is_empty() {
             return Err(ErasureError::EmptyBlock);
         }
@@ -256,44 +276,48 @@ impl ErasureEncoder for RaptorQEncoder {
         let t = params.t as usize;
 
         // Fetch source packets once (only if we need any source-range ESIs).
-        let source_packets: Option<Vec<EncodingPacket>> = if start_esi < k {
-            Some(encoder.source_packets())
-        } else {
-            None
-        };
-
-        let mut symbols = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            let esi = start_esi + i;
-            let raw_data: Vec<u8> = if esi < k {
-                source_packets
-                    .as_ref()
-                    .and_then(|v| v.get(esi as usize))
-                    .ok_or(ErasureError::SourcePacketMissing { esi })?
-                    .data()
-                    .to_vec()
+        let source_packets: Option<Vec<EncodingPacket>> =
+            if ranges.iter().any(|&(start, count)| count > 0 && start < k) {
+                Some(encoder.source_packets())
             } else {
-                let repair_offset = esi - k;
-                let packets = encoder.repair_packets(repair_offset, 1);
-                packets
-                    .into_iter()
-                    .next()
-                    .ok_or(ErasureError::RepairPacketMissing { esi })?
-                    .data()
-                    .to_vec()
+                None
             };
 
-            if raw_data.len() != t {
-                return Err(ErasureError::SymbolSizeMismatch {
-                    expected: t,
-                    got: raw_data.len(),
+        let total: usize = ranges.iter().map(|&(_, count)| count as usize).sum();
+        let mut symbols = Vec::with_capacity(total);
+        for &(start_esi, count) in ranges {
+            for i in 0..count {
+                let esi = start_esi + i;
+                let raw_data: Vec<u8> = if esi < k {
+                    source_packets
+                        .as_ref()
+                        .and_then(|v| v.get(esi as usize))
+                        .ok_or(ErasureError::SourcePacketMissing { esi })?
+                        .data()
+                        .to_vec()
+                } else {
+                    let repair_offset = esi - k;
+                    let packets = encoder.repair_packets(repair_offset, 1);
+                    packets
+                        .into_iter()
+                        .next()
+                        .ok_or(ErasureError::RepairPacketMissing { esi })?
+                        .data()
+                        .to_vec()
+                };
+
+                if raw_data.len() != t {
+                    return Err(ErasureError::SymbolSizeMismatch {
+                        expected: t,
+                        got: raw_data.len(),
+                    });
+                }
+
+                symbols.push(Symbol {
+                    esi,
+                    data: raw_data,
                 });
             }
-
-            symbols.push(Symbol {
-                esi,
-                data: raw_data,
-            });
         }
 
         Ok(symbols)

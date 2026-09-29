@@ -1619,6 +1619,7 @@ fn resolve_primary_file_id_single_block_without_placements_reverse_looks_up_file
             backed_up_at: Some(Timestamp::now()),
         }],
         first_seen: Timestamp::now(),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).unwrap();
 
@@ -1951,5 +1952,87 @@ async fn stuck_high_priority_block_does_not_starve_lower_block() {
         db.block_cooldown(&rec_b.block_id).last_attempted_at,
         Some(earlier),
         "B was picked"
+    );
+}
+
+// ─── repair-i9: delivery binds each placement ESI by ESI, not by position ───────
+
+const BIND_NS: u32 = 3 << 20;
+
+/// Raw symbol whose bytes name its ESI, so a symbol taken for the wrong ESI is visible.
+fn raw_symbol(esi: u32) -> viaticum_core::erasure::Symbol {
+    viaticum_core::erasure::Symbol {
+        esi,
+        data: esi.to_le_bytes().repeat(4),
+    }
+}
+
+fn raw_for_ranges(ranges: &[(u32, u32)]) -> Vec<viaticum_core::erasure::Symbol> {
+    ranges
+        .iter()
+        .flat_map(|&(start, count)| start..start + count)
+        .map(raw_symbol)
+        .collect()
+}
+
+fn bind_placement(ranges: Vec<(u32, u32)>) -> viaticum_core::types::SymbolPlacement {
+    let mut p = placement(
+        block_id(0xD1),
+        device_id(0xD2),
+        viaticum_core::types::PlacementStatus::Offered,
+        0,
+    );
+    p.esi_ranges = ranges;
+    p
+}
+
+/// Mutation Mu1: positional lookup (`idx = esi - first.esi`) → the ESIs after the gap are
+/// not found (or found wrong) → this test reddens.
+#[test]
+fn bind_placement_symbols_with_non_contiguous_ranges_binds_each_esi_to_its_own_symbol() {
+    use crate::daemon::work_pipeline::worker::bind_placement_symbols;
+    use viaticum_core::erasure::ErasureEncoder;
+
+    let encoder = RaptorQEncoder::new();
+    let placement = bind_placement(vec![(BIND_NS, 4), (BIND_NS + 10, 2)]);
+    // Union of the plan: this placement plus another holder's range above it; the gap
+    // BIND_NS+4..BIND_NS+10 is not encoded.
+    let raw = raw_for_ranges(&[(BIND_NS, 4), (BIND_NS + 10, 2), (BIND_NS + 20, 3)]);
+
+    let bound = bind_placement_symbols(&encoder, &placement.source_block_id, &placement, &raw)
+        .expect("every placement ESI is in the raw symbols");
+
+    let want_esis: Vec<u32> = (BIND_NS..BIND_NS + 4)
+        .chain(BIND_NS + 10..BIND_NS + 12)
+        .collect();
+    assert_eq!(bound.iter().map(|s| s.esi).collect::<Vec<_>>(), want_esis);
+    for s in &bound {
+        let want = encoder.apply_binding(
+            raw_symbol(s.esi),
+            &placement.source_block_id,
+            &placement.holder_id,
+        );
+        assert_eq!(
+            s.data, want.data,
+            "ESI {} carries its own bound bytes",
+            s.esi
+        );
+    }
+}
+
+#[test]
+fn bind_placement_symbols_when_a_placement_esi_is_missing_returns_error() {
+    use crate::daemon::work_pipeline::worker::bind_placement_symbols;
+
+    let encoder = RaptorQEncoder::new();
+    let placement = bind_placement(vec![(BIND_NS, 4), (BIND_NS + 10, 2)]);
+    // BIND_NS+11 was not encoded.
+    let raw = raw_for_ranges(&[(BIND_NS, 4), (BIND_NS + 10, 1)]);
+
+    let result = bind_placement_symbols(&encoder, &placement.source_block_id, &placement, &raw);
+
+    assert!(
+        result.is_err(),
+        "a missing ESI must fail the delivery, not shrink it silently"
     );
 }

@@ -45,6 +45,7 @@ fn make_file(
         devices,
         versions,
         first_seen: ts(0),
+        on_disk_confirmed: true,
     }
 }
 
