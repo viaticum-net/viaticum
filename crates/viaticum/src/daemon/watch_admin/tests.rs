@@ -61,6 +61,7 @@ fn make_file_record(file_id: u64, path: &str, k: u32, t: u16, backed_up: bool) -
             backed_up_at: if backed_up { Some(now) } else { None },
         }],
         first_seen: now,
+        on_disk_confirmed: true,
     }
 }
 
@@ -513,6 +514,7 @@ async fn remove_watch_with_purge_marks_all_devices_deleted_for_each_file() {
             backed_up_at: Some(now),
         }],
         first_seen: now,
+        on_disk_confirmed: true,
     };
     db.upsert_file(&record).unwrap();
 

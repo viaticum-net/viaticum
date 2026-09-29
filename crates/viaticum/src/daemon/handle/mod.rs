@@ -616,7 +616,6 @@ impl DaemonHandle {
                 epoch_key: epoch_key_bytes,
                 device_id,
                 mock_holders: vec![],
-                cluster_state: Some(cluster_state.clone()),
                 watch_configs: initial_watch_configs.clone(),
                 time_scale: cfg.time_scale.max(1),
                 mock_offer_budget_gb: None,

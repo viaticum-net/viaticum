@@ -608,6 +608,7 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).unwrap();
 
@@ -999,6 +1000,7 @@ async fn already_deleting_holder_is_not_republished() {
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).unwrap();
 
@@ -1178,6 +1180,7 @@ fn make_multi_holder_file(
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     }
 }
 
@@ -1582,6 +1585,7 @@ async fn delete_not_marked_sent_when_publish_zero_acks() {
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).unwrap();
 
@@ -1722,6 +1726,7 @@ async fn cleanup_block_removes_db_record() {
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).unwrap();
 

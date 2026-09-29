@@ -1619,6 +1619,7 @@ fn resolve_primary_file_id_single_block_without_placements_reverse_looks_up_file
             backed_up_at: Some(Timestamp::now()),
         }],
         first_seen: Timestamp::now(),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).unwrap();
 

@@ -64,7 +64,6 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         epoch_key: EPOCH_KEY,
         device_id: DEVICE_A,
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
@@ -134,7 +133,6 @@ fn config_source_block_size_drives_backup() {
             epoch_key: EPOCH_KEY,
             device_id: DEVICE_A,
             mock_holders: test_holders(),
-            cluster_state: None,
             watch_configs: vec![],
             time_scale: 1,
             mock_offer_budget_gb: None,
@@ -229,6 +227,7 @@ fn deletion_cooldown_full_lifecycle() {
             backed_up_at: Some(now),
         }],
         first_seen: now,
+        on_disk_confirmed: true,
     };
 
     // Active source block of type Single

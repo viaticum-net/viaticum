@@ -1,11 +1,87 @@
-// Event processing: handle_deleted, handle_added_or_modified, get_or_create_file_id.
-// Called from BackupCoordinator::process_event (mod.rs).
+// Event processing: handle_deleted, handle_added_or_modified, handle_dedup,
+// get_or_create_file_id. Called from BackupCoordinator::process_event (mod.rs).
+//
+// backup-i9: a path points at what is on disk now. An event for content that is
+// already in the network (a rollback, a restore put back in place, a copy over an
+// existing path) makes that content the path's current version; a pending edit of
+// the same path is superseded (at most one pending version per path, and it is the
+// last one).
 
 use viaticum_core::config::derive_file_importance;
-use viaticum_core::types::{FileId, FileRecord, FileVersion, LocalState, SourceBlockId, Timestamp};
+use viaticum_core::db::Db;
+use viaticum_core::types::{
+    DeviceId, FileCategory, FileId, FileRecord, FileVersion, LocalState, SourceBlockId, Timestamp,
+};
 
-use super::{BackupCoordinator, DirtyEvent, DirtyKind, QueuedFile};
-use viaticum_core::types::FileCategory;
+use super::{BackupCoordinator, DirtyEvent, QueuedFile};
+
+/// A backed-up version holding some content: where a path whose bytes have that
+/// content can point without any traffic.
+#[derive(Debug, Clone)]
+pub(crate) struct DedupSource {
+    pub(crate) record: FileRecord,
+    pub(crate) version: FileVersion,
+}
+
+/// The dedup source for `content_hash`, or `None` when no backed-up version holds it.
+///
+/// Only a backed-up version qualifies (a pending one has no block yet). Among the
+/// records holding one: a record whose last backed-up version has this content comes
+/// first — `own_path` before the others, so a touch or a rescan of a path that already
+/// points at this content keeps its block — then path order. Within the record, its
+/// last backed-up version with this content. L1b adds its "serviceable block" gate here.
+pub(crate) fn select_dedup_source(
+    db: &Db,
+    content_hash: &[u8; 32],
+    own_path: Option<&str>,
+) -> anyhow::Result<Option<DedupSource>> {
+    let mut best: Option<((u8, String), DedupSource)> = None;
+    for record in db.files_with_content_hash(content_hash)? {
+        let Some(version) = record
+            .versions
+            .iter()
+            .rev()
+            .find(|v| &v.content_hash == content_hash && v.backed_up_at.is_some())
+            .cloned()
+        else {
+            continue;
+        };
+        let last_backed_up_is_this = record
+            .versions
+            .iter()
+            .rev()
+            .find(|v| v.backed_up_at.is_some())
+            .is_some_and(|v| &v.content_hash == content_hash);
+        let rank = match (
+            last_backed_up_is_this,
+            own_path == Some(record.path.as_str()),
+        ) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, _) => 2,
+        };
+        let key = (rank, record.path.clone());
+        if best.as_ref().is_none_or(|(k, _)| key < *k) {
+            best = Some((key, DedupSource { record, version }));
+        }
+    }
+    Ok(best.map(|(_, src)| src))
+}
+
+/// Mark `device` Present in `record`. Returns whether the record changed.
+fn set_present(record: &mut FileRecord, device: DeviceId) -> bool {
+    match record.devices.iter_mut().find(|(d, _)| *d == device) {
+        Some((_, state)) if *state == LocalState::Present => false,
+        Some((_, state)) => {
+            *state = LocalState::Present;
+            true
+        }
+        None => {
+            record.devices.push((device, LocalState::Present));
+            true
+        }
+    }
+}
 
 impl BackupCoordinator {
     pub(super) fn handle_deleted(&mut self, event: &DirtyEvent) -> anyhow::Result<()> {
@@ -35,6 +111,7 @@ impl BackupCoordinator {
                 devices: vec![(event.device_id, LocalState::Deleted(now))],
                 versions: vec![],
                 first_seen: now,
+                on_disk_confirmed: false,
             };
             self.db.upsert_file(&record)?;
         }
@@ -47,30 +124,16 @@ impl BackupCoordinator {
         let size_bytes = file_bytes.len() as u64;
         let content_hash: [u8; 32] = *blake3::hash(&file_bytes).as_bytes();
 
-        // Dedup check: content already backed up → zero traffic.
-        // Use ClusterState if available (multi-device), else inline scan.
-        let is_backed_up = if let Some(cs) = &self.config.cluster_state {
-            let guard = cs.lock().expect("cluster_state lock poisoned");
-            guard
-                .is_content_backed_up(&content_hash)
-                .map_err(|e| anyhow::anyhow!("cluster dedup check: {e}"))?
-        } else {
-            // B-1: indexed lookup instead of an O(N) full FILES scan.
-            self.db.is_content_backed_up(&content_hash)?
-        };
-
-        if is_backed_up {
-            // Content is already fully backed up — update catalog without re-uploading.
-            // B-1: indexed lookup of the existing record (was a full FILES scan).
-            if let Some(existing) = self.db.find_file_by_content_hash(&content_hash)? {
-                tracing::debug!(
-                    "dedup: {} matches existing record path={}",
-                    event.path,
-                    existing.path
-                );
-                self.handle_dedup(event, &existing, content_hash)?;
-                return Ok(());
-            }
+        // Dedup: content already in the network → the path points at it, zero traffic.
+        // Indexed lookup (CONTENT_INDEX); the cluster branch that scanned every FILES
+        // record per event is gone (R1-f A19).
+        if let Some(src) = select_dedup_source(&self.db, &content_hash, Some(&event.path))? {
+            tracing::debug!(
+                path = %event.path,
+                source = %src.record.path,
+                "dedup: content already backed up"
+            );
+            return self.handle_dedup(event, &src, content_hash);
         }
 
         // Not a duplicate — classify and enqueue or process immediately (large file).
@@ -129,131 +192,134 @@ impl BackupCoordinator {
         Ok(())
     }
 
-    /// Handle dedup: content already exists, update catalog without queuing.
+    /// The path of `event` now holds content that `src` already has in the network:
+    /// point the path at it without queuing (backup-i9).
+    ///
+    /// Existing record: Present on this device, confirmed on disk, its pending edit
+    /// superseded; then, unless its last version already is this content on the
+    /// source's block and backed up, a new version (content, block, `created_at` =
+    /// `backed_up_at` = now) is appended. Written only when something changed, so a
+    /// touch or a rescan adds nothing. No record: a new one with a fresh `file_id`.
     fn handle_dedup(
         &mut self,
         event: &DirtyEvent,
-        existing: &viaticum_core::types::FileRecord,
+        src: &DedupSource,
         content_hash: [u8; 32],
     ) -> anyhow::Result<()> {
-        if event.path == existing.path {
-            // Same path, same content — ensure device is listed as Present.
-            let mut record = existing.clone();
-            let mut found = false;
-            for (dev, state) in &mut record.devices {
-                if *dev == event.device_id {
-                    *state = LocalState::Present;
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                record.devices.push((event.device_id, LocalState::Present));
-            }
-            self.db.upsert_file(&record)?;
-        } else {
-            // Different path, same content.
-            let source_version = existing
-                .versions
-                .iter()
-                .find(|v| v.content_hash == content_hash)
-                .expect("dedup match must have a matching version");
+        let now = Timestamp::now();
+        let current = FileVersion {
+            content_hash,
+            source_block_id: src.version.source_block_id,
+            k: src.version.k,
+            t: src.version.t,
+            created_at: now,
+            backed_up_at: Some(now),
+        };
 
-            if let Some(mut path_record) = self.db.get_file(&event.path)? {
-                // Existing record for this path — add new version for Modified events.
-                if event.kind == DirtyKind::Modified {
-                    let new_version = FileVersion {
-                        content_hash,
-                        source_block_id: source_version.source_block_id,
-                        k: source_version.k,
-                        t: source_version.t,
-                        created_at: Timestamp::now(),
-                        backed_up_at: source_version.backed_up_at,
-                    };
-                    path_record.versions.push(new_version);
-                    self.db.upsert_file(&path_record)?;
-                }
-                // Added: nothing to do (same path already registered in catalog).
-            } else {
-                // New path for existing content — create FileRecord pointing to existing block.
-                let file_id = self.alloc_file_id();
-                let version = FileVersion {
-                    content_hash,
-                    source_block_id: source_version.source_block_id,
-                    k: source_version.k,
-                    t: source_version.t,
-                    created_at: Timestamp::now(),
-                    backed_up_at: source_version.backed_up_at,
-                };
-                let record = FileRecord {
-                    file_id,
-                    path: event.path.clone(),
-                    importance: 0.5,
-                    devices: vec![(event.device_id, LocalState::Present)],
-                    versions: vec![version],
-                    first_seen: Timestamp::now(),
-                };
-                self.db.upsert_file(&record)?;
-            }
+        let Some(mut record) = self.db.get_file(&event.path)? else {
+            let record = FileRecord {
+                file_id: self.alloc_file_id(),
+                path: event.path.clone(),
+                importance: 0.5,
+                devices: vec![(event.device_id, LocalState::Present)],
+                versions: vec![current],
+                first_seen: now,
+                on_disk_confirmed: true,
+            };
+            self.db.upsert_file(&record)?;
+            return Ok(());
+        };
+
+        let mut changed = set_present(&mut record, event.device_id);
+        if !record.on_disk_confirmed {
+            record.on_disk_confirmed = true;
+            changed = true;
+        }
+        changed |= self.supersede_pending(&mut record);
+        let points_there = record.versions.last().is_some_and(|v| {
+            v.content_hash == content_hash
+                && v.source_block_id == src.version.source_block_id
+                && v.backed_up_at.is_some()
+        });
+        if !points_there {
+            tracing::info!(
+                path = %event.path,
+                block_id = %src.version.source_block_id,
+                "dedup: path now points at content already in the network"
+            );
+            record.versions.push(current);
+            changed = true;
+        }
+        if changed {
+            self.db.upsert_file(&record)?;
         }
         Ok(())
     }
 
+    /// Drop the pending (not yet backed-up) versions of `record` and its entries in the
+    /// packing queues: whatever the path held before this event is not what is on disk
+    /// now (≤ 1 pending version per path, backup-i9). Returns whether a version was
+    /// dropped. The coordinator is single-threaded, so no flush is in flight.
+    pub(super) fn supersede_pending(&mut self, record: &mut FileRecord) -> bool {
+        let before = record.versions.len();
+        record.versions.retain(|v| v.backed_up_at.is_some());
+        let dropped = before - record.versions.len();
+        let mut dequeued = 0usize;
+        for queue in self.queues.values_mut() {
+            let len = queue.len();
+            queue.retain(|qf| qf.path != record.path);
+            dequeued += len - queue.len();
+        }
+        if dropped > 0 || dequeued > 0 {
+            tracing::debug!(
+                path = %record.path,
+                versions = dropped,
+                queued = dequeued,
+                "backup: pending edit superseded"
+            );
+        }
+        dropped > 0
+    }
+
     /// Get existing FileId for a path, or create a new FileRecord.
     ///
-    /// For Modified events: appends a new FileVersion (with sentinel source_block_id).
+    /// Appends a pending version (sentinel `source_block_id`) after superseding any
+    /// older pending one, marks the device Present and the record confirmed on disk
+    /// (the caller has just read the file).
     pub(super) fn get_or_create_file_id(
         &mut self,
         path: &str,
-        device_id: &viaticum_core::types::DeviceId,
+        device_id: &DeviceId,
         content_hash: [u8; 32],
     ) -> anyhow::Result<FileId> {
         let now = Timestamp::now();
-        let sentinel_block_id = SourceBlockId([0u8; 32]);
+        let pending = FileVersion {
+            content_hash,
+            source_block_id: SourceBlockId([0u8; 32]),
+            k: 0,
+            t: 0,
+            created_at: now,
+            backed_up_at: None,
+        };
 
         if let Some(mut record) = self.db.get_file(path)? {
-            let new_version = FileVersion {
-                content_hash,
-                source_block_id: sentinel_block_id,
-                k: 0,
-                t: 0,
-                created_at: now,
-                backed_up_at: None,
-            };
-            record.versions.push(new_version);
-
-            let mut found = false;
-            for (dev, state) in &mut record.devices {
-                if *dev == *device_id {
-                    *state = LocalState::Present;
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                record.devices.push((*device_id, LocalState::Present));
-            }
-
+            self.supersede_pending(&mut record);
+            record.versions.push(pending);
+            set_present(&mut record, *device_id);
+            record.on_disk_confirmed = true;
             let file_id = record.file_id;
             self.db.upsert_file(&record)?;
             Ok(file_id)
         } else {
             let file_id = self.alloc_file_id();
-            let version = FileVersion {
-                content_hash,
-                source_block_id: sentinel_block_id,
-                k: 0,
-                t: 0,
-                created_at: now,
-                backed_up_at: None,
-            };
             let record = FileRecord {
                 file_id,
                 path: path.to_string(),
                 importance: 0.5,
                 devices: vec![(*device_id, LocalState::Present)],
-                versions: vec![version],
+                versions: vec![pending],
                 first_seen: now,
+                on_disk_confirmed: true,
             };
             self.db.upsert_file(&record)?;
             Ok(file_id)

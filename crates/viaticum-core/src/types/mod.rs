@@ -251,6 +251,12 @@ pub struct FileRecord {
     pub devices: Vec<(DeviceId, LocalState)>,
     pub versions: Vec<FileVersion>,
     pub first_seen: Timestamp,
+    /// This device saw the file at this path (an event or a scan found it on disk).
+    /// Cleared by DR (`prepare_restored_state`) and by a watch root change. A record
+    /// without the field decodes as unconfirmed: the safe side, since only a confirmed
+    /// record may be marked deleted by a recheck (dr-i64).
+    #[serde(default)]
+    pub on_disk_confirmed: bool,
 }
 
 /// One version of a file (immutable once created).

@@ -43,6 +43,7 @@ fn file(path: &str, devices: Vec<(DeviceId, LocalState)>) -> FileRecord {
         devices,
         versions: vec![],
         first_seen: Timestamp(1),
+        on_disk_confirmed: false,
     }
 }
 

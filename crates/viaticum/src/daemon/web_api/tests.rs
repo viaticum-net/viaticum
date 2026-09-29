@@ -44,6 +44,7 @@ fn test_state() -> (Arc<DaemonState>, mpsc::Receiver<RestoreRequest>) {
             backed_up_at: Some(Timestamp(20)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     })
     .unwrap();
     state_with(db, jobs)
@@ -384,7 +385,6 @@ async fn restore_job_outlives_the_client_that_submitted_it() {
             epoch_key: KEY,
             device_id: DeviceId([1u8; 32]),
             mock_holders: vec![],
-            cluster_state: None,
             watch_configs: vec![],
             time_scale: 1,
             mock_offer_budget_gb: None,

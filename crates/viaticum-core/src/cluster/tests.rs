@@ -246,6 +246,7 @@ mod cluster_state_tests {
                 backed_up_at,
             }],
             first_seen: NOW,
+            on_disk_confirmed: true,
         }
     }
 

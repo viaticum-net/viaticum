@@ -235,6 +235,7 @@ fn dedup_across_devices() {
             backed_up_at: Some(NOW), // backed up!
         }],
         first_seen: NOW,
+        on_disk_confirmed: true,
     })
     .unwrap();
 
@@ -253,6 +254,7 @@ fn dedup_across_devices() {
             backed_up_at: None, // not backed up yet
         }],
         first_seen: NOW,
+        on_disk_confirmed: true,
     })
     .unwrap();
 

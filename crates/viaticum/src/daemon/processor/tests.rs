@@ -4639,6 +4639,7 @@ async fn a_notice_inside_the_owners_delete_cooldown_is_still_the_friends_drop() 
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     let actions = viaticum_core::deletion::DeletionEngine::new().process_cooldowns(
         &[file],

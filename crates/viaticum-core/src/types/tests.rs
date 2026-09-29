@@ -286,6 +286,7 @@ fn cbor_roundtrip_file_record() {
             backed_up_at: Some(Timestamp(2000)),
         }],
         first_seen: Timestamp(1000),
+        on_disk_confirmed: true,
     };
     let bytes = to_cbor_bytes(&record);
     let decoded: FileRecord = from_cbor_bytes(&bytes).unwrap();
@@ -293,6 +294,36 @@ fn cbor_roundtrip_file_record() {
     assert_eq!(decoded.path, record.path);
     assert_eq!(decoded.versions.len(), 1);
     assert_eq!(decoded.versions[0].k, 2048);
+    assert!(decoded.on_disk_confirmed);
+}
+
+/// A record written before `on_disk_confirmed` existed (older DB, older SystemState)
+/// decodes as unconfirmed: a recheck must never mark such a record deleted (dr-i64).
+#[test]
+fn file_record_without_confirmed_field_decodes_unconfirmed() {
+    #[derive(serde::Serialize)]
+    struct LegacyFileRecord {
+        file_id: FileId,
+        path: String,
+        importance: f64,
+        devices: Vec<(DeviceId, LocalState)>,
+        versions: Vec<FileVersion>,
+        first_seen: Timestamp,
+    }
+    let legacy = LegacyFileRecord {
+        file_id: FileId(7),
+        path: "docs/a.txt".to_string(),
+        importance: 0.5,
+        devices: vec![(DeviceId([0xaa; 32]), LocalState::Present)],
+        versions: vec![],
+        first_seen: Timestamp(1000),
+    };
+    let decoded: FileRecord = from_cbor_bytes(&to_cbor_bytes(&legacy)).unwrap();
+    assert_eq!(decoded.file_id, FileId(7));
+    assert!(
+        !decoded.on_disk_confirmed,
+        "a record without the field must decode as unconfirmed"
+    );
 }
 
 #[test]
