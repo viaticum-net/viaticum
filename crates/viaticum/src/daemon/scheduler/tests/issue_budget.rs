@@ -1,153 +1,73 @@
 // pos-i7-a: the issue tick is bounded by a time budget (a fifth of the PoS tick period),
-// publishes with bounded concurrency, leaves what it did not reach due for the next tick,
-// and stamps every challenge at its own publish, not at the tick's start.
+// leaves what it did not reach due for the next tick, and stamps every challenge at its
+// own publish. СТ-0c round 3 (W-1): the tick does not wait for its publishes — they
+// settle later through the run loop, which stays free meanwhile.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use viaticum_core::db::Db;
-use viaticum_core::messages::{
-    MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse,
-    PosHashChallengeMsg,
-};
-use viaticum_core::pos::ChallengeScheduleEntry;
+use viaticum_core::messages::{PosHashChallengeMsg, PosHashResponseMsg};
 use viaticum_core::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp, from_cbor_bytes};
 
+use super::issue_support::{Owner, SlowPostman, owner_with_due};
 use super::pos_scale::{LogBuf, field};
-use super::{
-    TEST_EPOCH_KEY, dummy_master_pub, make_identity, make_peer_record, make_pending_challenges,
-    make_placement, make_test_encoder, seed_retained_pos_block,
-};
-use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter};
-use crate::daemon::repair::RepairTrigger;
-use crate::daemon::scheduler::issue::{
-    ISSUE_PUBLISH_CONCURRENCY, blocks_least_recently_verified_first, issue_budget,
-};
-use crate::daemon::scheduler::{
-    PendingChallenges, PendingHashChallenge, Scheduler, SchedulerConfig,
-};
+use crate::daemon::scheduler::issue::{ISSUE_PUBLISH_CONCURRENCY, InFlight, issue_budget};
+use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-fn unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after 1970")
-        .as_secs()
-}
-
-/// A postman that answers every store with an Ack after a delay, recording each
-/// request with the unix second it arrived.
-struct SlowAckSender {
-    delay: fn(&[u8; 16]) -> Duration,
-    stores: std::sync::Mutex<Vec<(u64, MailboxStoreRequest)>>,
-}
-
-impl SlowAckSender {
-    fn new(delay: fn(&[u8; 16]) -> Duration) -> Arc<Self> {
-        Arc::new(SlowAckSender {
-            delay,
-            stores: std::sync::Mutex::new(Vec::new()),
-        })
-    }
-
-    fn store_count(&self) -> usize {
-        self.stores.lock().unwrap().len()
-    }
-
-    fn stores(&self) -> Vec<(u64, MailboxStoreRequest)> {
-        self.stores.lock().unwrap().clone()
-    }
-}
-
-#[async_trait::async_trait]
-impl MailboxNetworkSender for SlowAckSender {
-    async fn send_store(
-        &self,
-        _device: DeviceId,
-        req: MailboxStoreRequest,
-    ) -> anyhow::Result<MailboxStoreResponse> {
-        let msg_id = req.entry.msg_id;
-        let delay = (self.delay)(&msg_id);
-        self.stores.lock().unwrap().push((unix_secs(), req));
-        tokio::time::sleep(delay).await;
-        Ok(MailboxStoreResponse::Ack { msg_id })
-    }
-    async fn send_fetch(
-        &self,
-        _device: DeviceId,
-        _req: MailboxFetchRequest,
-    ) -> anyhow::Result<MailboxFetchResponse> {
-        anyhow::bail!("slow ack sender: fetch not used")
-    }
-}
-
-/// 20-50 ms per store, fixed per challenge (a LAN postman under load).
-fn lan_delay(msg_id: &[u8; 16]) -> Duration {
-    Duration::from_millis(20 + u64::from(msg_id[0]) % 31)
-}
-
-/// Longer than a second: publishes of different waves land in different unix seconds.
-fn second_delay(_msg_id: &[u8; 16]) -> Duration {
-    Duration::from_millis(1100)
-}
-
-struct Owner {
-    scheduler: Scheduler,
-    pending: PendingChallenges,
-    _data_dir: tempfile::TempDir,
-}
-
-/// An owner with `blocks` blocks × `holders` holders, every placement due (never
-/// verified), publishing through `sender` to its one known peer, a postman with a real
-/// Ed25519 id. The holders are no peers (medium trust): one store per publish.
-fn owner_with_due(blocks: u8, holders: u8, time_scale: u64, sender: Arc<SlowAckSender>) -> Owner {
-    let db = Db::open_in_memory().expect("db open");
-    let data_dir = tempfile::TempDir::new().unwrap();
-    let holder_ids: Vec<DeviceId> = (0..holders).map(|h| make_identity(0x80 + h)).collect();
-    let postman = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
-    db.upsert_peer(&make_peer_record(DeviceId(
-        postman.verifying_key().to_bytes(),
-    )))
-    .unwrap();
-    for b in 0..blocks {
-        let block_id = seed_retained_pos_block(data_dir.path(), &db, b);
-        for h in &holder_ids {
-            db.upsert_placement(&make_placement(block_id, *h)).unwrap();
-        }
-    }
-    let pending = make_pending_challenges();
-    let router = Arc::new(MailboxRouter::with_sender(
-        sender as Arc<dyn MailboxNetworkSender>,
-        db.clone(),
-    ));
-    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
-    let scheduler = Scheduler::new(
-        db,
-        SchedulerConfig {
-            pos_interval_secs: 3600,
-            timeout_check_secs: 3600,
-            time_scale,
-            event_log_retain_rows: 100_000,
-            pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+/// A challenge already pending on `owner`, and its holder's signed response.
+async fn pending_with_response(owner: &Owner) -> ([u8; 16], PosHashResponseMsg) {
+    let holder_key = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]);
+    let holder = DeviceId(holder_key.verifying_key().to_bytes());
+    let block = SourceBlockId([0xEE; 32]);
+    let cid = [0xEE; 16];
+    owner.pending.lock().await.insert(
+        (block, holder),
+        PendingHashChallenge {
+            source_block_id: block,
+            holder_id: holder,
+            esi_ranges: vec![(0, 1)],
+            expected_chain_hash: [0u8; 32],
+            issued_at: Timestamp::now(),
+            challenge_id: cid,
+            holder_master: IdentityPub(holder.0),
         },
-        repair_tx,
-        pending.clone(),
-        router,
-        dummy_master_pub(),
-        ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng),
-        crate::daemon::processor::make_empty_accepted_offers(),
-        make_test_encoder(),
-        TEST_EPOCH_KEY,
-        data_dir.path().to_path_buf(),
     );
-    Owner {
-        scheduler,
-        pending,
-        _data_dir: data_dir,
+    let response = viaticum_core::messages::build_pos_hash_response(
+        cid,
+        block,
+        [0u8; 32],
+        Timestamp::now(),
+        None,
+        &holder_key,
+    );
+    (cid, response)
+}
+
+/// Wait until `postman` saw its first store (the first issue tick is publishing).
+async fn first_store(postman: &SlowPostman) {
+    let waited = Instant::now();
+    while postman.store_count() == 0 {
+        assert!(waited.elapsed() < Duration::from_secs(10), "no issue tick");
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+/// Send `response` into the run loop; how long its pending took to resolve.
+async fn resolve_delay(
+    pending: &PendingChallenges,
+    response_tx: &mpsc::Sender<PosHashResponseMsg>,
+    cid: [u8; 16],
+    response: PosHashResponseMsg,
+) -> Duration {
+    response_tx.send(response).await.expect("scheduler alive");
+    let sent = Instant::now();
+    while pending.lock().await.contains_challenge(&cid) {
+        assert!(sent.elapsed() < Duration::from_secs(10), "never resolved");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    sent.elapsed()
 }
 
 // ─── The budget ───────────────────────────────────────────────────────────────
@@ -163,16 +83,15 @@ fn issue_budget_is_a_fifth_of_the_scaled_pos_period() {
 }
 
 /// pos-i7-a: 1000 due placements, publishes of 20-50 ms. Unbounded, the tick takes
-/// ≥ 1000 / ISSUE_PUBLISH_CONCURRENCY × 35 ms ≈ 2 s (≈ 4.6 s measured in a debug
-/// build); the budget at time_scale 900 (the E2E's) is 800 ms. One call returns within
-/// the budget (tolerance 300 ms: a publish in flight and scheduling slack) having issued
+/// ≥ 1000 / ISSUE_PUBLISH_CONCURRENCY × 35 ms ≈ 4 s; the budget at time_scale 900 (the
+/// E2E's) is 800 ms. One call returns within the budget (tolerance 300 ms: the settling
+/// of the last publishes by this test-only caller, and scheduling slack) having issued
 /// part of them and deferred the rest; every later call issues more, and all 1000 are
 /// issued (nothing starves).
 #[tokio::test]
 async fn issue_tick_stops_at_its_budget_and_later_ticks_issue_the_rest() {
     const DUE: usize = 1000;
-    let sender = SlowAckSender::new(lan_delay);
-    let owner = owner_with_due(125, 8, 900, sender);
+    let owner = owner_with_due(125, 8, 900, SlowPostman::lan());
     let budget = issue_budget(3600, 900);
     let bound = budget + Duration::from_millis(300);
 
@@ -216,6 +135,13 @@ async fn issue_tick_stops_at_its_budget_and_later_ticks_issue_the_rest() {
         Some((DUE - first) as u64),
         "what the budget cut is reported deferred: {line}"
     );
+    let blocks = field(line, "blocks").expect("blocks");
+    assert!(
+        blocks >= first.div_ceil(8) as u64 && blocks <= first.div_ceil(8) as u64 + 1,
+        "blocks started for {first} challenges of 8 holders each: {line}"
+    );
+    assert!(field(line, "slowest_publish_ms").is_some(), "{line}");
+    assert!(field(line, "in_flight").is_some(), "{line}");
 
     // The next calls: each issues more, until all are issued.
     let mut calls = 1;
@@ -246,15 +172,94 @@ async fn issue_tick_stops_at_its_budget_and_later_ticks_issue_the_rest() {
     );
 }
 
+/// W-1 (СТ-0c round 3): publishes of 2 s each do not stretch the tick. The tick fills
+/// the publish slots (block 1: 8, block 2: 1), waits for a free one at most until its
+/// budget (800 ms at time_scale 900) ends, and returns within the budget plus one block
+/// encode, its publishes still in flight and nothing pending yet. They settle afterwards.
+#[tokio::test]
+async fn issue_tick_returns_before_its_slow_publishes_settle() {
+    let owner = owner_with_due(5, 8, 900, SlowPostman::acking_after(Duration::from_secs(2)));
+    let budget = issue_budget(3600, 900);
+    let mut in_flight = InFlight::default();
+
+    let t = Instant::now();
+    owner
+        .scheduler
+        .issue_tick(&mut in_flight)
+        .await
+        .expect("issue_tick");
+    let took = t.elapsed();
+
+    assert!(
+        took <= budget + Duration::from_millis(150),
+        "the tick took {took:?} (budget {budget:?}): it waited for its publishes"
+    );
+    assert_eq!(
+        in_flight.len(),
+        ISSUE_PUBLISH_CONCURRENCY,
+        "publishes left in flight"
+    );
+    assert!(owner.pending.lock().await.is_empty(), "nothing acked yet");
+
+    while let Some(done) = in_flight.join_next().await {
+        owner
+            .scheduler
+            .settle_publish(done, &mut in_flight.settled)
+            .await;
+    }
+    assert_eq!(
+        owner.pending.lock().await.len(),
+        ISSUE_PUBLISH_CONCURRENCY,
+        "every acked publish settles into pending"
+    );
+}
+
+/// W-1: a placement whose challenge is still being published gets no second one. One
+/// block of 8 holders (fewer than the publish slots): the first tick starts all 8 and
+/// returns; the second finds all 8 in flight and starts none.
+#[tokio::test]
+async fn a_placement_being_published_gets_no_second_challenge() {
+    let owner = owner_with_due(
+        1,
+        8,
+        3600,
+        SlowPostman::acking_after(Duration::from_secs(2)),
+    );
+    let mut in_flight = InFlight::default();
+
+    owner
+        .scheduler
+        .issue_tick(&mut in_flight)
+        .await
+        .expect("first tick");
+    assert_eq!(in_flight.len(), 8);
+    owner
+        .scheduler
+        .issue_tick(&mut in_flight)
+        .await
+        .expect("second tick");
+
+    assert_eq!(
+        in_flight.len(),
+        8,
+        "the second tick started a challenge for a placement already in flight"
+    );
+    let keys: HashSet<_> = in_flight.keys().copied().collect();
+    assert_eq!(keys.len(), 8);
+    in_flight.shutdown().await;
+}
+
+// ─── The stamp of a challenge ─────────────────────────────────────────────────
+
 /// pos-i7-a: a challenge is stamped when it is published, not when its tick started.
-/// 40 challenges, 16 publishes in flight, each publish 1.1 s: three waves ~1.1 s apart.
-/// Every stored entry's `stored_at` and signed `timestamp`, and the pending `issued_at`,
-/// are ≥ the unix second its store arrived − 1 (Timestamp is whole seconds). Stamped
-/// once per tick, the third wave is ≥ 2 s older than its publish.
+/// 24 challenges, ISSUE_PUBLISH_CONCURRENCY (9) publishes in flight, each 1.1 s: three
+/// waves ~1.1 s apart. Every stored entry's `stored_at` and signed `timestamp`, and the
+/// pending `issued_at`, are ≥ the unix second its store arrived − 1 (Timestamp is whole
+/// seconds). Stamped once per tick, the third wave is ≥ 2 s older than its publish.
 #[tokio::test]
 async fn challenge_is_stamped_at_its_publish_not_at_the_tick_start() {
-    let sender = SlowAckSender::new(second_delay);
-    let owner = owner_with_due(5, 8, 1, sender.clone());
+    let postman = SlowPostman::acking_after(Duration::from_millis(1100));
+    let owner = owner_with_due(3, 8, 1, postman.clone());
 
     owner
         .scheduler
@@ -262,9 +267,9 @@ async fn challenge_is_stamped_at_its_publish_not_at_the_tick_start() {
         .await
         .expect("issue_due_challenges");
 
-    let stores = sender.stores();
+    let stores = postman.stores();
     let pending = owner.pending.lock().await;
-    assert_eq!(pending.len(), 40, "all 40 issued (the budget is 720 s)");
+    assert_eq!(pending.len(), 24, "all 24 issued (the budget is 720 s)");
     let first_sent = stores.iter().map(|(s, _)| *s).min().expect("stores");
     let last_sent = stores.iter().map(|(s, _)| *s).max().expect("stores");
     assert!(
@@ -306,58 +311,24 @@ async fn challenge_is_stamped_at_its_publish_not_at_the_tick_start() {
     }
 }
 
+// ─── The run loop ─────────────────────────────────────────────────────────────
+
 /// pos-i7-a, the run loop: a response that arrives while a tick with 1000 due challenges
 /// runs is resolved within one PoS tick period (1 s at time_scale 3600) — the tick yields
-/// the loop after its budget (200 ms). Unbounded, the tick holds the loop ≈ 2 s.
+/// the loop after its budget (200 ms). Unbounded, the tick holds the loop ≈ 4 s.
 #[tokio::test]
 async fn response_during_a_long_tick_resolves_within_a_tick_period() {
-    let sender = SlowAckSender::new(lan_delay);
-    let owner = owner_with_due(125, 8, 3600, sender.clone());
-
-    // A challenge already pending, answered by a holder with a real key.
-    let holder_key = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]);
-    let holder = DeviceId(holder_key.verifying_key().to_bytes());
-    let block = SourceBlockId([0xEE; 32]);
-    let cid = [0xEE; 16];
-    owner.pending.lock().await.insert(
-        (block, holder),
-        PendingHashChallenge {
-            source_block_id: block,
-            holder_id: holder,
-            esi_ranges: vec![(0, 1)],
-            expected_chain_hash: [0u8; 32],
-            issued_at: Timestamp::now(),
-            challenge_id: cid,
-            holder_master: IdentityPub(holder.0),
-        },
-    );
-    let response = viaticum_core::messages::build_pos_hash_response(
-        cid,
-        block,
-        [0u8; 32],
-        Timestamp::now(),
-        None,
-        &holder_key,
-    );
+    let postman = SlowPostman::lan();
+    let owner = owner_with_due(125, 8, 3600, postman.clone());
+    let (cid, response) = pending_with_response(&owner).await;
 
     let (response_tx, response_rx) = mpsc::channel(8);
     let cancel = CancellationToken::new();
     let pending = owner.pending.clone();
     let run = tokio::spawn(owner.scheduler.run(response_rx, cancel.clone()));
 
-    // Wait for the first issue tick to start publishing, then answer.
-    let waited = Instant::now();
-    while sender.store_count() == 0 {
-        assert!(waited.elapsed() < Duration::from_secs(10), "no issue tick");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    response_tx.send(response).await.expect("scheduler alive");
-    let sent = Instant::now();
-    while pending.lock().await.contains_challenge(&cid) {
-        assert!(sent.elapsed() < Duration::from_secs(10), "never resolved");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    let delay = sent.elapsed();
+    first_store(&postman).await;
+    let delay = resolve_delay(&pending, &response_tx, cid, response).await;
     cancel.cancel();
     run.await.expect("run task").expect("run");
 
@@ -367,40 +338,36 @@ async fn response_during_a_long_tick_resolves_within_a_tick_period() {
     );
 }
 
-// ─── Fairness: the order of blocks ────────────────────────────────────────────
+/// W-1, the run loop: publishes of 2 s each are settled by the loop, not by the tick. A
+/// response that arrives while they are in flight resolves at once (the loop is free),
+/// and the publishes land in pending about 2 s later. Cancel aborts what is left.
+#[tokio::test]
+async fn slow_publishes_settle_through_the_run_loop() {
+    let postman = SlowPostman::acking_after(Duration::from_secs(2));
+    let owner = owner_with_due(5, 8, 3600, postman.clone());
+    let (cid, response) = pending_with_response(&owner).await;
 
-#[test]
-fn blocks_least_recently_verified_first_puts_never_verified_then_oldest() {
-    let block = |b: u8| SourceBlockId([b; 32]);
-    let (h1, h2) = (make_identity(1), make_identity(2));
-    let entry = |b: u8, h: DeviceId| ChallengeScheduleEntry {
-        holder_id: h,
-        source_block_id: block(b),
-        cpw: 1,
-    };
-    // In `due` order: A (300), B (h1 at 50, h2 never), C (100), D (100).
-    let due = [
-        entry(0xA, h1),
-        entry(0xB, h1),
-        entry(0xC, h1),
-        entry(0xB, h2),
-        entry(0xD, h1),
-    ];
-    let last_verified = |k: &(SourceBlockId, DeviceId)| match (k.0.0[0], k.1 == h2) {
-        (0xA, _) => Some(Timestamp(300)),
-        (0xB, false) => Some(Timestamp(50)),
-        (0xB, true) => None,
-        _ => Some(Timestamp(100)),
-    };
+    let (response_tx, response_rx) = mpsc::channel(8);
+    let cancel = CancellationToken::new();
+    let pending = owner.pending.clone();
+    let run = tokio::spawn(owner.scheduler.run(response_rx, cancel.clone()));
 
-    let ordered = blocks_least_recently_verified_first(due.iter(), last_verified);
+    first_store(&postman).await;
+    let delay = resolve_delay(&pending, &response_tx, cid, response).await;
+    let waited = Instant::now();
+    while pending.lock().await.len() < ISSUE_PUBLISH_CONCURRENCY {
+        assert!(
+            waited.elapsed() < Duration::from_secs(10),
+            "the publishes never settled through the loop"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cancel.cancel();
+    run.await.expect("run task").expect("run");
 
-    let order: Vec<u8> = ordered.iter().map(|(b, _)| b.0[0]).collect();
-    assert_eq!(
-        order,
-        vec![0xB, 0xC, 0xD, 0xA],
-        "never verified first, then oldest; C and D tie and keep the order of due"
+    assert!(
+        delay < Duration::from_millis(500),
+        "a response sent while publishes were in flight resolved after {delay:?}: \
+         the loop waited for the publishes"
     );
-    let b_holders: Vec<DeviceId> = ordered[0].1.iter().map(|e| e.holder_id).collect();
-    assert_eq!(b_holders, vec![h1, h2], "a block keeps all its due entries");
 }

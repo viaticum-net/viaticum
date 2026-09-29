@@ -105,6 +105,11 @@ pub struct Scheduler {
     /// `<data_dir>/system_state/`. Used by `load_source_block_data` to serve PoS
     /// challenges for SS blocks (which have no backing watch-dir file).
     data_dir: std::path::PathBuf,
+    /// When each placement's challenge was last tried (its block started by an issue
+    /// tick), in RAM only (pos-i7-c): orders the due blocks with `last_verified`, so a block
+    /// that cannot be served does not hold the head of every tick. Lost on restart — then
+    /// the order falls back to `last_verified` alone for one round.
+    last_attempted: std::sync::Mutex<HashMap<PendingKey, Timestamp>>,
 }
 
 impl Scheduler {
@@ -135,11 +140,13 @@ impl Scheduler {
             encoder,
             epoch_key,
             data_dir,
+            last_attempted: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
     /// Main run loop. Fires on five independent timers:
-    ///   - pos_timer: call issue_due_challenges() (bounded by its time budget, pos-i7-a)
+    ///   - pos_timer: call issue_tick() (bounded by its time budget, pos-i7-a); its
+    ///     challenge publishes end later and are settled by a `join_next` arm (pos-i7-c)
     ///   - timeout_timer: call check_timeouts()
     ///   - deletion_timer: call process_deletion_tick()
     ///   - ledger_timer: call accrue_pair_ledgers() (4R recorder, decides nothing)
@@ -201,6 +208,9 @@ impl Scheduler {
             "scheduler started"
         );
 
+        // Challenge publishes started by issue ticks, settled here as they end.
+        let mut in_flight = issue::InFlight::default();
+
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -208,9 +218,12 @@ impl Scheduler {
                     break;
                 }
                 _ = pos_timer.tick() => {
-                    if let Err(e) = self.issue_due_challenges().await {
-                        error!("scheduler: issue_due_challenges error: {e}");
+                    if let Err(e) = self.issue_tick(&mut in_flight).await {
+                        error!("scheduler: issue_tick error: {e}");
                     }
+                }
+                Some(done) = in_flight.join_next(), if !in_flight.is_empty() => {
+                    self.settle_publish(done, &mut in_flight.settled).await;
                 }
                 _ = timeout_timer.tick() => {
                     if let Err(e) = self.check_timeouts().await {
@@ -317,6 +330,9 @@ impl Scheduler {
                 }
             }
         }
+
+        // Abort the publishes in flight; their challenges never reached pending.
+        in_flight.shutdown().await;
 
         Ok(())
     }

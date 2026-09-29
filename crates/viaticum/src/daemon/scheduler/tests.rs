@@ -29,6 +29,10 @@ mod pos_scale;
 mod stale_verdict;
 // pos-i7-a: the issue tick is bounded by its budget; each challenge is stamped at publish.
 mod issue_budget;
+// pos-i7-a, pos-i7-c: the order of due blocks (least recently tried first).
+mod issue_order;
+// The shared owner / postman set-up of the two above.
+mod issue_support;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
