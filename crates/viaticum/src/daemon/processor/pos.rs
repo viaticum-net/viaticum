@@ -32,6 +32,26 @@ pub struct PosResponder {
     db: Db,
     holdings_dir: PathBuf,
     master_signing_key: ed25519_dalek::SigningKey,
+    /// Scales the freshness window (`challenge_max_age_secs`); 1 = production.
+    time_scale: u64,
+}
+
+/// Clock skew allowed between an owner's and a holder's clock when a challenge's age is
+/// judged (not scaled: clocks drift in real seconds whatever the run's time_scale).
+///
+/// 10 minutes covers consumer machines that sync time rarely (drift of seconds to a few
+/// minutes) with room to spare, and is negligible next to the 7-day TTL in production.
+/// On the stand (time_scale 900: TTL 672 s) all nodes share one clock and the window is
+/// 1272 s, still below the owner's scaled pending timeout (14 d 2 h / 900 ≈ 1353 s).
+pub(crate) const POS_CHALLENGE_MAX_CLOCK_SKEW_SECS: u64 = 600;
+
+/// Oldest challenge a holder still answers: the scaled challenge TTL (the owner's own
+/// entry lives no longer at the postmen) plus `POS_CHALLENGE_MAX_CLOCK_SKEW_SECS`.
+pub(crate) fn challenge_max_age_secs(time_scale: u64) -> u64 {
+    viaticum_core::mailbox::scaled_ttl_secs(
+        viaticum_core::mailbox::class_config::POS_CHALLENGE_TTL.as_secs(),
+        time_scale,
+    ) + POS_CHALLENGE_MAX_CLOCK_SKEW_SECS
 }
 
 impl PosResponder {
@@ -44,7 +64,14 @@ impl PosResponder {
             db,
             holdings_dir,
             master_signing_key,
+            time_scale: 1,
         }
+    }
+
+    /// Set the run's time_scale (the freshness window shrinks with it).
+    pub fn with_time_scale(mut self, time_scale: u64) -> Self {
+        self.time_scale = time_scale.max(1);
+        self
     }
 }
 
@@ -76,6 +103,26 @@ impl PosResponder {
             return Err(ProcessorError::UnauthenticatedChallenge);
         }
 
+        // pos-i5-a: a replay. The signature does not expire, so a postman could keep an
+        // owner's old challenges and replay them after the holder's memory forgot them.
+        // Answer only a challenge younger than the TTL + clock skew (the owner's own entry
+        // lives only the TTL); an older one is dropped before any disk or DB work. A
+        // challenge "from the future" (owner's clock ahead) is not judged here. The poll
+        // remembers the drop as a no-answer, so this WARN comes once per quarter TTL.
+        let age = Timestamp::now().0.saturating_sub(challenge.timestamp.0);
+        let max_age = challenge_max_age_secs(self.time_scale);
+        if age > max_age {
+            warn!(
+                block_id = %block_id,
+                challenger = %owner_id,
+                challenge_id = %hex_encode(&challenge.challenge_id),
+                age_secs = age,
+                max_age_secs = max_age,
+                "processor: PosHashChallenge older than TTL + clock skew — dropping (replay)"
+            );
+            return Err(ProcessorError::StaleChallenge { age_secs: age });
+        }
+
         // Verify we hold symbols for this owner+block. Capture the holding — its
         // `symbol_count()` bounds the legitimate challenge size (SM-1 guard below).
         let holding = match self.db.get_holding(&block_id, &owner_id)? {
@@ -84,6 +131,7 @@ impl PosResponder {
                 warn!(
                     block_id = %block_id,
                     challenger = %owner_id,
+                    challenge_id = %hex_encode(&challenge.challenge_id),
                     "processor: PosHashChallenge from non-owner, sending nack"
                 );
                 return Ok(Message::PosHashNack(build_pos_hash_nack(
@@ -132,8 +180,9 @@ impl PosResponder {
         }
         // CS-POS-4: an empty/zero esi_ranges (requested == 0) passes the `requested > held`
         // check below (0 <= held) but would then feed `compute_chain_hash` an empty input →
-        // `ChainHashEmptyInput` Err on EVERY poll until the entry's TTL (~168 re-serves) from
-        // one signed junk challenge. A legitimate challenge always covers ≥1 ESI, so reject
+        // `ChainHashEmptyInput` Err, and a handler error is not remembered by the poll (pos-i5),
+        // so it would recur on every poll until the entry's TTL from one signed junk
+        // challenge. A legitimate challenge always covers ≥1 ESI, so reject
         // it here as malformed — same clean-drop treatment as the oversized case (no Nack, no
         // response, surfaced as `OversizedChallenge` which the poll handler drops cleanly).
         if requested == 0 {
@@ -187,6 +236,7 @@ impl PosResponder {
                     warn!(
                         block_id = %block_id,
                         esi,
+                        challenge_id = %hex_encode(&challenge.challenge_id),
                         "processor: PosHashChallenge — symbol missing, sending nack"
                     );
                     return Ok(Message::PosHashNack(build_pos_hash_nack(
@@ -210,7 +260,14 @@ impl PosResponder {
         let chain_hash = compute_chain_hash(&challenge.challenge_id, &refs)
             .map_err(ProcessorError::PosVerify)?;
 
-        debug!(block_id = %block_id, "processor: PosHashChallenge — responding with chain hash");
+        // pos-i5: on the mailbox path this line comes once per challenge (the poll keeps
+        // the answer in memory); the scenario counts it per `challenge_id`.
+        debug!(
+            block_id = %block_id,
+            challenge_id = %hex_encode(&challenge.challenge_id),
+            owner = %owner_id,
+            "processor: PosHashChallenge — responding with chain hash"
+        );
         // CS-ID-1 / P1-1: sign the response with our master key so the owner can verify it
         // came from the challenged holder (not a positioned postman forging a wrong hash).
         Ok(Message::PosHashResponse(build_pos_hash_response(
@@ -320,10 +377,23 @@ impl PosMailboxChallengeHandler for ProcessorPosHandler {
                     // Same clean-drop treatment as UnauthenticatedChallenge — no Nack, no
                     // response, not surfaced as a handler error.
                     Err(ProcessorError::OversizedChallenge { .. }) => Ok(None),
+                    // pos-i5-a: a replay older than TTL + skew, already warn-logged.
+                    Err(ProcessorError::StaleChallenge { .. }) => Ok(None),
                     Err(e) => Err(anyhow::anyhow!("pos challenge handler error: {e}")),
                 }
             }
-            Err(e) => Err(anyhow::anyhow!("failed to decode PosHashChallengeMsg: {e}")),
+            // An undecodable payload is junk (a postman's plant or a broken peer): a clean
+            // drop like an unauthenticated challenge, so the poll remembers it as a
+            // no-answer and re-checks it once per quarter TTL instead of logging an
+            // error on every poll (pos-i5).
+            Err(e) => {
+                warn!(
+                    challenger = %owner_master_pub,
+                    err = %e,
+                    "mailbox PoS: undecodable PosHashChallengeMsg — dropping"
+                );
+                Ok(None)
+            }
         }
     }
 }

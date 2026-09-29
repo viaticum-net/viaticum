@@ -6,7 +6,8 @@
 // stabilize wait).
 //
 // Entry dispatch (§2.17):
-//   PosChallenge   → handle_pos_challenge_from_mailbox (compute response, publish PosResponse)
+//   PosChallenge   → compute the response once, publish it, keep it in memory and
+//                    re-publish the same entry rarely (pos-i5, see `pos_memo`)
 //   PosResponse    → pos_response_tx.try_send (scheduler resolves pending challenge)
 //   SelfPointer    → dropped with a warn: pointers live in the rendezvous box, which the
 //                    daemon never reads (CROWN-1 РС3.1, mailbox-i37; only DR reads it)
@@ -16,7 +17,7 @@
 //   Generic/other  → ignore
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -24,11 +25,14 @@ use tracing::{debug, error, info, warn};
 use viaticum_core::constants::MAILBOX_POLL_INTERVAL_SECS;
 use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
 use viaticum_core::messages::{
-    PosHashResponseMsg, SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, to_cbor,
+    PosHashChallengeMsg, PosHashResponseMsg, SymbolDropNoticeBatchMsg, SymbolDropNoticeMsg, to_cbor,
 };
 use viaticum_core::types::{IdentityPub, from_cbor_bytes, hex_encode};
 
 use super::routing::MailboxRouter;
+use crate::daemon::pos_memo::{
+    AnsweredChallenges, ChallengeKey, ChallengeStep, PollCounts, PosPollState,
+};
 use crate::daemon::processor::{DeleteMailboxHandler, RevocationMailboxHandler};
 
 /// Mailbox poll cadence in seconds, scaled by `time_scale`.
@@ -79,6 +83,9 @@ pub async fn run_mailbox_poll(
     let poll_secs = poll_interval_secs(time_scale);
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // pos-i5: what this task remembers about PoS between polls. RAM only: a restart
+    // starts empty and computes every live challenge once.
+    let mut pos = PosPollState::new(time_scale);
 
     loop {
         tokio::select! {
@@ -87,42 +94,116 @@ pub async fn run_mailbox_poll(
                 break;
             }
             _ = interval.tick() => {
-                // Poll our own mailbox from read-fanout peers.
-                let entries = match router
-                    .poll(&MailboxAddress::for_master(&my_master_pub), None, None)
-                    .await
-                {
-                    Ok(e) => e,
-                    Err(err) => {
-                        warn!(err = %err, "mailbox_poll: poll failed");
-                        continue;
-                    }
-                };
-
-                if entries.is_empty() {
-                    debug!("mailbox_poll: no entries");
-                    continue;
-                }
-
-                info!(count = entries.len(), "mailbox_poll: received entries");
-
-                for entry in entries {
-                    dispatch_entry(
-                        &router,
-                        &pos_response_tx,
-                        &challenge_handler,
-                        &drop_handler,
-                        &delete_handler,
-                        &revocation_handler,
-                        &my_master_pub,
-                        entry,
-                        time_scale,
-                    )
-                    .await;
-                }
+                poll_once(
+                    &router,
+                    &pos_response_tx,
+                    &mut pos,
+                    &challenge_handler,
+                    &drop_handler,
+                    &delete_handler,
+                    &revocation_handler,
+                    &my_master_pub,
+                    time_scale,
+                    unix_now(),
+                )
+                .await;
             }
         }
     }
+}
+
+/// One poll of our own master box: forget expired PoS memory, fetch, dispatch every
+/// entry, print `mailbox_poll: poll done` (INFO when the poll had entries, DEBUG when
+/// it was empty). Returns the counters (`None` when the fetch failed).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn poll_once(
+    router: &Arc<MailboxRouter>,
+    pos_response_tx: &mpsc::Sender<PosHashResponseMsg>,
+    pos: &mut PosPollState,
+    challenge_handler: &Arc<dyn PosMailboxChallengeHandler>,
+    drop_handler: &Arc<dyn DropNoticeHandler>,
+    delete_handler: &Arc<dyn DeleteMailboxHandler>,
+    revocation_handler: &Arc<dyn RevocationMailboxHandler>,
+    my_master_pub: &IdentityPub,
+    time_scale: u64,
+    now_secs: u64,
+) -> Option<PollCounts> {
+    let started = Instant::now();
+    let forgotten = pos.begin_poll(now_secs);
+
+    // Poll our own mailbox from read-fanout peers.
+    let entries = match router
+        .poll(&MailboxAddress::for_master(my_master_pub), None, None)
+        .await
+    {
+        Ok(e) => e,
+        Err(err) => {
+            warn!(err = %err, "mailbox_poll: poll failed");
+            return None;
+        }
+    };
+
+    let entry_count = entries.len();
+    let mut counts = PollCounts::default();
+    for entry in entries {
+        dispatch_entry(
+            router,
+            pos_response_tx,
+            pos,
+            &mut counts,
+            challenge_handler,
+            drop_handler,
+            delete_handler,
+            revocation_handler,
+            my_master_pub,
+            entry,
+            time_scale,
+            now_secs,
+        )
+        .await;
+    }
+
+    // One line per poll (pos-i5 observables): INFO with entries, DEBUG when empty.
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let memo_answered = pos.answered.len();
+    let memo_refused = pos.answered.refused();
+    if entry_count > 0 {
+        info!(
+            elapsed_ms,
+            entries = entry_count,
+            computed = counts.computed,
+            no_answer = counts.no_answer,
+            handler_error = counts.handler_error,
+            republished = counts.republished,
+            skipped = counts.skipped,
+            publish_zero_ack = counts.publish_zero_ack,
+            forwarded = counts.forwarded,
+            deferred_full = counts.deferred_full,
+            undecodable = counts.undecodable,
+            memo_answered,
+            memo_forgotten = forgotten,
+            memo_refused,
+            "mailbox_poll: poll done"
+        );
+    } else {
+        debug!(
+            elapsed_ms,
+            entries = 0,
+            memo_answered,
+            memo_forgotten = forgotten,
+            memo_refused,
+            "mailbox_poll: poll done"
+        );
+    }
+    Some(counts)
+}
+
+/// Unix seconds now.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Dispatch a single polled MailboxEntry to the appropriate handler.
@@ -130,6 +211,8 @@ pub async fn run_mailbox_poll(
 pub(crate) async fn dispatch_entry(
     router: &Arc<MailboxRouter>,
     pos_response_tx: &mpsc::Sender<PosHashResponseMsg>,
+    pos: &mut PosPollState,
+    counts: &mut PollCounts,
     challenge_handler: &Arc<dyn PosMailboxChallengeHandler>,
     drop_handler: &Arc<dyn DropNoticeHandler>,
     delete_handler: &Arc<dyn DeleteMailboxHandler>,
@@ -137,15 +220,28 @@ pub(crate) async fn dispatch_entry(
     my_master_pub: &IdentityPub,
     entry: MailboxEntry,
     time_scale: u64,
+    now_secs: u64,
 ) {
     match entry.class {
         MailboxClass::PosChallenge => {
-            dispatch_pos_challenge(router, challenge_handler, my_master_pub, entry, time_scale)
-                .await;
+            dispatch_pos_challenge(
+                router,
+                challenge_handler,
+                &mut pos.answered,
+                counts,
+                my_master_pub,
+                entry,
+                time_scale,
+                now_secs,
+            )
+            .await;
         }
-        MailboxClass::PosResponse => {
-            dispatch_pos_response(pos_response_tx, entry);
-        }
+        MailboxClass::PosResponse => match dispatch_pos_response(pos_response_tx, entry) {
+            ForwardResult::Forwarded => counts.forwarded += 1,
+            ForwardResult::ChannelFull => counts.deferred_full += 1,
+            ForwardResult::Undecodable => counts.undecodable += 1,
+            ForwardResult::ChannelClosed => {}
+        },
         MailboxClass::SelfPointer => {
             drop_self_pointer_from_master_box(&entry);
         }
@@ -175,19 +271,33 @@ pub(crate) async fn dispatch_entry(
     }
 }
 
-/// Handle a PosChallenge entry: compute response and publish to owner via mailbox.
+/// Handle a PosChallenge entry: compute the response once, publish it to the owner via
+/// the mailbox, and keep it in `answered` (pos-i5).
 ///
 /// The owner's master_pub comes from `entry.sender` (set by the scheduler when publishing
 /// the challenge — see scheduler::issue_due_challenges).
 ///
 /// `my_master_pub` is this (holder) node's master identity. It is stamped as the response
 /// `sender` so the owner can resolve who to verify the response signature against (CS-ID-1).
+///
+/// The challenge entry stays in our box until its TTL, so the poll sees it on every poll.
+/// Only the first sight computes (reads the symbols, hashes, signs). Later sights skip
+/// it, or re-publish the remembered response entry (the same bytes, the same msg_id):
+/// on the next poll after a 0-ack publish, otherwise once per quarter TTL while the
+/// challenge and the response entry live. That re-publish is the retry (trap W-1: a
+/// postman that lost the entry after acking it). A no-answer (Nack, unauthenticated,
+/// oversized) is remembered too and re-checked once per quarter TTL; a handler error
+/// is not remembered and is retried on the next poll.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_pos_challenge(
     router: &Arc<MailboxRouter>,
     challenge_handler: &Arc<dyn PosMailboxChallengeHandler>,
+    answered: &mut AnsweredChallenges,
+    counts: &mut PollCounts,
     my_master_pub: &IdentityPub,
     entry: MailboxEntry,
     time_scale: u64,
+    now_secs: u64,
 ) {
     // CS-ID-6 / SM-8 (defense-in-depth): we only ever poll our own mailbox
     // (`router.poll(&my_master_pub, ...)`), so a PosChallenge that reaches dispatch
@@ -215,6 +325,48 @@ async fn dispatch_pos_challenge(
         }
     };
 
+    // pos-i5-a: decode first and key the memory by what the owner signed, so no
+    // re-encoding of the same signed challenge is computed twice. An undecodable payload
+    // is keyed by its raw bytes and ends as a no-answer here, without the handler (no
+    // disk read). After mailbox encryption (C4) the entry is opened before this point.
+    let decoded = from_cbor_bytes::<PosHashChallengeMsg>(&entry.payload).ok();
+    let key = match &decoded {
+        Some(c) => ChallengeKey::signed(Some(&owner_master), c),
+        None => ChallengeKey::undecodable(&entry),
+    };
+
+    match answered.step(key, now_secs) {
+        ChallengeStep::Skip => {
+            counts.skipped += 1;
+            return;
+        }
+        ChallengeStep::Republish {
+            response,
+            challenge_id,
+        } => {
+            let acks =
+                publish_pos_response(router, response, &owner_master, &challenge_id, true).await;
+            counts.republished += 1;
+            if acks == 0 {
+                counts.publish_zero_ack += 1;
+            }
+            answered.record_republish(key, acks, now_secs);
+            return;
+        }
+        ChallengeStep::Compute => {}
+    }
+
+    if decoded.is_none() {
+        counts.no_answer += 1;
+        answered.remember_no_answer(key, now_secs);
+        warn!(
+            msg_id = %hex_encode(&entry.msg_id),
+            owner = %owner_master,
+            "mailbox_poll: undecodable PosChallenge — no answer (re-checked once per quarter TTL)"
+        );
+        return;
+    }
+
     // Pass owner_master as the first arg — PosMailboxChallengeHandler uses it as owner_id
     // to look up our HoldingRecord (owner = the one who sent the challenge).
     match challenge_handler
@@ -222,6 +374,7 @@ async fn dispatch_pos_challenge(
         .await
     {
         Ok(Some(response)) => {
+            counts.computed += 1;
             // Publish PosResponse back to the owner via mailbox.
             let response_payload = match to_cbor(&response) {
                 Ok(p) => p,
@@ -238,21 +391,18 @@ async fn dispatch_pos_challenge(
                 viaticum_core::mailbox::class_config::POS_CHALLENGE_TTL.as_secs(),
                 time_scale,
             );
-            let now_secs = SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let built_at = unix_now();
 
             // A3 (P1-4 / M1 / WARN-1): deterministic-but-UNPREDICTABLE msg_id.
             //
-            // The PoS challenge entry stays in our (holder's) mailbox until its TTL, so
-            // `dispatch_pos_challenge` re-runs on every poll while the challenge is alive
-            // — this IS the retry: if a publish gets 0 acks (all of the owner's write-
-            // fanout postmen were unreachable), the next poll re-publishes the same
-            // response. The owner's pending lives longer (POS_CHALLENGE_PENDING ≈14d2h)
-            // than the challenge TTL (7d), so a late retry is still accepted.
+            // The response entry is kept in memory and re-published as is (see the fn
+            // doc), so every copy the postmen see carries the same msg_id and bytes. The
+            // owner's pending lives longer (POS_CHALLENGE_PENDING ≈14d2h) than the
+            // challenge TTL (7d), so a late re-publish is still accepted. After a restart
+            // the memory is empty and the response is computed again: the msg_id is the
+            // same (same chain_hash), the timestamp and signature are new.
             //
-            // The msg_id must be (a) STABLE across re-dispatch so postmen dedup re-
+            // The msg_id must be (a) STABLE across re-computes so postmen dedup re-
             // published responses (closes M1 pile-up), and (b) UNPREDICTABLE to a third
             // party so a postman that has merely seen the challenge cannot pre-occupy the
             // response key. We derive it from the chain_hash — which only a node that
@@ -261,7 +411,7 @@ async fn dispatch_pos_challenge(
             //     msg_id = BLAKE3("viaticum-pos-resp-msgid-v1" ‖ challenge_id ‖ chain_hash)[..16]
             //
             // Stable: the same challenge yields the same chain_hash, hence the same msg_id
-            // on every re-dispatch. Unpredictable: a postman storing the challenge sees
+            // on every re-compute. Unpredictable: a postman storing the challenge sees
             // `challenge_id` (plaintext in the challenge entry) but NOT the symbols, so it
             // cannot compute chain_hash → cannot predict this key. Using the raw
             // `challenge_id` would let any postman pre-store garbage under (owner_master,
@@ -271,7 +421,7 @@ async fn dispatch_pos_challenge(
             // creating the very P1-4 false-penalty this fix prevents (WARN-1).
             //
             // Store dedup is KEEP-FIRST: an existing (target, msg_id, class) key returns
-            // Duplicate→Ack (mailbox_insert / handle_mailbox_store), so a re-dispatch is an
+            // Duplicate→Ack (mailbox_insert / handle_mailbox_store), so a re-publish is an
             // idempotent no-op Ack, not an overwrite. No cross-class collision: this entry
             // is keyed under (owner_master, msg_id, PosResponse) while the challenge sits
             // under (holder_master, challenge_id, PosChallenge).
@@ -291,42 +441,35 @@ async fn dispatch_pos_challenge(
                 class: MailboxClass::PosResponse,
                 payload_version: 1,
                 payload: response_payload,
-                expires_at: now_secs + ttl_secs,
-                stored_at: now_secs,
+                expires_at: built_at + ttl_secs,
+                stored_at: built_at,
                 // CS-ID-1: stamp our (holder) master so the owner can resolve and verify
                 // the response signature. The owner does not trust this hint blindly — it
                 // verifies the payload sig against the master of its own pending.holder_id.
                 sender: Some(*my_master_pub),
             };
 
-            match router.publish(response_entry, None).await {
-                Ok(0) => {
-                    warn!(
-                        owner = %owner_master,
-                        "mailbox_poll: PosResponse publish got 0 acks — response may be lost"
-                    );
-                }
-                Ok(ack_count) => {
-                    debug!(
-                        owner = %owner_master,
-                        ack_count,
-                        "mailbox_poll: PosResponse published"
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        owner = %owner_master,
-                        err = %e,
-                        "mailbox_poll: PosResponse publish failed"
-                    );
-                }
+            let acks = publish_pos_response(
+                router,
+                response_entry.clone(),
+                &owner_master,
+                &response.challenge_id,
+                false,
+            )
+            .await;
+            if acks == 0 {
+                counts.publish_zero_ack += 1;
             }
+            answered.remember_response(key, response_entry, response.challenge_id, acks, now_secs);
         }
         Ok(None) => {
             // Nack or CannotCompute — challenge_handler already logged
+            counts.no_answer += 1;
+            answered.remember_no_answer(key, now_secs);
             debug!(msg_id = %hex_encode(&entry.msg_id), "mailbox_poll: PosChallenge handler returned no response (nack)");
         }
         Err(e) => {
+            counts.handler_error += 1;
             error!(
                 msg_id = %hex_encode(&entry.msg_id),
                 err = %e,
@@ -336,26 +479,80 @@ async fn dispatch_pos_challenge(
     }
 }
 
+/// Publish one PosResponse entry (fresh or from memory) and return its acks; a publish
+/// error counts as 0 acks (the memory then re-publishes on the next poll).
+async fn publish_pos_response(
+    router: &Arc<MailboxRouter>,
+    response_entry: MailboxEntry,
+    owner_master: &IdentityPub,
+    challenge_id: &[u8; 16],
+    cached: bool,
+) -> usize {
+    match router.publish(response_entry, None).await {
+        Ok(0) => {
+            warn!(
+                owner = %owner_master,
+                challenge_id = %hex_encode(challenge_id),
+                cached,
+                "mailbox_poll: PosResponse publish got 0 acks — re-publishing from memory on the next poll"
+            );
+            0
+        }
+        Ok(acks) => {
+            debug!(
+                owner = %owner_master,
+                challenge_id = %hex_encode(challenge_id),
+                acks,
+                cached,
+                "mailbox_poll: PosResponse published"
+            );
+            acks
+        }
+        Err(e) => {
+            error!(
+                owner = %owner_master,
+                challenge_id = %hex_encode(challenge_id),
+                cached,
+                err = %e,
+                "mailbox_poll: PosResponse publish failed"
+            );
+            0
+        }
+    }
+}
+
+/// What happened to one PosResponse entry handed to the scheduler channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForwardResult {
+    Forwarded,
+    ChannelFull,
+    ChannelClosed,
+    Undecodable,
+}
+
 /// Handle a PosResponse entry: forward to scheduler via pos_response_tx.
 pub(crate) fn dispatch_pos_response(
     pos_response_tx: &mpsc::Sender<PosHashResponseMsg>,
     entry: MailboxEntry,
-) {
+) -> ForwardResult {
     match from_cbor_bytes::<PosHashResponseMsg>(&entry.payload) {
         Ok(response) => {
             // N-5: bounded channel, try_send + WARN on Full.
             match pos_response_tx.try_send(response) {
                 Ok(()) => {
                     debug!(msg_id = %hex_encode(&entry.msg_id), "mailbox_poll: PosResponse forwarded to scheduler");
+                    ForwardResult::Forwarded
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     warn!(
                         msg_id = %hex_encode(&entry.msg_id),
                         "mailbox_poll: pos_response_tx full — dropping PosResponse (N-5)"
                     );
+                    ForwardResult::ChannelFull
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     debug!("mailbox_poll: pos_response_tx closed (scheduler shut down)");
+                    ForwardResult::ChannelClosed
                 }
             }
         }
@@ -365,6 +562,7 @@ pub(crate) fn dispatch_pos_response(
                 err = %e,
                 "mailbox_poll: failed to decode PosHashResponseMsg"
             );
+            ForwardResult::Undecodable
         }
     }
 }

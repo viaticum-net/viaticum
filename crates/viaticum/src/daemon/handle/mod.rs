@@ -1143,11 +1143,11 @@ impl DaemonHandle {
                 ProcessorRevocationHandler,
             };
 
-            let pos_handler = ProcessorPosHandler::new(PosResponder::new(
-                db.clone(),
-                holdings_dir.clone(),
-                master_key.clone(),
-            ));
+            // pos-i5-a: the freshness window of an answered challenge scales with the run.
+            let pos_handler = ProcessorPosHandler::new(
+                PosResponder::new(db.clone(), holdings_dir.clone(), master_key.clone())
+                    .with_time_scale(time_scale),
+            );
 
             // T-13a: pass repair_tx so ProcessorDropHandler can wake the repair worker
             // for immediate-drop DropNotice entries (deadline ≈ now).

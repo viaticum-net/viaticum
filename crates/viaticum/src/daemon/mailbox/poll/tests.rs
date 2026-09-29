@@ -42,6 +42,29 @@ fn make_entry(class: MailboxClass, target: IdentityPub, payload: Vec<u8>) -> Mai
     }
 }
 
+/// Owner key of the test challenges.
+fn owner_signing_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32])
+}
+
+/// A decodable PosHashChallengeMsg signed by `owner_signing_key` (issued now).
+fn signed_challenge() -> viaticum_core::messages::PosHashChallengeMsg {
+    viaticum_core::messages::build_pos_hash_challenge(
+        [0x5A; 16],
+        SourceBlockId([8u8; 32]),
+        vec![(0, 1)],
+        Timestamp::now(),
+        None,
+        &owner_signing_key(),
+    )
+}
+
+/// CBOR payload of `signed_challenge()`: the poll decodes a PosChallenge before its
+/// memory step (pos-i5-a), so test challenges must decode.
+fn signed_challenge_payload() -> Vec<u8> {
+    to_cbor(&signed_challenge()).expect("encode challenge")
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 /// PosResponse dispatch forwards the decoded message to pos_response_tx.
@@ -1287,6 +1310,7 @@ use viaticum_core::messages::{
 };
 
 use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter};
+use crate::daemon::pos_memo::{AnsweredChallenges, PollCounts, PosPollState};
 
 /// Stub PosMailboxChallengeHandler: returns a canned response regardless of payload,
 /// so dispatch_pos_challenge proceeds to build + publish the PosResponse entry.
@@ -1390,14 +1414,30 @@ async fn pos_response_entry_ttl_is_scaled_by_time_scale() {
     let owner_master = make_identity(0x42);
     let my_master = make_identity(0xAA);
     // Payload is opaque to the stub handler; entry.sender = the challenging owner.
-    let base = make_entry(MailboxClass::PosChallenge, my_master, vec![0x00]);
+    let base = make_entry(
+        MailboxClass::PosChallenge,
+        my_master,
+        signed_challenge_payload(),
+    );
     let entry = MailboxEntry {
         sender: Some(owner_master),
         ..base
     };
 
     let time_scale = 60;
-    super::dispatch_pos_challenge(&router, &handler, &my_master, entry, time_scale).await;
+    let mut memo = AnsweredChallenges::new(time_scale);
+    let mut counts = PollCounts::default();
+    super::dispatch_pos_challenge(
+        &router,
+        &handler,
+        &mut memo,
+        &mut counts,
+        &my_master,
+        entry,
+        time_scale,
+        Timestamp::now().0,
+    )
+    .await;
 
     let stored = sender.stored.lock().await;
     assert_eq!(stored.len(), 1, "exactly one PosResponse must be published");
@@ -1449,14 +1489,34 @@ async fn pos_challenge_not_addressed_to_us_is_dropped() {
     let someone_else = make_identity(0xBB);
     // Entry addressed to `someone_else`, not us. sender is a valid owner so the only
     // thing stopping a publish is the target guard.
-    let base = make_entry(MailboxClass::PosChallenge, someone_else, vec![0x00]);
+    let base = make_entry(
+        MailboxClass::PosChallenge,
+        someone_else,
+        signed_challenge_payload(),
+    );
     let entry = MailboxEntry {
         sender: Some(owner_master),
         ..base
     };
 
-    super::dispatch_pos_challenge(&router, &handler, &my_master, entry, 1).await;
+    let mut memo = AnsweredChallenges::new(1);
+    let mut counts = PollCounts::default();
+    super::dispatch_pos_challenge(
+        &router,
+        &handler,
+        &mut memo,
+        &mut counts,
+        &my_master,
+        entry,
+        1,
+        Timestamp::now().0,
+    )
+    .await;
 
+    assert!(
+        memo.is_empty(),
+        "a mis-targeted challenge is not remembered"
+    );
     let stored = sender.stored.lock().await;
     assert!(
         stored.is_empty(),
@@ -1503,9 +1563,13 @@ async fn generic_entry_is_ignored_without_effect() {
     let entry = make_entry(MailboxClass::Generic, my_master, vec![0xDE, 0xAD]);
 
     // Must not panic, must not publish, must not forward anything.
+    let mut pos = PosPollState::new(1);
+    let mut counts = PollCounts::default();
     super::dispatch_entry(
         &router,
         &pos_tx,
+        &mut pos,
+        &mut counts,
         &challenge_handler,
         &drop_handler,
         &delete_handler,
@@ -1513,8 +1577,14 @@ async fn generic_entry_is_ignored_without_effect() {
         &my_master,
         entry,
         1,
+        Timestamp::now().0,
     )
     .await;
+    assert_eq!(
+        counts,
+        PollCounts::default(),
+        "a Generic entry counts nothing"
+    );
 
     assert!(
         sender.stored.lock().await.is_empty(),
@@ -1529,11 +1599,13 @@ async fn generic_entry_is_ignored_without_effect() {
 // ─── A3: PosResponse delivery is reliable (deterministic msg_id + retry) ───────
 //
 // P1-4: a PosResponse must not be lost on a single 0-ack publish. The PoS challenge
-// entry stays in the holder's mailbox until TTL, so dispatch_pos_challenge re-runs on
-// every poll — that re-run is the retry. M1: re-published responses must dedup, not
-// pile up; the msg_id must therefore be deterministic — derived from
-// (challenge_id ‖ chain_hash) so it is stable across re-dispatch yet unpredictable to a
-// postman that lacks the symbols (WARN-1), not a fresh random value each poll.
+// entry stays in the holder's mailbox until TTL, so dispatch_pos_challenge sees it on
+// every poll; since pos-i5 it computes once and re-publishes the remembered entry (next
+// poll after 0 acks, else once per quarter TTL) — that re-publish is the retry. M1:
+// re-published responses must dedup, not pile up; the msg_id must therefore be
+// deterministic — derived from (challenge_id ‖ chain_hash) so it is stable across
+// re-computes (a restart) yet unpredictable to a postman that lacks the symbols
+// (WARN-1), not a fresh random value each poll.
 
 /// A sender that fails (network error → 0 acks) for the first N store attempts, then
 /// records and Acks every store after that. Captures the entry of every attempt
@@ -1627,19 +1699,50 @@ async fn pos_response_msg_id_is_derived_from_chain_hash_and_stable_across_redisp
 
     let owner_master = make_identity(0x42);
     let my_master = make_identity(0xAA);
-    let base = make_entry(MailboxClass::PosChallenge, my_master, vec![0x00]);
+    let base = make_entry(
+        MailboxClass::PosChallenge,
+        my_master,
+        signed_challenge_payload(),
+    );
     let entry = MailboxEntry {
         sender: Some(owner_master),
         ..base
     };
 
-    // Two re-dispatches of the SAME challenge entry (simulating two polls while the
-    // challenge is still alive in our mailbox).
-    super::dispatch_pos_challenge(&router, &handler, &my_master, entry.clone(), 1).await;
-    super::dispatch_pos_challenge(&router, &handler, &my_master, entry, 1).await;
+    // Two polls of the SAME challenge entry a quarter TTL apart (the challenge is still
+    // alive in our mailbox): computed once, published twice (the second from memory).
+    // time_scale 900: the quarter TTL (168 s) falls inside the entry's hour of life.
+    let (handler, calls) = CountingChallengeHandler::wrap(handler);
+    let mut memo = AnsweredChallenges::new(900);
+    let mut counts = PollCounts::default();
+    let now = Timestamp::now().0;
+    let retry = memo.retry_secs();
+    for at in [now, now + retry] {
+        super::dispatch_pos_challenge(
+            &router,
+            &handler,
+            &mut memo,
+            &mut counts,
+            &my_master,
+            entry.clone(),
+            900,
+            at,
+        )
+        .await;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the challenge is computed once"
+    );
+    assert_eq!((counts.computed, counts.republished), (1, 1));
 
     let stored = sender.stored.lock().await;
-    assert_eq!(stored.len(), 2, "two re-dispatches must publish twice");
+    assert_eq!(stored.len(), 2, "a publish and a re-publish from memory");
+    assert_eq!(
+        stored[0].entry, stored[1].entry,
+        "the re-publish is the same entry bytes"
+    );
     let msg_id = stored[0].entry.msg_id;
     assert_eq!(
         msg_id, stored[1].entry.msg_id,
@@ -1674,20 +1777,36 @@ async fn pos_response_msg_id_depends_on_chain_hash() {
         device_id: None,
         sig: [0u8; 64],
     };
-    let base = make_entry(MailboxClass::PosChallenge, my_master, vec![0x00]);
+    let base = make_entry(
+        MailboxClass::PosChallenge,
+        my_master,
+        signed_challenge_payload(),
+    );
     let entry = MailboxEntry {
         sender: Some(owner_master),
         ..base
     };
 
-    let h1: Arc<dyn super::PosMailboxChallengeHandler> = Arc::new(StubChallengeHandler {
-        response: mk([9u8; 32]),
-    });
-    super::dispatch_pos_challenge(&router, &h1, &my_master, entry.clone(), 1).await;
-    let h2: Arc<dyn super::PosMailboxChallengeHandler> = Arc::new(StubChallengeHandler {
-        response: mk([0xA5u8; 32]),
-    });
-    super::dispatch_pos_challenge(&router, &h2, &my_master, entry, 1).await;
+    // A fresh memory per handler (as after a restart), so both compute.
+    let now = Timestamp::now().0;
+    for chain_hash in [[9u8; 32], [0xA5u8; 32]] {
+        let h: Arc<dyn super::PosMailboxChallengeHandler> = Arc::new(StubChallengeHandler {
+            response: mk(chain_hash),
+        });
+        let mut memo = AnsweredChallenges::new(1);
+        let mut counts = PollCounts::default();
+        super::dispatch_pos_challenge(
+            &router,
+            &h,
+            &mut memo,
+            &mut counts,
+            &my_master,
+            entry.clone(),
+            1,
+            now,
+        )
+        .await;
+    }
 
     let stored = sender.stored.lock().await;
     assert_eq!(stored.len(), 2);
@@ -1727,22 +1846,58 @@ async fn pos_response_zero_ack_is_recovered_by_redispatch() {
 
     let owner_master = make_identity(0x42);
     let my_master = make_identity(0xAA);
-    let base = make_entry(MailboxClass::PosChallenge, my_master, vec![0x00]);
+    let base = make_entry(
+        MailboxClass::PosChallenge,
+        my_master,
+        signed_challenge_payload(),
+    );
     let entry = MailboxEntry {
         sender: Some(owner_master),
         ..base
     };
 
+    let (handler, calls) = CountingChallengeHandler::wrap(handler);
+    let mut memo = AnsweredChallenges::new(1);
+    let mut counts = PollCounts::default();
+    let now = Timestamp::now().0;
+
     // First poll: publish gets 0 acks (postman unreachable). No panic, response not lost.
-    super::dispatch_pos_challenge(&router, &handler, &my_master, entry.clone(), 1).await;
+    super::dispatch_pos_challenge(
+        &router,
+        &handler,
+        &mut memo,
+        &mut counts,
+        &my_master,
+        entry.clone(),
+        1,
+        now,
+    )
+    .await;
     assert!(
         sender.acked.lock().await.is_empty(),
         "first dispatch must get 0 acks (simulated unreachable postman)"
     );
+    assert_eq!(counts.publish_zero_ack, 1);
 
-    // Next poll: the challenge is still alive in our mailbox, so dispatch re-runs and
-    // this time the publish is acked — the honest holder delivers.
-    super::dispatch_pos_challenge(&router, &handler, &my_master, entry, 1).await;
+    // Next poll (well within a quarter TTL): the 0-ack answer is re-published from
+    // memory, this time acked — the honest holder delivers without a second compute.
+    super::dispatch_pos_challenge(
+        &router,
+        &handler,
+        &mut memo,
+        &mut counts,
+        &my_master,
+        entry,
+        1,
+        now + 1,
+    )
+    .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the re-publish comes from memory"
+    );
+    assert_eq!(counts.republished, 1);
 
     let acked = sender.acked.lock().await;
     assert_eq!(
@@ -1753,5 +1908,654 @@ async fn pos_response_zero_ack_is_recovered_by_redispatch() {
     assert_ne!(
         acked[0].entry.msg_id, challenge_id,
         "the recovered delivery carries the derived (not plaintext-challenge_id) msg_id"
+    );
+}
+
+// ─── pos-i5: the holder computes a challenge once ──────────────────────────────
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Wraps a challenge handler and counts its calls (a call = the symbols are read).
+struct CountingChallengeHandler {
+    inner: Arc<dyn super::PosMailboxChallengeHandler>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl CountingChallengeHandler {
+    fn wrap(
+        inner: Arc<dyn super::PosMailboxChallengeHandler>,
+    ) -> (Arc<dyn super::PosMailboxChallengeHandler>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let h = CountingChallengeHandler {
+            inner,
+            calls: Arc::clone(&calls),
+        };
+        (Arc::new(h), calls)
+    }
+}
+
+#[async_trait::async_trait]
+impl super::PosMailboxChallengeHandler for CountingChallengeHandler {
+    async fn handle_pos_challenge(
+        &self,
+        owner_master_pub: IdentityPub,
+        payload: Vec<u8>,
+    ) -> anyhow::Result<Option<PosHashResponseMsg>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .handle_pos_challenge(owner_master_pub, payload)
+            .await
+    }
+}
+
+/// A handler that never answers (Nack, unauthenticated or oversized challenge).
+struct NoAnswerHandler;
+
+#[async_trait::async_trait]
+impl super::PosMailboxChallengeHandler for NoAnswerHandler {
+    async fn handle_pos_challenge(
+        &self,
+        _owner_master_pub: IdentityPub,
+        _payload: Vec<u8>,
+    ) -> anyhow::Result<Option<PosHashResponseMsg>> {
+        Ok(None)
+    }
+}
+
+fn stub_response(challenge_id: [u8; 16]) -> PosHashResponseMsg {
+    PosHashResponseMsg {
+        v: 1,
+        challenge_id,
+        source_block_id: SourceBlockId([8u8; 32]),
+        chain_hash: [9u8; 32],
+        timestamp: Timestamp::now(),
+        device_id: None,
+        sig: [0u8; 64],
+    }
+}
+
+/// A PosChallenge entry to `my_master` from `owner`.
+fn challenge_entry(my_master: IdentityPub, owner: IdentityPub) -> MailboxEntry {
+    MailboxEntry {
+        sender: Some(owner),
+        ..make_entry(
+            MailboxClass::PosChallenge,
+            my_master,
+            signed_challenge_payload(),
+        )
+    }
+}
+
+/// pos-i5: polls inside a quarter TTL neither call the handler again nor publish.
+#[tokio::test]
+async fn second_poll_does_not_recompute_answered_challenge() {
+    let db = Db::open_in_memory().expect("db");
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let (handler, calls) = CountingChallengeHandler::wrap(Arc::new(StubChallengeHandler {
+        response: stub_response([0x11; 16]),
+    }));
+    let my_master = make_identity(0xAA);
+    let entry = challenge_entry(my_master, make_identity(0x42));
+    let mut memo = AnsweredChallenges::new(900);
+    let mut counts = PollCounts::default();
+    let now = Timestamp::now().0;
+
+    for poll in 0..5u64 {
+        super::dispatch_pos_challenge(
+            &router,
+            &handler,
+            &mut memo,
+            &mut counts,
+            &my_master,
+            entry.clone(),
+            900,
+            now + 4 * poll,
+        )
+        .await;
+    }
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "symbols are read once");
+    assert_eq!(sender.stored.lock().await.len(), 1, "published once");
+    assert_eq!((counts.computed, counts.skipped), (1, 4));
+}
+
+/// pos-i5 (trap W-1): a postman that lost the response after acking it gets the same
+/// entry again a quarter TTL later, from memory — the symbols are not read again.
+#[tokio::test]
+async fn lost_response_is_republished_from_cache_after_quarter_ttl() {
+    let db = Db::open_in_memory().expect("db");
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let (handler, calls) = CountingChallengeHandler::wrap(Arc::new(StubChallengeHandler {
+        response: stub_response([0x22; 16]),
+    }));
+    let my_master = make_identity(0xAA);
+    let entry = challenge_entry(my_master, make_identity(0x42));
+    let mut memo = AnsweredChallenges::new(900);
+    let mut counts = PollCounts::default();
+    let now = Timestamp::now().0;
+
+    super::dispatch_pos_challenge(
+        &router,
+        &handler,
+        &mut memo,
+        &mut counts,
+        &my_master,
+        entry.clone(),
+        900,
+        now,
+    )
+    .await;
+    let retry = memo.retry_secs();
+    // The postman acked, then lost the entry (wiped / reinstalled).
+    let first = sender
+        .stored
+        .lock()
+        .await
+        .pop()
+        .expect("first publish")
+        .entry;
+
+    super::dispatch_pos_challenge(
+        &router,
+        &handler,
+        &mut memo,
+        &mut counts,
+        &my_master,
+        entry.clone(),
+        900,
+        now + retry,
+    )
+    .await;
+    // The re-publish is recorded: the very next poll does not publish again.
+    super::dispatch_pos_challenge(
+        &router,
+        &handler,
+        &mut memo,
+        &mut counts,
+        &my_master,
+        entry,
+        900,
+        now + retry + 4,
+    )
+    .await;
+
+    let stored = sender.stored.lock().await;
+    assert_eq!(
+        stored.len(),
+        1,
+        "the response reaches the postman again, once"
+    );
+    assert_eq!(
+        stored[0].entry, first,
+        "the same bytes under the same msg_id"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no second compute");
+    assert_eq!(counts.republished, 1);
+    assert_eq!(counts.skipped, 1);
+}
+
+/// pos-i5: a challenge the handler gave no answer to is not asked again on every poll,
+/// only once per quarter TTL.
+#[tokio::test]
+async fn no_answer_challenge_is_rechecked_once_per_quarter_ttl() {
+    let db = Db::open_in_memory().expect("db");
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let (handler, calls) = CountingChallengeHandler::wrap(Arc::new(NoAnswerHandler));
+    let my_master = make_identity(0xAA);
+    let entry = challenge_entry(my_master, make_identity(0x42));
+    let mut memo = AnsweredChallenges::new(900);
+    let mut counts = PollCounts::default();
+    let now = Timestamp::now().0;
+    let retry = memo.retry_secs();
+
+    for at in [now, now + 4, now + 8, now + retry] {
+        super::dispatch_pos_challenge(
+            &router,
+            &handler,
+            &mut memo,
+            &mut counts,
+            &my_master,
+            entry.clone(),
+            900,
+            at,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "first sight + one re-check"
+    );
+    assert_eq!((counts.no_answer, counts.skipped), (2, 2));
+    assert!(sender.stored.lock().await.is_empty());
+}
+
+/// pos-i5 observable: `mailbox_poll: poll done` is printed on every poll, the empty
+/// one included (at DEBUG; a poll with entries is INFO).
+#[tokio::test]
+async fn poll_done_line_is_printed_for_an_empty_poll() {
+    use std::io::Write;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<StdMutex<Vec<u8>>>);
+    impl Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let db = Db::open_in_memory().expect("db");
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let (pos_tx, _pos_rx) = mpsc::channel::<PosHashResponseMsg>(8);
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let buf = LogBuf::default();
+    let writer = buf.clone();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish(),
+    );
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let fut = super::run_mailbox_poll(
+        router,
+        pos_tx,
+        Arc::new(NoAnswerHandler),
+        Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx)),
+        Arc::new(ProcessorDeleteHandler::new(db.clone())),
+        Arc::new(crate::daemon::processor::ProcessorRevocationHandler::new(
+            db.clone(),
+        )),
+        make_identity(0xAA),
+        1,
+        cancel.clone(),
+    );
+    let task = tokio::spawn(tracing::instrument::WithSubscriber::with_subscriber(
+        fut, dispatch,
+    ));
+
+    // The first tick polls at once; wait for its line (bounded).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let logs = loop {
+        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        if logs.contains("mailbox_poll: poll done") || std::time::Instant::now() > deadline {
+            break logs;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    cancel.cancel();
+    task.await.unwrap();
+
+    let line = logs
+        .lines()
+        .find(|l| l.contains("mailbox_poll: poll done"))
+        .unwrap_or_else(|| panic!("no poll done line for an empty poll; logs:\n{logs}"));
+    assert!(line.contains("entries=0"), "{line}");
+    assert!(line.contains("elapsed_ms="), "{line}");
+    assert!(
+        line.contains("DEBUG"),
+        "an empty poll is a DEBUG line (N4): {line}"
+    );
+}
+
+// ─── Fix round 1: the poll's own start forgets, junk and sender-less entries ─────
+
+/// A postman that serves `entries` on the first fetch only, then an empty box.
+struct OneShotFetchSender {
+    entries: tokio::sync::Mutex<Option<Vec<MailboxEntry>>>,
+    stored: tokio::sync::Mutex<Vec<MailboxStoreRequest>>,
+}
+
+#[async_trait::async_trait]
+impl MailboxNetworkSender for OneShotFetchSender {
+    async fn send_store(
+        &self,
+        _device: DeviceId,
+        req: MailboxStoreRequest,
+    ) -> anyhow::Result<MailboxStoreResponse> {
+        let msg_id = req.entry.msg_id;
+        self.stored.lock().await.push(req);
+        Ok(MailboxStoreResponse::Ack { msg_id })
+    }
+
+    async fn send_fetch(
+        &self,
+        _device: DeviceId,
+        _req: MailboxFetchRequest,
+    ) -> anyhow::Result<MailboxFetchResponse> {
+        Ok(MailboxFetchResponse {
+            v: 1,
+            entries: self.entries.lock().await.take().unwrap_or_default(),
+            served_msg_ids: vec![],
+        })
+    }
+}
+
+/// B1: a poll starts by forgetting what expired — the memory of a challenge is gone
+/// one TTL after it was first seen, through the poll path itself.
+#[tokio::test]
+async fn poll_forgets_an_answered_challenge_one_ttl_later() {
+    let db = Db::open_in_memory().expect("db");
+    let my_master = make_identity(0xAA);
+    let sender = Arc::new(OneShotFetchSender {
+        entries: tokio::sync::Mutex::new(Some(vec![challenge_entry(
+            my_master,
+            make_identity(0x42),
+        )])),
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let (pos_tx, _pos_rx) = mpsc::channel::<PosHashResponseMsg>(8);
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let challenge_handler: Arc<dyn super::PosMailboxChallengeHandler> =
+        Arc::new(StubChallengeHandler {
+            response: stub_response([0x33; 16]),
+        });
+    let drop_handler: Arc<dyn super::DropNoticeHandler> =
+        Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx));
+    let delete_handler: Arc<dyn DeleteMailboxHandler> =
+        Arc::new(ProcessorDeleteHandler::new(db.clone()));
+    let revocation_handler: Arc<dyn crate::daemon::processor::RevocationMailboxHandler> = Arc::new(
+        crate::daemon::processor::ProcessorRevocationHandler::new(db.clone()),
+    );
+    let mut pos = PosPollState::new(900);
+    let ttl = pos.answered.ttl_secs();
+    let now = Timestamp::now().0;
+
+    for (at, want) in [(now, 1usize), (now + 4, 1), (now + ttl, 0)] {
+        let counts = super::poll_once(
+            &router,
+            &pos_tx,
+            &mut pos,
+            &challenge_handler,
+            &drop_handler,
+            &delete_handler,
+            &revocation_handler,
+            &my_master,
+            900,
+            at,
+        )
+        .await
+        .expect("poll");
+        assert_eq!(
+            pos.answered.len(),
+            want,
+            "memo_answered at +{} s (counts {counts:?})",
+            at - now
+        );
+    }
+    assert_eq!(
+        sender.stored.lock().await.len(),
+        1,
+        "computed and published once"
+    );
+}
+
+/// B NOTE (3): a PosChallenge without a sender is dropped before the memory — nothing
+/// is remembered (it cannot be answered, and it must not occupy the memory).
+#[tokio::test]
+async fn challenge_without_sender_is_not_remembered() {
+    let db = Db::open_in_memory().expect("db");
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let (handler, calls) = CountingChallengeHandler::wrap(Arc::new(StubChallengeHandler {
+        response: stub_response([0x44; 16]),
+    }));
+    let my_master = make_identity(0xAA);
+    let entry = MailboxEntry {
+        sender: None,
+        ..make_entry(
+            MailboxClass::PosChallenge,
+            my_master,
+            signed_challenge_payload(),
+        )
+    };
+    let mut memo = AnsweredChallenges::new(900);
+    let mut counts = PollCounts::default();
+    super::dispatch_pos_challenge(
+        &router,
+        &handler,
+        &mut memo,
+        &mut counts,
+        &my_master,
+        entry,
+        900,
+        Timestamp::now().0,
+    )
+    .await;
+    assert!(memo.is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(counts, PollCounts::default());
+    assert!(sender.stored.lock().await.is_empty());
+}
+
+/// B NOTE (4): a junk PosChallenge payload is a no-answer: the poll does not decode it,
+/// so the handler is never called (no disk read), it is remembered and re-checked once per
+/// quarter TTL, not an error on every poll.
+#[tokio::test]
+async fn junk_challenge_payload_is_remembered_as_no_answer() {
+    let db = Db::open_in_memory().expect("db");
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let (handler, calls) = CountingChallengeHandler::wrap(Arc::new(StubChallengeHandler {
+        response: stub_response([0x55; 16]),
+    }));
+    let my_master = make_identity(0xAA);
+    let entry = MailboxEntry {
+        sender: Some(make_identity(0x42)),
+        ..make_entry(
+            MailboxClass::PosChallenge,
+            my_master,
+            vec![0xFF, 0x00, 0x13],
+        )
+    };
+    let mut memo = AnsweredChallenges::new(900);
+    let mut counts = PollCounts::default();
+    let now = Timestamp::now().0;
+    for at in [now, now + 4] {
+        super::dispatch_pos_challenge(
+            &router,
+            &handler,
+            &mut memo,
+            &mut counts,
+            &my_master,
+            entry.clone(),
+            900,
+            at,
+        )
+        .await;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "junk never reaches the handler"
+    );
+    assert_eq!(counts.handler_error, 0, "junk is not a handler error");
+    assert_eq!((counts.no_answer, counts.skipped), (1, 1));
+    assert_eq!(memo.len(), 1);
+    assert!(sender.stored.lock().await.is_empty());
+}
+
+// ─── Fix round 2: the memory key is the signed challenge, not its encoding ───────
+
+/// Re-encode `c` through a generic CBOR value and let `f` edit it.
+fn reencoded(
+    c: &viaticum_core::messages::PosHashChallengeMsg,
+    f: impl FnOnce(&mut ciborium::Value),
+) -> Vec<u8> {
+    let bytes = to_cbor(c).unwrap();
+    let mut v: ciborium::Value = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+    f(&mut v);
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(&v, &mut out).unwrap();
+    out
+}
+
+/// pos-i5-a: a postman re-encodes one signed challenge five ways without breaking the
+/// signature. The poll computes it once and remembers one entry.
+#[tokio::test]
+async fn reencoded_signed_challenge_is_computed_once() {
+    use viaticum_core::messages::PosHashChallengeMsg;
+
+    let db = Db::open_in_memory().expect("db");
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let (handler, calls) = CountingChallengeHandler::wrap(Arc::new(StubChallengeHandler {
+        response: stub_response([0x5A; 16]),
+    }));
+    let my_master = make_identity(0xAA);
+    let owner = IdentityPub(owner_signing_key().verifying_key().to_bytes());
+    let c = signed_challenge();
+    let honest = to_cbor(&c).unwrap();
+    let mut with_tail = honest.clone();
+    with_tail.extend_from_slice(&[0x00, 0x01]);
+    let payloads = vec![
+        honest,
+        to_cbor(&PosHashChallengeMsg {
+            device_id: Some(DeviceId([7; 32])),
+            ..c.clone()
+        })
+        .unwrap(),
+        to_cbor(&PosHashChallengeMsg { v: 9, ..c.clone() }).unwrap(),
+        reencoded(&c, |v| {
+            if let ciborium::Value::Map(m) = v {
+                m.push((
+                    ciborium::Value::Text("zz".into()),
+                    ciborium::Value::Integer(1.into()),
+                ));
+            }
+        }),
+        with_tail,
+        reencoded(&c, |v| {
+            if let ciborium::Value::Map(m) = v {
+                m.reverse();
+            }
+        }),
+    ];
+    let mut memo = AnsweredChallenges::new(900);
+    let mut counts = PollCounts::default();
+    let now = Timestamp::now().0;
+    for (i, payload) in payloads.into_iter().enumerate() {
+        let entry = MailboxEntry {
+            msg_id: [i as u8; 16],
+            sender: Some(owner),
+            ..make_entry(MailboxClass::PosChallenge, my_master, payload)
+        };
+        super::dispatch_pos_challenge(
+            &router,
+            &handler,
+            &mut memo,
+            &mut counts,
+            &my_master,
+            entry,
+            900,
+            now + i as u64,
+        )
+        .await;
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the symbols are read once");
+    assert_eq!(memo.len(), 1, "one entry for one signed challenge");
+    assert_eq!(counts.skipped, 5);
+    assert_eq!(sender.stored.lock().await.len(), 1);
+}
+
+/// pos-i5-a: a forgery with the honest challenge_id and a junk signature arrives FIRST
+/// (a no-answer through the production handler); the honest challenge is still computed
+/// and answered on the next poll.
+#[tokio::test]
+async fn forgery_seen_first_does_not_block_the_honest_challenge() {
+    use crate::daemon::processor::{PosResponder, ProcessorPosHandler};
+    use viaticum_core::messages::PosHashChallengeMsg;
+    use viaticum_core::types::hex_encode;
+
+    let db = Db::open_in_memory().expect("db");
+    let holdings = tempfile::TempDir::new().expect("tempdir");
+    let owner = IdentityPub(owner_signing_key().verifying_key().to_bytes());
+    let c = signed_challenge();
+    db.upsert_holding(&HoldingRecord {
+        source_block_id: c.source_block_id,
+        owner_id: owner,
+        esi_ranges: vec![(0, 1)],
+        importance: 0.5,
+        total_bytes: 8,
+        status: HoldingStatus::Active,
+        received_at: Timestamp::now(),
+        delete_requested_at: None,
+        drop_notice_sent_at: None,
+    })
+    .expect("holding");
+    let block_dir = holdings.path().join(hex_encode(&c.source_block_id.0));
+    std::fs::create_dir_all(&block_dir).unwrap();
+    std::fs::write(block_dir.join("0.bin"), b"symbol-0").unwrap();
+
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let handler: Arc<dyn super::PosMailboxChallengeHandler> =
+        Arc::new(ProcessorPosHandler::new(PosResponder::new(
+            db.clone(),
+            holdings.path().to_path_buf(),
+            ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]),
+        )));
+    let my_master = make_identity(0xAA);
+    let entry_of = |payload: Vec<u8>| MailboxEntry {
+        sender: Some(owner),
+        ..make_entry(MailboxClass::PosChallenge, my_master, payload)
+    };
+    let forged = PosHashChallengeMsg {
+        sig: [0x13; 64],
+        ..c.clone()
+    };
+    let mut memo = AnsweredChallenges::new(900);
+    let mut counts = PollCounts::default();
+    let now = Timestamp::now().0;
+    for (at, payload) in [
+        (now, to_cbor(&forged).unwrap()),
+        (now + 4, to_cbor(&c).unwrap()),
+    ] {
+        super::dispatch_pos_challenge(
+            &router,
+            &handler,
+            &mut memo,
+            &mut counts,
+            &my_master,
+            entry_of(payload),
+            900,
+            at,
+        )
+        .await;
+    }
+    assert_eq!((counts.no_answer, counts.computed), (1, 1));
+    assert_eq!(memo.len(), 2);
+    assert_eq!(
+        sender.stored.lock().await.len(),
+        1,
+        "the honest challenge is answered"
     );
 }
