@@ -157,19 +157,20 @@ impl RestoreCoordinator {
     ) -> Result<(), RestoreError> {
         let file_bytes = match block_type {
             SourceBlockType::Pack { .. } => {
-                let extracted =
-                    pipeline::extract_from_pack(plaintext, record.file_id).map_err(|e| {
+                pipeline::extract_member(plaintext, record.file_id, &version.content_hash)
+                    .map_err(|e| {
                         RestoreError::PackIndexParseFailed(version.source_block_id, e.to_string())
-                    })?;
-                match extracted {
-                    Some(bytes) => bytes,
-                    None => {
-                        return Err(RestoreError::PackIndexParseFailed(
+                    })?
+                    .ok_or_else(|| {
+                        RestoreError::PackIndexParseFailed(
                             version.source_block_id,
-                            format!("file_id {} not found in pack", record.file_id),
-                        ));
-                    }
-                }
+                            format!(
+                                "no pack entry with file_id {} or content hash {}",
+                                record.file_id,
+                                pipeline::hex_encode(&version.content_hash)
+                            ),
+                        )
+                    })?
             }
             SourceBlockType::Single => plaintext.to_vec(),
         };

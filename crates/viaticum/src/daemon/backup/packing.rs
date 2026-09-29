@@ -61,38 +61,55 @@ pub fn extract_file_from_pack(
     file_id: FileId,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let parsed = parse_pack_index(plaintext)?;
-    let file_data_start = parsed.index_len;
-    let file_data = &plaintext[file_data_start..];
+    let file_data = &plaintext[parsed.index_len..];
+    match parsed.entries.iter().find(|e| e.file_id == file_id) {
+        Some(entry) => Ok(Some(entry_bytes(file_data, entry)?.to_vec())),
+        None => Ok(None),
+    }
+}
 
+/// The bytes of the pack member whose content hashes to `content_hash`, or `None`
+/// (restore-i38): a path that got its content by a rename, a copy or a swap points at a
+/// member packed under another `file_id`. The first matching member wins — members with
+/// the same hash hold the same bytes.
+pub fn extract_pack_entry_by_hash(
+    plaintext: &[u8],
+    content_hash: &[u8; 32],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let parsed = parse_pack_index(plaintext)?;
+    let file_data = &plaintext[parsed.index_len..];
     for entry in &parsed.entries {
-        if entry.file_id == file_id {
-            let start = entry.offset as usize;
-            // CS-DR-11: use checked_add — a corrupt pack index (behind AEAD, own
-            // data) with offset+size near usize::MAX would otherwise wrap, pass
-            // the bounds check below, and slice-panic. On overflow, error out.
-            let end = match start.checked_add(entry.size as usize) {
-                Some(e) => e,
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "pack entry range overflow: file_id={}, offset={}, size={}",
-                        entry.file_id,
-                        entry.offset,
-                        entry.size
-                    ));
-                }
-            };
-            if end > file_data.len() {
-                return Err(anyhow::anyhow!(
-                    "pack entry out of bounds: file_id={}, offset={}, size={}",
-                    entry.file_id,
-                    entry.offset,
-                    entry.size
-                ));
-            }
-            return Ok(Some(file_data[start..end].to_vec()));
+        let bytes = entry_bytes(file_data, entry)?;
+        if blake3::hash(bytes).as_bytes() == content_hash {
+            return Ok(Some(bytes.to_vec()));
         }
     }
     Ok(None)
+}
+
+/// The slice of one member in the file data after the index.
+fn entry_bytes<'a>(file_data: &'a [u8], entry: &PackEntry) -> anyhow::Result<&'a [u8]> {
+    let start = entry.offset as usize;
+    // CS-DR-11: use checked_add — a corrupt pack index (behind AEAD, own data) with
+    // offset+size near usize::MAX would otherwise wrap, pass the bounds check below,
+    // and slice-panic. On overflow, error out.
+    let Some(end) = start.checked_add(entry.size as usize) else {
+        return Err(anyhow::anyhow!(
+            "pack entry range overflow: file_id={}, offset={}, size={}",
+            entry.file_id,
+            entry.offset,
+            entry.size
+        ));
+    };
+    if end > file_data.len() {
+        return Err(anyhow::anyhow!(
+            "pack entry out of bounds: file_id={}, offset={}, size={}",
+            entry.file_id,
+            entry.offset,
+            entry.size
+        ));
+    }
+    Ok(&file_data[start..end])
 }
 
 /// Rebuild the plaintext for a source block by re-reading files from disk.
