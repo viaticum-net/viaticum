@@ -1606,9 +1606,14 @@ async fn place_on_fake_holders_with_status(
         .get_source_block(&version.source_block_id)
         .unwrap()
         .unwrap();
-    let blob = crate::daemon::backup::pipeline::rebuild_source_blob(db, &block, &TEST_EPOCH_KEY)
-        .await
-        .unwrap();
+    let blob = crate::daemon::backup::pipeline::rebuild_source_blob(
+        db,
+        &block,
+        &TEST_EPOCH_KEY,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
     let params = block.erasure_params();
     let enc = RaptorQEncoder::new();
     let raws = enc.encode_raw(&blob, &params, 0, params.n).unwrap();

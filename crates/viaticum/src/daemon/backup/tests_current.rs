@@ -18,11 +18,11 @@ use super::events::select_dedup_source;
 use super::pipeline::update_backed_up_at;
 use super::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind, QueuedFile};
 
-const BLOCK: u64 = 128 * 1024;
-const DEV: DeviceId = DeviceId([1u8; 32]);
+pub(super) const BLOCK: u64 = 128 * 1024;
+pub(super) const DEV: DeviceId = DeviceId([1u8; 32]);
 const SENTINEL: SourceBlockId = SourceBlockId([0u8; 32]);
 
-fn coord(db: &Db) -> BackupCoordinator {
+pub(super) fn coord(db: &Db) -> BackupCoordinator {
     let config = BackupConfig {
         source_block_size: BLOCK,
         epoch_key: [42u8; 32],
@@ -39,13 +39,13 @@ fn coord(db: &Db) -> BackupCoordinator {
     BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()))
 }
 
-fn write(dir: &TempDir, name: &str, content: &[u8]) -> String {
+pub(super) fn write(dir: &TempDir, name: &str, content: &[u8]) -> String {
     let path = dir.path().join(name);
     std::fs::write(&path, content).unwrap();
     path.to_string_lossy().into_owned()
 }
 
-fn event(path: &str, kind: DirtyKind) -> DirtyEvent {
+pub(super) fn event(path: &str, kind: DirtyKind) -> DirtyEvent {
     DirtyEvent {
         path: path.to_string(),
         kind,
@@ -53,22 +53,22 @@ fn event(path: &str, kind: DirtyKind) -> DirtyEvent {
     }
 }
 
-fn hash(content: &[u8]) -> [u8; 32] {
+pub(super) fn hash(content: &[u8]) -> [u8; 32] {
     *blake3::hash(content).as_bytes()
 }
 
 /// Distinct incompressible-enough content of `len` bytes.
-fn content(seed: u8, len: usize) -> Vec<u8> {
+pub(super) fn content(seed: u8, len: usize) -> Vec<u8> {
     (0..len)
         .map(|i| (i as u32).wrapping_mul(2_654_435_761).to_le_bytes()[i % 4] ^ seed)
         .collect()
 }
 
-fn record(db: &Db, path: &str) -> FileRecord {
+pub(super) fn record(db: &Db, path: &str) -> FileRecord {
     db.get_file(path).unwrap().expect("record must exist")
 }
 
-fn last(db: &Db, path: &str) -> FileVersion {
+pub(super) fn last(db: &Db, path: &str) -> FileVersion {
     record(db, path)
         .versions
         .last()
@@ -76,7 +76,7 @@ fn last(db: &Db, path: &str) -> FileVersion {
         .expect("a version")
 }
 
-fn queued_paths(c: &BackupCoordinator) -> BTreeSet<String> {
+pub(super) fn queued_paths(c: &BackupCoordinator) -> BTreeSet<String> {
     c.queues
         .values()
         .flatten()
@@ -84,12 +84,17 @@ fn queued_paths(c: &BackupCoordinator) -> BTreeSet<String> {
         .collect()
 }
 
-fn flush(c: &mut BackupCoordinator) -> usize {
+pub(super) fn flush(c: &mut BackupCoordinator) -> usize {
     c.flush_all(true, &Default::default()).unwrap().len()
 }
 
 /// `path` created with `bytes` and backed up; returns its block.
-fn backed_up(c: &mut BackupCoordinator, db: &Db, path: &str, kind: DirtyKind) -> SourceBlockId {
+pub(super) fn backed_up(
+    c: &mut BackupCoordinator,
+    db: &Db,
+    path: &str,
+    kind: DirtyKind,
+) -> SourceBlockId {
     c.process_event(event(path, kind)).unwrap();
     assert_eq!(flush(c), 1, "setup: one block for {path}");
     let v = last(db, path);

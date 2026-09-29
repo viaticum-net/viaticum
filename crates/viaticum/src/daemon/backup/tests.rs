@@ -119,10 +119,13 @@ fn process_event_deleted_marks_local_state() {
 
     let path = write_file(&files_dir, "doc.txt", b"some content");
 
-    // Add the file first
+    // Add the file and back it up (a never backed-up record is removed outright on
+    // deletion, delete-i12).
     coord.process_event(added_event(&path)).unwrap();
+    coord.flush_all(true, &Default::default()).unwrap();
 
     // Then delete it
+    std::fs::remove_file(&path).unwrap();
     coord.process_event(deleted_event(&path)).unwrap();
 
     let record = db.get_file(&path).unwrap().expect("record should exist");
@@ -404,10 +407,14 @@ async fn pipeline_roundtrip_can_decode() {
 
     // Wave 11b: no raw/ files on disk. Use rebuild_source_blob to get the stored blob.
     let block_record = db.get_source_block(&block_id).unwrap().unwrap();
-    let stored_blob =
-        crate::daemon::backup::pipeline::rebuild_source_blob(&db, &block_record, &epoch_key)
-            .await
-            .expect("rebuild_source_blob must succeed");
+    let stored_blob = crate::daemon::backup::pipeline::rebuild_source_blob(
+        &db,
+        &block_record,
+        &epoch_key,
+        &Default::default(),
+    )
+    .await
+    .expect("rebuild_source_blob must succeed");
 
     assert_eq!(
         stored_blob.len(),

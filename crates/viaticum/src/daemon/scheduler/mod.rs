@@ -110,6 +110,10 @@ pub struct Scheduler {
     /// `<data_dir>/system_state/`. Used by `load_source_block_data` to serve PoS
     /// challenges for SS blocks (which have no backing watch-dir file).
     data_dir: std::path::PathBuf,
+    /// Whose records the PoS rebuild reads and where it reports gone paths (К2b).
+    /// Default: any Present record, no recheck (tests); the daemon sets this device and
+    /// the watcher's recheck channel.
+    rebuild_scope: crate::daemon::backup::rebuild::RebuildScope,
 }
 
 impl Scheduler {
@@ -140,7 +144,13 @@ impl Scheduler {
             encoder,
             epoch_key,
             data_dir,
+            rebuild_scope: Default::default(),
         }
+    }
+
+    /// Set whose records the PoS rebuild reads and where gone paths go (К2b).
+    pub fn set_rebuild_scope(&mut self, scope: crate::daemon::backup::rebuild::RebuildScope) {
+        self.rebuild_scope = scope;
     }
 
     /// Main run loop. Fires on five independent timers:
@@ -648,7 +658,7 @@ impl Scheduler {
                 Err(e) => {
                     warn!(
                         block_id = %block_id,
-                        err = %e,
+                        err = %format!("{e:#}"),
                         "scheduler: cannot load source block for PoS hash, skipping"
                     );
                     continue;
@@ -929,10 +939,16 @@ impl Scheduler {
         let db = self.db.clone();
         let epoch_key = self.epoch_key;
         let expected_id = *block_id;
+        let scope = self.rebuild_scope.clone();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-            let plaintext =
-                crate::daemon::backup::packing::rebuild_plaintext_from_db(&db, &block_record)?;
+            use anyhow::Context;
+            let plaintext = crate::daemon::backup::rebuild::rebuild_plaintext_from_db(
+                &db,
+                &block_record,
+                &scope,
+            )
+            .context("rebuild plaintext")?;
             let blob =
                 crate::daemon::backup::pipeline::compress_and_encrypt(&plaintext, &epoch_key)?;
             let rebuilt_id: [u8; 32] = *blake3::hash(&blob).as_bytes();

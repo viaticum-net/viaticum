@@ -560,14 +560,20 @@ fn mark_backed_up(
 /// blob without any on-disk block.bin cache. It is also used by the restore path
 /// as a fallback when fetching symbols from holders fails.
 ///
+/// The plaintext is rebuilt by content (`rebuild::rebuild_plaintext_from_db`, INV-RB);
+/// its error keeps its type under the "rebuild plaintext" context, so a caller can tell
+/// `RebuildError::SourceMissing` apart. Gone paths go to `scope.recheck`.
+///
 /// CPU-bound portion (`compress_and_encrypt`) runs inside `spawn_blocking`.
 pub async fn rebuild_source_blob(
     db: &viaticum_core::db::Db,
     block_record: &viaticum_core::types::SourceBlockRecord,
     epoch_key: &[u8; 32],
+    scope: &super::rebuild::RebuildScope,
 ) -> anyhow::Result<Vec<u8>> {
-    let plaintext = crate::daemon::backup::packing::rebuild_plaintext_from_db(db, block_record)
-        .map_err(|e| anyhow::anyhow!("rebuild plaintext: {e}"))?;
+    use anyhow::Context;
+    let plaintext = super::rebuild::rebuild_plaintext_from_db(db, block_record, scope)
+        .context("rebuild plaintext")?;
 
     let epoch_key_owned = *epoch_key;
     let stored =

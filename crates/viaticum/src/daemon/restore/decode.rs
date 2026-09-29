@@ -43,6 +43,8 @@ impl RestoreCoordinator {
                 &self.db,
                 &block_record,
                 &self.config.epoch_key,
+                // Local tier: no recheck, any Present record (hash-checked reads).
+                &Default::default(),
             )
             .await
         {

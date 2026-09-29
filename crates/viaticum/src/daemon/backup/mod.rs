@@ -7,12 +7,16 @@
 //
 // Module layout:
 //   mod.rs      -- BackupCoordinator struct, public API, coordinator logic
-//   events.rs   -- process_event helpers: handle_deleted, handle_added_or_modified
+//   events.rs   -- process_event helpers: handle_added_or_modified, dedup
+//   gone.rs     -- deletions, recheck, the root rule (L0: delete-i12, dr-i64)
 //   pipeline.rs -- compress/encrypt/encode/write-symbols inner pipeline
 //   packing.rs  -- PackIndex format: build_plaintext, parse_pack_index
+//   rebuild.rs  -- rebuild a block's plaintext from this device's files, by content (L0)
 //   tests.rs    -- test scenarios
 //   tests_current.rs -- L1: a path points at its current content; packing does
 //                       not abort on a vanished or changed file (backup-i9, i23)
+//   tests_rebuild.rs -- L0: rebuild by content after renames, copies, swaps
+//   tests_gone.rs    -- L0: deletion by event and recheck, the watch root rule
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -29,13 +33,21 @@ use pipeline::{
 };
 
 pub mod events;
+mod gone;
 pub mod packing;
 pub mod pipeline;
+pub mod rebuild;
+
+pub(crate) use gone::path_gone;
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_current;
+#[cfg(test)]
+mod tests_gone;
+#[cfg(test)]
+mod tests_rebuild;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -52,7 +64,17 @@ pub struct DirtyEvent {
 pub enum DirtyKind {
     Added,
     Modified,
+    /// A live event: the path is gone and its watch root is intact (delete-i12).
     Deleted,
+    /// A rebuild did not find the path and the watcher confirmed it gone under an intact
+    /// root; marks the exact record deleted only if it is confirmed on disk (dr-i64).
+    GoneOnRecheck,
+    /// The watch root at `path` vanished or was replaced while watched: no deletion;
+    /// recent deletions under it are undone and its records lose the confirmation.
+    RootLost,
+    /// The watch root at `path` is another directory than the one recorded in
+    /// `watch_roots.json` (found at start): handled as `RootLost`.
+    RootChanged,
 }
 
 /// Notification from Processor about symbol offer outcomes.
@@ -355,10 +377,12 @@ impl BackupCoordinator {
     /// Process a single dirty event synchronously.
     ///
     /// For Added/Modified: read file, compute hash, dedup check, classify, enqueue.
-    /// For Deleted: update device state to Deleted(now).
+    /// For Deleted / GoneOnRecheck / RootLost / RootChanged: see `gone.rs`.
     pub fn process_event(&mut self, event: DirtyEvent) -> anyhow::Result<()> {
         match event.kind {
             DirtyKind::Deleted => self.handle_deleted(&event),
+            DirtyKind::GoneOnRecheck => self.handle_gone_on_recheck(&event),
+            DirtyKind::RootLost | DirtyKind::RootChanged => self.handle_root_lost(&event),
             DirtyKind::Added | DirtyKind::Modified => self.handle_added_or_modified(&event),
         }
     }

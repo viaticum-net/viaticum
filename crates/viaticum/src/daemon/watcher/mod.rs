@@ -7,9 +7,16 @@
 // Viaticum data directory; `.viaticumignore` rules. Symlinks to directories are
 // not followed (neither by the scan nor by notify).
 //
-// Design: the notify callback posts to a std::sync::mpsc::Sender<(PathBuf, DirtyKind)>.
-// A dedicated tokio task drains that channel, runs debounce, and forwards
-// DirtyEvent to the backup coordinator channel.
+// Design: the notify callback posts `Raw` items to a std::sync::mpsc channel. A
+// dedicated tokio task drains that channel into `event_loop::WatchLoop`, which runs the
+// debounce, resolves moves by the disk, applies the watch root rule, rescans after an
+// inotify overflow, answers rechecks, and forwards DirtyEvents to the backup
+// coordinator channel (L0: delete-i12, backup-i22, dr-i64).
+//
+// Paths: one spelling per file in the catalog. FSEvents (macOS) reports canonical paths
+// (`/private/var/…`) while the scan and the root use the configured spelling
+// (`/var/…`); the callback rewrites a path under a root's canonical alias to the
+// configured spelling (`IgnoreSet::to_configured`) before anything else sees it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -20,7 +27,7 @@ use std::time::Instant;
 use arc_swap::ArcSwap; // crate: arc-swap
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::event::{EventKind, ModifyKind, RemoveKind};
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, RecommendedWatcher, Watcher};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 use tokio_util::sync::CancellationToken;
@@ -46,7 +53,10 @@ const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
 /// gitignore-syntax patterns for files that should not be backed up.
 pub const VIATICUMIGNORE_FILENAME: &str = ".viaticumignore";
 
+mod event_loop;
 mod exclude;
+mod roots;
+use event_loop::{LoopParams, PendingKind, Raw, WatchLoop};
 pub(crate) use exclude::{
     FolderRefusal, data_dir_between, has_hidden_component_below, is_viaticum_data_dir,
     refuse_folder, symlink_into_data_dir,
@@ -56,6 +66,8 @@ pub(crate) use exclude::{
 mod tests;
 #[cfg(all(test, unix))]
 mod tests_exclude;
+#[cfg(all(test, unix))]
+mod tests_identity;
 
 // ─── Error ────────────────────────────────────────────────────────────────────
 
@@ -97,10 +109,10 @@ pub enum WatcherCommand {
 /// The matcher answers "is this path (or directory) ignored?" — see
 /// [`IgnoreSet::is_ignored`].
 pub struct IgnoreSet {
-    /// (root, matcher). A root whose canonical form differs appears twice: under
-    /// its configured spelling and canonicalized (macOS FSEvents reports canonical
-    /// paths; inotify reports the configured spelling).
-    matchers: Vec<(PathBuf, Gitignore)>,
+    /// (root, configured root, matcher). A root whose canonical form differs appears
+    /// twice: under its configured spelling and canonicalized (macOS FSEvents reports
+    /// canonical paths; inotify reports the configured spelling).
+    matchers: Vec<(PathBuf, PathBuf, Gitignore)>,
 }
 
 impl IgnoreSet {
@@ -114,11 +126,11 @@ impl IgnoreSet {
     pub fn build(watch_dirs: &[PathBuf]) -> Result<Self, WatcherError> {
         let mut matchers = Vec::with_capacity(watch_dirs.len());
         for dir in watch_dirs {
-            matchers.push((dir.clone(), Self::matcher_for(dir, dir)?));
+            matchers.push((dir.clone(), dir.clone(), Self::matcher_for(dir, dir)?));
             if let Ok(canon) = std::fs::canonicalize(dir)
                 && canon != *dir
             {
-                matchers.push((canon.clone(), Self::matcher_for(dir, &canon)?));
+                matchers.push((canon.clone(), dir.clone(), Self::matcher_for(dir, &canon)?));
             }
         }
         Ok(Self { matchers })
@@ -174,7 +186,7 @@ impl IgnoreSet {
     /// of such stray paths is the caller's responsibility.
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
         match self.matcher_of(path) {
-            Some((_, gi)) => matches!(
+            Some((_, _, gi)) => matches!(
                 gi.matched_path_or_any_parents(path, is_dir),
                 ignore::Match::Ignore(_)
             ),
@@ -184,14 +196,29 @@ impl IgnoreSet {
 
     /// The watch root that `path` lies under (longest match), if any.
     pub fn root_of(&self, path: &Path) -> Option<&Path> {
-        self.matcher_of(path).map(|(root, _)| root.as_path())
+        self.matcher_of(path).map(|(root, _, _)| root.as_path())
     }
 
-    fn matcher_of(&self, path: &Path) -> Option<&(PathBuf, Gitignore)> {
+    /// `path` in the spelling of its configured watch root: a path under a root's
+    /// canonical alias (macOS FSEvents: `/private/var/…` for a root `/var/…`) gets the
+    /// configured prefix, so the catalog holds one path per file whether the scan or a
+    /// live event found it. Any other path is returned as is.
+    pub fn to_configured(&self, path: &Path) -> PathBuf {
+        match self.matcher_of(path) {
+            Some((root, configured, _)) if root != configured => match path.strip_prefix(root) {
+                Ok(rest) if rest.as_os_str().is_empty() => configured.clone(),
+                Ok(rest) => configured.join(rest),
+                Err(_) => path.to_path_buf(),
+            },
+            _ => path.to_path_buf(),
+        }
+    }
+
+    fn matcher_of(&self, path: &Path) -> Option<&(PathBuf, PathBuf, Gitignore)> {
         self.matchers
             .iter()
-            .filter(|(root, _)| path.starts_with(root))
-            .max_by_key(|(root, _)| root.components().count())
+            .filter(|(root, _, _)| path.starts_with(root))
+            .max_by_key(|(root, _, _)| root.components().count())
     }
 }
 
@@ -216,6 +243,12 @@ pub struct WatcherConfig {
     /// Idle when complete, Error on failure. None in tests that don't use
     /// WatchAdmin.
     pub watch_states: Option<Arc<RwLock<HashMap<PathBuf, WatchEntryState>>>>,
+    /// Time acceleration: a recheck of the same path more often than once per
+    /// `3600 / time_scale` s is ignored.
+    pub time_scale: u64,
+    /// Paths a rebuild did not find (К2b): the watcher decides whether each is a
+    /// deletion. `None` in tests that do not exercise rechecks.
+    pub recheck_rx: Option<mpsc::Receiver<PathBuf>>,
 }
 
 /// Compute the watcher debounce window (ms) for a given `time_scale`.
@@ -242,15 +275,17 @@ pub(crate) fn absolute_watch_dir(dir: &Path) -> PathBuf {
 ///
 /// Spawns a tokio task that:
 /// 1. Creates a `notify::RecommendedWatcher` posting to a std channel.
-/// 2. Drains the std channel on a poll interval.
-/// 3. Debounces events by path within `debounce_ms`.
-/// 4. Sends `DirtyEvent` to `dirty_tx`.
+/// 2. Checks every watch root against `watch_roots.json` (a root changed while the
+///    daemon was down → `RootChanged`), then runs the initial scan when due.
+/// 3. Drains the std channel on a poll interval into the `WatchLoop` (debounce, moves
+///    resolved by the disk, root rule, overflow rescan) which sends `DirtyEvent`s.
+/// 4. Processes `WatcherCommand` messages from `control_rx` (add/remove/scan) and paths
+///    from `config.recheck_rx` (a rebuild did not find them).
 /// 5. Exits cleanly when `cancel` is triggered.
-/// 6. Processes `WatcherCommand` messages from `control_rx` to add/remove/scan dirs.
 ///
 /// Starts cleanly with an empty watch directory list (receives `Add` commands later).
 pub async fn start_watcher(
-    config: WatcherConfig,
+    mut config: WatcherConfig,
     dirty_tx: mpsc::Sender<DirtyEvent>,
     mut control_rx: mpsc::Receiver<WatcherCommand>,
     cancel: CancellationToken,
@@ -273,24 +308,16 @@ pub async fn start_watcher(
         Arc::new(ArcSwap::new(Arc::new(IgnoreSet::build(&watch_dirs)?)));
 
     // Bridge: notify → std channel → tokio task.
-    let (std_tx, std_rx) = std_mpsc::channel::<(PathBuf, DirtyKind)>();
-
-    // Build the notify watcher. The closure runs in a thread managed by notify.
-    let std_tx_clone = std_tx.clone();
+    let (std_tx, std_rx) = std_mpsc::channel::<Raw>();
     let ignore_for_notify = Arc::clone(&ignore_arc);
     // Symlinks to directories are not followed (W4): a link to an ancestor would
     // loop, a link elsewhere would pull a foreign part of the disk into the backup.
     let notify_config = notify::Config::default().with_follow_symlinks(false);
-    let mut watcher_inner = RecommendedWatcher::new(
+    let notify_watcher = RecommendedWatcher::new(
         move |res: Result<Event, notify::Error>| match res {
             Ok(event) => {
-                if let Some(kind) = classify_event(&event.kind) {
-                    for path in &event.paths {
-                        let ig = ignore_for_notify.load();
-                        if should_watch_path(path, &ig) {
-                            let _ = std_tx_clone.send((path.clone(), kind));
-                        }
-                    }
+                for raw in raw_items(&event, &ignore_for_notify.load()) {
+                    let _ = std_tx.send(raw);
                 }
             }
             Err(e) => {
@@ -300,73 +327,45 @@ pub async fn start_watcher(
         notify_config,
     )?;
 
-    // Register all directories (empty list = no-op). A folder that cannot be
-    // watched (missing — a USB disk or NAS share not mounted yet —, unreadable
-    // subfolder, inotify limit) must not stop the others (daemon-i3): it is marked
-    // Error with the reason and the rest carry on. It stays a root of the
-    // IgnoreSet and is scanned (backup-i17): whatever is readable is backed up,
-    // and live events from the part of the tree notify did put under watch pass.
-    // Scans leave its Error in place. A missing folder yields nothing; its files
-    // are NOT treated as deleted (dr-i10: absence is not deletion).
-    let mut watch_failed: HashSet<PathBuf> = HashSet::new();
-    for dir in &watch_dirs {
-        match watcher_inner.watch(dir, RecursiveMode::Recursive) {
-            Ok(()) => tracing::info!(dir = %dir.display(), "watching directory"),
-            Err(e) => {
-                let reason = describe_watch_error(&e);
-                tracing::warn!(
-                    path = %dir.display(), error = %reason,
-                    "watch folder unavailable; other folders keep being backed up"
-                );
-                set_status(
-                    &config.watch_states,
-                    dir,
-                    WatcherStatusSignal::Error,
-                    Some(reason),
-                );
-                watch_failed.insert(dir.clone());
-            }
-        }
-    }
+    let debounce_dur = Duration::from_millis(config.debounce_ms.max(1));
+    let mut lp = WatchLoop::new(
+        LoopParams {
+            device_id: config.device_id,
+            debounce: debounce_dur,
+            data_dir: config.data_dir.clone(),
+            watch_states: config.watch_states.clone(),
+            recheck_every: Duration::from_secs((3600 / config.time_scale.max(1)).max(1)),
+        },
+        dirty_tx,
+        notify_watcher,
+        Arc::clone(&ignore_arc),
+        watch_dirs,
+    );
+    lp.register_all();
+    let Ok(changed) = lp.check_roots_at_start().await else {
+        return Ok(());
+    };
 
     // ── Initial / periodic scan ────────────────────────────────────────────
     let scan_marker = config.data_dir.join("last_scan");
     let needs_scan = should_run_scan(&scan_marker, config.rescan_interval_secs);
-    if needs_scan && !watch_dirs.is_empty() {
-        for dir in &watch_dirs {
-            set_scan_status(
-                &config.watch_states,
-                &watch_failed,
-                dir,
-                WatcherStatusSignal::Scanning,
-            );
-        }
-        let ig = ignore_arc.load();
-        let count = run_full_scan(&watch_dirs, config.device_id, &dirty_tx, &ig).await;
-        // Write current timestamp as marker.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let _ = std::fs::write(&scan_marker, now.to_string());
-        for dir in &watch_dirs {
-            set_scan_status(
-                &config.watch_states,
-                &watch_failed,
-                dir,
-                WatcherStatusSignal::Idle,
-            );
-        }
+    if needs_scan && !lp.watch_dirs.is_empty() {
+        let roots = lp.watch_dirs.clone();
+        let Ok(count) = lp.scan_roots(&roots).await else {
+            return Ok(());
+        };
+        write_scan_marker(&scan_marker);
         tracing::info!(files = count, "initial/periodic scan complete");
-    } else if watch_dirs.is_empty() {
+    } else if lp.watch_dirs.is_empty() {
         tracing::info!("watcher started with empty watch list; awaiting Add commands");
     } else {
+        // A root that is another directory than at the last run is scanned anyway:
+        // the scan confirms what is there (its records just lost the confirmation).
+        if !changed.is_empty() && lp.scan_roots(&changed).await.is_err() {
+            return Ok(());
+        }
         tracing::info!("scan skipped (last scan recent enough)");
     }
-
-    // Debounce state: path → (kind, deadline).
-    let mut pending: HashMap<PathBuf, (DirtyKind, Instant)> = HashMap::new();
-    let debounce_dur = std::time::Duration::from_millis(config.debounce_ms.max(1));
 
     // Poll the std channel at quarter-debounce resolution (min 10 ms).
     let poll_ms = (config.debounce_ms / 4).max(10);
@@ -382,13 +381,10 @@ pub async fn start_watcher(
     } else {
         None
     };
-
-    // Keep watcher alive for the duration of this async function.
-    // Must be mut so we can call watch()/unwatch() on Add/Remove commands.
-    let mut notify_watcher = watcher_inner;
+    let mut recheck_rx = config.recheck_rx.take();
 
     loop {
-        tokio::select! {
+        let step = tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::debug!("watcher: cancel requested, exiting");
                 break;
@@ -399,172 +395,45 @@ pub async fn start_watcher(
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                if !watch_dirs.is_empty() {
-                    for dir in &watch_dirs {
-                        set_scan_status(&config.watch_states, &watch_failed, dir,
-                            WatcherStatusSignal::Scanning);
-                    }
-                    let ig = ignore_arc.load();
-                    let count = run_full_scan(
-                        &watch_dirs,
-                        config.device_id,
-                        &dirty_tx,
-                        &ig,
-                    ).await;
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let _ = std::fs::write(&scan_marker, now.to_string());
-                    for dir in &watch_dirs {
-                        set_scan_status(&config.watch_states, &watch_failed, dir,
-                            WatcherStatusSignal::Idle);
-                    }
-                    tracing::info!(files = count, "periodic rescan complete");
+                if lp.watch_dirs.is_empty() {
+                    Ok(())
+                } else {
+                    lp.periodic_scan().await.map(|count| {
+                        write_scan_marker(&scan_marker);
+                        tracing::info!(files = count, "periodic rescan complete");
+                    })
                 }
             }
-            Some(cmd) = control_rx.recv() => {
-                match cmd {
-                    WatcherCommand::Add { path, importance: _ } => {
-                        if let Some(refusal) = refuse_folder(&path) {
-                            refuse(&config.watch_states, &path, &refusal);
-                        } else {
-                            // A failed watch still makes the folder a root and
-                            // gets it scanned (backup-i17); its status stays Error.
-                            watch_failed.remove(&path);
-                            if let Err(e) = notify_watcher.watch(&path, RecursiveMode::Recursive) {
-                                let reason = describe_watch_error(&e);
-                                tracing::warn!(
-                                    path = %path.display(), error = %reason,
-                                    "watcher: failed to watch new directory"
-                                );
-                                set_status(&config.watch_states, &path,
-                                    WatcherStatusSignal::Error, Some(reason));
-                                watch_failed.insert(path.clone());
-                            }
-                            if !watch_dirs.contains(&path) {
-                                watch_dirs.push(path.clone());
-                            }
-                            // Rebuild IgnoreSet for all current dirs.
-                            match IgnoreSet::build(&watch_dirs) {
-                                Ok(new_set) => {
-                                    ignore_arc.store(Arc::new(new_set));
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "watcher: IgnoreSet rebuild failed");
-                                }
-                            }
-                            // Trigger initial scan of the new dir only.
-                            set_scan_status(&config.watch_states, &watch_failed, &path,
-                                WatcherStatusSignal::Scanning);
-                            let ig = ignore_arc.load();
-                            let count = run_full_scan_one(
-                                &path, config.device_id, &dirty_tx, &ig
-                            ).await;
-                            tracing::info!(
-                                dir = %path.display(), files = count,
-                                "watcher: initial scan of newly added dir"
-                            );
-                            set_scan_status(&config.watch_states, &watch_failed, &path,
-                                WatcherStatusSignal::Idle);
-                        }
-                    }
-                    WatcherCommand::Remove { path } => {
-                        let _ = notify_watcher.unwatch(&path);
-                        watch_dirs.retain(|d| d != &path);
-                        watch_failed.remove(&path);
-                        match IgnoreSet::build(&watch_dirs) {
-                            Ok(new_set) => { ignore_arc.store(Arc::new(new_set)); }
-                            Err(e) => { tracing::warn!(error = %e, "watcher: IgnoreSet rebuild"); }
-                        }
-                    }
-                    WatcherCommand::Scan { path } => {
-                        // The root of every scan goes through refuse_folder (W2): a
-                        // refused folder keeps its error, Scan does not turn it Idle.
-                        if let Some(refusal) = refuse_folder(&path) {
-                            tracing::info!(path = %path.display(), reason = %refusal,
-                                "manual scan skipped: folder refused");
-                            set_status(&config.watch_states, &path,
-                                WatcherStatusSignal::Error, Some(refusal.to_string()));
-                        } else {
-                            set_scan_status(&config.watch_states, &watch_failed, &path,
-                                WatcherStatusSignal::Scanning);
-                            let ig = ignore_arc.load();
-                            let count = run_full_scan_one(
-                                &path, config.device_id, &dirty_tx, &ig
-                            ).await;
-                            tracing::info!(
-                                dir = %path.display(), files = count,
-                                "watcher: manual rescan complete"
-                            );
-                            set_scan_status(&config.watch_states, &watch_failed, &path,
-                                WatcherStatusSignal::Idle);
-                        }
-                    }
+            Some(cmd) = control_rx.recv() => lp.on_command(cmd).await,
+            Some(path) = async {
+                match recheck_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending::<Option<PathBuf>>().await,
                 }
-            }
+            } => lp.on_recheck(path, Instant::now()).await,
             _ = poll_timer.tick() => {
                 // Drain all pending std-channel messages.
+                let mut disconnected = false;
                 loop {
                     match std_rx.try_recv() {
-                        Ok((path, kind)) => {
-                            pending.insert(path, (kind, Instant::now() + debounce_dur));
-                        }
+                        Ok(raw) => lp.ingest(raw, Instant::now()),
                         Err(std_mpsc::TryRecvError::Empty) => break,
                         Err(std_mpsc::TryRecvError::Disconnected) => {
-                            tracing::error!("watcher: std channel disconnected unexpectedly");
-                            return Ok(());
+                            disconnected = true;
+                            break;
                         }
                     }
                 }
-
-                // Flush all events whose debounce window has expired.
-                let ig = ignore_arc.load();
-                let mut data_dirs: HashMap<PathBuf, bool> = HashMap::new();
-                let now = Instant::now();
-                let mut to_flush: Vec<(PathBuf, DirtyKind)> = Vec::new();
-                pending.retain(|path, (kind, deadline)| {
-                    if now >= *deadline {
-                        to_flush.push((path.clone(), *kind));
-                        false
-                    } else {
-                        true
-                    }
-                });
-
-                for (path, kind) in to_flush {
-                    // A path under no root: its folder was removed meanwhile (N3).
-                    let Some(root) = ig.root_of(&path) else {
-                        tracing::debug!(path = %path.display(),
-                            "watcher: event outside every watch folder dropped");
-                        continue;
-                    };
-                    // Inside a Viaticum data dir below the root: the daemon's own
-                    // writes (db.redb, holdings, staging) never enter the backup.
-                    if data_dir_between(root, &path, &mut data_dirs) {
-                        tracing::debug!(path = %path.display(),
-                            "watcher: event inside a Viaticum data directory dropped");
-                        continue;
-                    }
-                    if path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink())
-                        && symlink_into_data_dir(&path, &mut data_dirs)
-                    {
-                        tracing::debug!(path = %path.display(),
-                            "watcher: event of a symlink into a Viaticum data directory dropped");
-                        continue;
-                    }
-                    let path_str = path.to_string_lossy().into_owned();
-                    let event = DirtyEvent {
-                        path: path_str,
-                        kind,
-                        device_id: config.device_id,
-                    };
-                    if dirty_tx.send(event).await.is_err() {
-                        tracing::debug!("watcher: dirty_tx receiver dropped, exiting");
-                        return Ok(());
-                    }
+                if disconnected {
+                    tracing::error!("watcher: std channel disconnected unexpectedly");
+                    return Ok(());
                 }
+                lp.flush_due(Instant::now()).await
             }
+        };
+        if step.is_err() {
+            tracing::debug!("watcher: dirty_tx receiver dropped, exiting");
+            return Ok(());
         }
     }
 
@@ -573,19 +442,47 @@ pub async fn start_watcher(
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Map a notify EventKind to a DirtyKind. Returns None for events we ignore.
-fn classify_event(kind: &EventKind) -> Option<DirtyKind> {
-    match kind {
-        EventKind::Create(_) => Some(DirtyKind::Added),
-        EventKind::Modify(
-            ModifyKind::Data(_) | ModifyKind::Any | ModifyKind::Other | ModifyKind::Name(_),
-        ) => Some(DirtyKind::Modified),
-        EventKind::Remove(RemoveKind::File | RemoveKind::Any | RemoveKind::Other) => {
-            Some(DirtyKind::Deleted)
+/// The items one notify event gives the loop: `Rescan` for an overflow, and each of its
+/// paths (in the configured spelling) that passes the filter for its kind.
+fn raw_items(event: &Event, ig: &IgnoreSet) -> Vec<Raw> {
+    let mut out = Vec::new();
+    if event.need_rescan() {
+        out.push(Raw::Rescan);
+    }
+    let Some(kind) = classify_event(&event.kind) else {
+        return out;
+    };
+    for path in &event.paths {
+        let path = ig.to_configured(path);
+        let keep = match kind {
+            PendingKind::Moved => should_watch_moved_path(&path, ig),
+            PendingKind::Dirty(_) => should_watch_path(&path, ig),
+        };
+        if keep {
+            out.push(Raw::Path(path, kind));
         }
+    }
+    out
+}
+
+/// Map a notify EventKind to what the loop resolves. Returns None for events we ignore.
+///
+/// A rename (`Modify(Name(_))`: From, To, Both, Any — inotify, FSEvents, Windows) and a
+/// directory removal (`Remove(Folder)`: `rm -rf`, the root itself removed) are resolved
+/// by the disk at the end of the debounce, whatever their form (Р-1).
+fn classify_event(kind: &EventKind) -> Option<PendingKind> {
+    match kind {
+        EventKind::Create(_) => Some(PendingKind::Dirty(DirtyKind::Added)),
+        EventKind::Modify(ModifyKind::Name(_)) => Some(PendingKind::Moved),
+        EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Any | ModifyKind::Other) => {
+            Some(PendingKind::Dirty(DirtyKind::Modified))
+        }
+        EventKind::Remove(RemoveKind::File | RemoveKind::Any | RemoveKind::Other) => {
+            Some(PendingKind::Dirty(DirtyKind::Deleted))
+        }
+        EventKind::Remove(RemoveKind::Folder) => Some(PendingKind::Moved),
         EventKind::Modify(ModifyKind::Metadata(_)) => None, // metadata-only: ignore
         EventKind::Access(_) => None,                       // reads: ignore
-        EventKind::Remove(RemoveKind::Folder) => None,      // directory removal: ignore
         _ => None,
     }
 }
@@ -606,6 +503,15 @@ pub(crate) fn describe_watch_error(e: &notify::Error) -> String {
             .to_string(),
         _ => e.to_string(),
     }
+}
+
+/// Record the time of the last full scan (the `last_scan` marker).
+fn write_scan_marker(marker: &Path) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = std::fs::write(marker, now.to_string());
 }
 
 /// Check whether a full scan is needed based on last_scan marker file.
@@ -771,24 +677,6 @@ pub(crate) async fn run_full_scan_one(
     count
 }
 
-/// Walk all watch directories and emit DirtyEvent::Added for every file found.
-///
-/// Directories matching `ignore_set` are pruned at descent time (no files
-/// under an ignored directory are emitted). Individual files are checked via
-/// [`should_watch_path`] using the same matcher.
-async fn run_full_scan(
-    dirs: &[PathBuf],
-    device_id: DeviceId,
-    dirty_tx: &mpsc::Sender<DirtyEvent>,
-    ignore_set: &IgnoreSet,
-) -> u64 {
-    let mut count: u64 = 0;
-    for dir in dirs {
-        count += run_full_scan_one(dir, device_id, dirty_tx, ignore_set).await;
-    }
-    count
-}
-
 /// Returns true if the path should trigger a DirtyEvent.
 ///
 /// Filters out:
@@ -826,4 +714,17 @@ pub(crate) fn should_watch_path(path: &std::path::Path, ignore_set: &IgnoreSet) 
         Ok(meta) => meta.is_file(),
         Err(_) => true,
     }
+}
+
+/// Returns true if a moved path (a rename or a directory removal) should be resolved:
+/// under a watch root, no hidden component below it, not ignored as a file. Its type is
+/// not checked — it may be gone, a file or a directory (checked at resolution).
+pub(crate) fn should_watch_moved_path(path: &Path, ignore_set: &IgnoreSet) -> bool {
+    if path.file_name().is_none() {
+        return false;
+    }
+    let Some(root) = ignore_set.root_of(path) else {
+        return false;
+    };
+    !has_hidden_component_below(root, path) && !ignore_set.is_ignored(path, false)
 }

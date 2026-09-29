@@ -112,60 +112,9 @@ fn entry_bytes<'a>(file_data: &'a [u8], entry: &PackEntry) -> anyhow::Result<&'a
     Ok(&file_data[start..end])
 }
 
-/// Rebuild the plaintext for a source block by re-reading files from disk.
-///
-/// Used by repair when block.bin is absent (cleaned up after delivery).
-/// Reads each file referenced in the block record, rebuilds the same
-/// plaintext that was originally passed to compress_and_encrypt.
-pub fn rebuild_plaintext_from_db(
-    db: &viaticum_core::db::Db,
-    block_record: &viaticum_core::types::SourceBlockRecord,
-) -> anyhow::Result<Vec<u8>> {
-    use viaticum_core::types::SourceBlockType;
-
-    match &block_record.block_type {
-        SourceBlockType::Single => {
-            // Single block: find any file version referencing this block_id.
-            let file_record = find_file_for_block(db, block_record.block_id)?;
-            let bytes = std::fs::read(&file_record.path)
-                .map_err(|e| anyhow::anyhow!("read source file {}: {e}", file_record.path))?;
-            Ok(bytes)
-        }
-        SourceBlockType::Pack { entries } => {
-            // Pack block: rebuild [CBOR index][file1][file2]...
-            let mut file_bytes_list = Vec::with_capacity(entries.len());
-            for entry in entries {
-                let file_record = db
-                    .get_file_by_id(entry.file_id)?
-                    .ok_or_else(|| anyhow::anyhow!("file_id {} not found in DB", entry.file_id))?;
-                let bytes = std::fs::read(&file_record.path)
-                    .map_err(|e| anyhow::anyhow!("read source file {}: {e}", file_record.path))?;
-                file_bytes_list.push((entry.file_id, bytes));
-            }
-
-            // Rebuild pack index + data in same order as original.
-            let mut pack_entries = Vec::with_capacity(entries.len());
-            let mut offset = 0u64;
-            for (file_id, bytes) in &file_bytes_list {
-                pack_entries.push(viaticum_core::types::PackEntry {
-                    file_id: *file_id,
-                    offset,
-                    size: bytes.len() as u64,
-                });
-                offset += bytes.len() as u64;
-            }
-
-            let index_bytes = viaticum_core::types::to_cbor_bytes(&pack_entries);
-            let mut plaintext = index_bytes;
-            for (_, bytes) in &file_bytes_list {
-                plaintext.extend_from_slice(bytes);
-            }
-            Ok(plaintext)
-        }
-    }
-}
-
-/// Find a FileRecord whose version references the given block_id.
+/// Find a FileRecord whose version references the given block_id — the worker's
+/// `file_id` attribution of a Single block's placements. Not a rebuild source any more:
+/// the rebuild reads by content (`rebuild::rebuild_plaintext_from_db`).
 ///
 /// Prefers a record with a locally-present device: after a rename the old path
 /// can linger as a `Deleted` record still referencing the same block, and reading

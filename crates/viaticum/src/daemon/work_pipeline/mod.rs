@@ -70,6 +70,9 @@ pub struct WorkPipelineConfig {
     /// Minimum pool size to attempt delivery. Below this, park the block without encoding.
     /// Default: 2.
     pub min_pool_size: usize,
+    /// Where a rebuild reports gone paths (К2b, delete-i12 (в)); the watcher rechecks
+    /// them. `None` in tests.
+    pub recheck_tx: Option<crate::daemon::backup::rebuild::RecheckTx>,
 }
 
 impl Default for WorkPipelineConfig {
@@ -83,6 +86,7 @@ impl Default for WorkPipelineConfig {
             epoch_key: [0u8; 32],
             data_dir: std::path::PathBuf::new(),
             min_pool_size: 2,
+            recheck_tx: None,
         }
     }
 }
