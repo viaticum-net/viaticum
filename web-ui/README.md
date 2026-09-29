@@ -1,6 +1,6 @@
 # Viaticum Web UI
 
-Browser-based interface for the Viaticum daemon. Talks to the daemon's local HTTP API (default `http://127.0.0.1:8765` — see `crates/viaticum/src/cli_server`). Built with Svelte 5 and Vite.
+Browser-based interface for the Viaticum daemon. Talks to the daemon's local HTTP API (`viaticum init` configures `http://127.0.0.1:7383`; `viaticum open` opens it — see `crates/viaticum/src/daemon/web_api`). Built with Svelte 5 and Vite.
 
 The daemon embeds the built `dist/` at compile time and serves it on its admin port, so end users don't run this separately — they open the browser at the daemon's URL. This directory is the source the daemon embeds.
 

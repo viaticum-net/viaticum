@@ -1,9 +1,10 @@
 // Tests for daemon/identity module.
 
 use super::{
-    DeviceSeedMode, IdentityError, MnemonicProblem, build_keyfile, corrupt_key_hint, derive_keys,
-    init_identity, init_identity_from_mnemonic, init_identity_new_device, load_identity,
-    normalize_phrase, not_initialized_hint, parse_mnemonic, write_keyfile_at,
+    DEFAULT_WEB_PORT, DeviceSeedMode, IdentityError, MnemonicProblem, build_keyfile,
+    corrupt_key_hint, default_config_toml, derive_keys, init_identity, init_identity_from_mnemonic,
+    init_identity_new_device, load_identity, normalize_phrase, not_initialized_hint,
+    parse_mnemonic, write_default_config_if_absent, write_keyfile_at,
 };
 
 fn tmp_dir() -> tempfile::TempDir {
@@ -650,4 +651,57 @@ fn corrupt_key_hint_never_advises_deleting_the_key() {
     std::fs::write(dir.path().join("identity.key"), b"not cbor").unwrap();
     let err = init_identity(dir.path()).expect_err("corrupt");
     assert!(err.to_string().contains("Do not delete it"), "{err}");
+}
+
+// ============================================================
+// init template: web API on a fixed loopback port (daemon-i9, F1)
+// ============================================================
+
+/// The `[web_api]` the daemon loads from the config `init` wrote into `dir`.
+fn web_api_after_init(dir: &std::path::Path) -> viaticum_core::config::WebApiCfg {
+    viaticum_core::config::AppConfig::load(&dir.join("config.toml"))
+        .expect("the daemon loads the init config")
+        .web_api
+}
+
+// Mutation: the template without `enabled = true` → web API off, the CLI has no
+// api-port to find the daemon by, and this test goes red.
+#[test]
+fn init_config_enables_web_api_on_fixed_loopback_port() {
+    let dir = tmp_dir();
+    init_identity(dir.path()).expect("plain init");
+    let web = web_api_after_init(dir.path());
+    assert!(web.enabled, "init must leave the web API on");
+    let addr: std::net::SocketAddr = web.bind.parse().expect("bind is a socket address");
+    assert!(addr.ip().is_loopback(), "bind {addr} must be loopback");
+    assert_ne!(addr.port(), 0, "port 0 changes on every restart");
+    assert_eq!(addr.port(), DEFAULT_WEB_PORT);
+}
+
+// Mutation: a port drawn at render time → two inits disagree, test red.
+#[test]
+fn init_config_port_is_the_same_on_every_render() {
+    let (a, b) = (tmp_dir(), tmp_dir());
+    init_identity(a.path()).expect("init a");
+    init_identity(b.path()).expect("init b");
+    assert_eq!(
+        web_api_after_init(a.path()).bind,
+        web_api_after_init(b.path()).bind
+    );
+    assert_eq!(default_config_toml(), default_config_toml());
+}
+
+// The port the user may have edited stays: a later default write (DR, re-init
+// path) never overwrites an existing config.
+#[test]
+fn default_config_write_keeps_an_existing_config() {
+    let dir = tmp_dir();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[web_api]\nenabled = true\nbind = \"127.0.0.1:9999\"\n",
+    )
+    .unwrap();
+    write_default_config_if_absent(dir.path()).expect("write if absent");
+    assert_eq!(web_api_after_init(dir.path()).bind, "127.0.0.1:9999");
 }

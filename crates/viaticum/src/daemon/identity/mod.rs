@@ -291,7 +291,7 @@ pub fn write_keyfile_at(path: &Path, kf: &IdentityKeyFile) -> Result<(), Identit
 pub fn write_default_config_if_absent(data_dir: &Path) -> Result<(), IdentityError> {
     let config_path = data_dir.join(CONFIG_FILE_NAME);
     if !config_path.exists() {
-        std::fs::write(&config_path, DEFAULT_CONFIG_TOML)?;
+        std::fs::write(&config_path, default_config_toml())?;
     }
     Ok(())
 }
@@ -447,7 +447,24 @@ fn write_secret_file(path: &Path, contents: &[u8]) -> Result<(), IdentityError> 
     Ok(())
 }
 
-const DEFAULT_CONFIG_TOML: &str = r#"# Viaticum configuration
+/// Loopback port of the web UI and JSON API in the `init` template (daemon-i9).
+///
+/// Fixed and written into `config.toml`, not 0: the CLI finds the daemon via the
+/// `api-port` file either way, but a bookmarked Dashboard must survive a restart.
+/// Chosen off the ports of apps self-hosters run next to us (8384 Syncthing, 8765
+/// AnkiConnect, 8080/8000/3000/5000, 7000 AirPlay, 9100+ Prometheus exporters, 8428
+/// VictoriaMetrics) and below the Linux ephemeral range (32768+), where an
+/// OS-chosen libp2p port could take it. A port already taken fails the start
+/// loudly (daemon-i7); choosing another one is left to the user.
+pub const DEFAULT_WEB_PORT: u16 = 7383;
+// Not 0 (it would change on every restart) and below the Linux ephemeral range.
+const _: () = assert!(DEFAULT_WEB_PORT != 0 && DEFAULT_WEB_PORT < 32768);
+
+/// The `config.toml` that `init` (and DR, when absent) writes. Same text on every
+/// render: nothing in it is random.
+pub fn default_config_toml() -> String {
+    format!(
+        r#"# Viaticum configuration
 # Generated automatically — edit as needed.
 
 [daemon]
@@ -462,7 +479,10 @@ const DEFAULT_CONFIG_TOML: &str = r#"# Viaticum configuration
 # reserve_gb = 10
 
 [web_api]
-# enabled = true          # then CLI can talk to the daemon over HTTP
-# bind = "127.0.0.1:0"    # loopback, random port (default when enabled)
-# bind = "0.0.0.0:8080"   # opt-in LAN/NAS access — token auth still required
-"#;
+# The web UI and the API the CLI talks to (`viaticum status`, `viaticum open`).
+enabled = true
+bind = "127.0.0.1:{DEFAULT_WEB_PORT}"   # loopback only, fixed port
+# bind = "0.0.0.0:{DEFAULT_WEB_PORT}"   # opt-in LAN/NAS access — token auth still required
+"#
+    )
+}
