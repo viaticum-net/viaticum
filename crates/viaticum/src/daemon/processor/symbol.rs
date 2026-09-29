@@ -1181,11 +1181,16 @@ impl Processor {
     ///
     /// Returns `true` = accept, `false` = reject.
     ///
-    /// Three-stage rejection (in order; stages, order and arithmetic unchanged by В-0b):
+    /// Three-stage rejection (in order):
     ///   1. Hard quota: held_bytes >= hard_quota → reject (absolute ceiling)
-    ///   2. Soft pressure: free_ratio < 15% → reject (prevent reaching hard pressure)
+    ///   2. Soft pressure: free_ratio < 15%, no room at all (`Bytes(0)`, holder-i1) or an
+    ///      unknown quota (holder-i2) → reject
     ///   3. Final fill: held_bytes + offer_bytes > effective → reject (would exceed cap)
+    ///
+    /// `held_bytes` of the ONE snapshot is both the quota's `used_holdings` and the rule's
+    /// `used` (holder-i3).
     pub(crate) fn decide_symbol_offer_on(&self, offer_bytes: u64, s: &OfferSnapshot) -> bool {
+        use viaticum_core::budget::Quota;
         let held_bytes = s.held_bytes;
 
         // Hard quota: absolute ceiling — always reject above this.
@@ -1193,11 +1198,12 @@ impl Processor {
             return false;
         }
 
-        // Effective soft quota: min(config_soft_quota, disk_free - reserve).
-        // When soft_quota=0, uses all available disk minus reserve.
+        // Effective quota: min(soft, disk_free + held − reserve); soft alone when the disk
+        // is unreadable; Unknown when neither is known.
         let effective = viaticum_core::budget::compute_effective_quota(
             self.soft_quota_bytes,
             s.disk_free,
+            held_bytes,
             self.disk_reserve_bytes,
         );
 
@@ -1208,10 +1214,11 @@ impl Processor {
             return false;
         }
 
-        if held_bytes + offer_bytes > effective {
-            return false;
+        match effective {
+            Quota::Bytes(n) => held_bytes.saturating_add(offer_bytes) <= n,
+            Quota::Unlimited => true,
+            Quota::Unknown => false,
         }
-        true
     }
 
     /// [`Processor::decide_symbol_offer_on`] over a fresh snapshot (the pre-В-0b API; tests).

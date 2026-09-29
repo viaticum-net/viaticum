@@ -261,18 +261,30 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         .restore_staging
         .lock()
         .expect("restore staging status lock poisoned");
-    let effective_quota_bytes = {
-        let disk_free = crate::daemon::handle::disk_available_bytes(&state.data_dir);
-        viaticum_core::budget::compute_effective_quota(
-            state.soft_quota_bytes,
-            disk_free,
-            state.disk_reserve_bytes,
-        )
+    // holder-i1..i3: one disk read and one holdings number for the quota, its state and the
+    // staging squeeze flag.
+    let disk_free = crate::daemon::handle::disk_available_bytes(&state.data_dir);
+    let quota = viaticum_core::budget::compute_effective_quota(
+        state.soft_quota_bytes,
+        disk_free,
+        holdings_bytes,
+        state.disk_reserve_bytes,
+    );
+    let (effective_quota_bytes, quota_state) = match quota {
+        viaticum_core::budget::Quota::Bytes(n) => (n, "bytes"),
+        viaticum_core::budget::Quota::Unknown => (0, "unknown"),
+        // Never produced by compute_effective_quota (tests only).
+        viaticum_core::budget::Quota::Unlimited => (0, "unlimited"),
+    };
+    let quota_note = if disk_free.is_none() {
+        crate::daemon::holder_cleanup::unreadable_disk_note(&state.data_dir, state.soft_quota_bytes)
+    } else {
+        String::new()
     };
     let staging_squeezes_holdings = crate::daemon::restore::cleanup::staging_squeezes_holdings(
         crate::daemon::restore::cleanup::holder_stops_taking_data(
             state.soft_quota_bytes,
-            crate::daemon::restore::cleanup::disk_free_bytes(&state.data_dir),
+            disk_free,
             state.disk_reserve_bytes,
             holdings_bytes,
         ),
@@ -295,6 +307,8 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         blocks_needing_repair,
         peers: peer_summaries,
         effective_quota_bytes,
+        quota_state: quota_state.to_string(),
+        quota_note,
         used_bytes: holdings_bytes,
         pos_total_challenges,
         pos_total_passes,

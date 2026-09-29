@@ -124,7 +124,16 @@
         <dt>Holding for others</dt>
         <dd>{formatBytes(status.holding_bytes)}</dd>
         <dt>Quota</dt>
-        <dd>{status.effective_quota_bytes ? formatBytes(status.effective_quota_bytes) : 'unlimited'}</dd>
+        <!-- holder-i1/i2: 0 is "no room", never "unlimited"; an unread disk says so -->
+        <dd>{status.quota_state === 'unknown'
+          ? 'unknown'
+          : status.effective_quota_bytes
+            ? formatBytes(status.effective_quota_bytes)
+            : '0 B — disk at reserve, giving space back'}</dd>
+        {#if status.quota_note}
+          <dt>Warning</dt>
+          <dd>{status.quota_note}</dd>
+        {/if}
         <dt>Used</dt>
         <dd>{formatBytes(status.used_bytes)}</dd>
       </dl>

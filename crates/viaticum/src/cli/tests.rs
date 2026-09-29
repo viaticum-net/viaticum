@@ -267,6 +267,8 @@ fn make_status_zero_peers() -> StatusData {
         blocks_needing_repair: 0,
         peers: vec![],
         effective_quota_bytes: 0,
+        quota_state: "bytes".into(),
+        quota_note: String::new(),
         used_bytes: 0,
         pos_total_challenges: 0,
         pos_total_passes: 0,
@@ -393,11 +395,33 @@ fn format_status_includes_identity_and_header() {
     assert!(rendered.contains("0000000000000000"), "got: {rendered}");
 }
 
+/// holder-i1: a zero quota is "no room", never "unlimited".
 #[test]
-fn format_status_unlimited_quota_when_zero() {
+fn format_status_zero_quota_is_no_room_not_unlimited() {
     let data = make_status_zero_peers();
     let rendered = output::render_status(&data);
-    assert!(rendered.contains("unlimited"), "got: {rendered}");
+    assert!(!rendered.contains("unlimited"), "got: {rendered}");
+    assert!(
+        rendered.contains("not taking friends' data"),
+        "got: {rendered}"
+    );
+}
+
+/// holder-i2: an unread disk shows `unknown` and the note naming the path.
+#[test]
+fn format_status_unknown_quota_names_the_path() {
+    let mut data = make_status_zero_peers();
+    data.quota_state = "unknown".into();
+    data.quota_note = "could not read free space on /srv/v; not taking friends' data".into();
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("quota:          unknown"),
+        "got: {rendered}"
+    );
+    assert!(
+        rendered.contains("WARNING: could not read free space on /srv/v"),
+        "got: {rendered}"
+    );
 }
 
 #[test]
@@ -443,6 +467,8 @@ fn format_status_top_peers_printed() {
             },
         ],
         effective_quota_bytes: 0,
+        quota_state: "bytes".into(),
+        quota_note: String::new(),
         used_bytes: 0,
         pos_total_challenges: 8,
         pos_total_passes: 7,
@@ -900,6 +926,8 @@ fn cli_response_roundtrips_cbor() {
             blocks_needing_repair: 0,
             peers: vec![],
             effective_quota_bytes: 0,
+            quota_state: "bytes".into(),
+            quota_note: String::new(),
             used_bytes: 1_000_000,
             pos_total_challenges: 0,
             pos_total_passes: 0,

@@ -34,17 +34,36 @@ fn avail_decay_tick_scales_with_time_scale() {
 fn disk_available_bytes_returns_positive_for_existing_path() {
     let bytes = disk_available_bytes(std::path::Path::new("/"));
     assert!(
-        bytes > 0,
-        "root filesystem should report > 0 available bytes"
+        bytes.is_some_and(|b| b > 0),
+        "root filesystem should report > 0 available bytes, got {bytes:?}"
     );
 }
 
+/// holder-i2: a path that cannot be read is unknown (`None`), never "disk full" (0).
 #[test]
-fn disk_available_bytes_returns_zero_for_relative_path() {
-    // Mount points are absolute. A relative path never satisfies
-    // `path.starts_with(mount_point)`, so the sysinfo impl falls through to 0.
-    let bytes = disk_available_bytes(std::path::Path::new("not/an/absolute/path"));
-    assert_eq!(bytes, 0);
+fn disk_available_bytes_is_none_for_missing_path() {
+    let dir = tempdir().unwrap();
+    assert_eq!(disk_available_bytes(&dir.path().join("no/such/dir")), None);
+}
+
+/// holder-i2 / F6: statvfs of the data dir itself reads tmpfs (which the old mount-point
+/// lookup through sysinfo skipped, reporting 0 = "disk full").
+#[cfg(target_os = "linux")]
+#[test]
+fn statvfs_of_data_dir_is_some_on_tmpfs() {
+    // A writable tmpfs mount of this machine (/dev/shm, /run/user/…, /tmp on the server).
+    let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+    let dir = mounts
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let (_, mount, fstype) = (f.next()?, f.next()?, f.next()?);
+            (fstype == "tmpfs").then_some(mount)
+        })
+        .find_map(|m| tempfile::tempdir_in(m).ok())
+        .expect("no writable tmpfs mount — cannot check F6");
+    let free = disk_available_bytes(dir.path());
+    assert!(free.is_some_and(|b| b > 0), "tmpfs data dir: {free:?}");
 }
 
 // ============================================================

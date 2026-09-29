@@ -16,6 +16,8 @@ fn make_status(peers: Vec<PeerSummary>) -> StatusData {
         blocks_needing_repair: 1,
         peers,
         effective_quota_bytes: 10_000_000,
+        quota_state: "bytes".into(),
+        quota_note: String::new(),
         used_bytes: 500,
         pos_total_challenges: 42,
         pos_total_passes: 40,

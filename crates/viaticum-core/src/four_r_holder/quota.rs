@@ -74,8 +74,8 @@ pub struct QuotaState {
     pub measure_valid: bool,
 }
 
-/// Р-12 quota: holdings counted once (the old `compute_effective_quota` subtracts them twice,
-/// because `disk_free` already excludes them), arithmetic in `i128`, no silent "0 = unlimited".
+/// Р-12 quota: holdings counted once (the pre-F-Q `compute_effective_quota` subtracted them
+/// twice, because `disk_free` already excludes them), arithmetic in `i128`, no silent "0 = unlimited".
 pub fn quota_state(q: &QuotaInputs) -> QuotaState {
     let h = q.h_all_bytes as i128;
     let base = h + q.disk_free_bytes as i128 - q.disk_reserve_bytes as i128;

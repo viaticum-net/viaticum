@@ -58,14 +58,30 @@ pub struct BackupBatch {
     pub deferred_count: usize,
 }
 
+/// Effective quota for held symbols (holder-i1, holder-i2).
+///
+/// `Unknown` is NEVER `Bytes(0)`: a node that could not read its free disk must not evict
+/// everything down to the floor (holder-i2), while `Bytes(0)` — the disk is at or below the
+/// reserve — must (holder-i1). "0" never means "no limit".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quota {
+    /// The quota in bytes. `Bytes(0)` = no room at all (Critical).
+    Bytes(u64),
+    /// Free disk could not be read and no soft quota is set: refuse offers, evict nothing.
+    Unknown,
+    /// No limit at all. Never produced by [`compute_effective_quota`] — explicit, for tests.
+    Unlimited,
+}
+
 /// Disk pressure level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskPressure {
     /// free_ratio >= 0.15. Normal.
     Normal,
-    /// 0.05 <= free_ratio < 0.15. Stop accepting new symbols.
+    /// 0.05 <= free_ratio < 0.15, or the quota is `Unknown`. Stop accepting new symbols.
     Soft,
-    /// free_ratio < 0.05. Evict immediately.
+    /// free_ratio < 0.05, or the quota is `Bytes(0)` (Critical: evict down to the hard
+    /// floor). Evict immediately.
     Hard,
 }
 
@@ -273,79 +289,88 @@ pub fn record_placement_outcome(
     r
 }
 
-/// Compute the effective storage quota for held symbols.
+/// Compute the effective storage quota for held symbols (holder-i1..i3).
 ///
-/// soft_quota:   user-configured cap in bytes. 0 = unlimited (no cap).
-/// disk_free:    current free bytes on the filesystem partition (passed in
-///               by caller — this function does NOT query the OS).
-/// disk_reserve: minimum free bytes to keep on the filesystem. Typically
-///               DEFAULT_DISK_RESERVE_BYTES (20 GB).
+/// soft_quota:    user-configured cap in bytes. 0 = no soft cap (the disk bounds the quota).
+/// disk_free:     free bytes on the data-dir filesystem (passed in by the caller — this
+///                function does NOT query the OS); `None` = the disk could not be read.
+/// used_holdings: bytes of held symbols, the SAME number (one snapshot per tick) the caller
+///                then passes to [`evaluate_pressure`] / [`should_reject_offers`] as `used`.
+/// disk_reserve:  free bytes to keep on the filesystem. Typically
+///                DEFAULT_DISK_RESERVE_BYTES (20 GB).
 ///
-/// Formula:
-///   available_from_disk = disk_free.saturating_sub(disk_reserve)
-///   if soft_quota == 0 { available_from_disk }
-///   else               { soft_quota.min(available_from_disk) }
-pub fn compute_effective_quota(soft_quota: u64, disk_free: u64, disk_reserve: u64) -> u64 {
-    let available_from_disk = disk_free.saturating_sub(disk_reserve);
-    if soft_quota == 0 {
-        available_from_disk
-    } else {
-        soft_quota.min(available_from_disk)
+/// Formula (holder-i3): `disk_free` already excludes our holdings, so they are added back —
+/// counted once, the equilibrium is `disk_free₀ − reserve`, not half of it:
+///   Some(free): avail = (free + used_holdings) − reserve (saturating at 0)
+///               soft == 0 → Bytes(avail), else Bytes(soft.min(avail))
+///   None:       soft > 0  → Bytes(soft) (holder-i2: work by the soft quota)
+///               soft == 0 → Unknown
+pub fn compute_effective_quota(
+    soft_quota: u64,
+    disk_free: Option<u64>,
+    used_holdings: u64,
+    disk_reserve: u64,
+) -> Quota {
+    match disk_free {
+        Some(free) => {
+            let avail = free
+                .saturating_add(used_holdings)
+                .saturating_sub(disk_reserve);
+            if soft_quota == 0 {
+                Quota::Bytes(avail)
+            } else {
+                Quota::Bytes(soft_quota.min(avail))
+            }
+        }
+        None if soft_quota > 0 => Quota::Bytes(soft_quota),
+        None => Quota::Unknown,
     }
 }
 
 /// Evaluate disk pressure and compute eviction targets.
 ///
-/// quota_bytes:      effective quota (call compute_effective_quota first).
-///                   0 = unlimited (returns Normal always).
+/// quota:            effective quota (call compute_effective_quota first).
+///                   `Bytes(0)` = no room at all (Critical, holder-i1): Hard, every holding
+///                   above the `hard_quota_bytes` floor is evicted.
+///                   `Unknown` = Soft (holder-i2): offers refused, nothing evicted.
+///                   `Unlimited` = Normal (tests only).
 /// hard_quota_bytes: eviction floor. Never evict if remaining usage would
 ///                   drop below this. 0 = disabled (no floor).
-/// used_bytes:       current bytes used by all held symbols.
+/// used_bytes:       current bytes used by all held symbols — the same snapshot as the
+///                   quota's `used_holdings` (holder-i3).
 /// holdings:         all HoldingRecord entries (caller loads from DB).
 /// owner_trust:      closure providing combined trust score for an owner.
 /// now_secs:         current Unix timestamp.
 pub fn evaluate_pressure(
-    quota_bytes: u64,
+    quota: Quota,
     hard_quota_bytes: u64,
     used_bytes: u64,
     holdings: &[HoldingRecord],
     owner_trust: impl Fn(&IdentityPub) -> f64,
     now_secs: u64,
 ) -> PressureResult {
-    if quota_bytes == 0 {
-        return PressureResult {
-            pressure: DiskPressure::Normal,
-            immediate_evictions: Vec::new(),
-            drop_notices: Vec::new(),
-            freed_bytes: 0,
-        };
-    }
-
-    let free_bytes = quota_bytes.saturating_sub(used_bytes);
-    let free_ratio = free_bytes as f64 / quota_bytes as f64;
-
-    if free_ratio >= SOFT_PRESSURE_THRESHOLD {
-        return PressureResult {
-            pressure: DiskPressure::Normal,
-            immediate_evictions: Vec::new(),
-            drop_notices: Vec::new(),
-            freed_bytes: 0,
-        };
-    }
-
-    if free_ratio >= HARD_PRESSURE_THRESHOLD {
-        return PressureResult {
-            pressure: DiskPressure::Soft,
-            immediate_evictions: Vec::new(),
-            drop_notices: Vec::new(),
-            freed_bytes: 0,
-        };
-    }
-
-    // Hard pressure: evict to bring free space back up to SOFT_PRESSURE_THRESHOLD.
-    let target_free_bytes = (SOFT_PRESSURE_THRESHOLD * quota_bytes as f64) as u64;
-    let deficit_bytes = target_free_bytes.saturating_sub(free_bytes);
-    let buffer_bytes = (0.05 * quota_bytes as f64) as u64;
+    let (deficit_bytes, buffer_bytes) = match quota {
+        Quota::Unlimited => return no_eviction(DiskPressure::Normal),
+        Quota::Unknown => return no_eviction(DiskPressure::Soft),
+        // Critical (holder-i1): no room at all — evict down to the hard floor.
+        Quota::Bytes(0) => (used_bytes, 0),
+        Quota::Bytes(quota_bytes) => {
+            let free_bytes = quota_bytes.saturating_sub(used_bytes);
+            let free_ratio = free_bytes as f64 / quota_bytes as f64;
+            if free_ratio >= SOFT_PRESSURE_THRESHOLD {
+                return no_eviction(DiskPressure::Normal);
+            }
+            if free_ratio >= HARD_PRESSURE_THRESHOLD {
+                return no_eviction(DiskPressure::Soft);
+            }
+            // Hard pressure: evict to bring free space back up to SOFT_PRESSURE_THRESHOLD.
+            let target_free_bytes = (SOFT_PRESSURE_THRESHOLD * quota_bytes as f64) as u64;
+            (
+                target_free_bytes.saturating_sub(free_bytes),
+                (0.05 * quota_bytes as f64) as u64,
+            )
+        }
+    };
 
     struct Candidate<'a> {
         record: &'a HoldingRecord,
@@ -430,6 +455,16 @@ pub fn evaluate_pressure(
     }
 }
 
+/// A pressure result that evicts nothing and sends no notice.
+fn no_eviction(pressure: DiskPressure) -> PressureResult {
+    PressureResult {
+        pressure,
+        immediate_evictions: Vec::new(),
+        drop_notices: Vec::new(),
+        freed_bytes: 0,
+    }
+}
+
 /// Compute eviction priority for a single holding entry (pure).
 ///
 /// priority = importance × trust_of_owner × (1 + age_bonus)
@@ -451,12 +486,15 @@ pub fn eviction_priority(
     importance * trust_of_owner * (1.0 + age_bonus)
 }
 
-/// Returns true when disk usage is at or above the soft threshold.
-/// Caller should refuse new symbol_offer messages when this returns true.
-pub fn should_reject_offers(quota_bytes: u64, used_bytes: u64) -> bool {
-    if quota_bytes == 0 {
-        return false;
-    }
+/// Returns true when the holder must refuse new symbol_offer messages: disk usage at or
+/// above the soft threshold, no room at all (`Bytes(0)`, holder-i1) or an unknown quota
+/// (holder-i2). `used_bytes` is the same snapshot as the quota's `used_holdings`.
+pub fn should_reject_offers(quota: Quota, used_bytes: u64) -> bool {
+    let quota_bytes = match quota {
+        Quota::Unlimited => return false,
+        Quota::Unknown | Quota::Bytes(0) => return true,
+        Quota::Bytes(n) => n,
+    };
     let free_bytes = quota_bytes.saturating_sub(used_bytes);
     let free_ratio = free_bytes as f64 / quota_bytes as f64;
     free_ratio < SOFT_PRESSURE_THRESHOLD

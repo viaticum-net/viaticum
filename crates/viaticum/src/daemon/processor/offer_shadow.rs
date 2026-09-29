@@ -33,8 +33,8 @@ use crate::daemon::four_r_log;
 pub(crate) struct OfferSnapshot {
     /// `total_holding_bytes` at the decision.
     pub held_bytes: u64,
-    /// Free bytes of the data-dir filesystem at the decision.
-    pub disk_free: u64,
+    /// Free bytes of the data-dir filesystem at the decision; `None` = unreadable.
+    pub disk_free: Option<u64>,
 }
 
 /// Everything the blocking shadow task needs (owned, `'static`).
@@ -160,7 +160,8 @@ pub(super) fn run_offer_shadow(job: &OfferShadowJob) -> Result<ShadowOffer, DbEr
     let latch = job.db.get_four_r_phase()?;
     let quota = QuotaInputs::from_holdings(
         &holdings,
-        job.snap.disk_free,
+        // F-Q: the shadow keeps its pre-F-Q input (unreadable = 0, `4r-i52` measure-invalid).
+        job.snap.disk_free.unwrap_or(0),
         job.soft,
         job.reserve,
         job.hard,

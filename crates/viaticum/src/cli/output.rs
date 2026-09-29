@@ -50,16 +50,23 @@ pub fn render_status(data: &StatusData) -> String {
         data.blocks_needing_repair
     ));
     out.push_str(&render_dr_readiness(data));
-    let quota_str = if data.effective_quota_bytes == 0 {
-        "unlimited".to_string()
-    } else {
-        format_bytes(data.effective_quota_bytes)
+    // holder-i1/i2: 0 is "no room", never "unlimited"; an unread disk says so.
+    let quota_str = match data.quota_state.as_str() {
+        "unknown" => "unknown".to_string(),
+        _ if data.effective_quota_bytes == 0 => {
+            "0 B — free disk at or below the reserve: not taking friends' data, giving space back"
+                .to_string()
+        }
+        _ => format_bytes(data.effective_quota_bytes),
     };
     out.push_str(&format!(
         "  quota:          {}  (used: {})\n",
         quota_str,
         format_bytes(data.used_bytes)
     ));
+    if !data.quota_note.is_empty() {
+        out.push_str(&format!("  WARNING: {}\n", data.quota_note));
+    }
     // restore-i8: restored files stay until the user moves them out.
     let staging_size = match data.restore_staging_bytes {
         Some(b) => format_bytes(b),
