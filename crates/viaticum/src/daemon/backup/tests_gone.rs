@@ -273,3 +273,27 @@ fn root_lost_does_not_touch_records_outside_root() {
     assert!(is_deleted(&db, &a));
     assert!(record(&db, &k).on_disk_confirmed);
 }
+
+/// BLOCK-1 (L0 review): c was edited (current version on Y), its old pack X was cleaned
+/// up after its other members were deleted. Moving the root away file by file must still
+/// undo c's early deletion — only the blocks reviving c makes live (Y) decide, not X.
+#[test]
+fn root_lost_undoes_deletion_whose_old_version_block_is_cleaned_up() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir(dir.path().join("photos")).unwrap();
+    let mut c = coord(&db);
+    let (p, x) = file(&mut c, &db, &dir, "photos/c.bin", 55);
+    write(&dir, "photos/c.bin", &content(56, 4096));
+    let y = backed_up(&mut c, &db, &p, DirtyKind::Modified);
+    assert_ne!(x, y, "setup: the edit is on its own block");
+    db.delete_source_block(&x).unwrap();
+    std::fs::remove_file(&p).unwrap();
+    c.process_event(event(&p, DirtyKind::Deleted)).unwrap();
+    assert!(is_deleted(&db, &p), "setup: c deleted before the root went");
+    let root = dir.path().join("photos").to_string_lossy().into_owned();
+
+    c.process_event(event(&root, DirtyKind::RootLost)).unwrap();
+
+    assert_eq!(state(&db, &p), LocalState::Present, "deletion undone");
+}

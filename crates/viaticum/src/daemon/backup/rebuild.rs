@@ -62,7 +62,7 @@ pub enum RebuildError {
 }
 
 /// Rebuild the plaintext of `block` (Single: the file bytes; Pack: index + members, in
-/// the packed order) from the files on this device (INV-RB).
+/// the packed order) from the files on this device (INV-RB). Every read is hash-checked.
 ///
 /// Every gone path met on the way (a Present record whose path is NotFound) is sent to
 /// `scope.recheck`, on success too (N2): a renamed member is rebuilt from its new path
@@ -72,10 +72,55 @@ pub fn rebuild_plaintext_from_db(
     block: &SourceBlockRecord,
     scope: &RebuildScope,
 ) -> Result<Vec<u8>, RebuildError> {
+    with_catalog(db, scope, |catalog, gone| rebuild(catalog, block, gone))?
+}
+
+/// A rebuilt plaintext, and whether it rests on unchecked reads.
+pub struct Candidate {
+    pub plaintext: Vec<u8>,
+    /// `Some`: the checked rebuild failed with this error (`SourceMissing`), and the
+    /// plaintext holds the missing members read UNCHECKED from their own record's path —
+    /// a catalog from before L1 may record the hash of a file at enqueue while the block
+    /// holds the bytes of the flush. The caller keeps it only when the sealed blob matches
+    /// the block id, and otherwise reports this error.
+    pub legacy_of: Option<RebuildError>,
+}
+
+/// As [`rebuild_plaintext_from_db`], with a last candidate when the content of a member
+/// is nowhere by hash: its own record's path, read unchecked (see [`Candidate`]).
+pub fn rebuild_candidate(
+    db: &Db,
+    block: &SourceBlockRecord,
+    scope: &RebuildScope,
+) -> Result<Candidate, RebuildError> {
+    with_catalog(db, scope, |catalog, gone| {
+        match rebuild(catalog, block, gone) {
+            Ok(plaintext) => Ok(Candidate {
+                plaintext,
+                legacy_of: None,
+            }),
+            Err(e @ RebuildError::SourceMissing { .. }) => match unchecked(catalog, block) {
+                Some(plaintext) => Ok(Candidate {
+                    plaintext,
+                    legacy_of: Some(e),
+                }),
+                None => Err(e),
+            },
+            Err(e) => Err(e),
+        }
+    })?
+}
+
+/// Run `f` over one pass of the catalog; the gone paths it met go to `scope.recheck`.
+fn with_catalog<T>(
+    db: &Db,
+    scope: &RebuildScope,
+    f: impl FnOnce(&Catalog<'_>, &mut BTreeSet<String>) -> T,
+) -> Result<T, RebuildError> {
     let files = db.list_all_files()?;
     let catalog = Catalog::new(&files, scope.device);
     let mut gone = BTreeSet::new();
-    let result = rebuild(&catalog, block, &mut gone);
+    let out = f(&catalog, &mut gone);
     if let Some(tx) = &scope.recheck {
         for path in gone {
             if tx.try_send(PathBuf::from(&path)).is_err() {
@@ -83,7 +128,32 @@ pub fn rebuild_plaintext_from_db(
             }
         }
     }
-    result
+    Ok(out)
+}
+
+/// The legacy candidate: each member as the checked rebuild finds it, else the bytes at
+/// its own record's path, unchecked. `None` when a member has neither.
+fn unchecked(catalog: &Catalog<'_>, block: &SourceBlockRecord) -> Option<Vec<u8>> {
+    let block_id = block.block_id;
+    let own_path = |record: &FileRecord| std::fs::read(&record.path).ok();
+    match &block.block_type {
+        SourceBlockType::Single => catalog
+            .files
+            .iter()
+            .find(|r| r.versions.iter().any(|v| v.source_block_id == block_id))
+            .and_then(own_path),
+        SourceBlockType::Pack { entries } => {
+            let mut members = Vec::with_capacity(entries.len());
+            let mut ignored = BTreeSet::new();
+            for entry in entries {
+                let bytes = catalog
+                    .read_member(entry, block_id, &mut ignored)
+                    .or_else(|| catalog.by_id.get(&entry.file_id).and_then(|r| own_path(r)))?;
+                members.push((entry.file_id, bytes));
+            }
+            Some(pack_plaintext(&members))
+        }
+    }
 }
 
 fn rebuild(

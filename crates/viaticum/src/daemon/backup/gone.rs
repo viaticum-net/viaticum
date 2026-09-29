@@ -136,10 +136,10 @@ impl BackupCoordinator {
 
     /// The root rule (`RootLost`, `RootChanged`; P-C2): every record under the root
     /// loses its confirmation; a deletion on this device within the owner window whose
-    /// blocks are not in deletion (block status not `Deleting`/`Deleted`, no placement
-    /// `Deleting`, block record still there) is undone. The block status is checked, not
-    /// only placements: after L2 the status is written before the Delete is published, and
-    /// with 0 acks there is no `Deleting` placement yet.
+    /// live blocks (see `any_block_in_deletion`) are not in deletion (block status not
+    /// `Deleting`/`Deleted`, no placement `Deleting`, block record still there) is undone.
+    /// The block status is checked, not only placements: after L2 the status is written
+    /// before the Delete is published, and with 0 acks there is no `Deleting` placement.
     pub(super) fn handle_root_lost(&mut self, event: &DirtyEvent) -> anyhow::Result<()> {
         let now = Timestamp::now();
         let window = OWNER_DELETE_COOLDOWN_SECS / self.config.time_scale.max(1);
@@ -190,14 +190,24 @@ impl BackupCoordinator {
         Ok(())
     }
 
-    /// A block of `record`'s backed-up versions is in deletion: its record is gone,
-    /// its status is `Deleting`/`Deleted`, or a placement of it is `Deleting`.
+    /// A block that reviving `record` makes live is in deletion: its record is gone, its
+    /// status is `Deleting`/`Deleted`, or a placement of it is `Deleting`. Only the block
+    /// of the last version and of the last backed-up version count (delete-i12 (а), L0
+    /// review BLOCK-1): an older, superseded version may point at a block long released —
+    /// `CleanupBlock` strips versions only from the record the block is attributed to —
+    /// and reviving the record does not make that block live again.
     fn any_block_in_deletion(
         &self,
         record: &FileRecord,
         cache: &mut HashMap<SourceBlockId, bool>,
     ) -> anyhow::Result<bool> {
-        for v in record.versions.iter().filter(|v| v.backed_up_at.is_some()) {
+        let last = record.versions.last().filter(|v| v.backed_up_at.is_some());
+        let last_backed_up = record
+            .versions
+            .iter()
+            .rev()
+            .find(|v| v.backed_up_at.is_some());
+        for v in last.into_iter().chain(last_backed_up) {
             let block = v.source_block_id;
             let deleting = match cache.get(&block) {
                 Some(d) => *d,

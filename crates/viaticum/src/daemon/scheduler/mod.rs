@@ -938,24 +938,15 @@ impl Scheduler {
             .ok_or_else(|| anyhow::anyhow!("source block record missing: {block_id}"))?;
         let db = self.db.clone();
         let epoch_key = self.epoch_key;
-        let expected_id = *block_id;
         let scope = self.rebuild_scope.clone();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-            use anyhow::Context;
-            let plaintext = crate::daemon::backup::rebuild::rebuild_plaintext_from_db(
+            crate::daemon::backup::pipeline::rebuild_blob_blocking(
                 &db,
                 &block_record,
+                &epoch_key,
                 &scope,
             )
-            .context("rebuild plaintext")?;
-            let blob =
-                crate::daemon::backup::pipeline::compress_and_encrypt(&plaintext, &epoch_key)?;
-            let rebuilt_id: [u8; 32] = *blake3::hash(&blob).as_bytes();
-            if rebuilt_id != expected_id.0 {
-                anyhow::bail!("rebuilt blob hash mismatch for {expected_id}");
-            }
-            Ok(blob)
         })
         .await?
     }

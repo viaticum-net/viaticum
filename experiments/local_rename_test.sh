@@ -34,7 +34,7 @@
 #               case-insensitive FS; an ancestor of a watch root renamed; restore from trash
 #               after the Delete was sent (backup-i8, L1b); cluster siblings; hard links; a
 #               file changed between enqueue and flush (unit tests); cp -r / mkdir races
-#               (R1-c2); DR side of dr-i64 (local_dr_test step 7); root self-heal on Scan (unit);
+#               (R1-c2); DR side of dr-i64 (local_dr_test step 8); root self-heal on Scan (unit);
 #               a move longer than the owner window; a rollback while the edit is still queued
 #               (unit only: dedup_same_path_after_supersede_does_not_duplicate_version); the
 #               large-file path process_large_file (no E2E file reaches the 128 MiB block).
@@ -64,8 +64,9 @@
 #                           photos/c1-copy fails ("file_id … not found in pack", or d2's
 #                           bytes for d1);
 #                 step 11 — no Delete for XT, XG, XZ; photos/ not in error, keep1..3 deleted;
-#                 step 12 — keep1..keep3, deleted one by one by their Remove events, get a
-#                           Delete on their holders.
+#                 step 12 — red through its control: K moved to the trash is read as
+#                           Modified, never deleted, so no holder of XK gets a Delete
+#                           ("control: nothing proven"); keep1..3 are not reached.
 #               Step 4 (atomic save) and 1B are GREEN on the old code too (guards).
 #               GREEN after L0-identity (К4, К2b, К3).
 # Phases:       PHASE=all (default, ≈ 25 min) | PHASE=A (≈ 5 min) | PHASE=B (≈ 20 min).

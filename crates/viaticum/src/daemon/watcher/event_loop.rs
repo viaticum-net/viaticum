@@ -7,11 +7,16 @@
 // - a move (`Modify(Name(_))`, and `Remove(Folder)`) is resolved at the end of its
 //   debounce by what is on disk: path gone → deletion; a file → `Added`; a directory →
 //   a scan of its subtree;
-// - a deletion is sent only while the watch root is on disk and is the same directory
-//   (`RootId`); otherwise the root rule fires once: `RootLost` to the backup (no deletion,
-//   recent deletions undone, confirmations dropped), unwatch, the folder in error, and
-//   events under it dropped until it heals (manual Scan, periodic scan: the root exists
-//   and is not empty → new identity, error cleared, scan);
+// - a deletion is sent only while the watch root is on disk and is the recorded
+//   directory (`RootId`); otherwise the root rule fires once: `RootLost` (or
+//   `RootChanged` for another directory) to the backup (no deletion, recent deletions
+//   undone, confirmations dropped), unwatch, the folder in error, and events under it
+//   dropped until it heals (manual Scan, periodic scan: the root exists and is not empty
+//   → new identity, error cleared, scan);
+// - the same check runs at start and before every scan: a recorded root missing or
+//   replaced gets the root rule (a loss whose event died with a shutdown inside the
+//   debounce, or happened while the daemon was down); a new root is recorded only when
+//   it is not empty (an unmounted mount point is never an identity);
 // - an inotify overflow (`Rescan` flag) → WARN and a full scan after a quiet window;
 // - a recheck (a rebuild did not find a path) → `GoneOnRecheck` when the root is intact,
 //   not in error, the path is gone and its parent exists and is not empty.
@@ -26,7 +31,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use viaticum_core::types::DeviceId;
 
-use super::roots::{RootId, RootStore};
+use super::roots::{RootId, RootStore, non_empty_dir};
 use super::{
     IgnoreSet, WatcherCommand, data_dir_between, describe_watch_error, is_viaticum_data_dir,
     refuse, refuse_folder, run_full_scan_one, set_scan_status, set_status, symlink_into_data_dir,
@@ -68,6 +73,19 @@ struct Pending {
 /// The dirty channel is closed: the daemon is shutting down.
 #[derive(Debug)]
 pub(crate) struct Closed;
+
+/// A watch root on disk against its recorded identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootCheck {
+    /// The recorded directory.
+    Same,
+    /// Nothing recorded (a new root, or one that was empty or missing so far).
+    NoRecord,
+    /// Recorded, and gone from disk.
+    Lost,
+    /// Recorded, and another directory stands at the path.
+    Changed,
+}
 
 /// Fixed parameters of the loop.
 pub(crate) struct LoopParams {
@@ -147,30 +165,17 @@ impl WatchLoop {
         }
     }
 
-    /// Compare every root on disk with `watch_roots.json`: an unknown root is recorded;
-    /// another directory than the recorded one (changed while the daemon was down) sends
-    /// `RootChanged` and is recorded anew. Returns the changed roots (to be scanned).
-    pub(crate) async fn check_roots_at_start(&mut self) -> Result<Vec<PathBuf>, Closed> {
+    /// Compare every root with `watch_roots.json` (BLOCK-2 of the L0 review): a recorded
+    /// root that is missing, or another directory, gets the root rule — it may have gone
+    /// while the daemon was down, or within the debounce before a shutdown, after its
+    /// first files were already marked deleted. A root seen for the first time is
+    /// recorded, unless it is empty (an unmounted mount point is never taken as a root).
+    pub(crate) async fn check_roots_at_start(&mut self) -> Result<(), Closed> {
         self.roots.retain(&self.watch_dirs);
-        let mut changed = Vec::new();
         for dir in self.watch_dirs.clone() {
-            let Some(now) = RootId::of(&dir) else {
-                continue;
-            };
-            match self.roots.get(&dir) {
-                Some(old) if old.same_dir(&now) => {}
-                Some(_) => {
-                    tracing::warn!(folder = %dir.display(),
-                        "watcher: watch folder is another directory than at the last run; \
-                         its files lose their on-disk confirmation, none is deleted");
-                    self.emit(&dir, DirtyKind::RootChanged).await?;
-                    self.roots.set(&dir, now);
-                    changed.push(dir);
-                }
-                None => self.roots.set(&dir, now),
-            }
+            self.verify_root(&dir).await?;
         }
-        Ok(changed)
+        Ok(())
     }
 
     // ── Events ─────────────────────────────────────────────────────────────────
@@ -261,10 +266,14 @@ impl WatchLoop {
                 "watcher: event of a symlink into a Viaticum data directory dropped");
             return Ok(());
         }
+        self.record_if_new(&root);
         match kind {
-            PendingKind::Dirty(DirtyKind::Deleted) => self.deletion(&root, &path, born).await,
+            // A removal is resolved by the disk too: a path that is back (a file) is
+            // `Added`, not deleted.
+            PendingKind::Dirty(DirtyKind::Deleted) | PendingKind::Moved => {
+                self.resolve_moved(&root, &path, born, &ig).await
+            }
             PendingKind::Dirty(kind) => self.emit(&path, kind).await,
-            PendingKind::Moved => self.resolve_moved(&root, &path, born, &ig).await,
         }
     }
 
@@ -288,10 +297,13 @@ impl WatchLoop {
             }
         };
         if path == root {
-            if !self.root_intact(root) {
-                return self.root_rule(root).await;
-            }
-            return Ok(());
+            return match self.check_root(root) {
+                RootCheck::Same => Ok(()),
+                RootCheck::Changed => self.root_rule(root, DirtyKind::RootChanged).await,
+                RootCheck::Lost | RootCheck::NoRecord => {
+                    self.root_rule(root, DirtyKind::RootLost).await
+                }
+            };
         }
         if meta.is_dir() {
             if ig.is_ignored(path, true) || is_viaticum_data_dir(path) {
@@ -318,11 +330,18 @@ impl WatchLoop {
         }
     }
 
-    /// `path` is gone: a deletion while its root is intact, else the root rule. A path
-    /// created and gone within the debounce has nothing to delete.
+    /// `path` is gone: a deletion while its root is the recorded directory, else the
+    /// root rule. A path created and gone within the debounce has nothing to delete.
     async fn deletion(&mut self, root: &Path, path: &Path, born: bool) -> Result<(), Closed> {
-        if !self.root_intact(root) {
-            return self.root_rule(root).await;
+        match self.check_root(root) {
+            RootCheck::Same => {}
+            RootCheck::Changed => return self.root_rule(root, DirtyKind::RootChanged).await,
+            // No record: no deletion without a known root (the safe side) — except for a
+            // path created and gone within the debounce, which has nothing to delete.
+            RootCheck::NoRecord if born => {}
+            RootCheck::Lost | RootCheck::NoRecord => {
+                return self.root_rule(root, DirtyKind::RootLost).await;
+            }
         }
         if born {
             tracing::debug!(path = %path.display(),
@@ -332,17 +351,51 @@ impl WatchLoop {
         self.emit(path, DirtyKind::Deleted).await
     }
 
-    /// The root is on disk and is the recorded directory. No record: not intact (the
-    /// safe side — no deletion without a known root).
-    fn root_intact(&self, root: &Path) -> bool {
+    fn check_root(&self, root: &Path) -> RootCheck {
         match (RootId::of(root), self.roots.get(root)) {
-            (Some(now), Some(recorded)) => now.same_dir(recorded),
-            _ => false,
+            (_, None) => RootCheck::NoRecord,
+            (None, Some(_)) => RootCheck::Lost,
+            (Some(now), Some(recorded)) if now.same_dir(recorded) => RootCheck::Same,
+            (Some(_), Some(_)) => RootCheck::Changed,
         }
     }
 
-    /// The root rule (Р-4, dr-i64): once per loss.
-    async fn root_rule(&mut self, root: &Path) -> Result<(), Closed> {
+    /// The root is on disk and is the recorded directory.
+    fn root_intact(&self, root: &Path) -> bool {
+        self.check_root(root) == RootCheck::Same
+    }
+
+    /// Record a root seen for the first time — only when it is a non-empty directory
+    /// (W1 b: an empty one may be an unmounted mount point).
+    fn record_if_new(&mut self, root: &Path) {
+        if self.roots.get(root).is_none()
+            && !self.lost.contains(root)
+            && non_empty_dir(root)
+            && let Some(id) = RootId::of(root)
+        {
+            self.roots.set(root, id);
+        }
+    }
+
+    /// On start and before a scan: a recorded root that is missing or another directory
+    /// gets the root rule (BLOCK-2); a new non-empty one is recorded.
+    async fn verify_root(&mut self, root: &Path) -> Result<(), Closed> {
+        match self.check_root(root) {
+            RootCheck::Same => Ok(()),
+            RootCheck::NoRecord => {
+                self.record_if_new(root);
+                Ok(())
+            }
+            RootCheck::Lost => self.root_rule(root, DirtyKind::RootLost).await,
+            RootCheck::Changed => self.root_rule(root, DirtyKind::RootChanged).await,
+        }
+    }
+
+    /// The root rule (Р-4, dr-i64), once per loss: `kind` (`RootLost` or `RootChanged`)
+    /// to the backup (no deletion, recent deletions undone, confirmations dropped),
+    /// unwatch, the same visible folder error for both (W1 c), events under it dropped
+    /// until it heals on a Scan or a periodic scan.
+    async fn root_rule(&mut self, root: &Path, kind: DirtyKind) -> Result<(), Closed> {
         if !self.lost.insert(root.to_path_buf()) {
             return Ok(());
         }
@@ -354,10 +407,16 @@ impl WatchLoop {
             WatcherStatusSignal::Error,
             Some(ROOT_LOST_ERROR.to_string()),
         );
-        tracing::warn!(folder = %root.display(),
-            "watch folder moved, renamed or removed: no file under it is deleted; \
-             folder in error until it is back");
-        self.emit(root, DirtyKind::RootLost).await
+        if kind == DirtyKind::RootChanged {
+            tracing::warn!(folder = %root.display(),
+                "watch folder is another directory than the recorded one: no file under it \
+                 is deleted; folder in error until a scan accepts it");
+        } else {
+            tracing::warn!(folder = %root.display(),
+                "watch folder moved, renamed or removed: no file under it is deleted; \
+                 folder in error until it is back");
+        }
+        self.emit(root, kind).await
     }
 
     async fn emit(&self, path: &Path, kind: DirtyKind) -> Result<(), Closed> {
@@ -417,7 +476,7 @@ impl WatchLoop {
     // ── Scans and commands ─────────────────────────────────────────────────────
 
     /// Roots not under the root rule.
-    fn active_roots(&self) -> Vec<PathBuf> {
+    pub(crate) fn active_roots(&self) -> Vec<PathBuf> {
         self.watch_dirs
             .iter()
             .filter(|d| !self.lost.contains(*d))
@@ -450,49 +509,34 @@ impl WatchLoop {
         Ok(count)
     }
 
-    /// The periodic scan: folders in error try to heal, the others are scanned.
+    /// The periodic scan: folders already in error try to heal (and are scanned by the
+    /// heal); every other root is checked against its record (BLOCK-2: a missing or
+    /// replaced root gets the root rule and waits for the next scan to heal), then scanned.
     pub(crate) async fn periodic_scan(&mut self) -> Result<u64, Closed> {
-        let roots = self.active_roots();
-        for root in &roots {
-            self.refresh_root(root).await?;
-        }
-        let count = self.scan_roots(&roots).await?;
-        // A healed folder is scanned by `try_heal` itself.
+        let mut healed = Vec::new();
         for root in self.lost.clone() {
-            self.try_heal(&root, false).await?;
-        }
-        Ok(count)
-    }
-
-    /// Before a scan of a folder not in error: a root that is another directory than the
-    /// recorded one (replaced without an event reaching us) gets `RootChanged` and is
-    /// recorded anew; the scan then confirms what it finds.
-    async fn refresh_root(&mut self, root: &Path) -> Result<(), Closed> {
-        let Some(now) = RootId::of(root) else {
-            return Ok(());
-        };
-        match self.roots.get(root) {
-            Some(old) if old.same_dir(&now) => Ok(()),
-            Some(_) => {
-                tracing::warn!(folder = %root.display(),
-                    "watcher: watch folder is another directory now; its files lose their \
-                     on-disk confirmation, none is deleted");
-                self.roots.set(root, now);
-                self.emit(root, DirtyKind::RootChanged).await
-            }
-            None => {
-                self.roots.set(root, now);
-                Ok(())
+            if self.try_heal(&root, false).await? {
+                healed.push(root);
             }
         }
+        for root in self.active_roots() {
+            if !healed.contains(&root) {
+                self.verify_root(&root).await?;
+            }
+        }
+        let roots: Vec<PathBuf> = self
+            .active_roots()
+            .into_iter()
+            .filter(|r| !healed.contains(r))
+            .collect();
+        self.scan_roots(&roots).await
     }
 
     /// Self-heal of a folder under the root rule (Р-13): it exists, is a directory and is
     /// not empty → watch it again, record its identity, clear the error, scan it (the scan
     /// confirms what is there). Otherwise the error stays.
     async fn try_heal(&mut self, root: &Path, manual: bool) -> Result<bool, Closed> {
-        let back = RootId::of(root).is_some()
-            && std::fs::read_dir(root).is_ok_and(|mut e| e.next().is_some());
+        let back = RootId::of(root).is_some() && non_empty_dir(root);
         if !back {
             if manual {
                 tracing::info!(folder = %root.display(), "manual scan skipped: folder unavailable");
@@ -542,9 +586,9 @@ impl WatchLoop {
                     );
                     self.watch_failed.insert(path.clone());
                 }
-                if let Some(id) = RootId::of(&path) {
-                    self.roots.set(&path, id);
-                }
+                // An explicit Add accepts the directory there now (if it is not empty).
+                self.roots.remove(&path);
+                self.record_if_new(&path);
                 if !self.watch_dirs.contains(&path) {
                     self.watch_dirs.push(path.clone());
                 }
@@ -578,7 +622,13 @@ impl WatchLoop {
                 } else if self.lost.contains(&path) {
                     self.try_heal(&path, true).await?;
                 } else {
-                    self.refresh_root(&path).await?;
+                    // A root missing or replaced gets the root rule first; an explicit
+                    // Scan then accepts the directory there if it is not empty (Р-13).
+                    self.verify_root(&path).await?;
+                    if self.lost.contains(&path) {
+                        self.try_heal(&path, true).await?;
+                        return Ok(());
+                    }
                     let count = self.scan_roots(std::slice::from_ref(&path)).await?;
                     tracing::info!(dir = %path.display(), files = count,
                         "watcher: manual rescan complete");

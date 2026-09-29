@@ -445,3 +445,39 @@ async fn rebuild_ignores_records_of_other_devices() {
     w.db.upsert_file(&rc).unwrap();
     w.rebuilds(x).await.unwrap();
 }
+
+/// A catalog from before L1: the version records the hash of the file at enqueue while
+/// the pack holds other bytes (those of the flush). No path has the recorded hash; the
+/// member's own path, read unchecked as the last candidate, rebuilds the block — the
+/// block id check still guards the result.
+#[tokio::test]
+async fn rebuild_reads_own_path_unchecked_when_version_hash_differs_from_packed_bytes() {
+    let (a, b) = (content(36, 4096), content(37, 4096));
+    let mut w = World::new();
+    let x = w.pack(&[("a.bin", &a), ("b.bin", &b)]);
+    let mut ra = record(&w.db, &w.path("a.bin"));
+    ra.versions[0].content_hash = [7u8; 32];
+    w.db.upsert_file(&ra).unwrap();
+
+    w.rebuilds(x).await.unwrap();
+}
+
+/// The unchecked last candidate never hides a real loss: an edited member whose packed
+/// content is nowhere still reports `SourceMissing` (the unchecked bytes do not give the
+/// block id).
+#[tokio::test]
+async fn rebuild_of_edited_member_without_copy_stays_source_missing() {
+    let (a, b, a2) = (content(38, 4096), content(39, 4096), content(40, 4096));
+    let mut w = World::new();
+    let x = w.pack(&[("a.bin", &a), ("b.bin", &b)]);
+    w.put("a.bin", &a2);
+
+    let err = w.rebuilds(x).await.expect_err("a's packed content is gone");
+    assert!(
+        matches!(
+            err.downcast_ref::<RebuildError>(),
+            Some(RebuildError::SourceMissing { .. })
+        ),
+        "error type lost: {err:#}"
+    );
+}

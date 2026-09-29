@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use viaticum_core::types::DeviceId;
 
 use super::event_loop::{LoopParams, ROOT_LOST_ERROR, Raw, WatchLoop};
-use super::roots::WATCH_ROOTS_FILE;
+use super::roots::{RootId, WATCH_ROOTS_FILE};
 use super::{IgnoreSet, WatcherCommand, WatcherConfig, raw_items, start_watcher};
 use crate::daemon::backup::{DirtyEvent, DirtyKind};
 use crate::daemon::watch_admin::{WatchEntryState, WatcherStatusSignal};
@@ -307,7 +307,8 @@ async fn slow_file_by_file_move_emits_deleted_then_root_lost() {
 }
 
 /// The root renamed away and a new directory created under its name: an event for a
-/// path under it (inotify still reports the old spelling) finds another directory.
+/// path under it (inotify still reports the old spelling) finds another directory — the
+/// root rule, sent as `RootChanged` (handled as `RootLost` by the backup).
 #[tokio::test]
 async fn moved_events_after_root_replaced_by_new_dir_emit_root_lost() {
     let (tmp, root, data) = setup();
@@ -320,7 +321,8 @@ async fn moved_events_after_root_replaced_by_new_dir_emit_root_lost() {
 
     h.feed(ev(name(RenameMode::From), &[&f]));
 
-    assert_eq!(h.flush().await, vec![(s(&root), DirtyKind::RootLost)]);
+    assert_eq!(h.flush().await, vec![(s(&root), DirtyKind::RootChanged)]);
+    assert!(h.lp.lost.contains(&root));
 }
 
 /// The identity is read from metadata: no descriptor on the root stays open, so the
@@ -329,6 +331,7 @@ async fn moved_events_after_root_replaced_by_new_dir_emit_root_lost() {
 #[tokio::test]
 async fn root_identity_holds_no_open_descriptor() {
     let (_tmp, root, data) = setup();
+    std::fs::write(root.join("a.bin"), b"x").unwrap();
     let _h = H::start(std::slice::from_ref(&root), &data).await;
 
     let canon = std::fs::canonicalize(&root).unwrap();
@@ -355,11 +358,30 @@ async fn root_changed_while_down_detected_at_start_from_watch_roots_json() {
 
     let mut second = H::start(std::slice::from_ref(&root), &data).await;
     assert_eq!(second.drain(), vec![(s(&root), DirtyKind::RootChanged)]);
+    // Visible, like a lost root (W1 c): in error until a scan accepts it.
+    assert_eq!(
+        second.status(&root),
+        (
+            WatcherStatusSignal::Error,
+            Some(ROOT_LOST_ERROR.to_string())
+        )
+    );
+    assert!(second.lp.lost.contains(&root));
 
-    // The same root at the next start: nothing.
+    // Not accepted yet: the next start reports it again.
     drop(second);
     let mut third = H::start(std::slice::from_ref(&root), &data).await;
-    assert_eq!(third.drain(), vec![]);
+    assert_eq!(third.drain(), vec![(s(&root), DirtyKind::RootChanged)]);
+    // A Scan accepts it; from then on it is the recorded root.
+    third
+        .lp
+        .on_command(WatcherCommand::Scan { path: root.clone() })
+        .await
+        .unwrap();
+    assert!(third.lp.lost.is_empty());
+    drop(third);
+    let mut fourth = H::start(std::slice::from_ref(&root), &data).await;
+    assert_eq!(fourth.drain(), vec![]);
 }
 
 /// Self-heal on Scan: the root is back and not empty → identity renewed, error
@@ -553,4 +575,141 @@ async fn live_event_under_canonical_alias_and_scan_give_one_path() {
     let want = vec![(s(&link.join("p.jpg")), DirtyKind::Added)];
     assert_eq!(scanned, want);
     assert_eq!(live, want);
+}
+
+// ─── Root checked at start and on scans (L0 review BLOCK-2, W1) ────────────────
+
+/// The root went while the daemon was down — or within the debounce before a shutdown,
+/// its DELETE_SELF lost with the process: at start it is simply missing. That is the
+/// root rule, not just a watch error: RootLost, the folder error, heal on Scan.
+#[tokio::test]
+async fn root_missing_at_start_fires_root_rule() {
+    let (tmp, root, data) = setup();
+    std::fs::write(root.join("keep1.bin"), b"x").unwrap();
+    drop(H::start(std::slice::from_ref(&root), &data).await);
+    std::fs::rename(&root, tmp.path().join("elsewhere")).unwrap();
+
+    let mut h = H::start(std::slice::from_ref(&root), &data).await;
+
+    assert_eq!(h.drain(), vec![(s(&root), DirtyKind::RootLost)]);
+    assert_eq!(
+        h.status(&root),
+        (
+            WatcherStatusSignal::Error,
+            Some(ROOT_LOST_ERROR.to_string())
+        )
+    );
+    std::fs::rename(tmp.path().join("elsewhere"), &root).unwrap();
+    h.lp.on_command(WatcherCommand::Scan { path: root.clone() })
+        .await
+        .unwrap();
+    assert_eq!(
+        h.drain(),
+        vec![(s(&root.join("keep1.bin")), DirtyKind::Added)]
+    );
+    assert!(h.lp.lost.is_empty());
+}
+
+/// The root went with no event reaching the loop: the periodic scan finds it missing,
+/// fires the root rule, scans nothing; a later periodic scan heals it once it is back.
+#[tokio::test]
+async fn root_missing_at_periodic_scan_fires_root_rule() {
+    let (tmp, root, data) = setup();
+    let f = root.join("keep1.bin");
+    std::fs::write(&f, b"x").unwrap();
+    let mut h = H::start(std::slice::from_ref(&root), &data).await;
+    std::fs::rename(&root, tmp.path().join("elsewhere")).unwrap();
+
+    h.lp.periodic_scan().await.unwrap();
+
+    assert_eq!(h.drain(), vec![(s(&root), DirtyKind::RootLost)]);
+    assert_eq!(h.status(&root).0, WatcherStatusSignal::Error);
+    std::fs::rename(tmp.path().join("elsewhere"), &root).unwrap();
+    h.lp.periodic_scan().await.unwrap();
+    assert_eq!(h.drain(), vec![(s(&f), DirtyKind::Added)]);
+    assert!(h.lp.lost.is_empty());
+}
+
+/// An empty directory is never taken as a root identity (W1 b): replaced by an empty
+/// directory (an unmounted mount point), the root is in error and a Scan does not
+/// accept it; once files are there, a Scan does.
+#[tokio::test]
+async fn root_replaced_by_empty_dir_is_not_accepted_until_not_empty() {
+    let (tmp, root, data) = setup();
+    std::fs::write(root.join("a.bin"), b"x").unwrap();
+    drop(H::start(std::slice::from_ref(&root), &data).await);
+    std::fs::rename(&root, tmp.path().join("mounted-elsewhere")).unwrap();
+    std::fs::create_dir(&root).unwrap();
+
+    let mut h = H::start(std::slice::from_ref(&root), &data).await;
+    assert_eq!(h.drain(), vec![(s(&root), DirtyKind::RootChanged)]);
+    h.lp.on_command(WatcherCommand::Scan { path: root.clone() })
+        .await
+        .unwrap();
+    assert!(
+        h.lp.lost.contains(&root),
+        "an empty directory is not accepted"
+    );
+
+    std::fs::write(root.join("b.bin"), b"y").unwrap();
+    h.lp.on_command(WatcherCommand::Scan { path: root.clone() })
+        .await
+        .unwrap();
+    assert!(h.lp.lost.is_empty());
+    assert_eq!(h.drain(), vec![(s(&root.join("b.bin")), DirtyKind::Added)]);
+}
+
+/// A new root that is empty is not recorded: a deletion under it before any file was
+/// seen there is the root rule, never a deletion.
+#[tokio::test]
+async fn empty_new_root_is_not_recorded_and_deletes_nothing() {
+    let (_tmp, root, data) = setup();
+    let mut h = H::start(std::slice::from_ref(&root), &data).await;
+    assert!(
+        !data.join(WATCH_ROOTS_FILE).exists(),
+        "nothing recorded for an empty root"
+    );
+
+    h.feed(ev(
+        EventKind::Remove(RemoveKind::File),
+        &[&root.join("x.bin")],
+    ));
+
+    assert_eq!(h.flush().await, vec![(s(&root), DirtyKind::RootLost)]);
+}
+
+/// W1 a: with both creation times known the device number is ignored (it changes on
+/// USB re-enumeration, dm/LUKS reorder, btrfs subvolumes, NFS remount); without them
+/// (device, inode) decide.
+#[test]
+fn same_dir_ignores_device_when_creation_times_are_known() {
+    let born = Some((1_700_000_000, 5));
+    assert!(RootId::for_test(1, 42, born).same_dir(&RootId::for_test(2, 42, born)));
+    assert!(!RootId::for_test(1, 42, born).same_dir(&RootId::for_test(1, 43, born)));
+    assert!(!RootId::for_test(1, 42, born).same_dir(&RootId::for_test(
+        1,
+        42,
+        Some((1_700_000_000, 6))
+    )));
+}
+
+#[test]
+fn same_dir_uses_device_and_inode_without_creation_time() {
+    assert!(RootId::for_test(1, 42, None).same_dir(&RootId::for_test(1, 42, None)));
+    assert!(!RootId::for_test(1, 42, None).same_dir(&RootId::for_test(2, 42, None)));
+    assert!(!RootId::for_test(1, 42, Some((1, 0))).same_dir(&RootId::for_test(2, 42, None)));
+}
+
+/// A removal event whose path is back on disk at the end of the debounce is resolved by
+/// the disk: `Added`, never a deletion.
+#[tokio::test]
+async fn remove_event_of_path_back_on_disk_resolves_added() {
+    let (_tmp, root, data) = setup();
+    let f = root.join("f.bin");
+    std::fs::write(&f, b"x").unwrap();
+    let mut h = H::start(std::slice::from_ref(&root), &data).await;
+
+    h.feed(ev(EventKind::Remove(RemoveKind::File), &[&f]));
+
+    assert_eq!(h.flush().await, vec![(s(&f), DirtyKind::Added)]);
 }

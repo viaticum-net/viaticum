@@ -1,12 +1,15 @@
 // Watch root identity (dr-i64): which directory a watch root is, so that a root that
 // vanished or was replaced is never read as "every file under it was deleted".
 //
-// Unix: (st_dev, st_ino, creation time); Windows: the directory's creation time only —
+// Unix: (st_dev, st_ino, creation time), compared as (inode, creation time) when both
+// creation times are known (the device number is unstable, see `RootId::same_dir`),
+// else as (device, inode); Windows: the directory's creation time only —
 // the file index needs an open handle on stable Rust, so a folder replaced by a copy
 // that kept its creation time is not recognised there (boundary of dr-i64, A17). Read
 // from `std::fs::metadata`: no descriptor is held, so the root can be unmounted (К8).
 // Persisted in `<data_dir>/watch_roots.json` (tmp + rename), so a root changed while
-// the daemon was down is caught at the next start.
+// the daemon was down is caught at the next start. An empty directory is never recorded
+// as a root's identity (an unmounted mount point).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -54,18 +57,44 @@ impl RootId {
         }
     }
 
-    /// Both describe the same directory. Creation times are compared only when both are
-    /// known.
+    /// Both describe the same directory.
+    ///
+    /// Unix: when both creation times are known, (inode, creation time) decide and the
+    /// device number is ignored — `st_dev` changes on USB re-enumeration, a dm/LUKS
+    /// reorder, btrfs subvolumes' anonymous devices or an NFS remount while the directory
+    /// is the same, and every false "changed" costs the undo of the folder's recent
+    /// deletions (delete-i12 (а), L0 review W1). Without a creation time on either side:
+    /// (device, inode). Windows: the creation time only (A17).
     pub(crate) fn same_dir(&self, other: &RootId) -> bool {
         #[cfg(unix)]
-        if self.dev != other.dev || self.ino != other.ino {
-            return false;
+        {
+            match (self.created, other.created) {
+                (Some(a), Some(b)) => self.ino == other.ino && a == b,
+                _ => self.dev == other.dev && self.ino == other.ino,
+            }
         }
-        match (self.created, other.created) {
-            (Some(a), Some(b)) => a == b,
-            _ => true,
+        #[cfg(not(unix))]
+        {
+            match (self.created, other.created) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
         }
     }
+}
+
+#[cfg(all(test, unix))]
+impl RootId {
+    /// An identity with the given fields (unit tests of `same_dir`).
+    pub(crate) fn for_test(dev: u64, ino: u64, created: Option<(u64, u32)>) -> RootId {
+        RootId { dev, ino, created }
+    }
+}
+
+/// `dir` exists, is a directory and has at least one entry. An empty directory is never
+/// taken as a new root identity: it is what an unmounted mount point looks like (Р-13).
+pub(crate) fn non_empty_dir(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

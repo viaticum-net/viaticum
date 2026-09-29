@@ -615,13 +615,17 @@ weekly rescan emit every file; live events cover changes in between.
   moved in → its subtree is scanned. A file created and gone within the debounce (an
   editor's temporary file, a `.part`) leaves nothing.
 - A deletion is sent only while the watch root is on disk and is the same directory
-  as recorded: (device, inode, creation time) on Unix, the creation time on Windows,
-  read from metadata (no descriptor is held) and kept in `<data_dir>/watch_roots.json`.
-  A root that vanished or was replaced (moved away, removed, remounted) deletes
-  nothing: recent deletions under it whose Delete has not gone out are undone, its
-  records lose their on-disk confirmation, and the folder is in Error until it is back
-  (the next Scan or periodic scan finds it present and not empty: new identity, error
-  cleared, rescan). A root changed while the daemon was down is caught at start.
+  as recorded: on Unix (inode, creation time) when the creation time is known — the
+  device number is not stable across remounts — else (device, inode); the creation
+  time on Windows. It is read from metadata (no descriptor is held) and kept in
+  `<data_dir>/watch_roots.json`; an empty directory is never recorded (it may be an
+  unmounted mount point). A root that vanished or was replaced (moved away, removed,
+  remounted) deletes nothing: recent deletions under it whose Delete has not gone out
+  are undone, its records lose their on-disk confirmation, and the folder is in Error
+  until it is back (the next Scan or periodic scan finds it present and not empty: new
+  identity, error cleared, rescan). The same check runs at start and before every
+  scan, so a root that went while the daemon was down, or whose removal event died with
+  a shutdown inside the debounce, is caught too.
 - An inotify queue overflow (events lost) → WARN and a full scan after a quiet window.
 - A recheck: when the rebuild of a block for PoS or repair does not find a path, the
   path is sent to the watcher on its own channel; it becomes a deletion only if the

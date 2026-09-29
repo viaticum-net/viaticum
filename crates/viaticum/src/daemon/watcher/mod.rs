@@ -275,8 +275,8 @@ pub(crate) fn absolute_watch_dir(dir: &Path) -> PathBuf {
 ///
 /// Spawns a tokio task that:
 /// 1. Creates a `notify::RecommendedWatcher` posting to a std channel.
-/// 2. Checks every watch root against `watch_roots.json` (a root changed while the
-///    daemon was down → `RootChanged`), then runs the initial scan when due.
+/// 2. Checks every watch root against `watch_roots.json` (a recorded root missing or
+///    replaced → the root rule), then runs the initial scan when due.
 /// 3. Drains the std channel on a poll interval into the `WatchLoop` (debounce, moves
 ///    resolved by the disk, root rule, overflow rescan) which sends `DirtyEvent`s.
 /// 4. Processes `WatcherCommand` messages from `control_rx` (add/remove/scan) and paths
@@ -342,15 +342,15 @@ pub async fn start_watcher(
         watch_dirs,
     );
     lp.register_all();
-    let Ok(changed) = lp.check_roots_at_start().await else {
+    if lp.check_roots_at_start().await.is_err() {
         return Ok(());
-    };
+    }
 
     // ── Initial / periodic scan ────────────────────────────────────────────
     let scan_marker = config.data_dir.join("last_scan");
     let needs_scan = should_run_scan(&scan_marker, config.rescan_interval_secs);
     if needs_scan && !lp.watch_dirs.is_empty() {
-        let roots = lp.watch_dirs.clone();
+        let roots = lp.active_roots();
         let Ok(count) = lp.scan_roots(&roots).await else {
             return Ok(());
         };
@@ -359,11 +359,6 @@ pub async fn start_watcher(
     } else if lp.watch_dirs.is_empty() {
         tracing::info!("watcher started with empty watch list; awaiting Add commands");
     } else {
-        // A root that is another directory than at the last run is scanned anyway:
-        // the scan confirms what is there (its records just lost the confirmation).
-        if !changed.is_empty() && lp.scan_roots(&changed).await.is_err() {
-            return Ok(());
-        }
         tracing::info!("scan skipped (last scan recent enough)");
     }
 
