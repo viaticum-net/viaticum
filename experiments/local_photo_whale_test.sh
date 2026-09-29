@@ -179,7 +179,13 @@ rough() { verdict "$CUR_STEP" ROUGH "$1"; }
 fail() { verdict "$CUR_STEP" FAIL "$1"; }
 note() { echo "  NOTE [step $CUR_STEP]: $1"; }
 
+FINISHED=0
 cleanup() {
+    local rc=$?
+    # A step that dies without its verdict (errexit, a signal) still says so.
+    if [ "$FINISHED" -eq 0 ]; then
+        echo "  FAIL [step $CUR_STEP]: the script exited (rc=$rc) before the step's verdict"
+    fi
     echo ""
     echo "=== Cleanup ==="
     for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
@@ -305,6 +311,7 @@ PY
 }
 
 finish() {
+    FINISHED=1
     echo ""
     echo "============================================================"
     local overall=PASS s v
@@ -869,6 +876,10 @@ if ! awk -v s="$FS_SIZE" -v r="$BIG_RESERVE_GB" 'BEGIN { exit !(s + 0 > 0 && s <
     finish
 fi
 [ "${H12:-0}" -gt 0 ] || { fail "FAIL(setup): L holds nothing before step 12 (holding_bytes=$H12)"; finish; }
+# Never `kill` an empty or 0 PID (0 = this script's whole process group).
+case "${PIDS[$L]:-}" in
+    ''|0|*[!0-9]*) fail "FAIL(setup): no PID recorded for L ('${PIDS[$L]:-}')"; finish ;;
+esac
 kill -TERM "${PIDS[$L]}" 2>/dev/null
 wait_pid_exit "${PIDS[$L]}" 30 || { kill -9 "${PIDS[$L]}" 2>/dev/null; fail "FAIL(setup): L did not stop within 30 s"; finish; }
 write_config "$L" "$SOFT2" "$BIG_RESERVE_GB"
