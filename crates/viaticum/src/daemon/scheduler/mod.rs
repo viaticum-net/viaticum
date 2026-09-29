@@ -10,9 +10,9 @@
 // forwards to the scheduler only the responses whose challenge is still pending (pos-i6).
 // A response is resolved by its challenge_id through the index (pos-i7).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -27,7 +27,7 @@ use viaticum_core::messages::{PosHashResponseMsg, to_cbor};
 use viaticum_core::pair_ledger::{
     AccrualStats, LossCause, PairLedgerError, PairLedgerRecorder, TickReport, tick_interval_secs,
 };
-use viaticum_core::pos::{VerifyOutcome, apply_pos_outcome, due_challenges, outcome_from_verify};
+use viaticum_core::pos::{VerifyOutcome, apply_pos_outcome, outcome_from_verify};
 use viaticum_core::trust::{compute_combined, compute_effective_trust, recalculate_trust};
 use viaticum_core::types::{
     DeviceId, IdentityPub, PlacementStatus, SourceBlockId, SourceBlockStatus, SymbolPlacement,
@@ -37,6 +37,7 @@ use viaticum_core::types::{
 use crate::daemon::mailbox::routing::MailboxRouter;
 use crate::daemon::repair::RepairTrigger;
 
+mod issue;
 mod pending;
 #[cfg(test)]
 mod tests;
@@ -138,7 +139,7 @@ impl Scheduler {
     }
 
     /// Main run loop. Fires on five independent timers:
-    ///   - pos_timer: call issue_due_challenges()
+    ///   - pos_timer: call issue_due_challenges() (bounded by its time budget, pos-i7-a)
     ///   - timeout_timer: call check_timeouts()
     ///   - deletion_timer: call process_deletion_tick()
     ///   - ledger_timer: call accrue_pair_ledgers() (4R recorder, decides nothing)
@@ -511,418 +512,6 @@ impl Scheduler {
                 .send(crate::daemon::repair::RepairTrigger::Wake)
                 .await;
         }
-
-        Ok(())
-    }
-
-    /// Issue PoS hash challenges to all holders that are due for a challenge this cycle.
-    ///
-    /// Steps:
-    ///   1. Get current timestamp.
-    ///   2. List all placements from DB; filter to challengeable statuses.
-    ///   3. Filter out SS-blocks (Bug-B: hash-PoS for SS-blocks is a separate near-term task).
-    ///   4. Use due_challenges() to find which holders are overdue.
-    ///   5. Skip placements that already have a pending challenge (avoid double-issue).
-    ///   6. Group due entries by source_block_id.
-    ///   7. For each block: encode_raw once (union of all holders' ESI ranges), then
-    ///      per-holder apply binding + compute chain hash in spawn_blocking.
-    ///   8. Publish PosHashChallengeMsg to holder via mailbox_router (T-6).
-    ///      W-3: insert into pending ONLY after ≥1 MailboxStoreAck; 0 acks = retry next tick.
-    ///
-    /// pos-i7: linear in the placements — `due_challenges` indexes `last_verified`, the
-    /// pending keys are a set, the placements are indexed by (block, holder), and a
-    /// holder's trust is read once per tick. A tick with due challenges ends with one
-    /// INFO line `scheduler: PoS issue tick` (due, issued, elapsed_ms, cpw_min, cpw_max).
-    pub async fn issue_due_challenges(&self) -> anyhow::Result<()> {
-        let started = Instant::now();
-        let now = Timestamp::now();
-
-        let placements = match self.db.list_all_placements() {
-            Ok(ps) => ps,
-            Err(e) => {
-                error!("scheduler: list_all_placements failed: {e}");
-                return Ok(());
-            }
-        };
-
-        // Bug-B: SS-blocks are excluded from due_challenges until hash-PoS for SS-blocks
-        // is implemented (separate near-term task, high priority). See TODO(bug-b) in pos/mod.rs.
-        // publish() enforces per-peer ack window (PEER_REQUEST_TIMEOUT in MailboxRouter); the >=1-ack count gate is the W-3 check.
-        let ss_ids = match self.db.ss_block_id_set() {
-            Ok(ids) => ids,
-            Err(e) => {
-                warn!(
-                    "scheduler: ss_block_id_set failed: {e}; treating as empty (may challenge SS blocks)"
-                );
-                HashSet::new()
-            }
-        };
-
-        // Only challenge placements in a challengeable state, excluding SS-blocks.
-        let challengeable: Vec<_> = placements
-            .into_iter()
-            .filter(|p| {
-                matches!(
-                    p.status,
-                    PlacementStatus::Alive
-                        | PlacementStatus::Uncertain
-                        | PlacementStatus::PresumedLost
-                ) && !ss_ids.contains(&p.source_block_id.0)
-            })
-            .collect();
-
-        if challengeable.is_empty() {
-            debug!("scheduler: no challengeable placements");
-            return Ok(());
-        }
-
-        // Build last_verified slice for due_challenges.
-        let last_verified: Vec<_> = challengeable
-            .iter()
-            .map(|p| (p.source_block_id, p.holder_id, p.last_verified))
-            .collect();
-
-        // 5b (pos-i7): a holder's trust is three redb reads; read it once per holder per
-        // tick, not once per placement.
-        let trust = holder_trust_map(&challengeable, |h| self.holder_trust(h));
-
-        let due = due_challenges(
-            &challengeable,
-            &last_verified,
-            now,
-            |h| trust.get(h).copied().unwrap_or(0.5),
-            self.config.time_scale,
-        );
-
-        if due.is_empty() {
-            debug!("scheduler: no challenges due at this interval");
-            return Ok(());
-        }
-        let mut tick = IssueTick {
-            due: due.len(),
-            cpw_min: due.iter().map(|e| e.cpw).min().unwrap_or(0),
-            cpw_max: due.iter().map(|e| e.cpw).max().unwrap_or(0),
-            ..IssueTick::default()
-        };
-
-        // Snapshot pending keys once to avoid repeatedly locking inside the loop.
-        let already_pending: HashSet<PendingKey> = {
-            let guard = self.pending.lock().await;
-            guard.keys().copied().collect()
-        };
-
-        // The challengeable placements by (block, holder), built once per tick.
-        let placement_of: HashMap<PendingKey, &SymbolPlacement> = challengeable
-            .iter()
-            .map(|p| ((p.source_block_id, p.holder_id), p))
-            .collect();
-
-        // Group due entries by source_block_id so we encode each block's raw symbols once.
-        let mut by_block: HashMap<SourceBlockId, Vec<&viaticum_core::pos::ChallengeScheduleEntry>> =
-            HashMap::new();
-        for entry in &due {
-            by_block
-                .entry(entry.source_block_id)
-                .or_default()
-                .push(entry);
-        }
-
-        for (block_id, block_entries) in by_block {
-            // Filter out already-pending entries.
-            let before = block_entries.len();
-            let block_entries: Vec<_> = block_entries
-                .into_iter()
-                .filter(|e| !already_pending.contains(&(e.source_block_id, e.holder_id)))
-                .collect();
-            tick.skipped_pending += before - block_entries.len();
-            if block_entries.is_empty() {
-                continue;
-            }
-            let cpw_of: HashMap<DeviceId, u32> =
-                block_entries.iter().map(|e| (e.holder_id, e.cpw)).collect();
-
-            // Find corresponding SymbolPlacements.
-            let holder_placements: Vec<&SymbolPlacement> = block_entries
-                .iter()
-                .filter_map(|e| placement_of.get(&(e.source_block_id, e.holder_id)).copied())
-                .collect();
-
-            if holder_placements.is_empty() {
-                continue;
-            }
-
-            // Load source block data (retained SS blob, else rebuild from source files).
-            let source_data = match self.load_source_block_data(&block_id).await {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!(
-                        block_id = %block_id,
-                        err = %e,
-                        "scheduler: cannot load source block for PoS hash, skipping"
-                    );
-                    continue;
-                }
-            };
-
-            let block_record = match self.db.get_source_block(&block_id) {
-                Ok(Some(r)) => r,
-                _ => {
-                    warn!(block_id = %block_id, "scheduler: source block record missing, skipping");
-                    continue;
-                }
-            };
-            let params = block_record.erasure_params();
-
-            // Compute union of all ESI ranges across all holders for this block.
-            let mut all_esi_ranges: Vec<(u32, u32)> = Vec::new();
-            for p in &holder_placements {
-                all_esi_ranges.extend_from_slice(&p.esi_ranges);
-            }
-
-            // Per-holder data for the spawn_blocking closure.
-            let holder_data: Vec<(DeviceId, Vec<(u32, u32)>)> = holder_placements
-                .iter()
-                .map(|p| (p.holder_id, p.esi_ranges.clone()))
-                .collect();
-
-            // Generate challenge_ids BEFORE spawn_blocking so the OsRng nonce is committed
-            // before compute_chain_hash runs. This binds expected_hash to this challenge_id.
-            let challenge_ids: HashMap<DeviceId, [u8; 16]> = holder_data
-                .iter()
-                .map(|(holder_id, _)| (*holder_id, random_challenge_id()))
-                .collect();
-            let challenge_ids_clone = challenge_ids.clone();
-
-            let encoder = std::sync::Arc::clone(&self.encoder);
-            let block_id_clone = block_id;
-
-            // encode_raw once for the block, then compute per-holder chain hashes.
-            #[allow(clippy::type_complexity)]
-            let hash_results = tokio::task::spawn_blocking(
-                move || -> Vec<(DeviceId, [u8; 32], Vec<(u32, u32)>)> {
-                    // Encode raw symbols for the union of all holders' ESI ranges.
-                    let mut raw_symbols: HashMap<u32, Vec<u8>> = HashMap::new();
-                    for &(start, count) in &all_esi_ranges {
-                        if count == 0 {
-                            continue;
-                        }
-                        match encoder.encode_raw(&source_data, &params, start, count) {
-                            Ok(syms) => {
-                                for sym in syms {
-                                    raw_symbols.insert(sym.esi, sym.data);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    block_id = %block_id_clone,
-                                    "scheduler: encode_raw failed: {e}"
-                                );
-                                return vec![];
-                            }
-                        }
-                    }
-
-                    // Per-holder: apply binding, compute chain hash.
-                    let mut results = Vec::new();
-                    for (holder_id, esi_ranges) in &holder_data {
-                        // Expand ranges to sorted ESI list.
-                        let mut esis: Vec<u32> = esi_ranges
-                            .iter()
-                            .flat_map(|&(start, count)| start..start + count)
-                            .collect();
-                        esis.sort_unstable();
-
-                        // Apply binding keystream and collect bound symbols.
-                        let bound_pairs: Vec<(u32, Vec<u8>)> = esis
-                            .iter()
-                            .filter_map(|&esi| {
-                                raw_symbols.get(&esi).map(|raw_data| {
-                                    let mut data = raw_data.clone();
-                                    let ks = viaticum_core::erasure::binding_keystream(
-                                        &block_id_clone,
-                                        holder_id,
-                                        esi,
-                                        data.len(),
-                                    );
-                                    for (d, k) in data.iter_mut().zip(ks.iter()) {
-                                        *d ^= k;
-                                    }
-                                    (esi, data)
-                                })
-                            })
-                            .collect();
-
-                        let refs: Vec<(u32, &[u8])> = bound_pairs
-                            .iter()
-                            .map(|(esi, data)| (*esi, data.as_slice()))
-                            .collect();
-
-                        // Use the pre-generated challenge_id to seed the chain hash.
-                        // Invariant: challenge_ids_clone is built from the same holder_data
-                        // iterated here, so the key is always present. Falling back to a
-                        // constant seed would silently bind chain_hash to a known value —
-                        // expect() surfaces any future invariant violation immediately.
-                        let cid = *challenge_ids_clone
-                            .get(holder_id)
-                            .expect("challenge_id always present: built from same holder_data");
-                        match viaticum_core::pos::compute_chain_hash(&cid, &refs) {
-                            Ok(hash) => results.push((*holder_id, hash, esi_ranges.clone())),
-                            Err(e) => {
-                                tracing::error!(
-                                    holder = %holder_id,
-                                    block_id = %block_id_clone,
-                                    "scheduler: chain hash failed: {e}"
-                                );
-                            }
-                        }
-                    }
-                    results
-                },
-            )
-            .await;
-
-            // CS-POS-8: a JoinError here means the blocking task panicked (e.g. the
-            // `expect` inside it). `unwrap_or_default()` would silently swallow that and
-            // skip the whole block with zero logs. Log it loudly and degrade gracefully —
-            // treat it as "no hashes for this block this tick" rather than re-panicking the
-            // scheduler task.
-            let hash_results = match hash_results {
-                Ok(results) => results,
-                Err(join_err) => {
-                    error!(
-                        block_id = %block_id,
-                        err = %join_err,
-                        "scheduler: PoS hash compute task failed (panicked or cancelled) — skipping block this tick"
-                    );
-                    continue;
-                }
-            };
-
-            // Publish a challenge for each holder we computed a hash for via mailbox (T-6).
-            for (holder_id, expected_hash, esi_ranges) in hash_results {
-                let challenge_id = challenge_ids[&holder_id];
-                let holder_master = self
-                    .db
-                    .get_master_for_device(&holder_id)
-                    .ok()
-                    .flatten()
-                    .map(|m| IdentityPub(m.0))
-                    .unwrap_or_else(|| IdentityPub(holder_id.0));
-
-                // CS-ID-5 / P1-2: sign the challenge with our master key so the holder can
-                // authenticate it against MailboxEntry.sender before doing any disk work.
-                let challenge_msg = viaticum_core::messages::build_pos_hash_challenge(
-                    challenge_id,
-                    block_id,
-                    esi_ranges.clone(),
-                    now,
-                    Some(holder_id),
-                    &self.signing_key,
-                );
-
-                let payload = match to_cbor(&challenge_msg) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        error!(
-                            block_id = %block_id,
-                            holder_id = %holder_id,
-                            err = %e,
-                            "scheduler: failed to encode PosHashChallenge"
-                        );
-                        continue;
-                    }
-                };
-
-                let ttl_secs = viaticum_core::mailbox::scaled_ttl_secs(
-                    viaticum_core::mailbox::class_config::POS_CHALLENGE_TTL.as_secs(),
-                    self.config.time_scale,
-                );
-                let expires_at = now.0 + ttl_secs;
-                let entry = MailboxEntry {
-                    target: MailboxAddress::for_master(&holder_master),
-                    msg_id: challenge_id,
-                    class: MailboxClass::PosChallenge,
-                    payload_version: 1,
-                    payload,
-                    expires_at,
-                    stored_at: now.0,
-                    // W-3: sender is our master_pub so holder knows where to publish the response.
-                    sender: Some(self.my_master_pub),
-                };
-
-                // W-3: publish via mailbox and gate pending-challenge creation on ≥1 Ack.
-                // If 0 acks returned, the challenge is treated as unsent — retry on next tick.
-                // MAILBOX_STORE_TIMEOUT_SECS is the per-peer request timeout (enforced in routing.rs).
-                match self.mailbox_router.publish(entry, None).await {
-                    Ok(0) => {
-                        warn!(
-                            block_id = %block_id,
-                            holder_id = %holder_id,
-                            "scheduler: PoS challenge: 0 acks — treating as unsent, will retry next tick"
-                        );
-                        tick.zero_ack += 1;
-                        // Do NOT insert into pending — no confirmed delivery.
-                        continue;
-                    }
-                    Ok(ack_count) => {
-                        debug!(
-                            block_id = %block_id,
-                            holder_id = %holder_id,
-                            ack_count,
-                            "scheduler: PoS challenge published via mailbox"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            block_id = %block_id,
-                            holder_id = %holder_id,
-                            err = %e,
-                            "scheduler: PoS challenge publish error — will retry next tick"
-                        );
-                        tick.zero_ack += 1;
-                        continue;
-                    }
-                }
-
-                // Insert into pending ONLY after confirmed ack (W-3 requirement).
-                // CS-POS-3: capture the holder_master we resolved above so the response
-                // is later verified against the SAME key the challenge was addressed to —
-                // not a re-resolve that may have degraded to device-pub by then.
-                self.pending.lock().await.insert(
-                    (block_id, holder_id),
-                    PendingHashChallenge {
-                        source_block_id: block_id,
-                        holder_id,
-                        esi_ranges,
-                        expected_chain_hash: expected_hash,
-                        issued_at: now,
-                        challenge_id,
-                        holder_master,
-                    },
-                );
-
-                tick.issued += 1;
-                info!(
-                    block_id = %block_id,
-                    holder_id = %holder_id,
-                    challenge_id = %hex_encode(&challenge_id),
-                    cpw = cpw_of.get(&holder_id).copied().unwrap_or(0),
-                    "scheduler: PoS hash challenge issued via mailbox"
-                );
-            }
-        }
-
-        // pos-i7 observable: one line per tick with due challenges.
-        info!(
-            due = tick.due,
-            issued = tick.issued,
-            skipped_pending = tick.skipped_pending,
-            zero_ack = tick.zero_ack,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            cpw_min = tick.cpw_min,
-            cpw_max = tick.cpw_max,
-            "scheduler: PoS issue tick"
-        );
 
         Ok(())
     }
@@ -1538,21 +1127,6 @@ fn log_ledger_rows(report: &TickReport) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Counters of one PoS issue tick, printed by `scheduler: PoS issue tick` (pos-i7).
-#[derive(Debug, Default)]
-struct IssueTick {
-    /// Placements due this tick (`due_challenges`).
-    due: usize,
-    /// Challenges published with ≥ 1 ack and put in pending.
-    issued: usize,
-    /// Due placements skipped because a challenge is already pending for them.
-    skipped_pending: usize,
-    /// Challenge publishes with 0 acks or an error (retried next tick).
-    zero_ack: usize,
-    cpw_min: u32,
-    cpw_max: u32,
-}
 
 /// Trust of every distinct holder of `placements`, `f` called once per holder (pos-i7:
 /// the trust lookup is three redb reads; once per placement it was ~27 000 reads a tick

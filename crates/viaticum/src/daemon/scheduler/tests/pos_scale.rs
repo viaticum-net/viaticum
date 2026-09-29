@@ -175,7 +175,7 @@ fn holder_trust_map_calls_f_once_per_holder() {
 // ─── The issue-tick line (pos-i7 observable) ──────────────────────────────────
 
 #[derive(Clone, Default)]
-struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+pub(super) struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl std::io::Write for LogBuf {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -188,13 +188,13 @@ impl std::io::Write for LogBuf {
 }
 
 impl LogBuf {
-    fn text(&self) -> String {
+    pub(super) fn text(&self) -> String {
         String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
     }
 }
 
 /// The integer value of `field=` in `line`.
-fn field(line: &str, name: &str) -> Option<u64> {
+pub(super) fn field(line: &str, name: &str) -> Option<u64> {
     line.split_whitespace()
         .find_map(|w| w.strip_prefix(&format!("{name}=")))
         .and_then(|v| v.parse().ok())

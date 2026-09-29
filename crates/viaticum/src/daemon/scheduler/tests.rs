@@ -27,6 +27,8 @@ use crate::daemon::scheduler::{
 mod pos_scale;
 // pos-i4: a stale verdict is written neither to the weekly counters nor to trust.
 mod stale_verdict;
+// pos-i7-a: the issue tick is bounded by its budget; each challenge is stamped at publish.
+mod issue_budget;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 

@@ -30,7 +30,8 @@
 #               1b. O writes 995 files -> within 60 min 1000 `backup: pipeline complete` lines and
 #                    1000 files restorable on O, else FAIL(setup) with the pace (pace = NOTE)
 #               2.  W1+W2: `scheduler: PoS issue tick` elapsed_ms p95 <= 800; gap between O's
-#                    ledger accruals <= 12 s (pos-i7)
+#                    ledger accruals <= 12 s; ticks cut by the budget, deferred, issued per
+#                    placement per scaled week = NOTE (pos-i7, pos-i7-a)
 #               3.  W2, H1..H8, per challenge_id seen in W2: exactly 1 `responding with chain
 #                    hash`; `PosResponse published` <= 4 + its 0-ack lines; every challenge first
 #                    computed in [W2 start, W2 end - 200 s] has >= 1 `cached=true`; rchar growth
@@ -57,14 +58,17 @@
 #                    computed exactly twice, the others once; rchar growth over the first poll
 #                    with entries <= 1.5 x sum(bytes of the blocks of H1's live challenges) +
 #                    1.5 x R0 x (elapsed / week); O: 0 timeouts to H1, WARN unknown <= timeouts
-#                    (pos-i5, pos-i6)
+#                    (pos-i5, pos-i6). The first poll is awaited until W5 - 10 s; later than
+#                    180 s after the start = NOTE
 #               8.  end of W4: O SIGTERM for 720 s (about a scaled week), start: the first issue
 #                    tick has due >= 0.8 x placements (elapsed_ms = NOTE); T_off shorter than
 #                    one challenge interval + 30 s (604800 / (cpw_min x 900) + 30, cpw_min read
-#                    from O's issue ticks) = FAIL(setup), not a product FAIL; then half a week: 0
-#                    timeouts, every new challenge resolved (+120 s margin), WARN unknown <=
-#                    timeouts, ledger gap <= 12 s outside the first tick (the first = NOTE, K-5)
-#                    (pos-i6, pos-i7)
+#                    from O's issue ticks) = FAIL(setup), not a product FAIL; then 600 s past the
+#                    first tick: every new challenge resolved (+120 s margin); with >= 1 issue
+#                    tick and >= 1 resolution after the restart (else FAIL "nothing to judge"):
+#                    0 timeouts, WARN unknown <= timeouts; >= 2 ledger rows and ledger gap
+#                    <= 12 s outside the first tick (the first = NOTE, K-5); the time until a
+#                    tick with deferred = 0 = NOTE (pos-i6, pos-i7, pos-i7-a)
 #
 # Pre-registered on the current code (СТ-0a and СТ-0c in):
 #   every step GREEN, except 7b's poll bar: ROUGH "known: poll waits for the slowest postman"
@@ -74,6 +78,35 @@
 #   line.
 #   Before СТ-0c (СТ-0a only) steps 2, 7b, 8 were RED (no issue-tick line) and step 4 RED
 #   (every live answer forwarded, O's log tens of MB per minute: STOP_AFTER=4).
+#
+# Changes after run 20260929-193455 (pos-i7-a; written before the next run, bars unchanged
+# unless stated):
+#   - the product change: the issue tick is bounded by a budget (a fifth of the PoS tick
+#     period = 800 ms here), publishes 16 at a time, stamps each challenge at its publish;
+#     what the budget cuts stays due (`deferred` on the tick line). Before it, one tick with
+#     ~8 000 due challenges held the scheduler's loop for minutes (step 8: the first tick
+#     after O's restart never ended in 458 s; step 2: p95 2.8 s in a quiet window).
+#   - step 2: + NOTE on `deferred` and the issue rate. Bars unchanged.
+#   - step 5: the wait for H1's first poll with entries: 180 s -> until W5 - 10 s (~590 s);
+#     later than 180 s = NOTE. The 180 s was this script's wait, not a bar of the passport:
+#     the step judges compute counts, the rchar over the first poll (its bound already scales
+#     R0 by the elapsed time) and O's timeouts, none of which depends on how soon the first
+#     poll comes. A first poll that never comes is still a FAIL.
+#   - step 8: the judged window: half a week (336 s) past the first tick -> 600 s. With the
+#     budget the ~8 000 due challenges go out over many ticks: a block's re-encode is
+#     ~110 ms and serial, so ≈ 6 blocks of 8 per 800 ms tick, 1000 blocks in ≈ 170 ticks
+#     ≈ 11 min — half a week ends long before the backlog is issued. 600 s covers most of
+#     it and many ticks under backlog (the time to deferred = 0 is a NOTE, not a bar).
+#     New guards, not new bars: the timeout and unknown bars count bad events and passed on
+#     an owner that issued and resolved nothing; they now need >= 1 issue tick and >= 1
+#     resolution after the restart. `ledger_gap` is 0.0 for fewer than two rows (step 2
+#     guards ROWS = 0); step 8 now needs >= 2 rows.
+#   - mutation (b'): its mechanism was the backlog of thousands of responses queued behind
+#     one long tick. The burst now goes out over ticks and the loop resolves between them,
+#     so (b') may stay GREEN here; the pre-declared fallback (К0-6, unit-only) applies.
+#   - known, not changed: "0 timeouts after the restart" cannot redden in step 8. Pending
+#     lives in RAM (empty after the restart) and the scaled pending timeout is 1352 s
+#     (14 d 2 h / 900), longer than the window (600 + 120 s). Kept as a tripwire only.
 #
 # Implementation notes (how the passport is executed, not what it claims):
 #   - "ledger accrual" is measured on O's `pair-ledger row` lines (target viaticum::ledger,
@@ -154,6 +187,8 @@ BAR_MEMO_RATIO=1.5
 FIRST_CACHED_MARGIN=200
 ALIVE_MARGIN=60
 STEP8_MARGIN=120
+STEP8_RUN=600       # step 8: judged window past O's first tick, s (the backlog drains over ticks)
+H1_FIRST_POLL_NOTE=180  # step 5: a first poll of H1 later than this after its start = NOTE
 O_OFF=720           # step 8: O off, s (> one challenge interval 672 s at cpw 1, + 30 s)
 
 E2E_BASE="${E2E_BASE:-$HOME/e2e-runs}"
@@ -318,7 +353,7 @@ o_issues() { events_grep "$(node_log "$O")" "PoS hash challenge issued via mailb
 o_resolved() { events_grep "$(node_log "$O")" "mailbox PosResponse resolved" block_id holder outcome challenge_id; }
 o_timeouts() { events_grep "$(node_log "$O")" "PoS challenge timed out" block_id holder_id challenge_id; }
 o_unknown() { events_grep "$(node_log "$O")" "unknown challenge_id" challenge_id; }
-o_issue_ticks() { events_grep "$(node_log "$O")" "scheduler: PoS issue tick" elapsed_ms due issued cpw_min; }
+o_issue_ticks() { events_grep "$(node_log "$O")" "scheduler: PoS issue tick" elapsed_ms due issued cpw_min deferred; }
 o_ledger_rows() { events_grep "$(node_log "$O")" "pair-ledger row" master; }
 
 # Holder-side events (the holder's own log).
@@ -599,6 +634,13 @@ elif awk -v g="$GAP" -v b="$BAR_LEDGER_GAP" 'BEGIN { exit !(g <= b) }'; then
 else
     fail "ledger accrual gap max = ${GAP} s > ${BAR_LEDGER_GAP} s"
 fi
+# pos-i7-a: a tick cut by its budget leaves the rest due (`deferred`). NOTE: how often the
+# budget cut, and the issue rate against the placements (the cadence the owner keeps).
+read -r N_T N_DEF MAX_DEF LAST_DEF ISS_W12 <<< "$(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '
+    $7 ~ /^[0-9]+$/ { n++; if ($7 + 0 > 0) d++; if ($7 + 0 > m) m = $7 + 0; last = $7 + 0 }
+    $5 ~ /^[0-9]+$/ { iss += $5 }
+    END { printf "%d %d %d %d %d\n", n, d, m, last, iss }')"
+note "deferred (pos-i7-a): $N_DEF of $N_T ticks cut by the budget, max deferred $MAX_DEF, last tick $LAST_DEF; issued $ISS_W12 in W1+W2 = $(awk -v i="$ISS_W12" -v p="$PLACEMENTS_AT_1B" 'BEGIN { printf "%.2f", (p > 0 ? i / (2 * p) : 0) }') per placement per scaled week"
 stop_point 2
 
 # ── STEP 3: every holder computed each challenge once in W2 ────────────────
@@ -772,13 +814,20 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 T_FIRST=""
-for _ in $(seq 1 180); do
+# Wait for the first poll with entries until just before W5 ends (the former 180 s was a
+# wait of this script, not a bar of the passport; see "Changes after run 20260929-193455").
+while [ "$(now_t)" -lt $((T_W5 - 10)) ]; do
     T_FIRST=$(h_polls "$H1" | in_window "$T_START" 999999999 | awk '$4 != "-" && $4 + 0 > 0 { print $1; exit }')
     [ -n "$T_FIRST" ] && break
     sleep 1
 done
 RC_FIRST=$(rchar_of "$H1")
 info "H1 killed t=$T_KILL, started t=$T_START, first poll with entries t=${T_FIRST:-none}"
+if [ -n "$T_FIRST" ]; then
+    FIRST_S=$(awk -v a="$T_START" -v b="$T_FIRST" 'BEGIN { printf "%.0f", b - a }')
+    [ "$FIRST_S" -gt "$H1_FIRST_POLL_NOTE" ] \
+        && note "H1's first poll with entries came ${FIRST_S} s after its start (> ${H1_FIRST_POLL_NOTE} s)"
+fi
 
 # ── STEP 7 runs until W4 ends; then step 8 stops O, and 5 and 7 are judged meanwhile ─
 sleep_until "$T_W5"
@@ -891,7 +940,7 @@ T8="$T_O_START"
 if [ -z "$FIRST_TICK" ]; then
     fail "no 'scheduler: PoS issue tick' on O within 180 s of its start (the line comes with СТ-0c)"
 else
-    read -r T8 _ FT_MS FT_DUE _ FT_CPW <<< "$FIRST_TICK"
+    read -r T8 _ FT_MS FT_DUE _ FT_CPW FT_DEF <<< "$FIRST_TICK"
     T8=${T8%.*}
     T_OFF=$((T_O_START - T_O_KILL))
     # Setup self-check: the bar needs every placement's challenge interval to have passed
@@ -900,7 +949,7 @@ else
     # week before the kill cover every placement.
     CPW_MIN=$( { o_issue_ticks | in_window $((T_O_KILL - WEEK)) "$T_O_KILL" | awk '{ print $6 }'
                  echo "$FT_CPW"; } | awk '$1 ~ /^[0-9]+$/ && $1 > 0' | sort -n | head -1)
-    note "first issue tick: elapsed_ms=$FT_MS due=$FT_DUE placements=$PLACEMENTS; T_off=${T_OFF} s cpw_min=${CPW_MIN:-none}"
+    note "first issue tick: elapsed_ms=$FT_MS due=$FT_DUE deferred=$FT_DEF placements=$PLACEMENTS; T_off=${T_OFF} s cpw_min=${CPW_MIN:-none}"
     if [ -z "$CPW_MIN" ]; then
         fail "FAIL(setup): no cpw_min on O's issue ticks (cannot check T_off)"
     elif [ "$T_OFF" -lt $((604800 / (CPW_MIN * TIME_SCALE) + 30)) ]; then
@@ -911,11 +960,19 @@ else
             || fail "first tick due=$FT_DUE < 0.8 x $PLACEMENTS placements"
     fi
 fi
-T8_END=$((T8 + HALF))
-sleep_until $((T8_END + STEP8_MARGIN))
-read -r UNRES8 ISSUED8 <<< "$(unresolved_issues "$T_O_START" "$T8_END" $((T8_END + STEP8_MARGIN)))"
-TO8A=$(o_timeouts | count_in "$T_O_START" $((T8_END + STEP8_MARGIN)))
-UNK8=$(o_unknown | count_in "$T_O_START" $((T8_END + STEP8_MARGIN)))
+T8_END=$((T8 + STEP8_RUN))
+T8_JUDGE=$((T8_END + STEP8_MARGIN))
+sleep_until "$T8_JUDGE"
+read -r UNRES8 ISSUED8 <<< "$(unresolved_issues "$T_O_START" "$T8_END" "$T8_JUDGE")"
+TO8A=$(o_timeouts | count_in "$T_O_START" "$T8_JUDGE")
+UNK8=$(o_unknown | count_in "$T_O_START" "$T8_JUDGE")
+TICKS8=$(o_issue_ticks | count_in "$T_O_START" "$T8_JUDGE")
+RES8=$(o_resolved | count_in "$T_O_START" "$T8_JUDGE")
+ROWS8=$(o_ledger_rows | count_in $((T8 + 30)) "$T8_JUDGE")
+note "after the restart: issue ticks=$TICKS8, resolutions=$RES8, ledger rows=$ROWS8"
+# pos-i7-a: the ~8 000 challenges due at once go out over many budget-bound ticks.
+DRAIN8=$(o_issue_ticks | in_window "$T8" "$T8_JUDGE" | awk -v t="$T8" '$7 == "0" { printf "%.0f", $1 - t; exit }')
+note "backlog after the restart: first tick with deferred=0 at T8 + ${DRAIN8:-never (within the window)} s"
 if [ "$ISSUED8" -eq 0 ]; then
     fail "no challenge issued by O after its restart (nothing to judge)"
 elif [ "$UNRES8" -eq 0 ]; then
@@ -923,15 +980,26 @@ elif [ "$UNRES8" -eq 0 ]; then
 else
     fail "$UNRES8 of $ISSUED8 challenges issued after the restart not resolved"
 fi
-[ "$TO8A" -eq 0 ] && pass "0 timeouts after the restart" || fail "$TO8A timeouts after the restart"
-[ "$UNK8" -le "$TO8A" ] && pass "WARN unknown challenge_id = $UNK8 <= timeouts ($TO8A)" \
-    || fail "WARN unknown challenge_id = $UNK8 > timeouts ($TO8A) after the restart"
+# The timeout / unknown bars count bad events: with no issue tick or no resolution after
+# the restart they would pass on an owner that did nothing.
+if [ "$TICKS8" -eq 0 ] || [ "$RES8" -eq 0 ]; then
+    fail "nothing to judge after the restart: issue ticks=$TICKS8, resolutions=$RES8 (the timeout and unknown bars would pass vacuously)"
+else
+    [ "$TO8A" -eq 0 ] && pass "0 timeouts after the restart" || fail "$TO8A timeouts after the restart"
+    [ "$UNK8" -le "$TO8A" ] && pass "WARN unknown challenge_id = $UNK8 <= timeouts ($TO8A)" \
+        || fail "WARN unknown challenge_id = $UNK8 > timeouts ($TO8A) after the restart"
+fi
 GAP_FIRST=$(ledger_gap "$T_O_START" $((T8 + 30)))
 note "ledger gap around the first tick = ${GAP_FIRST} s (K-5, A's decision)"
-GAP8=$(ledger_gap $((T8 + 30)) $((T8_END + STEP8_MARGIN)))
-awk -v g="$GAP8" -v b="$BAR_LEDGER_GAP" 'BEGIN { exit !(g <= b) }' \
-    && pass "ledger accrual gap after the first tick = ${GAP8} s" \
-    || fail "ledger accrual gap after the first tick = ${GAP8} s > ${BAR_LEDGER_GAP} s"
+GAP8=$(ledger_gap $((T8 + 30)) "$T8_JUDGE")
+# ledger_gap is 0.0 for fewer than two rows: guard it, as step 2 guards ROWS = 0.
+if [ "$ROWS8" -lt 2 ]; then
+    fail "$ROWS8 'pair-ledger row' on O after the first tick (the gap bar needs >= 2)"
+elif awk -v g="$GAP8" -v b="$BAR_LEDGER_GAP" 'BEGIN { exit !(g <= b) }'; then
+    pass "ledger accrual gap after the first tick = ${GAP8} s ($ROWS8 rows)"
+else
+    fail "ledger accrual gap after the first tick = ${GAP8} s > ${BAR_LEDGER_GAP} s"
+fi
 stop_point 8
 
 finish
