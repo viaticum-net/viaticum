@@ -1,4 +1,7 @@
-//! What the mailbox poll remembers about PoS between polls (pos-i5).
+//! What the mailbox poll remembers about PoS between polls (pos-i5, pos-i6).
+//!
+//! Owner side: `ForwardedResponses` (see `forwarded`): a response envelope goes to the
+//! scheduler once while its challenge is pending.
 //!
 //! Holder side: `AnsweredChallenges`. A PoS challenge stays in the holder's master box
 //! until its TTL, and the poll sees it on every poll. The holder computes it once
@@ -30,6 +33,13 @@ use viaticum_core::mailbox::class_config::POS_CHALLENGE_TTL;
 use viaticum_core::mailbox::{MailboxClass, MailboxEntry, scaled_ttl_secs};
 use viaticum_core::messages::PosHashChallengeMsg;
 use viaticum_core::types::IdentityPub;
+
+use crate::daemon::scheduler::PendingChallenges;
+
+mod forwarded;
+pub use forwarded::{
+    ForwardCounts, ForwardedResponses, MAX_FORWARDED_RESPONSES, ResponseKey, ResponseToForward,
+};
 
 /// Cap on remembered responses (pos-i5-a).
 ///
@@ -414,18 +424,39 @@ pub struct PollCounts {
     pub deferred_full: u32,
     /// PosResponse entries that did not decode.
     pub undecodable: u32,
+    /// PosResponse entries whose challenge is not pending (resolved, timed out, not
+    /// ours): dropped without a WARN (pos-i6).
+    pub not_pending: u32,
+    /// PosResponse entries already handed over and still pending, or a second envelope
+    /// of one challenge in this poll (pos-i6).
+    pub in_flight: u32,
+}
+
+impl PollCounts {
+    /// Add what `ForwardedResponses::select` counted (`selected` is counted as
+    /// `forwarded` / `deferred_full` by the send).
+    pub fn add_forward(&mut self, f: ForwardCounts) {
+        self.not_pending += f.not_pending;
+        self.in_flight += f.in_flight;
+        self.undecodable += f.undecodable;
+    }
 }
 
 /// Everything the poll loop keeps about PoS between polls.
 #[derive(Debug)]
 pub struct PosPollState {
+    /// The owner's in-flight challenges (written by the scheduler, read here).
+    pub pending: PendingChallenges,
     pub answered: AnsweredChallenges,
+    pub forwarded: ForwardedResponses,
 }
 
 impl PosPollState {
-    pub fn new(time_scale: u64) -> Self {
+    pub fn new(pending: PendingChallenges, time_scale: u64) -> Self {
         PosPollState {
+            pending,
             answered: AnsweredChallenges::new(time_scale),
+            forwarded: ForwardedResponses::new(time_scale),
         }
     }
 

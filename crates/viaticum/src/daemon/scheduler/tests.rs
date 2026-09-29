@@ -4,10 +4,9 @@
 // (not the run() loop) to avoid real timers and network connections.
 // The PendingChallenges map is used as the primary observable output.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use viaticum_core::db::Db;
 use viaticum_core::messages::{
     MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse,
@@ -23,6 +22,9 @@ use crate::daemon::repair::RepairTrigger;
 use crate::daemon::scheduler::{
     PendingChallenges, PendingHashChallenge, Scheduler, SchedulerConfig,
 };
+
+// pos-i6/pos-i7 (СТ-0c): the pending index, the issue tick, the trust memory.
+mod pos_scale;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -83,7 +85,7 @@ fn make_placement(block_id: SourceBlockId, holder_id: DeviceId) -> SymbolPlaceme
 }
 
 fn make_pending_challenges() -> PendingChallenges {
-    Arc::new(Mutex::new(HashMap::new()))
+    crate::daemon::scheduler::new_pending_challenges()
 }
 
 fn make_test_encoder() -> std::sync::Arc<dyn viaticum_core::erasure::ErasureEncoder> {
@@ -251,7 +253,7 @@ async fn check_timeouts_ignores_fresh_challenges() {
 /// PendingChallenges can be cloned and accessed concurrently from two tasks.
 #[tokio::test]
 async fn pending_challenges_shared_between_tasks() {
-    let pending: PendingChallenges = Arc::new(Mutex::new(HashMap::new()));
+    let pending: PendingChallenges = make_pending_challenges();
     let block_id = make_block_id(10);
     let holder_id = make_identity(11);
 

@@ -64,12 +64,13 @@
 #                    timeouts, ledger gap <= 12 s outside the first tick (the first = NOTE, K-5)
 #                    (pos-i6, pos-i7)
 #
-# Pre-registered on the current code (СТ-0a in, СТ-0c not yet):
-#   steps 2, 7b, 8 (issue-tick bars) are RED: the `scheduler: PoS issue tick` line comes with
-#   СТ-0c. Step 4 is RED (the owner still forwards every live answer: WARN full / unknown
-#   challenge_id). Step 5's owner half and step 8's WARN bar are RED for the same reason.
-#   Step 3 and step 5's holder half are the СТ-0a proof. O's log grows by tens of MB per
-#   minute until СТ-0c: run the baseline with STOP_AFTER=4.
+# Pre-registered on the current code (СТ-0a and СТ-0c in):
+#   every step GREEN, except 7b's poll bar: ROUGH "known: poll waits for the slowest postman"
+#   (routing poll, line B's Р-5), not a FAIL. Step 4 is the СТ-0c proof (the owner forwards
+#   only answers to pending challenges, once: no WARN full, no WARN unknown challenge_id),
+#   step 8 its burst door (O back after 3 scaled days), step 2 the issue-tick line.
+#   Before СТ-0c (СТ-0a only) steps 2, 7b, 8 were RED (no issue-tick line) and step 4 RED
+#   (every live answer forwarded, O's log tens of MB per minute: STOP_AFTER=4).
 #
 # Implementation notes (how the passport is executed, not what it claims):
 #   - "ledger accrual" is measured on O's `pair-ledger row` lines (target viaticum::ledger,
@@ -78,8 +79,8 @@
 #     one row per accrued pair, so the gap between rows is the gap between ticks.
 #   - step 1b gates on "restorable" (>= k symbols on Alive placements, GET /api/files): the
 #     status has no per-block ">= 1 Alive" count. Stronger than the passport's bar.
-#   - step 4 matches an issue to its resolution by (block_id, holder): the issue line has no
-#     challenge_id until СТ-0c, and one (block, holder) has at most one pending challenge.
+#   - steps 4 and 8 match an issue to its resolution by challenge_id (both lines carry it
+#     since СТ-0c).
 #   - "challenge alive" on a holder is judged from the time the holder first computed it
 #     (issue -> compute is a few polls): expiry ~ first compute + 672 s. Margins: 200 s for the
 #     first cached re-publish (step 3), 60 s after the restart for "alive" (step 5).
@@ -89,7 +90,7 @@
 #     run after that step; later steps print "not run" and do not count.
 #   - The test dir is removed on PASS and kept otherwise.
 #
-# Mutations (step 3 is the СТ-0a proof; which bar reddens):
+# Mutations (step 3 is the СТ-0a proof, step 4 the СТ-0c one; which bar reddens):
 #   (a)  memory off (compute on every poll) -> "computed exactly once" (a challenge's compute
 #        count != 1). The rchar bar stays GREEN: it sums the block bytes per compute line,
 #        so more computes raise the bound with the reads; it guards reads outside the
@@ -97,6 +98,11 @@
 #   (a') re-publish on every poll -> "published <= 4 + 0-acks" (rchar green: mutations differ)
 #   (c)  no quarter-TTL re-publish -> "re-published from memory (cached=true)"
 #   (B1) no sweep at the poll's start -> "memo_answered <= 1.5 x live"
+#   (b)  owner forwards every response (no pending filter, M0-b) -> step 4 "WARN unknown
+#        challenge_id <= timeouts" (STOP_AFTER=4)
+#   (b') no "forwarded" memory (M0-b') -> step 8 "WARN unknown <= timeouts" (the burst after
+#        O's absence holds the scheduler for more than a poll period; full run)
+#   (d)  no postman contact in routing poll AND fanout Ack (M0-d) -> step 6 dr_ready
 #
 # Usage:
 #   The full run takes 1.5-2 h (STOP_AFTER=4 about 1 h): longer than the 1800 s timeout of
@@ -297,9 +303,9 @@ restorable_count() {
 }
 
 # Owner-side events (O's log). Times are seconds since T_BASE.
-o_issues() { events_grep "$(node_log "$O")" "PoS hash challenge issued via mailbox" block_id holder_id; }
-o_resolved() { events_grep "$(node_log "$O")" "mailbox PosResponse resolved" block_id holder outcome; }
-o_timeouts() { events_grep "$(node_log "$O")" "PoS challenge timed out" block_id holder_id; }
+o_issues() { events_grep "$(node_log "$O")" "PoS hash challenge issued via mailbox" block_id holder_id challenge_id; }
+o_resolved() { events_grep "$(node_log "$O")" "mailbox PosResponse resolved" block_id holder outcome challenge_id; }
+o_timeouts() { events_grep "$(node_log "$O")" "PoS challenge timed out" block_id holder_id challenge_id; }
 o_unknown() { events_grep "$(node_log "$O")" "unknown challenge_id" challenge_id; }
 o_issue_ticks() { events_grep "$(node_log "$O")" "scheduler: PoS issue tick" elapsed_ms due issued; }
 o_ledger_rows() { events_grep "$(node_log "$O")" "pair-ledger row" master; }
@@ -316,17 +322,19 @@ h_polls() { events_grep "$(node_log "$1")" "mailbox_poll: poll done" elapsed_ms 
 count_in() { in_window "$1" "$2" | awk 'NF' | wc -l | tr -d ' '; }
 
 # unresolved_issues A B DEADLINE [HOLDER16] : O's issues in [A, B] (optionally to one
-# holder) without a `mailbox PosResponse resolved` for the same (block, holder) after the
-# issue and by DEADLINE. Prints "<count> <issued>".
+# holder) without a `mailbox PosResponse resolved` of the same challenge_id by DEADLINE.
+# Prints "<count> <issued>".
 unresolved_issues() {
     local a="$1" b="$2" dl="$3" h="${4:-}"
-    { o_resolved | awk '{ print "R", $1, $3, $4 }'
-      o_issues | in_window "$a" "$b" | awk -v h="$h" 'h == "" || $4 == h { print "I", $1, $3, $4 }'
+    { o_resolved | awk '{ print "R", $1, $6 }'
+      o_issues | in_window "$a" "$b" | awk -v h="$h" 'h == "" || $4 == h { print "I", $1, $5, $3, $4 }'
     } | awk -v dl="$dl" '
-        $1 == "R" { k = $3 " " $4; r[k] = r[k] " " $2; next }
-        $1 == "I" { n++; k = $3 " " $4; ok = 0; m = split(r[k], ts, " ")
-                    for (i = 1; i <= m; i++) if (ts[i] + 0 > $2 + 0 && ts[i] + 0 <= dl) { ok = 1; break }
-                    if (!ok) { bad++; if (bad <= 3) print "    unresolved: t=" $2 " block=" $3 " holder=" $4 > "/dev/stderr" } }
+        $1 == "R" { if (!($3 in r) || $2 + 0 < r[$3]) r[$3] = $2 + 0; next }
+        $1 == "I" { n++
+                    if ($3 == "-" || !($3 in r) || r[$3] > dl + 0) {
+                        bad++
+                        if (bad <= 3) print "    unresolved: t=" $2 " challenge=" $3 " block=" $4 " holder=" $5 > "/dev/stderr"
+                    } }
         END { print bad + 0, n + 0 }'
 }
 

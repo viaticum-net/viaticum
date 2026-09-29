@@ -32,7 +32,9 @@ use crate::daemon::identity::{
 use crate::daemon::processor::Processor;
 use crate::daemon::repair::RepairTrigger;
 use crate::daemon::restore::{RestoreConfig, RestoreCoordinator, RestoreRequest};
-use crate::daemon::scheduler::{PendingChallenges, Scheduler, SchedulerConfig};
+use crate::daemon::scheduler::{
+    PendingChallenges, Scheduler, SchedulerConfig, new_pending_challenges,
+};
 use crate::daemon::watcher::{WatcherCommand, WatcherConfig};
 
 use shutdown::{NamedTask, ShutdownOutcome};
@@ -934,10 +936,10 @@ impl DaemonHandle {
         }
 
         // ── Phase 7.2: spawn Processor ────────────────────────────────────────
-        // PendingChallenges map: owned by the Scheduler (it both writes challenges
-        // and resolves mailbox PoS responses against them). Wired below.
-        let pending_challenges: PendingChallenges =
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        // In-flight PoS challenges: written by the Scheduler (it issues challenges and
+        // resolves mailbox PoS responses against them), read by the mailbox poll loop
+        // (it forwards only responses to pending challenges, pos-i6). Wired below.
+        let pending_challenges: PendingChallenges = new_pending_challenges();
 
         // Raw quota values from config. 0 = "not configured" (use disk-based limit).
         // Processor and holder_cleanup compute effective_quota from disk_free at runtime.
@@ -1088,12 +1090,13 @@ impl DaemonHandle {
             ));
         }
         // ── Phase 6.5: Scheduler + Mailbox poll (T-6) ────────────────────────
-        // Pass the same PendingChallenges Arc created for Processor above.
-        // Scheduler writes to it; Processor reads it when verifying PosResponse.
+        // The PendingChallenges created above: the Scheduler writes it, the mailbox poll
+        // loop reads it to forward only responses to pending challenges (pos-i6).
 
         // T-6: MailboxRouter already built in step 11.5 (early_mailbox_router).
         // Reuse the same Arc here for scheduler + mailbox poll wiring.
-        // pos_response_tx: poll loop → scheduler (bounded 256, try_send + WARN on full).
+        // pos_response_tx: poll loop → scheduler (bounded 256, try_send; a full channel
+        // defers the response to the next poll, pos-i6).
         let (pos_response_tx, pos_response_rx) =
             mpsc::channel::<viaticum_core::messages::PosHashResponseMsg>(256);
 
@@ -1111,7 +1114,7 @@ impl DaemonHandle {
                 pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
             },
             repair_tx.clone(),
-            pending_challenges,
+            std::sync::Arc::clone(&pending_challenges),
             std::sync::Arc::clone(&mailbox_router),
             identity_pub,
             master_key.clone(),
@@ -1164,6 +1167,7 @@ impl DaemonHandle {
 
             let poll_router = std::sync::Arc::clone(&mailbox_router);
             let poll_pos_tx = pos_response_tx.clone();
+            let poll_pending = std::sync::Arc::clone(&pending_challenges);
             let poll_identity = identity_pub;
             let poll_cancel = cancel.clone();
             tasks.push((
@@ -1172,6 +1176,7 @@ impl DaemonHandle {
                     run_mailbox_poll(
                         poll_router,
                         poll_pos_tx,
+                        poll_pending,
                         std::sync::Arc::new(pos_handler),
                         std::sync::Arc::new(drop_handler),
                         std::sync::Arc::new(delete_handler),

@@ -8,7 +8,9 @@
 // Entry dispatch (§2.17):
 //   PosChallenge   → compute the response once, publish it, keep it in memory and
 //                    re-publish the same entry rarely (pos-i5, see `pos_memo`)
-//   PosResponse    → pos_response_tx.try_send (scheduler resolves pending challenge)
+//   PosResponse    → pos_response_tx.try_send, only for a challenge still pending and once
+//                    per envelope; a full channel defers it to the next poll (pos-i6, see
+//                    `forward_pos_responses`)
 //   SelfPointer    → dropped with a warn: pointers live in the rendezvous box, which the
 //                    daemon never reads (CROWN-1 РС3.1, mailbox-i37; only DR reads it)
 //   DropNotice     → DropNoticeHandler::handle_drop_notice (T-7: decode batch, apply each notice)
@@ -34,6 +36,7 @@ use crate::daemon::pos_memo::{
     AnsweredChallenges, ChallengeKey, ChallengeStep, PollCounts, PosPollState,
 };
 use crate::daemon::processor::{DeleteMailboxHandler, RevocationMailboxHandler};
+use crate::daemon::scheduler::PendingChallenges;
 
 /// Mailbox poll cadence in seconds, scaled by `time_scale`.
 ///
@@ -57,6 +60,8 @@ pub(crate) fn poll_interval_secs(time_scale: u64) -> u64 {
 /// Parameters:
 /// - `router`: the MailboxRouter used to poll and publish responses
 /// - `pos_response_tx`: bounded channel (capacity 256) to scheduler for PosResponse entries
+/// - `pending`: the owner's in-flight challenges, written by the scheduler; only responses
+///   to these are forwarded (pos-i6)
 /// - `challenge_handler`: called with (owner_master, challenge_payload_bytes) to process a
 ///   PosChallenge and return an optional PosHashResponseMsg + owner_master for publishing
 /// - `drop_handler`: called for each DropNotice decoded from a SymbolDropNoticeBatchMsg entry
@@ -70,6 +75,7 @@ pub(crate) fn poll_interval_secs(time_scale: u64) -> u64 {
 pub async fn run_mailbox_poll(
     router: Arc<MailboxRouter>,
     pos_response_tx: mpsc::Sender<PosHashResponseMsg>,
+    pending: PendingChallenges,
     challenge_handler: Arc<dyn PosMailboxChallengeHandler>,
     drop_handler: Arc<dyn DropNoticeHandler>,
     delete_handler: Arc<dyn DeleteMailboxHandler>,
@@ -83,9 +89,10 @@ pub async fn run_mailbox_poll(
     let poll_secs = poll_interval_secs(time_scale);
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // pos-i5: what this task remembers about PoS between polls. RAM only: a restart
-    // starts empty and computes every live challenge once.
-    let mut pos = PosPollState::new(time_scale);
+    // pos-i5/pos-i6: what this task remembers about PoS between polls. RAM only: a
+    // restart starts empty, computes every live challenge once, and (the owner's pending
+    // being empty too) forwards no stale response.
+    let mut pos = PosPollState::new(pending, time_scale);
 
     loop {
         tokio::select! {
@@ -112,9 +119,10 @@ pub async fn run_mailbox_poll(
     }
 }
 
-/// One poll of our own master box: forget expired PoS memory, fetch, dispatch every
-/// entry, print `mailbox_poll: poll done` (INFO when the poll had entries, DEBUG when
-/// it was empty). Returns the counters (`None` when the fetch failed).
+/// One poll of our own master box: forget expired PoS memory, fetch, forward the
+/// PosResponse entries as one batch (pos-i6), dispatch every other entry, print
+/// `mailbox_poll: poll done` (INFO when the poll had entries, DEBUG when it was empty).
+/// Returns the counters (`None` when the fetch failed).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn poll_once(
     router: &Arc<MailboxRouter>,
@@ -145,7 +153,13 @@ pub(crate) async fn poll_once(
 
     let entry_count = entries.len();
     let mut counts = PollCounts::default();
-    for entry in entries {
+    // pos-i6: the responses go as one batch — one lock of `pending` for all of them —
+    // and first, before the challenges' publishes.
+    let (responses, others): (Vec<MailboxEntry>, Vec<MailboxEntry>) = entries
+        .into_iter()
+        .partition(|e| e.class == MailboxClass::PosResponse);
+    forward_pos_responses(pos, pos_response_tx, responses, now_secs, &mut counts).await;
+    for entry in others {
         dispatch_entry(
             router,
             pos_response_tx,
@@ -167,6 +181,7 @@ pub(crate) async fn poll_once(
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let memo_answered = pos.answered.len();
     let memo_refused = pos.answered.refused();
+    let memo_forwarded = pos.forwarded.len();
     if entry_count > 0 {
         info!(
             elapsed_ms,
@@ -178,9 +193,12 @@ pub(crate) async fn poll_once(
             skipped = counts.skipped,
             publish_zero_ack = counts.publish_zero_ack,
             forwarded = counts.forwarded,
+            not_pending = counts.not_pending,
+            in_flight = counts.in_flight,
             deferred_full = counts.deferred_full,
             undecodable = counts.undecodable,
             memo_answered,
+            memo_forwarded,
             memo_forgotten = forgotten,
             memo_refused,
             "mailbox_poll: poll done"
@@ -190,6 +208,7 @@ pub(crate) async fn poll_once(
             elapsed_ms,
             entries = 0,
             memo_answered,
+            memo_forwarded,
             memo_forgotten = forgotten,
             memo_refused,
             "mailbox_poll: poll done"
@@ -236,12 +255,11 @@ pub(crate) async fn dispatch_entry(
             )
             .await;
         }
-        MailboxClass::PosResponse => match dispatch_pos_response(pos_response_tx, entry) {
-            ForwardResult::Forwarded => counts.forwarded += 1,
-            ForwardResult::ChannelFull => counts.deferred_full += 1,
-            ForwardResult::Undecodable => counts.undecodable += 1,
-            ForwardResult::ChannelClosed => {}
-        },
+        MailboxClass::PosResponse => {
+            // The poll loop batches responses (`poll_once`); a single entry takes the
+            // same path.
+            forward_pos_responses(pos, pos_response_tx, vec![entry], now_secs, counts).await;
+        }
         MailboxClass::SelfPointer => {
             drop_self_pointer_from_master_box(&entry);
         }
@@ -521,49 +539,54 @@ async fn publish_pos_response(
     }
 }
 
-/// What happened to one PosResponse entry handed to the scheduler channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ForwardResult {
-    Forwarded,
-    ChannelFull,
-    ChannelClosed,
-    Undecodable,
-}
-
-/// Handle a PosResponse entry: forward to scheduler via pos_response_tx.
-pub(crate) fn dispatch_pos_response(
+/// Hand the PosResponse entries of one poll to the scheduler (pos-i6).
+///
+/// One lock of `pending` covers the selection (no await inside it): only responses to
+/// challenges still pending, each envelope once while it is pending, one envelope per
+/// challenge per poll. Then `try_send` outside the lock: a sent envelope is marked; a
+/// full channel leaves it unmarked and the next poll sends it (the entry lives at the
+/// postmen until its TTL) — N-5 bounds the channel, nothing is dropped. Resolved,
+/// foreign and duplicate responses are dropped silently and counted in `poll done`.
+pub(crate) async fn forward_pos_responses(
+    pos: &mut PosPollState,
     pos_response_tx: &mpsc::Sender<PosHashResponseMsg>,
-    entry: MailboxEntry,
-) -> ForwardResult {
-    match from_cbor_bytes::<PosHashResponseMsg>(&entry.payload) {
-        Ok(response) => {
-            // N-5: bounded channel, try_send + WARN on Full.
-            match pos_response_tx.try_send(response) {
-                Ok(()) => {
-                    debug!(msg_id = %hex_encode(&entry.msg_id), "mailbox_poll: PosResponse forwarded to scheduler");
-                    ForwardResult::Forwarded
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(
-                        msg_id = %hex_encode(&entry.msg_id),
-                        "mailbox_poll: pos_response_tx full — dropping PosResponse (N-5)"
-                    );
-                    ForwardResult::ChannelFull
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    debug!("mailbox_poll: pos_response_tx closed (scheduler shut down)");
-                    ForwardResult::ChannelClosed
-                }
+    responses: Vec<MailboxEntry>,
+    now_secs: u64,
+    counts: &mut PollCounts,
+) {
+    if responses.is_empty() && pos.forwarded.is_empty() {
+        return;
+    }
+    let (to_send, selected) = {
+        let pending = pos.pending.lock().await;
+        pos.forwarded.select(&pending, responses, now_secs)
+    };
+    counts.add_forward(selected);
+
+    let mut deferred = 0u32;
+    for r in to_send {
+        match pos_response_tx.try_send(r.msg.clone()) {
+            Ok(()) => {
+                pos.forwarded.mark_sent(&r);
+                counts.forwarded += 1;
+                debug!(
+                    challenge_id = %hex_encode(&r.challenge_id),
+                    "mailbox_poll: PosResponse forwarded to scheduler"
+                );
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => deferred += 1,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                debug!("mailbox_poll: pos_response_tx closed (scheduler shut down)");
+                break;
             }
         }
-        Err(e) => {
-            warn!(
-                msg_id = %hex_encode(&entry.msg_id),
-                err = %e,
-                "mailbox_poll: failed to decode PosHashResponseMsg"
-            );
-            ForwardResult::Undecodable
-        }
+    }
+    if deferred > 0 {
+        counts.deferred_full += deferred;
+        debug!(
+            deferred,
+            "mailbox_poll: pos_response_tx full — deferring to the next poll"
+        );
     }
 }
 
