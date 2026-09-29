@@ -103,12 +103,21 @@
   }
 
   // ── Network ─────────────────────────────────────────────────────────────────
+  // "HTTP <code>: <the server's text>" — the daemon says why (e.g. a config
+  // value it cannot read, daemon-i10); long bodies are cut.
+  async function httpError(res) {
+    let text = '';
+    try { text = (await res.text()).trim(); } catch { /* no body */ }
+    if (text.length > 300) text = text.slice(0, 300) + '…';
+    return text ? `HTTP ${res.status}: ${text}` : `HTTP ${res.status}`;
+  }
+
   async function fetchConfig() {
     loading = true;
     loadError = null;
     try {
       const res = await fetch('/api/config');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) throw new Error(await httpError(res));
       const body = await res.json();
       current = body;
       draft = clone(body);
@@ -159,7 +168,7 @@
     }
     if (!res.ok) {
       phase = 'failed';
-      phaseMessage = `Save failed: HTTP ${res.status}`;
+      phaseMessage = `Save failed: ${await httpError(res)}`;
       return;
     }
 

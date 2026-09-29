@@ -1,9 +1,10 @@
 // Tests for daemon/identity module.
 
 use super::{
-    DeviceSeedMode, IdentityError, MnemonicProblem, build_keyfile, corrupt_key_hint, derive_keys,
-    init_identity, init_identity_from_mnemonic, init_identity_new_device, load_identity,
-    normalize_phrase, not_initialized_hint, parse_mnemonic, write_keyfile_at,
+    DEFAULT_WEB_PORT, DeviceSeedMode, IdentityError, MnemonicProblem, build_keyfile,
+    corrupt_key_hint, default_config_toml, derive_keys, init_identity, init_identity_from_mnemonic,
+    init_identity_new_device, load_identity, normalize_phrase, not_initialized_hint,
+    parse_mnemonic, write_default_config_if_absent, write_keyfile_at,
 };
 
 fn tmp_dir() -> tempfile::TempDir {
@@ -650,4 +651,150 @@ fn corrupt_key_hint_never_advises_deleting_the_key() {
     std::fs::write(dir.path().join("identity.key"), b"not cbor").unwrap();
     let err = init_identity(dir.path()).expect_err("corrupt");
     assert!(err.to_string().contains("Do not delete it"), "{err}");
+}
+
+// ============================================================
+// init template: web API on a fixed loopback port (daemon-i9, F1)
+// ============================================================
+
+/// The `[web_api]` the daemon loads from the config `init` wrote into `dir`.
+fn web_api_after_init(dir: &std::path::Path) -> viaticum_core::config::WebApiCfg {
+    viaticum_core::config::AppConfig::load(&dir.join("config.toml"))
+        .expect("the daemon loads the init config")
+        .web_api
+}
+
+// Mutation: the template without `enabled = true` → web API off, the CLI has no
+// api-port to find the daemon by, and this test goes red.
+#[test]
+fn init_config_enables_web_api_on_fixed_loopback_port() {
+    let dir = tmp_dir();
+    init_identity(dir.path()).expect("plain init");
+    let web = web_api_after_init(dir.path());
+    assert!(web.enabled, "init must leave the web API on");
+    let addr: std::net::SocketAddr = web.bind.parse().expect("bind is a socket address");
+    assert!(addr.ip().is_loopback(), "bind {addr} must be loopback");
+    assert_ne!(addr.port(), 0, "port 0 changes on every restart");
+    assert_eq!(addr.port(), DEFAULT_WEB_PORT);
+}
+
+// Mutation: a port drawn at render time → two inits disagree, test red.
+#[test]
+fn init_config_port_is_the_same_on_every_render() {
+    let (a, b) = (tmp_dir(), tmp_dir());
+    init_identity(a.path()).expect("init a");
+    init_identity(b.path()).expect("init b");
+    assert_eq!(
+        web_api_after_init(a.path()).bind,
+        web_api_after_init(b.path()).bind
+    );
+    assert_eq!(default_config_toml(), default_config_toml());
+}
+
+// The port the user may have edited stays: a later default write (DR, re-init
+// path) never overwrites an existing config.
+#[test]
+fn default_config_write_keeps_an_existing_config() {
+    let dir = tmp_dir();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[web_api]\nenabled = true\nbind = \"127.0.0.1:9999\"\n",
+    )
+    .unwrap();
+    write_default_config_if_absent(dir.path()).expect("write if absent");
+    assert_eq!(web_api_after_init(dir.path()).bind, "127.0.0.1:9999");
+}
+
+// ============================================================
+// init template: every key names a config field (daemon-i10 class, W2)
+// ============================================================
+
+/// `key` of a `key = value` line (bare lower-case key), else None.
+fn template_key(line: &str) -> Option<&str> {
+    let (key, _) = line.split_once(" = ")?;
+    let bare_char = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_';
+    let bare = !key.is_empty() && key.chars().all(bare_char);
+    bare.then_some(key)
+}
+
+/// The init template with every commented-out `# key = value` example turned on,
+/// and the number of keys that are then live. An example whose key is already live
+/// in its table (the LAN `bind` alternative) stays commented: TOML refuses a
+/// duplicate key.
+fn template_with_examples_on() -> (String, usize) {
+    let text = default_config_toml();
+    let mut live = std::collections::HashSet::new();
+    let mut section = "";
+    for line in text.lines() {
+        if line.starts_with('[') {
+            section = line;
+        } else if let Some(key) = template_key(line) {
+            live.insert((section, key));
+        }
+    }
+    let mut out = String::new();
+    let mut section = "";
+    for line in text.lines() {
+        if line.starts_with('[') {
+            section = line;
+        }
+        let mut kept = line;
+        if let Some(rest) = line.strip_prefix("# ") {
+            let key = template_key(rest);
+            if key.is_some_and(|key| live.insert((section, key))) {
+                kept = rest;
+            }
+        }
+        out.push_str(kept);
+        out.push('\n');
+    }
+    (out, live.len())
+}
+
+// Mutation: an example key the daemon has no field for (`reserve_gb` for
+// `disk_reserve_gb`, a `[daemon]` table AppConfig does not have) → serde drops it
+// silently, the lookup in the loaded config finds nothing, test red.
+#[test]
+fn init_template_every_key_turned_on_is_read_by_the_daemon() {
+    let (text, expected) = template_with_examples_on();
+    assert!(
+        text.lines().any(|l| l.starts_with("soft_quota_gb = ")),
+        "the quota example was not turned on:\n{text}"
+    );
+    let dir = tmp_dir();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, &text).unwrap();
+    let cfg = viaticum_core::config::AppConfig::load(&path)
+        .unwrap_or_else(|e| panic!("the daemon loads the template with examples on: {e}\n{text}"));
+    let loaded = serde_json::to_value(&cfg).expect("config as JSON");
+    let doc: toml_edit::DocumentMut = text.parse().expect("the template parses");
+    let mut checked = 0;
+    for (section, item) in doc.as_table().iter() {
+        let table = item
+            .as_table()
+            .unwrap_or_else(|| panic!("top-level {section:?} is not a table"));
+        for (key, value) in table.iter() {
+            let got = loaded
+                .get(section)
+                .and_then(|s| s.get(key))
+                .unwrap_or_else(|| {
+                    panic!("[{section}] {key} is not a config field: the daemon ignores it")
+                });
+            let want = value.as_value().expect("a plain value");
+            let same = match want {
+                toml_edit::Value::Integer(i) => got.as_f64() == Some(*i.value() as f64),
+                toml_edit::Value::Float(f) => got.as_f64() == Some(*f.value()),
+                toml_edit::Value::String(s) => got.as_str() == Some(s.value().as_str()),
+                toml_edit::Value::Boolean(b) => got.as_bool() == Some(*b.value()),
+                other => panic!("[{section}] {key}: unexpected value kind {other}"),
+            };
+            assert!(
+                same,
+                "[{section}] {key} = {want} in the template, the daemon reads {got}"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, expected, "every live key was checked");
 }
