@@ -13,7 +13,8 @@
 #               what L actually did and against an independent replay
 #               (experiments/four_r_replay.py).
 # Intent:       4r-i44, 4r-i45, 4r-i46, 4r-i50 (journal note only), 4r-i52, 4r-i66, 4r-i67 (В-0); later slices
-#               add 4r-i12..i16, i18, i19, i21, i37, i41 to this file.
+#               add 4r-i12..i16, i18, i19, i21, i37, i41 to this file. F-Q (step 12): holder-i1,
+#               holder-i4 (holder-i1-a — Q > 0 below the reserve — is proven by core units only).
 # Proves:       on L: the shadow ranks W (no service to L) first and would cap-trim all of W's
 #               parked bytes at the first contention while F (serving L) keeps its share; the
 #               shadow would admit F's offer by preemption with W as the victim and would refuse
@@ -23,7 +24,11 @@
 #               L's rejected offers (W is "asked");
 #               F's log shows PoS answers for L's blocks (F's service is real). Every shadow
 #               record replays exactly. Restore of F's, L's and two of W's files from the network
-#               by sha256 (the shadow broke nothing).
+#               by sha256 (the shadow broke nothing). Step 12 (F-Q, the OLD path itself): L restarted
+#               with a reserve above its disk is Critical — one pressure tick gives back ALL it holds
+#               (hard floor 0), the owners get immediate DropNotices, new offers get QuotaFull, and
+#               `status` says "disk below reserve". Red on the pre-F-Q code: the effective quota 0 was
+#               read as "unlimited" → Normal, no eviction, no notices, status "quota: unlimited".
 # Adversarial:  the whale offers the full laptop (refused in the shadow); contention entered
 #               through a restart with a shrunken quota; an independent
 #               replay of every shadow record (a seat-inverted kappa or a view that includes
@@ -92,6 +97,17 @@
 #              11. F, W, L delete sources with the daemon alive -> restore from the network: all
 #                    of F's and L's files and 2 of W's match by sha256; holders logged `sending
 #                    RestoreResponse` (the shadow broke nothing)
+#              12. [F-Q] SIGTERM L, restart with disk_reserve_gb = BIG_RESERVE_GB (> L's filesystem
+#                    size: free < reserve without filling a disk) -> within 180 s L logs `hard disk
+#                    pressure` with critical=true (holder-i1); that first Critical tick frees all
+#                    it holds (freed_bytes = used_bytes) and holding_bytes reach 0 (hard floor 0;
+#                    Q = 0 case only; holder-i1-a is unit-proven); >= 1 `immediate-drop DropNotice published`
+#                    on L and >= 1 `received SymbolDropNotice` from L in an owner's own log; L's
+#                    `status` has "disk below reserve" (holder-i4); W and F write a new file ->
+#                    `rejected offer for block … QuotaFull` from L in the offerer's own log (no
+#                    offer to L within 120 s -> ROUGH: the offer rule is proven by units then).
+#                    Red on the pre-F-Q code: no Critical line, holdings stay, no notices, status
+#                    "quota: unlimited" (the QuotaFull check alone was green there too).
 #
 # Implementation notes (how the passport is executed, not what it claims):
 #   - Numbers are derived from the dials by the passport's formulas and printed; a violated
@@ -137,13 +153,16 @@ MIB=1048576
 # count either never fills L or depends on placement dynamics; see Implementation notes.
 W_BATCH=8
 W_MAX=96
+# Step 12: a reserve far above any disk of the run (tmpfs /tmp is 32 GB on the server), so
+# L's free disk is below it without filling a disk.
+BIG_RESERVE_GB="100000.0"
 TEST_DIR="/tmp/viaticum-photo-whale-$$"
 BINARY="${BINARY:-viaticum}"
 T_BASE=$(date -u +%s)
 
 PIDS=()
 declare -A VERDICT
-STEP_ORDER=(1 2 3 4 5a 5b 6 7 R 11)
+STEP_ORDER=(1 2 3 4 5a 5b 6 7 R 11 12)
 CUR_STEP=0
 
 rank() { case "$1" in PASS) echo 0 ;; ROUGH) echo 1 ;; *) echo 2 ;; esac; }
@@ -160,7 +179,13 @@ rough() { verdict "$CUR_STEP" ROUGH "$1"; }
 fail() { verdict "$CUR_STEP" FAIL "$1"; }
 note() { echo "  NOTE [step $CUR_STEP]: $1"; }
 
+FINISHED=0
 cleanup() {
+    local rc=$?
+    # A step that dies without its verdict (errexit, a signal) still says so.
+    if [ "$FINISHED" -eq 0 ]; then
+        echo "  FAIL [step $CUR_STEP]: the script exited (rc=$rc) before the step's verdict"
+    fi
     echo ""
     echo "=== Cleanup ==="
     for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
@@ -210,14 +235,14 @@ start_node() { # IDX — appends to the node's log
     PIDS[$idx]=$!
 }
 
-write_config() { # IDX SOFT_GB
-    local idx="$1" soft="$2"
+write_config() { # IDX SOFT_GB [RESERVE_GB]
+    local idx="$1" soft="$2" reserve="${3:-0.0}"
     {
         echo "[web_api]"
         echo "enabled = true"
         echo "bind = \"127.0.0.1:0\""
         echo "[storage]"
-        echo "disk_reserve_gb = 0.0"
+        echo "disk_reserve_gb = $reserve"
         echo "soft_quota_gb = $soft"
         echo "[backup]"
         echo "source_block_size_mb = 4"
@@ -286,6 +311,7 @@ PY
 }
 
 finish() {
+    FINISHED=1
     echo ""
     echo "============================================================"
     local overall=PASS s v
@@ -837,5 +863,96 @@ for f in $(echo ${FILES[$W]} | tr ' ' '\n' | head -2); do restore_one "$W" "$f";
 [ "$N_OK" -eq "$N_ALL" ] && [ "$N_ALL" -eq 8 ] \
     && pass "all $N_ALL restores matched by sha256 from the network" \
     || fail "$N_OK of $N_ALL restores (want 8 of 8)"
+
+# ── STEP 12: free disk below the reserve — Critical (F-Q) ────────────────────
+CUR_STEP=12
+echo ""
+echo "=== Step 12: [F-Q] restart L with a reserve above its disk — Critical: give back all, refuse offers ==="
+FS_SIZE=$(df -B1 --output=size "$(node_dir "$L")" | tail -1 | tr -d ' ')
+H12=$(status_num "$L" holding_bytes)
+info "L holds $H12 bytes; its filesystem is $FS_SIZE bytes; reserve ${BIG_RESERVE_GB} GB"
+if ! awk -v s="$FS_SIZE" -v r="$BIG_RESERVE_GB" 'BEGIN { exit !(s + 0 > 0 && s < r * 1073741824) }'; then
+    fail "FAIL(setup): L's filesystem ($FS_SIZE B) is not below the reserve ${BIG_RESERVE_GB} GB"
+    finish
+fi
+[ "${H12:-0}" -gt 0 ] || { fail "FAIL(setup): L holds nothing before step 12 (holding_bytes=$H12)"; finish; }
+# Never `kill` an empty or 0 PID (0 = this script's whole process group).
+case "${PIDS[$L]:-}" in
+    ''|0|*[!0-9]*) fail "FAIL(setup): no PID recorded for L ('${PIDS[$L]:-}')"; finish ;;
+esac
+kill -TERM "${PIDS[$L]}" 2>/dev/null
+wait_pid_exit "${PIDS[$L]}" 30 || { kill -9 "${PIDS[$L]}" 2>/dev/null; fail "FAIL(setup): L did not stop within 30 s"; finish; }
+write_config "$L" "$SOFT2" "$BIG_RESERVE_GB"
+LSTART12=$(log_lines "$L_LOG")
+declare -A MARK12
+for i in $(seq 1 $((NUM_NODES - 1))); do MARK12[$i]=$(log_lines "$(node_log "$i")"); done
+T12=$(date -u +%s)
+start_node "$L"
+wait_daemon "$L" || { fail "FAIL(setup): L did not come back"; finish; }
+# holder-i1 (Q = 0; holder-i1-a with Q > 0 is unit-only): the pressure tick (every 60 s at this time_scale) is Critical and gives
+# back everything above the (zero) hard floor in one tick.
+CRIT=""
+while [ $(( $(date -u +%s) - T12 )) -le 180 ]; do
+    CRIT=$(log_since "$L" "$LSTART12" | grep -a "holder_cleanup: hard disk pressure" \
+        | grep -a "critical=true" | head -1)
+    [ -n "$CRIT" ] && break
+    sleep 2
+done
+if [ -n "$CRIT" ]; then
+    pass "L's pressure tick is Critical: evictions=$(log_field "$CRIT" evictions) freed_bytes=$(log_field "$CRIT" freed_bytes) (holder-i1)"
+else
+    fail "no 'hard disk pressure' with critical=true on L within 180 s (pre-F-Q: quota 0 read as unlimited)"
+fi
+H_AFTER=""
+for _ in $(seq 1 30); do
+    H_AFTER=$(status_num "$L" holding_bytes)
+    [ "${H_AFTER:-1}" -eq 0 ] && break
+    sleep 2
+done
+# One tick: the FIRST Critical tick freed all it held (freed_bytes = used_bytes of that line;
+# later ticks stay Critical with nothing left to evict).
+USED1=$(log_field "$CRIT" used_bytes); FREED1=$(log_field "$CRIT" freed_bytes)
+if [ "${H_AFTER:-1}" -eq 0 ] && [ -n "$USED1" ] && [ "$USED1" -gt 0 ] && [ "${FREED1:-0}" -eq "$USED1" ]; then
+    pass "L gave back everything in one Critical tick: freed $FREED1 of $USED1 B; holding_bytes $H12 -> 0 (holder-i1, Q = 0)"
+else
+    fail "L: first Critical tick freed ${FREED1:-?} of ${USED1:-?} B; holding_bytes $H12 -> ${H_AFTER:-?} (want all in one tick, then 0)"
+fi
+PUB12=0; GOT12=0; GOT_BY=""
+for _ in $(seq 1 60); do
+    PUB12=$(log_since "$L" "$LSTART12" | grep -ac "immediate-drop DropNotice published" || true)
+    GOT12=0; GOT_BY=""
+    for i in $(seq 1 $((NUM_NODES - 1))); do
+        n=$(log_since "$i" "${MARK12[$i]}" | grep -a "received SymbolDropNotice" \
+            | grep -ac "holder=${MASTER[$L]}" || true)
+        [ "${n:-0}" -ge 1 ] && { GOT12=$((GOT12 + n)); GOT_BY="$GOT_BY node-0$i:$n"; }
+    done
+    [ "${PUB12:-0}" -ge 1 ] && [ "$GOT12" -ge 1 ] && break
+    sleep 2
+done
+[ "${PUB12:-0}" -ge 1 ] && [ "$GOT12" -ge 1 ] \
+    && pass "L published $PUB12 immediate DropNotice(s); owners' own logs received $GOT12 from L:$GOT_BY" \
+    || fail "L published ${PUB12:-0} immediate DropNotice(s), owners received $GOT12 from L (want >= 1 each)"
+ST12=$(run_cli_q "$L" status)
+if echo "$ST12" | grep -q "disk below reserve"; then
+    pass "L's status: $(echo "$ST12" | grep "disk below reserve" | sed 's/^ *//') (holder-i4)"
+else
+    fail "L's status has no 'disk below reserve': $(echo "$ST12" | grep "quota:" | sed 's/^ *//')"
+fi
+# New offers to L: refused with QuotaFull, per the offerer's own log.
+OMARK_W=$(log_lines "$(node_log "$W")"); OMARK_F=$(log_lines "$(node_log "$F")")
+head -c $((4 * MIB)) /dev/urandom > "$(node_dir "$W")/files/whale_step12.bin"
+head -c "$MIB" /dev/urandom > "$(node_dir "$F")/files/friend_step12.bin"
+REJ12=""
+for _ in $(seq 1 60); do
+    REJ12=$( { log_since "$W" "$OMARK_W"; log_since "$F" "$OMARK_F"; } | grep -a "rejected offer for block" \
+        | grep -a "QuotaFull" | grep -a "holder ${DEV[$L]:0:16}" | head -1)
+    [ -n "$REJ12" ] && break
+    sleep 2
+done
+if [ -n "$REJ12" ]; then
+    pass "a new offer to L refused with QuotaFull: $(echo "$REJ12" | grep -oE 'rejected offer for block [0-9a-f]+')"
+else
+    rough "neither W nor F offered L within 120 s (backoff?) — the Critical offer rule stands on units only"
+fi
 
 finish

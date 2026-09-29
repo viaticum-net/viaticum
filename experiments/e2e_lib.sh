@@ -105,12 +105,15 @@ wait_auth_peers() {
 # (the finished job, last line; "" if none), RESTORE_ERR (stderr).
 restore_run() {
     local idx="$1" secs="$2"; shift 2
-    local out errf
+    local out errf had_e=0
+    # Restore the CALLER's errexit, not force it on: a scenario without `set -e`
+    # (photo_whale) turned errexit on here and later died silently on a grep miss.
+    [[ $- == *e* ]] && had_e=1
     errf=$(mktemp)
     set +e
     out=$(timeout "$secs" "$BINARY" --data-dir "$(node_dir "$idx")" restore "$@" --json 2>"$errf")
     RESTORE_RC=$?
-    set -e
+    [ "$had_e" -eq 1 ] && set -e
     RESTORE_ERR=$(cat "$errf"); rm -f "$errf"
     RESTORE_FIRST=$(printf '%s\n' "$out" | sed -n '1p')
     RESTORE_LAST=$(printf '%s\n' "$out" | sed -n '2,$p' | tail -1)

@@ -105,8 +105,20 @@ pub struct StatusData {
     pub blocks_needing_repair: u32,
     /// Peer summaries (up to 20 entries, sorted by trust descending).
     pub peers: Vec<PeerSummary>,
-    /// Effective quota in bytes. 0 = unlimited.
+    /// Effective quota in bytes when `quota_state` is `bytes`; 0 then means no room at all
+    /// (free disk at or below the reserve, holder-i1) — never "unlimited".
     pub effective_quota_bytes: u64,
+    /// `bytes` — the quota is known; `unknown` — the free disk could not be read and no
+    /// soft quota is set: offers are refused, nothing is evicted (holder-i2).
+    #[serde(default)]
+    pub quota_state: String,
+    /// "could not read free space on <path>; …" when the free disk could not be read, else "".
+    #[serde(default)]
+    pub quota_note: String,
+    /// holder-i4: the free disk is below the reserve — `Some(bytes the pressure tick gives
+    /// back)` (friends' data, down to the hard floor), at any quota; `None` otherwise.
+    #[serde(default)]
+    pub below_reserve_giving_back_bytes: Option<u64>,
     /// Bytes currently used for held symbols.
     pub used_bytes: u64,
     /// Total PoS challenges issued (all peers, all weeks).

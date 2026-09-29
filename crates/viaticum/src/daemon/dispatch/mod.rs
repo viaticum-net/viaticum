@@ -261,18 +261,39 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         .restore_staging
         .lock()
         .expect("restore staging status lock poisoned");
-    let effective_quota_bytes = {
-        let disk_free = crate::daemon::handle::disk_available_bytes(&state.data_dir);
-        viaticum_core::budget::compute_effective_quota(
-            state.soft_quota_bytes,
-            disk_free,
-            state.disk_reserve_bytes,
-        )
+    // holder-i1..i3: one disk read and one holdings number for the quota, its state and the
+    // staging squeeze flag.
+    let disk_free = crate::daemon::handle::disk_available_bytes(&state.data_dir);
+    let quota = viaticum_core::budget::compute_effective_quota(
+        state.soft_quota_bytes,
+        disk_free,
+        holdings_bytes,
+        state.disk_reserve_bytes,
+    );
+    let (effective_quota_bytes, quota_state) = match quota {
+        viaticum_core::budget::Quota::Bytes(n) => (n, "bytes"),
+        viaticum_core::budget::Quota::Unknown => (0, "unknown"),
+        // Never produced by compute_effective_quota (tests only).
+        viaticum_core::budget::Quota::Unlimited => (0, "unlimited"),
+    };
+    let quota_note = if disk_free.is_none() {
+        crate::daemon::holder_cleanup::unreadable_disk_note(&state.data_dir, state.soft_quota_bytes)
+    } else {
+        String::new()
+    };
+    // holder-i4: below the reserve (at any quota), say so and what the pressure tick gives
+    // back — the Hard deficit, bounded by the hard floor.
+    let below_reserve_giving_back_bytes = match (disk_free, quota) {
+        (Some(free), viaticum_core::budget::Quota::Bytes(q)) if free < state.disk_reserve_bytes => {
+            let above_floor = holdings_bytes.saturating_sub(state.hard_quota_bytes);
+            Some(viaticum_core::budget::hard_eviction_deficit(q, holdings_bytes).min(above_floor))
+        }
+        _ => None,
     };
     let staging_squeezes_holdings = crate::daemon::restore::cleanup::staging_squeezes_holdings(
         crate::daemon::restore::cleanup::holder_stops_taking_data(
             state.soft_quota_bytes,
-            crate::daemon::restore::cleanup::disk_free_bytes(&state.data_dir),
+            disk_free,
             state.disk_reserve_bytes,
             holdings_bytes,
         ),
@@ -295,6 +316,9 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         blocks_needing_repair,
         peers: peer_summaries,
         effective_quota_bytes,
+        quota_state: quota_state.to_string(),
+        quota_note,
+        below_reserve_giving_back_bytes,
         used_bytes: holdings_bytes,
         pos_total_challenges,
         pos_total_passes,

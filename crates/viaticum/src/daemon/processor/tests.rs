@@ -4666,6 +4666,8 @@ mod four_r_shadow;
 mod four_r_shadow_wedge;
 // R1-u-H1 (backup-i19): the SymbolTransfer reply matches the holder's disk; offers per device.
 mod symbol_transfer_reply;
+// F-Q: the offer rule over the quota states (holder-i1..i3).
+mod quota_states;
 
 // ─── pos-i5-a: a holder answers only a fresh challenge (replay guard) ───────────
 

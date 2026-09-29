@@ -1472,16 +1472,30 @@ async fn open_db_with_retry(path: &std::path::Path) -> Result<Db, DbError> {
 
 // ── Disk space ────────────────────────────────────────────────────────────────
 
-/// Query available bytes on the filesystem containing `path` via `sysinfo`.
-/// Returns 0 if no mount point matches (conservative — treats as "disk full").
-pub(crate) fn disk_available_bytes(path: &std::path::Path) -> u64 {
-    use sysinfo::Disks;
-    let disks = Disks::new_with_refreshed_list();
+/// Free bytes available to this user on the filesystem holding `path` (holder-i2, F6):
+/// `statvfs` of the canonical path itself — no mount-point lookup, so NAS, container and
+/// tmpfs data dirs are read too. `None` = could not be read (never "disk full": the quota
+/// is then `Quota::Unknown` or the soft quota, see `budget::compute_effective_quota`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn disk_available_bytes(path: &std::path::Path) -> Option<u64> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let st = rustix::fs::statvfs(&canonical).ok()?;
+    Some(st.f_bavail.saturating_mul(st.f_frsize))
+}
+
+/// Free bytes on the filesystem holding `path` via `sysinfo` (no `statvfs` here); `None`
+/// when the path is missing or no mount point matches (unknown — never read as "disk full").
+/// `std::path::absolute`, not `canonicalize`: on Windows the latter returns a verbatim
+/// `\\?\C:\…` path that never `starts_with` the mount point `C:\`.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn disk_available_bytes(path: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(path).ok()?;
+    let abs = std::path::absolute(path).ok()?;
+    let disks = sysinfo::Disks::new_with_refreshed_list();
     disks
         .list()
         .iter()
-        .filter(|d| path.starts_with(d.mount_point()))
+        .filter(|d| abs.starts_with(d.mount_point()))
         .max_by_key(|d| d.mount_point().as_os_str().len())
         .map(|d| d.available_space())
-        .unwrap_or(0)
 }

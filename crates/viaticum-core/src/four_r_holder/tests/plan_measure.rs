@@ -239,7 +239,7 @@ fn old_owner_order_matches_evaluate_pressure_candidate_order() {
     };
     // used = 990 of 1000 ⇒ Hard, hard floor 0.
     let used: u64 = h.iter().map(|r| r.total_bytes).sum();
-    let res = evaluate_pressure(1000, 0, used, &h, trust, now);
+    let res = evaluate_pressure(crate::budget::Quota::Bytes(1000), 0, used, &h, trust, now);
     assert_eq!(res.pressure, crate::budget::DiskPressure::Hard);
     let old = old_owner_order(&h, trust, now);
     assert_eq!(res.immediate_evictions[0].owner_id, old[0]);

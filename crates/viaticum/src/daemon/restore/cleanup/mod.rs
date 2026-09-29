@@ -186,38 +186,28 @@ pub(crate) fn staging_status_from_probe(
 /// Staging below this size is not worth a warning (N6).
 pub const SQUEEZE_WARN_MIN_BYTES: u64 = 1024 * 1024;
 
-/// Free bytes on the filesystem holding `path`; `None` when no mount point matches
-/// (unknown — never read as "disk full").
-pub fn disk_free_bytes(path: &Path) -> Option<u64> {
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    disks
-        .list()
-        .iter()
-        .filter(|d| path.starts_with(d.mount_point()))
-        .max_by_key(|d| d.mount_point().as_os_str().len())
-        .map(|d| d.available_space())
-}
-
-/// Has this node stopped taking new data from friends? The same rule the holder
-/// applies to symbol offers: soft pressure (< 15 % of the effective quota free,
-/// `budget::should_reject_offers`), or free disk at or below the reserve (the
-/// effective quota is then 0, which `should_reject_offers` reads as "unlimited",
-/// while `decide_symbol_offer` refuses every offer). Unknown free space → false.
+/// Has disk pressure stopped this node taking new data from friends? The quota rule the
+/// holder applies to symbol offers (`budget::should_reject_offers` over
+/// `compute_effective_quota`, one snapshot of `holdings_used_bytes`): soft pressure, or no
+/// room at all — free disk plus our holdings at or below the reserve (holder-i1). An
+/// unreadable disk without a soft quota (`Quota::Unknown`) refuses offers too, but that is
+/// not disk pressure: staging cannot be squeezing what we cannot measure → false.
 pub fn holder_stops_taking_data(
     soft_quota_bytes: u64,
     disk_free_bytes: Option<u64>,
     disk_reserve_bytes: u64,
     holdings_used_bytes: u64,
 ) -> bool {
-    let Some(free) = disk_free_bytes else {
-        return false;
-    };
-    if free <= disk_reserve_bytes {
-        return true;
+    use viaticum_core::budget::{Quota, compute_effective_quota, should_reject_offers};
+    match compute_effective_quota(
+        soft_quota_bytes,
+        disk_free_bytes,
+        holdings_used_bytes,
+        disk_reserve_bytes,
+    ) {
+        Quota::Unknown => false,
+        quota => should_reject_offers(quota, holdings_used_bytes),
     }
-    let quota =
-        viaticum_core::budget::compute_effective_quota(soft_quota_bytes, free, disk_reserve_bytes);
-    viaticum_core::budget::should_reject_offers(quota, holdings_used_bytes)
 }
 
 /// Staging that the user has not moved out takes disk space from friends' data
@@ -263,7 +253,7 @@ impl HoldingsPressure {
         };
         holder_stops_taking_data(
             self.soft_quota_bytes,
-            disk_free_bytes(&self.data_dir),
+            crate::daemon::handle::disk_available_bytes(&self.data_dir),
             self.disk_reserve_bytes,
             used,
         )
