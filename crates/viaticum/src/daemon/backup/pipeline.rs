@@ -279,6 +279,11 @@ pub enum BlockTypeTag {
 }
 
 /// Pack one batch into a Pack block and mark its files backed up.
+///
+/// An error is returned only from before the block record is committed; the caller
+/// then requeues the batch. Once the block is committed its files are marked one by one
+/// and a file whose record cannot be updated stays pending (backup-i23): requeueing
+/// after the commit would build and commit the block again on every flush.
 fn pack_batch(
     db: &Db,
     config: &BackupConfig,
@@ -297,7 +302,7 @@ fn pack_batch(
         &[],
         pack_importance,
     )?;
-    update_backed_up_at(db, batch, result.source_block_id, result.k, result.t)?;
+    update_backed_up_at(db, batch, result.source_block_id, result.k, result.t);
     Ok(result)
 }
 
@@ -360,8 +365,9 @@ pub(crate) fn read_at_flush(
 ///
 /// backup-i23: a file that vanished or changed since enqueue does not stop the others
 /// (see [`read_at_flush`]; `in_network` answers "is this content already backed up").
-/// A pipeline or DB error puts the batch being built and every file not yet processed
-/// back into `queued`, in order, and returns the error.
+/// An error before a block record is committed puts the batch being built and every
+/// file not yet processed back into `queued`, in order, and returns the error. After the
+/// commit nothing is requeued (see [`pack_batch`]).
 ///
 /// Returns pipeline results for each emitted source block.
 /// If `force=false` and total bytes < MIN_BATCH_BYTES, returns empty vec.
@@ -397,8 +403,8 @@ pub fn flush_queue_inner(
     let mut prev_importance: Option<f64> = None;
     let mut rest = std::mem::take(queued).into_iter();
 
-    // On a pipeline error: the batch, the file in hand (if not in the batch yet) and
-    // everything not yet processed go back to the queue, in their order.
+    // On an error before the block commit: the batch, the file in hand (if not in the
+    // batch yet) and everything not yet processed go back to the queue, in their order.
     let requeue = |queued: &mut Vec<QueuedFile>,
                    batch: &mut Vec<(QueuedFile, Vec<u8>)>,
                    in_hand: Option<QueuedFile>,
@@ -474,7 +480,7 @@ pub fn flush_queue_inner(
     Ok(results)
 }
 
-/// Mark the files of a packed batch backed up (backup-i9, backup-i23).
+/// Mark the files of a packed, committed batch backed up (backup-i9, backup-i23).
 ///
 /// For each file: the LAST version of its record, if it is pending, becomes the
 /// packed version — its `content_hash` is set to the hash of the bytes actually packed
@@ -482,40 +488,63 @@ pub fn flush_queue_inner(
 /// version with the same hash is never touched (a rollback to earlier content keeps
 /// that earlier version on its own block). No pending last version, or a record of
 /// another `file_id` at the path → WARN, nothing written.
+///
+/// Never fails: the block is already committed, so a file whose record cannot be read
+/// or written gets a WARN and stays pending until its next event or rescan; the other
+/// files are still marked.
 pub fn update_backed_up_at(
     db: &Db,
     batch: &[(QueuedFile, Vec<u8>)],
     block_id: SourceBlockId,
     k: u32,
     t: u16,
-) -> anyhow::Result<()> {
+) {
     let now = Timestamp::now();
     for (qf, _) in batch {
-        let Some(mut record) = db.get_file(&qf.path)? else {
-            tracing::warn!(path = %qf.path, "backed_up_at update skipped: no catalog record");
-            continue;
-        };
-        if record.file_id != qf.file_id {
+        if let Err(e) = mark_backed_up(db, qf, block_id, k, t, now) {
             tracing::warn!(
                 path = %qf.path,
-                "backed_up_at update skipped: the record at this path has another file_id"
+                block_id = %block_id,
+                error = %e,
+                "backed_up_at update failed; the file stays pending until its next event or rescan"
             );
-            continue;
         }
-        match record.versions.last_mut() {
-            Some(version) if version.backed_up_at.is_none() => {
-                version.content_hash = qf.content_hash;
-                version.backed_up_at = Some(now);
-                version.source_block_id = block_id;
-                version.k = k;
-                version.t = t;
-                db.upsert_file(&record)?;
-            }
-            _ => tracing::warn!(
-                path = %qf.path,
-                "backed_up_at update skipped: the last version is not pending"
-            ),
+    }
+}
+
+/// One file of [`update_backed_up_at`].
+fn mark_backed_up(
+    db: &Db,
+    qf: &QueuedFile,
+    block_id: SourceBlockId,
+    k: u32,
+    t: u16,
+    now: Timestamp,
+) -> Result<(), viaticum_core::db::DbError> {
+    let Some(mut record) = db.get_file(&qf.path)? else {
+        tracing::warn!(path = %qf.path, "backed_up_at update skipped: no catalog record");
+        return Ok(());
+    };
+    if record.file_id != qf.file_id {
+        tracing::warn!(
+            path = %qf.path,
+            "backed_up_at update skipped: the record at this path has another file_id"
+        );
+        return Ok(());
+    }
+    match record.versions.last_mut() {
+        Some(version) if version.backed_up_at.is_none() => {
+            version.content_hash = qf.content_hash;
+            version.backed_up_at = Some(now);
+            version.source_block_id = block_id;
+            version.k = k;
+            version.t = t;
+            db.upsert_file(&record)?;
         }
+        _ => tracing::warn!(
+            path = %qf.path,
+            "backed_up_at update skipped: the last version is not pending"
+        ),
     }
     Ok(())
 }

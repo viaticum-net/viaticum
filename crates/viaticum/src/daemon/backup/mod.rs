@@ -644,7 +644,7 @@ impl BackupCoordinator {
             &[],
             importance,
         )?;
-        update_backed_up_at(&self.db, &batch, result.source_block_id, result.k, result.t)?;
+        update_backed_up_at(&self.db, &batch, result.source_block_id, result.k, result.t);
         Ok(Some(result))
     }
 

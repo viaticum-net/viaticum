@@ -756,6 +756,20 @@ impl Db {
         Ok(())
     }
 
+    /// Test seam (backup-i23): overwrite the PEERS row of `device` with bytes that do not
+    /// decode as a `PeerRecord`, so [`Db::list_all_peers`] answers `Err` — a DB error
+    /// before any block is built (candidate selection).
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn corrupt_peer_row_for_test(&self, device: &DeviceId) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(PEERS)?;
+            table.insert(&device.0, [0xffu8, 0x00, 0x13].as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Test seam (backup-i23): overwrite the FILES row at `path` with bytes that do not
     /// decode as a `FileRecord`, so [`Db::get_file`] answers `Err` — a DB error inside the
     /// packing pipeline, not a missing record. CONTENT_INDEX is left as it was.

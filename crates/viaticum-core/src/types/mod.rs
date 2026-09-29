@@ -259,7 +259,10 @@ pub struct FileRecord {
     pub on_disk_confirmed: bool,
 }
 
-/// One version of a file (immutable once created).
+/// One version of a file. A backed-up version is never rewritten. The pending one
+/// (`backed_up_at == None`, sentinel block; at most one per record, and it is the last)
+/// is completed in place when its batch is packed — with the hash of the bytes actually
+/// packed — or dropped when a newer event for the path supersedes it (backup-i9, i23).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileVersion {
     pub content_hash: [u8; 32],

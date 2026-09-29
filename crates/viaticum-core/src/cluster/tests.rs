@@ -6,10 +6,7 @@ mod cluster_state_tests {
     };
     use crate::db::Db;
     use crate::messages::{build_handshake, extract_cluster_identity, verify_handshake};
-    use crate::types::{
-        DeviceId, Event, EventEntry, FileId, FileRecord, FileVersion, IdentityPub, LocalState,
-        SourceBlockId, Timestamp,
-    };
+    use crate::types::{DeviceId, Event, EventEntry, IdentityPub, Timestamp};
 
     const SEED: [u8; 32] = [1u8; 32];
     // device_seed is separate from device_id; device_id = pubkey derived from seed + device_seed
@@ -227,55 +224,8 @@ mod cluster_state_tests {
         assert_eq!(loaded.peer_device(&peer_a), Some(d1));
     }
 
-    fn make_file_record_with_version(
-        content_hash: [u8; 32],
-        backed_up_at: Option<Timestamp>,
-    ) -> FileRecord {
-        let (_, _, device_id) = make_master_and_cert();
-        FileRecord {
-            file_id: FileId(1),
-            path: "/test/file.txt".to_string(),
-            importance: 1.0,
-            devices: vec![(device_id, LocalState::Present)],
-            versions: vec![FileVersion {
-                content_hash,
-                source_block_id: SourceBlockId([0xAB; 32]),
-                k: 2,
-                t: 65535,
-                created_at: NOW,
-                backed_up_at,
-            }],
-            first_seen: NOW,
-            on_disk_confirmed: true,
-        }
-    }
-
-    // 14. is_content_backed_up true when version exists with backed_up_at
-    #[test]
-    fn is_content_backed_up_true_when_version_exists() {
-        let state = make_cluster_state();
-        let hash = [0xBBu8; 32];
-        let record = make_file_record_with_version(hash, Some(NOW));
-        state.db.upsert_file(&record).unwrap();
-        assert!(state.is_content_backed_up(&hash).unwrap());
-    }
-
-    // 15. is_content_backed_up false when backed_up_at is None
-    #[test]
-    fn is_content_backed_up_false_when_not_backed_up_yet() {
-        let state = make_cluster_state();
-        let hash = [0xCCu8; 32];
-        let record = make_file_record_with_version(hash, None);
-        state.db.upsert_file(&record).unwrap();
-        assert!(!state.is_content_backed_up(&hash).unwrap());
-    }
-
-    // 16. is_content_backed_up false when no file
-    #[test]
-    fn is_content_backed_up_false_when_no_file() {
-        let state = make_cluster_state();
-        assert!(!state.is_content_backed_up(&[0u8; 32]).unwrap());
-    }
+    // 14-16 (is_content_backed_up) removed in L1: backup dedups through the DB's
+    // content index (Db::files_with_content_hash); the full-scan helper had no caller.
 
     // 17. esi_namespace correct for device
     #[test]
@@ -409,39 +359,7 @@ mod cluster_state_tests {
         assert_eq!(state.sync_cursor(&peer_b), 200);
     }
 
-    // 25. find_source_block_for_content returns Some when backed up
-    #[test]
-    fn find_source_block_for_content_returns_some_when_backed_up() {
-        let state = make_cluster_state();
-        let hash = [0xDDu8; 32];
-        let expected_block = SourceBlockId([0xABu8; 32]);
-        let record = make_file_record_with_version(hash, Some(NOW));
-        // override the source_block_id
-        let mut record = record;
-        record.versions[0].source_block_id = expected_block;
-        state.db.upsert_file(&record).unwrap();
-        let result = state.find_source_block_for_content(&hash).unwrap();
-        assert_eq!(result, Some(expected_block));
-    }
-
-    // 26. find_source_block_for_content returns None when not backed up
-    #[test]
-    fn find_source_block_for_content_returns_none_when_not_backed_up() {
-        let state = make_cluster_state();
-        let hash = [0xEEu8; 32];
-        let record = make_file_record_with_version(hash, None);
-        state.db.upsert_file(&record).unwrap();
-        let result = state.find_source_block_for_content(&hash).unwrap();
-        assert_eq!(result, None);
-    }
-
-    // 27. find_source_block_for_content returns None when no files
-    #[test]
-    fn find_source_block_for_content_returns_none_when_no_files() {
-        let state = make_cluster_state();
-        let result = state.find_source_block_for_content(&[0u8; 32]).unwrap();
-        assert_eq!(result, None);
-    }
+    // 25-27 (find_source_block_for_content) removed in L1 with the helper (no caller).
 
     // 28. local_last_seq returns 1 after init (one DeviceAdded event)
     #[test]

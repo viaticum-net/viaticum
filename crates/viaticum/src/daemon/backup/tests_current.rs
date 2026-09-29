@@ -406,7 +406,7 @@ fn update_backed_up_at_marks_last_pending_version_not_older_same_hash() {
         importance: 0.5,
     };
 
-    update_backed_up_at(&db, &[(qf, vec![0; 4])], x_new, 7, 1024).unwrap();
+    update_backed_up_at(&db, &[(qf, vec![0; 4])], x_new, 7, 1024);
 
     let rec = record(&db, "/w/p.bin");
     assert_eq!(
@@ -504,50 +504,120 @@ fn flush_skips_file_changed_back_to_content_already_in_network() {
     assert_eq!(rec.versions[0].source_block_id, xa);
 }
 
-/// A DB error inside the pipeline: the batch and the rest go back to the queue.
+/// A DB error before any block record is committed (here: candidate selection): the
+/// files go back to the queue and are packed once the error is gone.
 #[test]
-fn flush_pipeline_error_requeues_unprocessed_files() {
+fn flush_error_before_block_commit_requeues_the_files() {
     let db = Db::open_in_memory().unwrap();
     let dir = TempDir::new().unwrap();
     let mut c = coord(&db);
+    // Candidates from the DB (not the mock list), so a bad peer row fails the flush.
+    c.config.mock_holders.clear();
     let paths: Vec<String> = (1..=3)
         .map(|i| write(&dir, &format!("r{i}.bin"), &content(40 + i, 4096)))
         .collect();
     for p in &paths {
         c.process_event(event(p, DirtyKind::Added)).unwrap();
     }
-    db.corrupt_file_row_for_test(&paths[1]).unwrap();
+    let bad_peer = DeviceId([0x77; 32]);
+    db.corrupt_peer_row_for_test(&bad_peer).unwrap();
 
     let res = c.flush_queue(FileCategory::Document, true, &Default::default());
 
     assert!(res.is_err(), "the DB error is reported");
+    assert!(
+        db.list_all_source_blocks().unwrap().is_empty(),
+        "no block was committed"
+    );
     assert_eq!(
         queued_paths(&c),
         paths.iter().cloned().collect::<BTreeSet<_>>(),
         "every file of the failed pass is queued again"
     );
+    assert!(
+        paths.iter().all(|p| last(&db, p).backed_up_at.is_none()),
+        "nothing marked"
+    );
 }
 
-/// An error in one category (Photo) does not keep another (Document) from flushing.
+/// A record that cannot be updated after its block was committed: the others of the
+/// batch are marked, nothing is requeued, and the next flush builds no block again
+/// (was: requeue → the same batch packed and committed on every idle tick).
 #[test]
-fn flush_all_error_in_one_category_does_not_stop_others() {
+fn flush_bad_record_after_block_commit_marks_the_others_and_is_not_repacked() {
     let db = Db::open_in_memory().unwrap();
     let dir = TempDir::new().unwrap();
     let mut c = coord(&db);
+    let paths: Vec<String> = (1..=3)
+        .map(|i| write(&dir, &format!("m{i}.bin"), &content(45 + i, 4096)))
+        .collect();
+    for p in &paths {
+        c.process_event(event(p, DirtyKind::Added)).unwrap();
+    }
+    db.corrupt_file_row_for_test(&paths[1]).unwrap();
+
+    let blocks = c
+        .flush_queue(FileCategory::Document, true, &Default::default())
+        .expect("a bad row after the commit is not a flush error");
+
+    assert_eq!(blocks.len(), 1);
+    for p in [&paths[0], &paths[2]] {
+        let v = last(&db, p);
+        assert!(v.backed_up_at.is_some(), "{p} marked");
+        assert_eq!(v.source_block_id, blocks[0].source_block_id);
+    }
+    assert!(
+        db.get_file(&paths[1]).is_err(),
+        "the bad row is left as it was (its file stays pending)"
+    );
+    assert!(queued_paths(&c).is_empty(), "nothing requeued");
+    assert_eq!(flush(&mut c), 0, "the next flush builds no block again");
+    assert_eq!(db.list_all_source_blocks().unwrap().len(), 1);
+}
+
+/// A flush error leaves every category's files queued, and `flush_all` reports it.
+/// (The error sources left before a block commit — candidate selection, the block
+/// write — are DB-wide, so every category meets the same error.)
+#[test]
+fn flush_all_error_keeps_every_category_queued() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let mut c = coord(&db);
+    c.config.mock_holders.clear();
     let photo = write(&dir, "a.jpg", &content(50, 4096));
     let doc = write(&dir, "b.txt", &content(51, 4096));
     c.process_event(event(&photo, DirtyKind::Added)).unwrap();
     c.process_event(event(&doc, DirtyKind::Added)).unwrap();
-    db.corrupt_file_row_for_test(&photo).unwrap();
+    db.corrupt_peer_row_for_test(&DeviceId([0x77; 32])).unwrap();
 
     let res = c.flush_all(true, &Default::default());
 
-    assert!(res.is_err(), "the Photo error is returned");
-    assert!(
-        last(&db, &doc).backed_up_at.is_some(),
-        "Document still flushed"
-    );
-    assert_eq!(queued_paths(&c), BTreeSet::from([photo]));
+    assert!(res.is_err(), "the error is returned");
+    assert_eq!(queued_paths(&c), BTreeSet::from([photo, doc]));
+}
+
+/// An rm'd queued file: its pending version and queue entry go with it (no Deleted
+/// record with a pending last version, nothing packed for it).
+#[test]
+fn deleted_event_drops_pending_version_and_queue_entry() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let mut c = coord(&db);
+    let (a, b) = (content(70, 4096), content(71, 4096));
+    let p = write(&dir, "gone.bin", &a);
+    let xa = backed_up(&mut c, &db, &p, DirtyKind::Added);
+    write(&dir, "gone.bin", &b);
+    c.process_event(event(&p, DirtyKind::Modified)).unwrap();
+    assert_eq!(queued_paths(&c).len(), 1, "setup: edit B queued");
+
+    std::fs::remove_file(&p).unwrap();
+    c.process_event(event(&p, DirtyKind::Deleted)).unwrap();
+
+    let rec = record(&db, &p);
+    assert!(matches!(rec.devices[0].1, LocalState::Deleted(_)));
+    assert_eq!(rec.versions.len(), 1, "pending B dropped");
+    assert_eq!(rec.versions[0].source_block_id, xa);
+    assert!(queued_paths(&c).is_empty(), "queue entry dropped");
 }
 
 /// Large file: the second read (at packing) sees other bytes than the first — the

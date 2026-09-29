@@ -208,14 +208,14 @@ fn cluster_sync_event_exchange() {
 
 // ─── 3. dedup_across_devices ──────────────────────────────────────────────────
 //
-// Device A backs up a file (backed_up_at = Some). Device B queries via
-// ClusterState::is_content_backed_up on the same DB — returns true.
-// A file that was not backed up (backed_up_at = None) returns false.
+// Device A backs up a file (backed_up_at = Some). Device B finds it through the
+// shared DB's content index; a file not backed up yet (backed_up_at = None) is no source.
 
 #[test]
 fn dedup_across_devices() {
     let db = Db::open_in_memory().unwrap();
-    let state = init_state_ab(db.clone());
+    // Both devices registered on the shared DB.
+    let _state = init_state_ab(db.clone());
 
     let content_hash_backed: [u8; 32] = [0x11; 32];
     let content_hash_pending: [u8; 32] = [0x22; 32];
@@ -258,33 +258,31 @@ fn dedup_across_devices() {
     })
     .unwrap();
 
-    // Query via ClusterState (shared DB).
-    assert!(
-        state.is_content_backed_up(&content_hash_backed).unwrap(),
-        "content backed up by device A must be visible"
+    // Device B looks the content up in the shared DB's content index (what backup's
+    // dedup reads since L1): A's backed-up version is a dedup source, B's pending one
+    // is not.
+    let backed_up_blocks = |h: &[u8; 32]| -> Vec<SourceBlockId> {
+        db.files_with_content_hash(h)
+            .unwrap()
+            .iter()
+            .flat_map(|r| r.versions.iter())
+            .filter(|v| &v.content_hash == h && v.backed_up_at.is_some())
+            .map(|v| v.source_block_id)
+            .collect()
+    };
+    assert_eq!(
+        backed_up_blocks(&content_hash_backed),
+        vec![SourceBlockId([0xAA; 32])],
+        "content backed up by device A must be visible with its block"
     );
     assert!(
-        !state.is_content_backed_up(&content_hash_pending).unwrap(),
-        "content not yet backed up must return false"
+        backed_up_blocks(&content_hash_pending).is_empty(),
+        "content not yet backed up is no dedup source"
     );
-
-    // Unknown hash must return false.
     assert!(
-        !state.is_content_backed_up(&[0xFF; 32]).unwrap(),
-        "unknown content hash must return false"
+        backed_up_blocks(&[0xFF; 32]).is_empty(),
+        "unknown content hash has no source"
     );
-
-    // find_source_block_for_content must return the block for the backed-up hash.
-    let block = state
-        .find_source_block_for_content(&content_hash_backed)
-        .unwrap();
-    assert_eq!(block, Some(SourceBlockId([0xAA; 32])));
-
-    // And None for the not-backed-up hash.
-    let block_pending = state
-        .find_source_block_for_content(&content_hash_pending)
-        .unwrap();
-    assert_eq!(block_pending, None);
 }
 
 // ─── 4. device_revocation_rotates_epoch ──────────────────────────────────────

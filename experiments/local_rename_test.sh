@@ -35,7 +35,9 @@
 #               after the Delete was sent (backup-i8, L1b); cluster siblings; hard links; a
 #               file changed between enqueue and flush (unit tests); cp -r / mkdir races
 #               (R1-c2); DR side of dr-i64 (local_dr_test step 7); root self-heal on Scan (unit);
-#               a move longer than the owner window.
+#               a move longer than the owner window; a rollback while the edit is still queued
+#               (unit only: dedup_same_path_after_supersede_does_not_duplicate_version); the
+#               large-file path process_large_file (no E2E file reaches the 128 MiB block).
 # Expectation:  PHASE A is RED on the code before L1 (vps/run-1 ee01fb6):
 #                 step 8  — the idle flush aborts on the vanished q1 ("flush error … q1.bin")
 #                           and drops q2, q3 from the queue: they reach no holder within 20 s
@@ -60,9 +62,10 @@
 #       wait_file_restorable, block_symbols_on
 #   8.  ADVERSARIAL q1..q3 (64 KiB) by one mv; sleep 0.4; SIGSTOP node-00; q1 moved to the
 #       trash; sleep 2; SIGCONT → setup: `file vanished since enqueue` or `flush error … q1.bin`
-#       after the STOP (else repeat with sleep 0.2, ≤ 2 times); ≤ 20 s q2, q3 ≥ k_eff on
-#       holder disks; no periodic rescan in the window (else repeat) (backup-i23) — check:
-#       grep, block_symbols_on, assert_no_periodic_since
+#       after the STOP, and q2's and q3's block built after it (`backup: pipeline complete`
+#       with their block_id after the STOP) — else repeat with sleep 0.2, ≤ 2 times; ≤ 20 s
+#       q2, q3 ≥ k_eff on holder disks; no periodic rescan in the window (else repeat)
+#       (backup-i23) — check: grep, block_symbols_on, assert_no_periodic_since
 #   9.  V: cat B > V, wait XB ≠ XA restorable and on holders; cat A > V → ≤ 15 s last block XA.
 #       W: random R > W, wait XR ≠ XAW restorable and on holders; restore W --version 1 →
 #       sha A_W, holders log RestoreResponse for XAW; mv the staged copy to files/W.bin →
@@ -381,8 +384,8 @@ if run_a; then
             sleep 1
         done
         Q_WALL=$(( $(date +%s) - T_CONT ))
-        on_holders "$Q2" || true; Q2_STATE="q2 ${OH_ON}/${OH_TARGET:-?} on ${OH_BLOCK:0:16}"
-        on_holders "$Q3" || true; Q3_STATE="q3 ${OH_ON}/${OH_TARGET:-?} on ${OH_BLOCK:0:16}"
+        on_holders "$Q2" || true; Q2_BLOCK=$OH_BLOCK; Q2_STATE="q2 ${OH_ON}/${OH_TARGET:-?} on ${OH_BLOCK:0:16}"
+        on_holders "$Q3" || true; Q3_BLOCK=$OH_BLOCK; Q3_STATE="q3 ${OH_ON}/${OH_TARGET:-?} on ${OH_BLOCK:0:16}"
 
         # Setup: the vanish hit a queued file (the flush saw it gone), not an already packed one.
         VANISH=$(log_since 0 "$LINE_STOP" | grep -E "file vanished since enqueue|flush error" \
@@ -395,6 +398,17 @@ if run_a; then
             info "attempt $attempt: a periodic rescan ran in the window (it re-adds every file); repeating"
             continue
         fi
+        # Setup: q2 and q3 were still queued at the STOP too — their block was built by a flush
+        # after it ("backup: pipeline complete" with that block_id after LINE_STOP). A fallback
+        # flush (every 4 s) between their events and the STOP would have packed them already:
+        # the old code then passes, so the attempt is void. (Blocks are logged by 16 hex.)
+        if [ "$Q_OK" -eq 1 ]; then
+            AFTER=$(log_since 0 "$LINE_STOP" | grep -F "backup: pipeline complete" || true)
+            if ! has "$AFTER" "block_id=${Q2_BLOCK:0:16}" || ! has "$AFTER" "block_id=${Q3_BLOCK:0:16}"; then
+                info "attempt $attempt: q2/q3 were packed before the STOP (no pipeline line for their block after it); repeating"
+                continue
+            fi
+        fi
         STEP8_DONE=1
         if [ "$Q_OK" -eq 1 ]; then
             pass "q2, q3 >= k_eff on holder disks ${Q_WALL}s after SIGCONT; the vanished q1 did not hold them back ($Q2_STATE; $Q3_STATE)"
@@ -404,7 +418,7 @@ if run_a; then
         break
     done
     if [ "$STEP8_DONE" -eq 0 ]; then
-        rough "step 8: 3 attempts, none both hit a queued file and missed the periodic rescan — not proven"
+        rough "step 8: 3 attempts, none had q1..q3 all queued at the STOP and missed the periodic rescan — not proven"
     fi
 fi
 

@@ -100,6 +100,9 @@ impl BackupCoordinator {
                     .devices
                     .push((event.device_id, LocalState::Deleted(now)));
             }
+            // What was queued for this path is gone with it: no pending last version
+            // on a deleted record, no queue entry to pack.
+            self.supersede_pending(&mut record);
             self.db.upsert_file(&record)?;
         } else {
             // File not in catalog — create a minimal record for the deletion.
