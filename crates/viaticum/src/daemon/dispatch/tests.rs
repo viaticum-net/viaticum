@@ -2052,7 +2052,7 @@ async fn status_below_reserve_says_what_is_given_back_at_any_quota() {
     let free = crate::daemon::handle::disk_available_bytes(dir.path()).unwrap();
     // Held is only a DB number here; large, so the disk moving between reads (parallel
     // tests on the same filesystem) stays small against it.
-    let held = 1024 * 1024 * 1024u64;
+    let held = 1024 * 1024 * 1024 * 1024u64;
     // reserve = free + held/2 ⇒ Q = free + held − reserve = held/2 > 0, free < reserve.
     let state = make_test_state_with(dir.path().to_path_buf(), 0, free + held / 2).await;
     state

@@ -14,7 +14,7 @@
 #               (experiments/four_r_replay.py).
 # Intent:       4r-i44, 4r-i45, 4r-i46, 4r-i50 (journal note only), 4r-i52, 4r-i66, 4r-i67 (В-0); later slices
 #               add 4r-i12..i16, i18, i19, i21, i37, i41 to this file. F-Q (step 12): holder-i1,
-#               holder-i1-a, holder-i4.
+#               holder-i4 (holder-i1-a — Q > 0 below the reserve — is proven by core units only).
 # Proves:       on L: the shadow ranks W (no service to L) first and would cap-trim all of W's
 #               parked bytes at the first contention while F (serving L) keeps its share; the
 #               shadow would admit F's offer by preemption with W as the victim and would refuse
@@ -101,7 +101,7 @@
 #                    size: free < reserve without filling a disk) -> within 180 s L logs `hard disk
 #                    pressure` with critical=true (holder-i1); that first Critical tick frees all
 #                    it holds (freed_bytes = used_bytes) and holding_bytes reach 0 (hard floor 0;
-#                    holder-i1-a); >= 1 `immediate-drop DropNotice published`
+#                    Q = 0 case only; holder-i1-a is unit-proven); >= 1 `immediate-drop DropNotice published`
 #                    on L and >= 1 `received SymbolDropNotice` from L in an owner's own log; L's
 #                    `status` has "disk below reserve" (holder-i4); W and F write a new file ->
 #                    `rejected offer for block … QuotaFull` from L in the offerer's own log (no
@@ -878,7 +878,7 @@ for i in $(seq 1 $((NUM_NODES - 1))); do MARK12[$i]=$(log_lines "$(node_log "$i"
 T12=$(date -u +%s)
 start_node "$L"
 wait_daemon "$L" || { fail "FAIL(setup): L did not come back"; finish; }
-# holder-i1 / i1-a: the pressure tick (every 60 s at this time_scale) is Critical and gives
+# holder-i1 (Q = 0; holder-i1-a with Q > 0 is unit-only): the pressure tick (every 60 s at this time_scale) is Critical and gives
 # back everything above the (zero) hard floor in one tick.
 CRIT=""
 while [ $(( $(date -u +%s) - T12 )) -le 180 ]; do
@@ -902,7 +902,7 @@ done
 # later ticks stay Critical with nothing left to evict).
 USED1=$(log_field "$CRIT" used_bytes); FREED1=$(log_field "$CRIT" freed_bytes)
 if [ "${H_AFTER:-1}" -eq 0 ] && [ -n "$USED1" ] && [ "$USED1" -gt 0 ] && [ "${FREED1:-0}" -eq "$USED1" ]; then
-    pass "L gave back everything in one Critical tick: freed $FREED1 of $USED1 B; holding_bytes $H12 -> 0 (holder-i1-a)"
+    pass "L gave back everything in one Critical tick: freed $FREED1 of $USED1 B; holding_bytes $H12 -> 0 (holder-i1, Q = 0)"
 else
     fail "L: first Critical tick freed ${FREED1:-?} of ${USED1:-?} B; holding_bytes $H12 -> ${H_AFTER:-?} (want all in one tick, then 0)"
 fi
