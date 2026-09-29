@@ -664,11 +664,15 @@ impl Scheduler {
             };
             let params = block_record.erasure_params();
 
-            // Compute union of all ESI ranges across all holders for this block.
-            let mut all_esi_ranges: Vec<(u32, u32)> = Vec::new();
-            for p in &holder_placements {
-                all_esi_ranges.extend_from_slice(&p.esi_ranges);
-            }
+            // Union of all holders' ESI ranges for this block: sorted, deduplicated, merged
+            // (a placement may hold several ranges — own range + fresh numbers, repair-i9).
+            let mut all_esis: Vec<u32> = holder_placements
+                .iter()
+                .flat_map(|p| viaticum_core::types::ranges_to_esi_list(&p.esi_ranges))
+                .collect();
+            all_esis.sort_unstable();
+            all_esis.dedup();
+            let all_esi_ranges = viaticum_core::types::esi_list_to_ranges(&all_esis);
 
             // Per-holder data for the spawn_blocking closure.
             let holder_data: Vec<(DeviceId, Vec<(u32, u32)>)> = holder_placements
@@ -691,25 +695,21 @@ impl Scheduler {
             #[allow(clippy::type_complexity)]
             let hash_results = tokio::task::spawn_blocking(
                 move || -> Vec<(DeviceId, [u8; 32], Vec<(u32, u32)>)> {
-                    // Encode raw symbols for the union of all holders' ESI ranges.
+                    // Encode raw symbols for the union of all holders' ESI ranges — one
+                    // encoder build for every range.
                     let mut raw_symbols: HashMap<u32, Vec<u8>> = HashMap::new();
-                    for &(start, count) in &all_esi_ranges {
-                        if count == 0 {
-                            continue;
+                    match encoder.encode_raw_ranges(&source_data, &params, &all_esi_ranges) {
+                        Ok(syms) => {
+                            for sym in syms {
+                                raw_symbols.insert(sym.esi, sym.data);
+                            }
                         }
-                        match encoder.encode_raw(&source_data, &params, start, count) {
-                            Ok(syms) => {
-                                for sym in syms {
-                                    raw_symbols.insert(sym.esi, sym.data);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    block_id = %block_id_clone,
-                                    "scheduler: encode_raw failed: {e}"
-                                );
-                                return vec![];
-                            }
+                        Err(e) => {
+                            tracing::error!(
+                                block_id = %block_id_clone,
+                                "scheduler: encode_raw failed: {e}"
+                            );
+                            return vec![];
                         }
                     }
 

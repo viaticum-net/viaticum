@@ -136,10 +136,13 @@ pub(crate) fn plan_offers(
 ///
 /// A device with a reusable own range (`reusable_own_ranges`) gets it back first, then fresh
 /// numbers for the rest of its share. An own range LARGER than the share is kept whole, not
-/// narrowed: without a persistent `esi_high_water` a narrowed row could lower the cursor
-/// (it is the max end of the rows) and the cut tail — possibly on the holder's disk after an
-/// interrupted transfer — would be handed out fresh to another device (repair-i8). Narrowing
-/// comes with `esi_high_water` in C-SP K1b.
+/// narrowed (repair-i9-a): the row is the device's reservation, and a narrowed row would burn
+/// fresh numbers again every time the share swings back up — the cut part is no longer in any
+/// row, so it cannot come back to the device (a persistent `esi_high_water` would not change
+/// that). Cost: the offer can exceed the share (more QuotaFull in a greedy network, extra
+/// symbols if accepted). The real fix — offer a subset of the reservation, narrow the row on
+/// `Offered→Alive` — is tracked in private tech-debt «Повтор оффера несёт весь
+/// зарезервированный диапазон» (2026-09-30).
 pub(crate) fn assign_esi_ranges(
     allocations: &[HolderAllocation],
     placements: &[SymbolPlacement],

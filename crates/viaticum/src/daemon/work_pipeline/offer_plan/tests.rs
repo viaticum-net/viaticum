@@ -118,8 +118,10 @@ fn intersects(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
 
 // ─── repair-i9: pool of only rejects, 1000 ticks ────────────────────────────────
 
-/// repair-i9. Mutation: fresh range on every retry (`assign_esi_ranges` ignores the own
-/// `Offered` row) → the cursor grows by the whole plan each tick and this test reddens.
+/// repair-i9, repair-i9-b. Mutations: fresh range on every retry (`assign_esi_ranges` ignores
+/// the own `Offered` row) → the cursor grows by the whole plan each tick; the cursor without
+/// `Offered` rows (`esi_cursor`) → fresh numbers land on reserved ranges and rows of two
+/// devices overlap. Either reddens this test.
 #[test]
 fn reject_only_pool_1000_iterations_keeps_cursor_within_distinct_shares() {
     let db = make_db();
@@ -150,6 +152,19 @@ fn reject_only_pool_1000_iterations_keeps_cursor_within_distinct_shares() {
                 .or_default()
                 .insert(offer.share);
             offered_symbols += u64::from(offer.share);
+        }
+
+        // repair-i9-b: the rows of different devices never share an ESI.
+        let rows = db.list_placements_for_block(&block.block_id).unwrap();
+        for (i, r1) in rows.iter().enumerate() {
+            for r2 in &rows[i + 1..] {
+                assert!(
+                    !intersects(&r1.esi_ranges, &r2.esi_ranges),
+                    "tick {tick}: rows of two devices overlap: {:?} vs {:?}",
+                    r1.esi_ranges,
+                    r2.esi_ranges
+                );
+            }
         }
 
         let bound = NS + largest_share.values().sum::<u32>();

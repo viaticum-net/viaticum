@@ -344,6 +344,42 @@ async fn deliver_to_holder_worker(
     }
 }
 
+/// Every symbol of `placement`, bound to its holder: each ESI of `placement.esi_ranges` is
+/// looked up BY ESI in `raw_symbols` (ascending by ESI — encoded from
+/// `offer_plan::union_ranges`; ranges need not be contiguous, repair-i9) and bound with
+/// (block, holder). An ESI missing from `raw_symbols` is an error, never silently skipped:
+/// the holder must get exactly the placement's symbols.
+pub(crate) fn bind_placement_symbols(
+    encoder: &dyn ErasureEncoder,
+    block_id: &SourceBlockId,
+    placement: &SymbolPlacement,
+    raw_symbols: &[viaticum_core::erasure::Symbol],
+) -> anyhow::Result<Vec<viaticum_core::erasure::Symbol>> {
+    let bound: Vec<viaticum_core::erasure::Symbol> = placement
+        .esi_ranges
+        .iter()
+        .flat_map(|&(start_esi, count)| start_esi..start_esi.saturating_add(count))
+        .filter_map(|esi| {
+            let idx = raw_symbols.binary_search_by_key(&esi, |s| s.esi).ok()?;
+            Some(encoder.apply_binding(raw_symbols[idx].clone(), block_id, &placement.holder_id))
+        })
+        .collect();
+
+    let expected = placement.symbol_count() as usize;
+    if bound.len() != expected {
+        anyhow::bail!(
+            "raw symbols missing for block {} holder {}: {} of {} (ranges={:?}, raw_len={})",
+            block_id,
+            placement.holder_id,
+            bound.len(),
+            expected,
+            placement.esi_ranges,
+            raw_symbols.len(),
+        );
+    }
+    Ok(bound)
+}
+
 /// Send SymbolTransfer chunks to a holder, wait for SymbolStored acks.
 ///
 /// On full ack: transitions placement Offered→Alive + runs W11a hook.
@@ -357,35 +393,11 @@ async fn deliver_transfer_worker(
     raw_symbols: &[viaticum_core::erasure::Symbol],
 ) -> anyhow::Result<bool> {
     use viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES;
-    use viaticum_core::erasure::{Symbol, chunk_symbols_by_size};
+    use viaticum_core::erasure::chunk_symbols_by_size;
     use viaticum_core::messages::{Message, SymbolTransferMsg};
 
-    // Bind raw symbols inline at send time — no disk read. `raw_symbols` is ascending by
-    // ESI (encoded from `offer_plan::union_ranges`).
-    let bound: Vec<Symbol> = placement
-        .esi_ranges
-        .iter()
-        .flat_map(|&(start_esi, count)| {
-            (start_esi..start_esi + count).filter_map(|esi| {
-                let idx = raw_symbols.binary_search_by_key(&esi, |s| s.esi).ok()?;
-                Some(encoder.apply_binding(
-                    raw_symbols[idx].clone(),
-                    block_id,
-                    &placement.holder_id,
-                ))
-            })
-        })
-        .collect();
-
-    if bound.is_empty() {
-        anyhow::bail!(
-            "no raw symbols available for block {} holder {} (ranges={:?}, raw_len={})",
-            block_id,
-            placement.holder_id,
-            placement.esi_ranges,
-            raw_symbols.len(),
-        );
-    }
+    // Bind raw symbols inline at send time — no disk read.
+    let bound = bind_placement_symbols(encoder.as_ref(), block_id, placement, raw_symbols)?;
 
     let symbol_count = bound.len();
     let chunks = chunk_symbols_by_size(bound, SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES);
