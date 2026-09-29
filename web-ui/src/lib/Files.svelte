@@ -294,9 +294,9 @@
       {#if f.local_state === 'present'}
         {#if f.is_safe_to_delete}
           <!-- delete-i7: the network keeps the current state of your files, not a history;
-               a file deleted here leaves the network after the deletion window. Never
+               a file deleted from this computer leaves the network after the deletion window. Never
                suggest the local copy can go. -->
-          <span class="badge badge-ok" title="Reached its target reliability on the network. Keep your local copy: a file deleted here is removed from the network too after the deletion window.">at target</span>
+          <span class="badge badge-ok" title="Reached its target reliability on the network. Keep your local copy: a file deleted from this computer is removed from the network too after the deletion window.">at target</span>
         {:else if f.last_backed_up !== 'pending'}
           <span class="badge badge-working" title="Below its target reliability — the network is still adding redundancy.">below target</span>
         {/if}

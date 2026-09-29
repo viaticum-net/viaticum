@@ -1,17 +1,21 @@
 #!/bin/bash
 # Viaticum fresh-init E2E (mini-fixes F1, F13, F9): what a friend gets from
-# `viaticum init` + `viaticum daemon` with nothing edited by hand.
+# `viaticum init` + `viaticum daemon --watch-dir <folder>` (the README's "Try it",
+# literally) with nothing edited by hand.
 #
 # Scenario:     one node, clean data dir. `init` with defaults, no config edits;
-#               the daemon is started, restarted, and the Settings form is read
-#               and saved back unchanged over the web API after the friend wrote
-#               `soft_quota_gb = 50` (a TOML integer) by hand.
+#               the daemon is started the way the README says (`daemon --watch-dir`
+#               a folder with one small file), restarted by SIGTERM + start and by
+#               POST /api/restart (what the Settings "Save & restart" sends), and
+#               the Settings form is read and saved back unchanged over the web API
+#               after the friend wrote `soft_quota_gb = 50` (a TOML integer) by hand.
 # Intent:       daemon-i9 (F1), daemon-i10 (F13) private/intent/daemon.md;
 #               delete-i7 (F9) private/intent/delete.md
 # Proves:       after a plain `init` the CLI reaches the daemon (`status --json`
 #               answers), `token --url` gives the Dashboard URL (what `open`
 #               launches) and `GET /` = 200 — on the port written in config.toml
-#               (not 0, loopback), the same port after a restart. An integer quota
+#               (not 0, loopback), the same port after a restart, a plain one and
+#               the web UI's self re-exec (POST /api/restart). An integer quota
 #               reads back as 50 in the Settings API and survives Save unchanged.
 #               The web UI the daemon serves does not call a file "safe to delete".
 # Adversarial:  red on the old code, per fix:
@@ -24,6 +28,12 @@
 #                  writes 0.0 over the friend's 50.
 #               F9 (old badge text): step 4 — the served JS contains "safe to
 #                  delete" / "without your local copy".
+#               README start line (W1: `--watch` instead of `--watch-dir`): clap
+#                  refuses the flag, the daemon exits — step 2 fails "daemon exited:
+#                  error: unexpected argument '--watch'", every later step with it.
+#               Self re-exec that loses the port (child binds another / cannot bind
+#                  while the parent drains, or never comes up): step 5b — status does
+#                  not answer within the deadline, or api-port ≠ P.
 #               Positive controls keep the greps honest: the bundle must be the
 #               Files view (contains `is_safe_to_delete` and the new label "at
 #               target"), and the quota is checked against a value ≠ the default.
@@ -31,13 +41,19 @@
 #               — local_daemon_health_test covers the listen-port twin); LAN
 #               access and choosing another port (R2a/R3b); `open` itself (it
 #               launches a browser — `token --url` prints the same URL); the
-#               web-ui pages rendering in a browser.
-# Steps:        1. `init` (defaults) → config.toml: [web_api] enabled = true,
+#               web-ui pages rendering in a browser (the Settings page's own poll
+#               after "Save & restart" — step 5b sends the same POST); that the
+#               watched folder's file gets backed up (one node, no peers — other
+#               scenarios cover backup).
+# Steps:        0. setup: a folder with one small file to watch (the README's
+#                  ~/Documents)
+#               1. `init` (defaults) → config.toml: [web_api] enabled = true,
 #                  bind loopback, port P ≠ 0 (daemon-i9) — check: tomllib
 #               1b. setup: P must be free before the daemon starts (taken =
 #                  setup FAIL, never a skip) — check: ss
-#               2. daemon start → `status --json` answers (exit 0, JSON) within
-#                  30 s; api-port = P (daemon-i9) — check: poll with deadline
+#               2. `daemon --watch-dir <folder>` (README) → `status --json` answers
+#                  (exit 0, JSON) within 30 s; api-port = P (daemon-i9) — check:
+#                  poll with deadline
 #               3. `token --url` → http://127.0.0.1:P/auth/start?token=…; that URL
 #                  → 303; `GET /` → 200 HTML (daemon-i9) — check: curl codes
 #               4. every JS asset referenced by index.html → 200, contains
@@ -45,6 +61,10 @@
 #                  delete" nor "without your local copy" (delete-i7) — check: grep
 #               5. SIGTERM → exit 0; restart → status answers; port in config and
 #                  api-port still P (daemon-i9) — check: poll, compare
+#               5b. POST /api/restart (bearer token) → 202; the old process exits
+#                  within 60 s; the re-exec'd child (same args) answers `status`
+#                  within 30 s; config bind and api-port still P (daemon-i9) —
+#                  check: wait_pid_exit, pgrep, poll, compare
 #               6. stop; `soft_quota_gb = 50` (integer) under [storage]; start →
 #                  GET /api/config .storage.soft_quota_gb = 50; PUT the same body
 #                  → 200; config.toml soft_quota_gb = 50 and GET again = 50
@@ -52,6 +72,7 @@
 #               7. SIGTERM → exit 0; no panic in the log — check: exit status, grep
 #
 # Usage:
+#   Needs: jq, curl, python3 (tomllib), ss, pgrep.
 #   ./rbuild.sh      # release binary, built on the server
 #   bash experiments/local_fresh_init_test.sh
 #   (or: private/testing/run_e2e.sh fresh_init)
@@ -61,6 +82,8 @@ set -euo pipefail
 TEST_DIR="/tmp/viaticum-fi-$$"
 BINARY="${BINARY:-viaticum}"
 STATUS_DEADLINE=30
+# The folder the README tells the friend to watch (`--watch-dir ~/Documents`).
+WATCH_DIR="$TEST_DIR/Documents"
 
 PASS=0; FAIL=0
 DPID=""
@@ -95,6 +118,9 @@ cleanup() {
         kill "$DPID" 2>/dev/null || true
         wait_pid_exit "$DPID" 10 || kill -9 "$DPID" 2>/dev/null || true
     fi
+    # A re-exec'd daemon step 5b could not find (not this shell's child) must not
+    # outlive the run on the shared server.
+    pkill -TERM -f -- "--data-dir $TEST_DIR/node-00 daemon" 2>/dev/null || true
     if [ "$FAIL" -eq 0 ] && [ "$PASS" -gt 0 ]; then
         rm -rf "$TEST_DIR"
     else
@@ -115,9 +141,12 @@ PY
 }
 
 # The binary itself in the background (not the run_cli function: $! would be a
-# subshell, and SIGTERM would miss the daemon).
+# subshell, and SIGTERM would miss the daemon), started the way the README says:
+# `daemon --watch-dir <folder>` — a flag the CLI does not know exits the daemon,
+# and wait_status reports it.
 start_daemon() {
-    "$BINARY" --data-dir "$(node_dir 0)" daemon >> "$(node_log 0)" 2>&1 &
+    "$BINARY" --data-dir "$(node_dir 0)" daemon --watch-dir "$WATCH_DIR" \
+        >> "$(node_log 0)" 2>&1 &
     DPID=$!
 }
 
@@ -129,7 +158,10 @@ wait_status() {
         if out=$(run_cli status --json 2> "$TEST_DIR/status.err") && jq -e . <<< "$out" > /dev/null 2>&1; then
             return 0
         fi
-        kill -0 "$DPID" 2>/dev/null || { STATUS_ERR="daemon exited"; return 1; }
+        if ! kill -0 "$DPID" 2>/dev/null; then
+            STATUS_ERR="daemon exited: $(tail -n 3 "$(node_log 0)" 2>/dev/null | tr '\n' ' ')"
+            return 1
+        fi
         sleep 0.5
     done
     STATUS_ERR=$(tr '\n' ' ' < "$TEST_DIR/status.err")
@@ -164,6 +196,10 @@ api_put() {
 }
 
 mkdir -p "$(node_dir 0)"
+
+echo "=== Step 0: setup — a folder with one small file to watch ==="
+mkdir -p "$WATCH_DIR"
+printf 'fresh-init %s\n' "$$" > "$WATCH_DIR/note.txt"
 
 echo "=== Step 1: init with defaults → web API on a fixed loopback port (daemon-i9) ==="
 run_cli init > "$TEST_DIR/init.out" 2>&1 || fail "step 1: init exited non-zero: $(tail -3 "$TEST_DIR/init.out")"
@@ -256,6 +292,41 @@ if [ "$BIND2" = "$BIND" ] && [ "$AP2" = "$P" ]; then
     pass "step 5: config bind and api-port still $P"
 else
     fail "step 5: after restart bind='$BIND2' api-port='$AP2' (was $BIND)"
+fi
+
+echo "=== Step 5b: POST /api/restart — the re-exec'd daemon answers on the same port (daemon-i9) ==="
+# The Settings "Save & restart" path: the daemon spawns a child with the same
+# binary and args, then drains and exits; the child waits for the DB lock and
+# binds the same fixed web port.
+OLD_PID="$DPID"
+read -r RS_CODE RS_BODY <<< "$(api_post 0 /api/restart '{}')"
+if [ "$RS_CODE" = "202" ]; then
+    pass "step 5b: POST /api/restart → 202"
+else
+    fail "step 5b: POST /api/restart → $RS_CODE $RS_BODY (want 202)"
+fi
+if wait_pid_exit "$OLD_PID" 60; then
+    pass "step 5b: the old daemon (pid $OLD_PID) exited after the restart request"
+    info "old daemon exit status: $EXIT_RC"
+    # The child is not this shell's child: find it by its command line (the
+    # per-run data dir makes it unique).
+    NEW_PID=$(pgrep -f -- "--data-dir $(node_dir 0) daemon" | grep -vx "$OLD_PID" | head -n 1 || true)
+    DPID="$NEW_PID"
+    [ -n "$NEW_PID" ] || fail "step 5b: no re-exec'd daemon runs for $(node_dir 0)"
+else
+    fail "step 5b: the old daemon (pid $OLD_PID) still runs 60 s after POST /api/restart"
+fi
+if wait_status "$STATUS_DEADLINE"; then
+    pass "step 5b: status answers from the re-exec'd daemon (pid $DPID) within ${STATUS_DEADLINE}s"
+else
+    fail "step 5b: status did not answer after POST /api/restart: $STATUS_ERR"
+fi
+BIND3=$(toml_get web_api bind | jq -r '. // empty' 2>/dev/null || true)
+AP3=$(api_port_file)
+if [ "$BIND3" = "$BIND" ] && [ "$AP3" = "$P" ]; then
+    pass "step 5b: config bind and api-port still $P after the self re-exec"
+else
+    fail "step 5b: after POST /api/restart bind='$BIND3' api-port='$AP3' (was $BIND)"
 fi
 
 echo "=== Step 6: an integer quota survives the Settings round-trip (daemon-i10) ==="

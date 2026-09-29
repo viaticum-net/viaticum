@@ -466,17 +466,17 @@ pub fn default_config_toml() -> String {
     format!(
         r#"# Viaticum configuration
 # Generated automatically — edit as needed.
-
-[daemon]
-# data_dir defaults to platform-native:
+#
+# This file lives in the data directory, chosen with `viaticum --data-dir <path>`;
+# the default is platform-native:
 #   Linux:   ~/.local/share/viaticum
 #   macOS:   ~/Library/Application Support/viaticum
 #   Windows: %APPDATA%/viaticum
-# log_level = "info"
+# Log level: the RUST_LOG environment variable (default "info"), e.g. RUST_LOG=debug.
 
 [storage]
 # soft_quota_gb = 50
-# reserve_gb = 10
+# disk_reserve_gb = 10
 
 [web_api]
 # The web UI and the API the CLI talks to (`viaticum status`, `viaticum open`).

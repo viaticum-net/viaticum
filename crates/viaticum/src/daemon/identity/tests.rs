@@ -705,3 +705,96 @@ fn default_config_write_keeps_an_existing_config() {
     write_default_config_if_absent(dir.path()).expect("write if absent");
     assert_eq!(web_api_after_init(dir.path()).bind, "127.0.0.1:9999");
 }
+
+// ============================================================
+// init template: every key names a config field (daemon-i10 class, W2)
+// ============================================================
+
+/// `key` of a `key = value` line (bare lower-case key), else None.
+fn template_key(line: &str) -> Option<&str> {
+    let (key, _) = line.split_once(" = ")?;
+    let bare_char = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_';
+    let bare = !key.is_empty() && key.chars().all(bare_char);
+    bare.then_some(key)
+}
+
+/// The init template with every commented-out `# key = value` example turned on,
+/// and the number of keys that are then live. An example whose key is already live
+/// in its table (the LAN `bind` alternative) stays commented: TOML refuses a
+/// duplicate key.
+fn template_with_examples_on() -> (String, usize) {
+    let text = default_config_toml();
+    let mut live = std::collections::HashSet::new();
+    let mut section = "";
+    for line in text.lines() {
+        if line.starts_with('[') {
+            section = line;
+        } else if let Some(key) = template_key(line) {
+            live.insert((section, key));
+        }
+    }
+    let mut out = String::new();
+    let mut section = "";
+    for line in text.lines() {
+        if line.starts_with('[') {
+            section = line;
+        }
+        let mut kept = line;
+        if let Some(rest) = line.strip_prefix("# ") {
+            let key = template_key(rest);
+            if key.is_some_and(|key| live.insert((section, key))) {
+                kept = rest;
+            }
+        }
+        out.push_str(kept);
+        out.push('\n');
+    }
+    (out, live.len())
+}
+
+// Mutation: an example key the daemon has no field for (`reserve_gb` for
+// `disk_reserve_gb`, a `[daemon]` table AppConfig does not have) → serde drops it
+// silently, the lookup in the loaded config finds nothing, test red.
+#[test]
+fn init_template_every_key_turned_on_is_read_by_the_daemon() {
+    let (text, expected) = template_with_examples_on();
+    assert!(
+        text.lines().any(|l| l.starts_with("soft_quota_gb = ")),
+        "the quota example was not turned on:\n{text}"
+    );
+    let dir = tmp_dir();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, &text).unwrap();
+    let cfg = viaticum_core::config::AppConfig::load(&path)
+        .unwrap_or_else(|e| panic!("the daemon loads the template with examples on: {e}\n{text}"));
+    let loaded = serde_json::to_value(&cfg).expect("config as JSON");
+    let doc: toml_edit::DocumentMut = text.parse().expect("the template parses");
+    let mut checked = 0;
+    for (section, item) in doc.as_table().iter() {
+        let table = item
+            .as_table()
+            .unwrap_or_else(|| panic!("top-level {section:?} is not a table"));
+        for (key, value) in table.iter() {
+            let got = loaded
+                .get(section)
+                .and_then(|s| s.get(key))
+                .unwrap_or_else(|| {
+                    panic!("[{section}] {key} is not a config field: the daemon ignores it")
+                });
+            let want = value.as_value().expect("a plain value");
+            let same = match want {
+                toml_edit::Value::Integer(i) => got.as_f64() == Some(*i.value() as f64),
+                toml_edit::Value::Float(f) => got.as_f64() == Some(*f.value()),
+                toml_edit::Value::String(s) => got.as_str() == Some(s.value().as_str()),
+                toml_edit::Value::Boolean(b) => got.as_bool() == Some(*b.value()),
+                other => panic!("[{section}] {key}: unexpected value kind {other}"),
+            };
+            assert!(
+                same,
+                "[{section}] {key} = {want} in the template, the daemon reads {got}"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, expected, "every live key was checked");
+}
