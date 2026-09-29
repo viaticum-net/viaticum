@@ -24,6 +24,15 @@ pub enum ConfigAdminError {
 
     #[error("validation: {field}: {msg}")]
     Validation { field: String, msg: String },
+
+    /// A field is present in config.toml but holds a value the editor cannot
+    /// represent. Reported instead of silently substituting the default, which a
+    /// later Save would write back over the user's value (daemon-i10).
+    #[error("config field {field} is not {expected}")]
+    Unreadable {
+        field: String,
+        expected: &'static str,
+    },
 }
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -82,22 +91,12 @@ impl ConfigAdmin {
         let doc: toml_edit::DocumentMut = raw.parse()?;
         let defaults = viaticum_core::config::AppConfig::default();
 
-        let disk_reserve_gb = doc
-            .get("storage")
-            .and_then(|s| s.get("disk_reserve_gb"))
-            .and_then(|v| v.as_float())
+        let disk_reserve_gb = read_gb(&doc, "storage", "disk_reserve_gb")?
             .unwrap_or(defaults.storage.disk_reserve_gb);
-        let soft_quota_gb = doc
-            .get("storage")
-            .and_then(|s| s.get("soft_quota_gb"))
-            .and_then(|v| v.as_float())
-            .unwrap_or(defaults.storage.soft_quota_gb);
-        let listen_port = doc
-            .get("network")
-            .and_then(|n| n.get("listen_port"))
-            .and_then(|v| v.as_integer())
-            .and_then(|i| u16::try_from(i).ok())
-            .unwrap_or(defaults.network.listen_port);
+        let soft_quota_gb =
+            read_gb(&doc, "storage", "soft_quota_gb")?.unwrap_or(defaults.storage.soft_quota_gb);
+        let listen_port =
+            read_port(&doc, "network", "listen_port")?.unwrap_or(defaults.network.listen_port);
 
         Ok(EditableConfig {
             storage: StorageEditable {
@@ -155,6 +154,48 @@ impl ConfigAdmin {
         std::fs::rename(&tmp, &self.config_path)?;
         Ok(())
     }
+}
+
+/// A gigabyte amount at `[section].key`: `None` when absent, the value when it is a
+/// TOML float or integer (`50` and `50.0` are the same amount, as the daemon's own
+/// serde parse reads them), `Unreadable` for any other type.
+fn read_gb(
+    doc: &toml_edit::DocumentMut,
+    section: &str,
+    key: &str,
+) -> Result<Option<f64>, ConfigAdminError> {
+    let Some(item) = doc.get(section).and_then(|s| s.get(key)) else {
+        return Ok(None);
+    };
+    if let Some(f) = item.as_float() {
+        return Ok(Some(f));
+    }
+    if let Some(i) = item.as_integer() {
+        return Ok(Some(i as f64));
+    }
+    Err(ConfigAdminError::Unreadable {
+        field: format!("{section}.{key}"),
+        expected: "a number",
+    })
+}
+
+/// A port at `[section].key`: `None` when absent, the value when it is a TOML
+/// integer in `0..=65535`, `Unreadable` otherwise (the daemon would refuse it too).
+fn read_port(
+    doc: &toml_edit::DocumentMut,
+    section: &str,
+    key: &str,
+) -> Result<Option<u16>, ConfigAdminError> {
+    let Some(item) = doc.get(section).and_then(|s| s.get(key)) else {
+        return Ok(None);
+    };
+    item.as_integer()
+        .and_then(|i| u16::try_from(i).ok())
+        .map(Some)
+        .ok_or_else(|| ConfigAdminError::Unreadable {
+            field: format!("{section}.{key}"),
+            expected: "a port number (integer 0..=65535)",
+        })
 }
 
 fn tmp_sibling(p: &Path) -> PathBuf {
