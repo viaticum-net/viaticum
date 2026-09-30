@@ -1,4 +1,5 @@
-// Tests for the holder's PoS memory (pos-i5). Pure logic: time is passed in.
+// Tests for the holder's PoS memory (pos-i5). Pure logic: time is passed in. The owner's
+// memory (pos-i6) is tested in `forwarded/tests.rs`.
 
 use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
 use viaticum_core::types::IdentityPub;
@@ -324,7 +325,7 @@ fn record_republish_of_unknown_challenge_is_a_no_op() {
 fn restart_memory_is_empty_and_every_live_challenge_is_computed_once() {
     // RAM only (INV-4): a fresh poll state knows nothing, so the first poll after a
     // restart computes every live challenge (the pre-registered burst).
-    let state = PosPollState::new(TS);
+    let state = PosPollState::new(crate::daemon::scheduler::new_pending_challenges(), TS);
     let ttl = state.answered.ttl_secs();
     assert!(state.answered.is_empty());
     for id in 0..5u8 {
@@ -463,7 +464,7 @@ fn production_caps_are_the_documented_ones() {
 
 #[test]
 fn begin_poll_forgets_what_expired() {
-    let mut state = PosPollState::new(TS);
+    let mut state = PosPollState::new(crate::daemon::scheduler::new_pending_challenges(), TS);
     let ttl = state.answered.ttl_secs();
     let c = challenge(1, vec![1], T0, ttl);
     state.answered.remember_no_answer(k(&c), T0);

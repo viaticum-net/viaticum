@@ -152,6 +152,78 @@ fn due_challenges_entry_identifies_block_and_holder() {
     assert_eq!(entries[0].holder_id, hid);
 }
 
+/// Block id `i` for the scale test: distinct for every u32.
+fn indexed_block(i: u32) -> SourceBlockId {
+    let mut id = [0u8; 32];
+    id[..4].copy_from_slice(&i.to_le_bytes());
+    SourceBlockId(id)
+}
+
+/// pos-i7: `due_challenges` is linear in the placements. 50 000 placements with
+/// `last_verified` in the reverse order: the former per-placement linear `find` is
+/// ~1.25·10⁹ comparisons (seconds even in release); the index is milliseconds. Every
+/// even placement was never verified (due), every odd one was verified just now (not
+/// due): the lookup must also find the right row.
+#[test]
+fn due_challenges_is_linear_in_placements() {
+    const N: u32 = 50_000;
+    let now = Timestamp(10_000_000);
+    let placements: Vec<SymbolPlacement> = (0..N)
+        .map(|i| make_placement(indexed_block(i), holder((i % 8) as u8), vec![(0, 10)]))
+        .collect();
+    let last_verified: Vec<(SourceBlockId, DeviceId, Option<Timestamp>)> = (0..N)
+        .rev()
+        .map(|i| {
+            let p = &placements[i as usize];
+            let ts = if i % 2 == 0 { None } else { Some(now) };
+            (p.source_block_id, p.holder_id, ts)
+        })
+        .collect();
+
+    let started = std::time::Instant::now();
+    let entries = due_challenges(&placements, &last_verified, now, |_| 0.5, 1);
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        entries.len(),
+        (N / 2) as usize,
+        "the never-verified half is due"
+    );
+    assert!(
+        entries.iter().all(|e| e.source_block_id.0[0] % 2 == 0),
+        "only never-verified placements are due"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "due_challenges over {N} placements took {elapsed:?} (must be linear)"
+    );
+}
+
+/// pos-i7: every entry carries the challenges-per-week its interval was derived from.
+#[test]
+fn due_challenges_reports_cpw_of_each_entry() {
+    let now = Timestamp(1_000_000);
+    // 10 symbols at trust 1.0 → cpw 1; 1500 symbols at trust 0.5 → cpw 3.
+    let small = make_placement(block_id(1), holder(2), vec![(0, 10)]);
+    let large = make_placement(block_id(3), holder(4), vec![(0, 1500)]);
+    let last_verified: Vec<(SourceBlockId, DeviceId, Option<Timestamp>)> = vec![
+        (small.source_block_id, small.holder_id, None),
+        (large.source_block_id, large.holder_id, None),
+    ];
+    let trust = |h: &DeviceId| if *h == holder(2) { 1.0 } else { 0.5 };
+
+    let entries = due_challenges(&[small, large], &last_verified, now, trust, 1);
+
+    let cpw_of = |b: SourceBlockId| {
+        entries
+            .iter()
+            .find(|e| e.source_block_id == b)
+            .map(|e| e.cpw)
+    };
+    assert_eq!(cpw_of(block_id(1)), Some(1));
+    assert_eq!(cpw_of(block_id(3)), Some(3));
+}
+
 // ─── outcome_from_verify ─────────────────────────────────────────────────────
 
 #[test]

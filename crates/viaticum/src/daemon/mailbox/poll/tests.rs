@@ -67,30 +67,58 @@ fn signed_challenge_payload() -> Vec<u8> {
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
-/// PosResponse dispatch forwards the decoded message to pos_response_tx.
-#[tokio::test]
-async fn poll_dispatches_pos_response_to_channel() {
-    let (tx, mut rx) = mpsc::channel::<PosHashResponseMsg>(16);
-    let expected_response = PosHashResponseMsg {
+/// A response to challenge `cid` (unsigned: the poll does not verify, the scheduler does).
+fn response_to(cid: [u8; 16]) -> PosHashResponseMsg {
+    PosHashResponseMsg {
         v: 1,
-        challenge_id: [7u8; 16],
+        challenge_id: cid,
         source_block_id: SourceBlockId([8u8; 32]),
         chain_hash: [99u8; 32],
         timestamp: Timestamp::now(),
         device_id: None,
         sig: [0u8; 64],
-    };
-    let payload = to_cbor(&expected_response).expect("encode");
-    let entry = make_entry(MailboxClass::PosResponse, make_identity(1), payload);
+    }
+}
 
-    super::dispatch_pos_response(&tx, entry);
+/// The owner's pending index with one challenge per id in `cids`.
+fn pending_for(cids: &[[u8; 16]]) -> crate::daemon::scheduler::PendingChallenges {
+    let mut index = crate::daemon::scheduler::PendingIndex::default();
+    for (i, cid) in cids.iter().enumerate() {
+        let holder_id = DeviceId([i as u8 + 1; 32]);
+        index.insert(
+            (SourceBlockId([8u8; 32]), holder_id),
+            crate::daemon::scheduler::PendingHashChallenge {
+                source_block_id: SourceBlockId([8u8; 32]),
+                holder_id,
+                esi_ranges: vec![(0, 1)],
+                expected_chain_hash: [0u8; 32],
+                issued_at: Timestamp::now(),
+                challenge_id: *cid,
+                holder_master: IdentityPub(holder_id.0),
+            },
+        );
+    }
+    Arc::new(tokio::sync::Mutex::new(index))
+}
+
+/// A PosResponse to a pending challenge is forwarded to pos_response_tx, decoded.
+#[tokio::test]
+async fn poll_dispatches_pos_response_to_channel() {
+    let (tx, mut rx) = mpsc::channel::<PosHashResponseMsg>(16);
+    let payload = to_cbor(&response_to([7u8; 16])).expect("encode");
+    let entry = make_entry(MailboxClass::PosResponse, make_identity(1), payload);
+    let mut pos = PosPollState::new(pending_for(&[[7u8; 16]]), 1);
+    let mut counts = PollCounts::default();
+
+    super::forward_pos_responses(&mut pos, &tx, vec![entry], Timestamp::now().0, &mut counts).await;
 
     let received = rx.try_recv().expect("message should be in channel");
     assert_eq!(received.challenge_id, [7u8; 16]);
     assert_eq!(received.chain_hash, [99u8; 32]);
+    assert_eq!(counts.forwarded, 1);
 }
 
-/// PosResponse with invalid payload is silently dropped (no panic).
+/// PosResponse with invalid payload is dropped and counted (no panic).
 #[tokio::test]
 async fn poll_pos_response_bad_payload_does_not_panic() {
     let (tx, mut rx) = mpsc::channel::<PosHashResponseMsg>(16);
@@ -99,11 +127,14 @@ async fn poll_pos_response_bad_payload_does_not_panic() {
         make_identity(1),
         vec![0xFF, 0x00],
     );
+    let mut pos = PosPollState::new(pending_for(&[[7u8; 16]]), 1);
+    let mut counts = PollCounts::default();
 
-    super::dispatch_pos_response(&tx, entry);
+    super::forward_pos_responses(&mut pos, &tx, vec![entry], Timestamp::now().0, &mut counts).await;
 
     // Nothing should be sent — invalid payload is dropped gracefully.
     assert!(rx.try_recv().is_err());
+    assert_eq!(counts.undecodable, 1);
 }
 
 /// CROWN-1 РС3.1 / AC-16 (mailbox-i37): a SelfPointer polled from the master box —
@@ -124,28 +155,36 @@ async fn self_pointer_in_master_box_is_dropped() {
     }
 }
 
-/// PosResponse channel full: warn but do not panic (N-5).
+/// N-5 / pos-i6: a full channel defers the response to the next poll — it is counted,
+/// not marked as sent, and the next poll (with room in the channel) sends it.
 #[tokio::test]
-async fn poll_pos_response_channel_full_does_not_panic() {
-    // Channel capacity = 1; fill it first.
-    let (tx, _rx) = mpsc::channel::<PosHashResponseMsg>(1);
-    let response = PosHashResponseMsg {
-        v: 1,
-        challenge_id: [1u8; 16],
-        source_block_id: SourceBlockId([3u8; 32]),
-        chain_hash: [2u8; 32],
-        timestamp: Timestamp::now(),
-        device_id: None,
-        sig: [0u8; 64],
-    };
-    let payload = to_cbor(&response).expect("encode");
-    // Fill the channel.
-    tx.try_send(response.clone()).expect("first send");
+async fn full_channel_defers_response_to_next_poll() {
+    let (tx, mut rx) = mpsc::channel::<PosHashResponseMsg>(1);
+    let cid = [1u8; 16];
+    // Fill the channel with something else.
+    tx.try_send(response_to([0xEE; 16])).expect("first send");
+    let entry = make_entry(
+        MailboxClass::PosResponse,
+        make_identity(1),
+        to_cbor(&response_to(cid)).expect("encode"),
+    );
+    let mut pos = PosPollState::new(pending_for(&[cid]), 1);
+    let now = Timestamp::now().0;
 
-    // Second send via dispatch_pos_response should WARN and not panic.
-    let entry = make_entry(MailboxClass::PosResponse, make_identity(1), payload);
-    // Should not panic — just warn.
-    super::dispatch_pos_response(&tx, entry);
+    let mut counts = PollCounts::default();
+    super::forward_pos_responses(&mut pos, &tx, vec![entry.clone()], now, &mut counts).await;
+    assert_eq!((counts.forwarded, counts.deferred_full), (0, 1));
+    assert!(
+        pos.forwarded.is_empty(),
+        "a deferred response is not marked"
+    );
+
+    // The scheduler drains the channel; the next poll sends the deferred response.
+    assert_eq!(rx.try_recv().expect("filler").challenge_id, [0xEE; 16]);
+    let mut counts = PollCounts::default();
+    super::forward_pos_responses(&mut pos, &tx, vec![entry], now + 4, &mut counts).await;
+    assert_eq!((counts.forwarded, counts.deferred_full), (1, 0));
+    assert_eq!(rx.try_recv().expect("deferred response").challenge_id, cid);
 }
 
 // ─── T-7: DropNotice dispatch tests ──────────────────────────────────────────
@@ -1563,7 +1602,7 @@ async fn generic_entry_is_ignored_without_effect() {
     let entry = make_entry(MailboxClass::Generic, my_master, vec![0xDE, 0xAD]);
 
     // Must not panic, must not publish, must not forward anything.
-    let mut pos = PosPollState::new(1);
+    let mut pos = PosPollState::new(pending_for(&[]), 1);
     let mut counts = PollCounts::default();
     super::dispatch_entry(
         &router,
@@ -2179,6 +2218,7 @@ async fn poll_done_line_is_printed_for_an_empty_poll() {
     let fut = super::run_mailbox_poll(
         router,
         pos_tx,
+        pending_for(&[]),
         Arc::new(NoAnswerHandler),
         Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx)),
         Arc::new(ProcessorDeleteHandler::new(db.clone())),
@@ -2277,7 +2317,7 @@ async fn poll_forgets_an_answered_challenge_one_ttl_later() {
     let revocation_handler: Arc<dyn crate::daemon::processor::RevocationMailboxHandler> = Arc::new(
         crate::daemon::processor::ProcessorRevocationHandler::new(db.clone()),
     );
-    let mut pos = PosPollState::new(900);
+    let mut pos = PosPollState::new(pending_for(&[]), 900);
     let ttl = pos.answered.ttl_secs();
     let now = Timestamp::now().0;
 
@@ -2558,4 +2598,170 @@ async fn forgery_seen_first_does_not_block_the_honest_challenge() {
         1,
         "the honest challenge is answered"
     );
+}
+
+// ─── pos-i6: the owner forwards only pending responses, once ───────────────────
+
+/// A postman that serves the same `entries` on every fetch (the responses live in the
+/// owner's box until their TTL).
+struct RepeatFetchSender {
+    entries: Vec<MailboxEntry>,
+}
+
+#[async_trait::async_trait]
+impl MailboxNetworkSender for RepeatFetchSender {
+    async fn send_store(
+        &self,
+        _device: DeviceId,
+        req: MailboxStoreRequest,
+    ) -> anyhow::Result<MailboxStoreResponse> {
+        Ok(MailboxStoreResponse::Ack {
+            msg_id: req.entry.msg_id,
+        })
+    }
+
+    async fn send_fetch(
+        &self,
+        _device: DeviceId,
+        _req: MailboxFetchRequest,
+    ) -> anyhow::Result<MailboxFetchResponse> {
+        Ok(MailboxFetchResponse {
+            v: 1,
+            entries: self.entries.clone(),
+            served_msg_ids: vec![],
+        })
+    }
+}
+
+/// pos-i6 (M0-b, M0-b′): three polls of a box holding a response to a pending challenge
+/// and two responses to challenges not pending, the scheduler not reading the channel:
+/// the pending one is in the channel once, the others never; nothing is WARNed about.
+#[tokio::test]
+async fn poll_forwards_only_pending_responses_once() {
+    let db = Db::open_in_memory().expect("db");
+    let my_master = make_identity(0xAA);
+    let pending_cid = [1u8; 16];
+    let entries: Vec<MailboxEntry> = [pending_cid, [2u8; 16], [3u8; 16]]
+        .iter()
+        .map(|cid| MailboxEntry {
+            msg_id: *cid,
+            ..make_entry(
+                MailboxClass::PosResponse,
+                my_master,
+                to_cbor(&response_to(*cid)).expect("encode"),
+            )
+        })
+        .collect();
+    let router = router_with_one_peer(
+        &db,
+        Arc::new(RepeatFetchSender { entries }) as Arc<dyn MailboxNetworkSender>,
+    );
+    let (pos_tx, mut pos_rx) = mpsc::channel::<PosHashResponseMsg>(16);
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let challenge_handler: Arc<dyn super::PosMailboxChallengeHandler> = Arc::new(NoAnswerHandler);
+    let drop_handler: Arc<dyn super::DropNoticeHandler> =
+        Arc::new(ProcessorDropHandler::new(db.clone(), repair_tx));
+    let delete_handler: Arc<dyn DeleteMailboxHandler> =
+        Arc::new(ProcessorDeleteHandler::new(db.clone()));
+    let revocation_handler: Arc<dyn crate::daemon::processor::RevocationMailboxHandler> = Arc::new(
+        crate::daemon::processor::ProcessorRevocationHandler::new(db.clone()),
+    );
+    let mut pos = PosPollState::new(pending_for(&[pending_cid]), 900);
+    let now = Timestamp::now().0;
+    let mut total = PollCounts::default();
+
+    for poll in 0..3u64 {
+        let counts = super::poll_once(
+            &router,
+            &pos_tx,
+            &mut pos,
+            &challenge_handler,
+            &drop_handler,
+            &delete_handler,
+            &revocation_handler,
+            &my_master,
+            900,
+            now + 4 * poll,
+        )
+        .await
+        .expect("poll");
+        total.forwarded += counts.forwarded;
+        total.not_pending += counts.not_pending;
+        total.in_flight += counts.in_flight;
+    }
+
+    let mut in_channel = vec![];
+    while let Ok(r) = pos_rx.try_recv() {
+        in_channel.push(r.challenge_id);
+    }
+    assert_eq!(
+        in_channel,
+        vec![pending_cid],
+        "one copy, only the pending one"
+    );
+    assert_eq!(
+        (total.forwarded, total.not_pending, total.in_flight),
+        (1, 6, 2)
+    );
+    assert_eq!(pos.forwarded.len(), 1);
+}
+
+/// pos-i6-b: the daemon's poll → scheduler channel takes a poll of 3000 responses to
+/// pending challenges (the old channel of 256 deferred all but 256 of them to later
+/// polls, and a response deferred past its TTL became a false timeout), the scheduler
+/// not reading meanwhile: every one is forwarded once, none deferred.
+#[tokio::test]
+async fn production_channel_forwards_a_3000_response_poll_without_deferring() {
+    const BURST: u16 = 3000;
+    let cids: Vec<[u8; 16]> = (0..BURST)
+        .map(|i| {
+            let mut cid = [0u8; 16];
+            cid[..2].copy_from_slice(&i.to_le_bytes());
+            cid
+        })
+        .collect();
+    let mut index = crate::daemon::scheduler::PendingIndex::default();
+    for (i, cid) in cids.iter().enumerate() {
+        let mut block = [0u8; 32];
+        block[..2].copy_from_slice(&(i as u16).to_le_bytes());
+        let holder_id = DeviceId([7u8; 32]);
+        index.insert(
+            (SourceBlockId(block), holder_id),
+            crate::daemon::scheduler::PendingHashChallenge {
+                source_block_id: SourceBlockId(block),
+                holder_id,
+                esi_ranges: vec![(0, 1)],
+                expected_chain_hash: [0u8; 32],
+                issued_at: Timestamp::now(),
+                challenge_id: *cid,
+                holder_master: IdentityPub(holder_id.0),
+            },
+        );
+    }
+    let entries: Vec<MailboxEntry> = cids
+        .iter()
+        .map(|cid| MailboxEntry {
+            msg_id: *cid,
+            ..make_entry(
+                MailboxClass::PosResponse,
+                make_identity(1),
+                to_cbor(&response_to(*cid)).expect("encode"),
+            )
+        })
+        .collect();
+    let (tx, mut rx) = super::pos_response_channel();
+    let mut pos = PosPollState::new(Arc::new(tokio::sync::Mutex::new(index)), 1);
+    let mut counts = PollCounts::default();
+
+    super::forward_pos_responses(&mut pos, &tx, entries, Timestamp::now().0, &mut counts).await;
+
+    assert_eq!(
+        (counts.forwarded, counts.deferred_full),
+        (u32::from(BURST), 0)
+    );
+    let mut received = std::collections::HashSet::new();
+    while let Ok(r) = rx.try_recv() {
+        assert!(received.insert(r.challenge_id), "one copy of each");
+    }
+    assert_eq!(received.len(), usize::from(BURST));
 }

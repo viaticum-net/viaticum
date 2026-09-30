@@ -30,10 +30,11 @@
 //   mailbox dispatch handlers, not through this Processor's inbound path.
 //
 // Design note: PosHashResponseMsg carries source_block_id (bound by the holder's
-// signature so a postman cannot retarget a captured response). The owner still locates
-// the matching pending challenge by challenge_id in the shared PendingChallenges map
-// (written by Scheduler when the challenge was issued), then verifies the response
-// signature against the master of pending.holder_id before applying any outcome (CS-ID-1).
+// signature so a postman cannot retarget a captured response). The owner's Scheduler
+// (not this Processor) locates the matching pending challenge by challenge_id in its
+// PendingIndex (written when the challenge was issued, read by the mailbox poll loop),
+// then verifies the response signature against the holder master captured in the pending
+// before applying any outcome (CS-ID-1, CS-POS-3).
 
 use std::collections::HashMap;
 use std::path::PathBuf;

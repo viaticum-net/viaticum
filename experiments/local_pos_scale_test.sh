@@ -15,8 +15,8 @@
 #               the issue tick stays short, also with a stopped postman (O's log);
 #               DR readiness holds (O's status); the laptop passes every day (O's log).
 # Adversarial:  H9 SIGKILL schedule; H8 SIGSTOP/SIGCONT (sleeping laptop, half-open
-#               connections); H1 restart mid-run (memory lost); O off for 5 min then restart
-#               (everything due at once).
+#               connections); H1 restart mid-run (memory lost); O off for 12 min (about a
+#               scaled week) then restart (everything due at once).
 # Cannot close: T1 at 100k holdings (see СТ-L); healing of a response lost at every postman
 #               (unit only); a world of 30-40; kernel sleep and Wi-Fi; clock jumps; the
 #               laptop's online window is 30 s real = 7.5 scaled h (startup and transport are
@@ -30,7 +30,8 @@
 #               1b. O writes 995 files -> within 60 min 1000 `backup: pipeline complete` lines and
 #                    1000 files restorable on O, else FAIL(setup) with the pace (pace = NOTE)
 #               2.  W1+W2: `scheduler: PoS issue tick` elapsed_ms p95 <= 800; gap between O's
-#                    ledger accruals <= 12 s (pos-i7)
+#                    ledger accruals <= 12 s; ticks cut by the budget, deferred, issued per
+#                    placement per scaled week = NOTE (pos-i7, pos-i7-a)
 #               3.  W2, H1..H8, per challenge_id seen in W2: exactly 1 `responding with chain
 #                    hash`; `PosResponse published` <= 4 + its 0-ack lines; every challenge first
 #                    computed in [W2 start, W2 end - 200 s] has >= 1 `cached=true`; rchar growth
@@ -45,7 +46,9 @@
 #                    the first true within one scaled week, else FAIL "premise: DR did not become
 #                    ready" (pos-i8)
 #               7.  H9, 28 cycles over W1..W4: 0 timeouts to H9; >= 1 Pass from H9 on O in every
-#                    online window; in every window H9 computes >= 90 % of its live challenges
+#                    online window with something to answer (a challenge to H9 issued while it
+#                    was off, or up to 15 s before the window's end), and >= 14 such windows;
+#                    windows with nothing to answer = NOTE; in every window H9 computes >= 90 % of its live challenges
 #                    (issued by O to H9 in the 672 s before its start), < 90 % = FAIL "finding:
 #                    the laptop does not keep up"; T_up = NOTE (4r-i113, pos-i5);
 #                    rchar per online window = NOTE (pos-i5-c, the price of a restart)
@@ -57,19 +60,145 @@
 #                    computed exactly twice, the others once; rchar growth over the first poll
 #                    with entries <= 1.5 x sum(bytes of the blocks of H1's live challenges) +
 #                    1.5 x R0 x (elapsed / week); O: 0 timeouts to H1, WARN unknown <= timeouts
-#                    (pos-i5, pos-i6)
-#               8.  end of W4: O SIGTERM for 300 s (~3 scaled days), start: the first issue tick
-#                    has due >= 0.8 x placements (elapsed_ms = NOTE); then half a week: 0
-#                    timeouts, every new challenge resolved (+120 s margin), WARN unknown <=
-#                    timeouts, ledger gap <= 12 s outside the first tick (the first = NOTE, K-5)
-#                    (pos-i6, pos-i7)
+#                    (pos-i5, pos-i6). The first poll is awaited until W5 - 10 s; later than
+#                    180 s after the start = NOTE
+#               8.  end of W4: O SIGTERM for 720 s (about a scaled week), start: the first issue
+#                    tick has due >= 0.8 x placements (elapsed_ms = NOTE); T_off shorter than
+#                    one challenge interval + 30 s (604800 / (cpw_min x 900) + 30, cpw_min read
+#                    from O's issue ticks) = FAIL(setup), not a product FAIL; then 600 s past the
+#                    first tick: every new challenge resolved (+120 s margin); with >= 1 issue
+#                    tick and >= 1 resolution after the restart (else FAIL "nothing to judge"):
+#                    0 timeouts, WARN unknown <= timeouts; >= 2 ledger rows and ledger gap
+#                    <= 12 s outside the first tick (the first = NOTE, K-5); the time until a
+#                    tick with deferred = 0 = NOTE (pos-i6, pos-i7, pos-i7-a)
 #
-# Pre-registered on the current code (СТ-0a in, СТ-0c not yet):
-#   steps 2, 7b, 8 (issue-tick bars) are RED: the `scheduler: PoS issue tick` line comes with
-#   СТ-0c. Step 4 is RED (the owner still forwards every live answer: WARN full / unknown
-#   challenge_id). Step 5's owner half and step 8's WARN bar are RED for the same reason.
-#   Step 3 and step 5's holder half are the СТ-0a proof. O's log grows by tens of MB per
-#   minute until СТ-0c: run the baseline with STOP_AFTER=4.
+# Pre-registered on the current code (СТ-0a and СТ-0c in, with its rounds 2 and 3: the
+# budgeted issue tick, publishes settled by the run loop, blocks least recently tried first):
+#   every step GREEN, except 7b's poll bar: ROUGH "known: poll waits for the slowest postman"
+#   (routing poll, line B's Р-5), not a FAIL. Step 4 is the СТ-0c proof (the owner forwards
+#   only answers to pending challenges, once: no WARN unknown challenge_id; deferred_full
+#   = NOTE), step 8 its burst door (O back after about a scaled week), step 2 the issue-tick
+#   line.
+#   Expected on the issue tick (steps 2, 7b): the owner is saturated — `deferred > 0` on
+#   most ticks is the steady state, not a fault (pos-i7-b: demand ≈ 95-107 challenges per
+#   4 s tick against ≈ 40 issued: 5 blocks of 8, re-encode ~110 ms each, serial). A
+#   saturated tick starts its last block by 800 - 2 x 110 = 580 ms and ends by ≈ 700 ms;
+#   every wait of the tick (a block's preparation, a publish slot) ends at 760 ms (95 % of
+#   the budget); publishes no longer count. Expected elapsed_ms p95 ≈ 650-770 in step 2
+#   and in 7b. Over 800 only if the scheduler's async thread itself is held: its own
+#   synchronous scan (`scan_ms`, 45-90 ms in run 20260929-224644) or a runtime stalled by
+#   synchronous database commits of OTHER tasks (the postman contact commits, the main
+#   one, are off the async workers since round 4; see below). Step 8: DRAIN8 = "never"
+#   expected.
+#   Before СТ-0c (СТ-0a only) steps 2, 7b, 8 were RED (no issue-tick line) and step 4 RED
+#   (every live answer forwarded, O's log tens of MB per minute: STOP_AFTER=4).
+#
+# Changes after run 20260929-193455 (pos-i7-a; written before the next run, bars unchanged
+# unless stated):
+#   - the product change: the issue tick is bounded by a budget (a fifth of the PoS tick
+#     period = 800 ms here), publishes 16 at a time, stamps each challenge at its publish;
+#     what the budget cuts stays due (`deferred` on the tick line). Before it, one tick with
+#     ~8 000 due challenges held the scheduler's loop for minutes (step 8: the first tick
+#     after O's restart never ended in 458 s; step 2: p95 2.8 s in a quiet window).
+#   - step 2: + NOTE on `deferred` and the issue rate. Bars unchanged.
+#   - step 5: the wait for H1's first poll with entries: 180 s -> until W5 - 10 s (~590 s);
+#     later than 180 s = NOTE. The 180 s was this script's wait, not a bar of the passport:
+#     the step judges compute counts, the rchar over the first poll (its bound already scales
+#     R0 by the elapsed time) and O's timeouts, none of which depends on how soon the first
+#     poll comes. A first poll that never comes is still a FAIL. Why it can be late: H1's
+#     `mailbox_poll: poll done` is logged only after the poll has computed and published
+#     every live challenge it fetched (`poll.rs`, the dispatch loop before the line), and
+#     after a restart its memory is empty, so the first poll computes every live challenge
+#     again (pos-i5-c) — at ~1 000 live challenges, minutes.
+#   - step 8: the judged window: half a week (336 s) past the first tick -> 600 s. With the
+#     budget the ~8 000 due challenges go out over many ticks, and the backlog does not
+#     drain at all: demand in steady state (≈ 95-107 per 4 s tick) is above what a tick
+#     issues (≈ 18-54), so `deferred > 0` is the steady state and DRAIN8 = "never" is the
+#     expected NOTE (pos-i7-b). 600 s gives ~150 ticks under backlog for the bars (every
+#     issued challenge resolved, ledger gap); the time to deferred = 0 is a NOTE, not a bar.
+#     New guards, not new bars: the timeout and unknown bars count bad events and passed on
+#     an owner that issued and resolved nothing; they now need >= 1 issue tick and >= 1
+#     resolution after the restart. `ledger_gap` is 0.0 for fewer than two rows (step 2
+#     guards ROWS = 0); step 8 now needs >= 2 rows.
+#   - mutation (b'): its mechanism was the backlog of thousands of responses queued behind
+#     one long tick. The burst now goes out over ticks and the loop resolves between them,
+#     so (b') may stay GREEN here; the pre-declared fallback (К0-6, unit-only) applies.
+#   - known, not changed: "0 timeouts after the restart" cannot redden in step 8. Pending
+#     lives in RAM (empty after the restart) and the scaled pending timeout is 1352 s
+#     (14 d 2 h / 900), longer than the window (600 + 120 s). Kept as a tripwire only.
+#
+# Changes after the review of round 2 (СТ-0c round 3, pos-i7-c; bars unchanged):
+#   - the product change: the tick no longer waits for its publishes (they are settled by
+#     the run loop; a placement being published is skipped like a pending one); a block
+#     starts only with a spare block of headroom (elapsed + 2 x slowest block <= budget);
+#     a wait for a publish slot ends at 95 % of the budget; 9 publishes in flight instead
+#     of 16; the blocks are ordered by the later of `last_verified` and the last attempt
+#     (in RAM), so blocks that cannot be served do not hold the head of every tick.
+#   - the tick line: `issued` now counts the publishes the tick started (they reach
+#     pending on their first Ack, `PoS hash challenge issued via mailbox`); + `blocks`,
+#     `in_flight`, `slowest_publish_ms`; `zero_ack` and `slowest_publish_ms` cover the
+#     publishes settled since the previous tick line. Step 2's NOTE reads them; step 8's
+#     first-tick `read` takes the three new fields.
+#
+# Changes after run 20260929-224644 (СТ-0c round 4; bars unchanged). The run: steps 3-8
+# PASS; step 2 FAIL p95 974 > 800, 7b FAIL p95 834; every one of 336 W1+W2 ticks cut by
+# the budget; slowest_publish_ms p95 1295 (predicted 20-100).
+#   - the cause, from O's log (node-00): of 1060 ticks, 111 over 800 ms, mostly with 2-3
+#     blocks (elapsed up to 2388 ms), i.e. after the start rule had admitted the last
+#     block with headroom. In those ticks the scheduler logged nothing for 0.5-2 s and
+#     then settled publishes that had finished long before, in one burst (2388 ms tick:
+#     silence 1.99 s, then 3 settles within 0.3 ms and the tick line) — it was not
+#     waiting in `join_next`, which wakes at each finished publish. Several ticks settled
+#     publishes 0.2-0.8 s past the 760 ms slot deadline: the deadline's timer did not
+#     fire. Overrun ticks had slow first Acks (slowest_publish_ms median 521, p90 992 vs
+#     216 / 641 in the others). The link: every Ack is recorded as a postman contact — a
+#     durable redb commit — on the async worker that got it; 9 publications × ~9 postmen
+#     put dozens of workers in `begin_write` behind one slow commit, the runtime (timers,
+#     the scheduler task) stalled until the commits drained, and the tick's last block
+#     finished a second late. Reproduced by the unit
+#     `issue_tick_keeps_its_budget_while_a_commit_holds_the_database` (a held write lock,
+#     2 workers: the tick took 2.0 s against 800 ms before the fix).
+#   - the product change: (1) the contact commit runs in `block_in_place` on the daemon's
+#     multi-thread runtime, so a waiting commit no longer holds an async worker (same
+#     order: the contact is still recorded before the Ack counts; [cross:B] routing);
+#     (2) a block's whole preparation (database reads, source read, encode) is one
+#     blocking task the tick waits for only until the 95 % deadline — past it the block is
+#     cut (`cut_blocks`) and stays due; (3) the tick line gains `cut_blocks`, `scan_ms`
+#     (the synchronous scan before the first block) and `slowest_block_ms`, so the next
+#     run breaks `elapsed_ms` down without guessing. Step 2's NOTE reads them.
+#
+# Changes after run 20260930-021936 (step 7's Pass bar; written before the next run). The
+# run: every step PASS except step 7 "no Pass from H9 on O in windows: 7" (T_up 11 s, the
+# computed >= 90 % bar PASS).
+#   - evidence (O's log, H9 = node-09): O issued nothing to H9 from t=1784 to t=1913 (133 s,
+#     while it issued ~40 challenges a tick to the others): 0 challenges to H9 while it was
+#     off before window 7 (t 1788-1853) and 0 in the window. H9 did its part: it started at
+#     1853, fetched 712 live challenges and published 712 answers with an Ack (cached=false)
+#     by 1864 — all answers to challenges already resolved in earlier windows (H9's memory
+#     is lost at each SIGKILL, pos-i5-c), so O dropped them as not pending. Nothing to answer,
+#     so no Pass possible. Window 8 had 1 (one issue at t=1913).
+#   - why a gap: not starvation. The time from a Pass to the next challenge of the same
+#     placement is the same for H9 and the always-on H1 (p10/p50/p90 686/774/1391 s vs
+#     683/775/1434 s over the run): cpw 1 (interval 672 s) + the queue of the saturated owner
+#     (pos-i7-b). But H9 answers only in its 30 s windows, so its placements are verified in
+#     bursts and come due again in bursts ≈ 775 s ≈ 8.07 windows later: its challenge load
+#     is a pattern that repeats every ~8 windows. A slot of that pattern that happens to be
+#     empty stays empty — windows 7, 15 and 22-24 of this run dip (0, 36, 43/37/11 Passes;
+#     windows 8, 16, 24 are rescued by challenges issued during the window). The previous
+#     quiet run (d6c7182) had no empty slot (min 44 issued while off). Whether a slot is
+#     empty is set by the phase of the first weeks, so it is close to a coin flip per run;
+#     nothing in the product spreads a holder's challenges over its days.
+#   - the bar: >= 1 Pass is required only in a window where H9 had something to answer — a
+#     challenge issued while it was off before the window, or up to 15 s before its end; a
+#     window with none is a NOTE (with the longest gap between issues to H9); and at least
+#     half of the 28 windows must be judged, so the bar cannot pass on nothing. What the bar
+#     guards is unchanged: answers of the laptop lost on the owner's side (pre-СТ-0: the
+#     channel of 256) make a judged window red. 4r-i113's "credited every day" is the pair's
+#     confirmation (W_conf 14 d 3 h), which one challenge per scaled week keeps (7a-7c).
+#   - open question (proposed intent item, not decided): should an intermittent holder be
+#     challenged every day it is online? Today a holder with hundreds of placements can go
+#     an online day without a challenge. Recommendation: no — W_conf covers weeks; if yes,
+#     spread due times with jitter.
 #
 # Implementation notes (how the passport is executed, not what it claims):
 #   - "ledger accrual" is measured on O's `pair-ledger row` lines (target viaticum::ledger,
@@ -78,8 +207,8 @@
 #     one row per accrued pair, so the gap between rows is the gap between ticks.
 #   - step 1b gates on "restorable" (>= k symbols on Alive placements, GET /api/files): the
 #     status has no per-block ">= 1 Alive" count. Stronger than the passport's bar.
-#   - step 4 matches an issue to its resolution by (block_id, holder): the issue line has no
-#     challenge_id until СТ-0c, and one (block, holder) has at most one pending challenge.
+#   - steps 4 and 8 match an issue to its resolution by challenge_id (both lines carry it
+#     since СТ-0c).
 #   - "challenge alive" on a holder is judged from the time the holder first computed it
 #     (issue -> compute is a few polls): expiry ~ first compute + 672 s. Margins: 200 s for the
 #     first cached re-publish (step 3), 60 s after the restart for "alive" (step 5).
@@ -89,7 +218,7 @@
 #     run after that step; later steps print "not run" and do not count.
 #   - The test dir is removed on PASS and kept otherwise.
 #
-# Mutations (step 3 is the СТ-0a proof; which bar reddens):
+# Mutations (step 3 is the СТ-0a proof, step 4 the СТ-0c one; which bar reddens):
 #   (a)  memory off (compute on every poll) -> "computed exactly once" (a challenge's compute
 #        count != 1). The rchar bar stays GREEN: it sums the block bytes per compute line,
 #        so more computes raise the bound with the reads; it guards reads outside the
@@ -97,6 +226,18 @@
 #   (a') re-publish on every poll -> "published <= 4 + 0-acks" (rchar green: mutations differ)
 #   (c)  no quarter-TTL re-publish -> "re-published from memory (cached=true)"
 #   (B1) no sweep at the poll's start -> "memo_answered <= 1.5 x live"
+#   (b)  owner forwards every response (no pending filter, M0-b) -> step 4 "WARN unknown
+#        challenge_id <= timeouts" (STOP_AFTER=4)
+#   (b') no "forwarded" memory (M0-b') -> step 8 "WARN unknown <= timeouts" (full run).
+#        Mechanism: after O's absence every placement is due at once, and the scheduler
+#        works through a backlog of thousands of queued responses, each with redb commits;
+#        a challenge still pending in that backlog gets its response forwarded again by the
+#        next polls, and the second copy lands after the first resolved it. Not only a stall
+#        longer than the poll period: the drain backlog alone makes the copies.
+#        Pre-declared (spec К0-6): a GREEN step 8 under (b') counts as "unit-only" — the
+#        proof of M0-b' is then the unit `second_copy_of_pending_response_is_not_selected`
+#        (pos_memo/forwarded/tests.rs), not this scenario.
+#   (d)  no postman contact in routing poll AND fanout Ack (M0-d) -> step 6 dr_ready
 #
 # Usage:
 #   The full run takes 1.5-2 h (STOP_AFTER=4 about 1 h): longer than the 1800 s timeout of
@@ -138,6 +279,10 @@ BAR_MEMO_RATIO=1.5
 FIRST_CACHED_MARGIN=200
 ALIVE_MARGIN=60
 STEP8_MARGIN=120
+STEP8_RUN=600       # step 8: judged window past O's first tick, s (the backlog drains over ticks)
+H1_FIRST_POLL_NOTE=180  # step 5: a first poll of H1 later than this after its start = NOTE
+H9_ANSWER_MARGIN=15 # step 7: an issue this close to a window's end is not expected answered in it
+O_OFF=720           # step 8: O off, s (> one challenge interval 672 s at cpw 1, + 30 s)
 
 E2E_BASE="${E2E_BASE:-$HOME/e2e-runs}"
 TEST_DIR="$E2E_BASE/pos-scale-$$"
@@ -297,11 +442,14 @@ restorable_count() {
 }
 
 # Owner-side events (O's log). Times are seconds since T_BASE.
-o_issues() { events_grep "$(node_log "$O")" "PoS hash challenge issued via mailbox" block_id holder_id; }
-o_resolved() { events_grep "$(node_log "$O")" "mailbox PosResponse resolved" block_id holder outcome; }
-o_timeouts() { events_grep "$(node_log "$O")" "PoS challenge timed out" block_id holder_id; }
+o_issues() { events_grep "$(node_log "$O")" "PoS hash challenge issued via mailbox" block_id holder_id challenge_id; }
+o_resolved() { events_grep "$(node_log "$O")" "mailbox PosResponse resolved" block_id holder outcome challenge_id; }
+o_timeouts() { events_grep "$(node_log "$O")" "PoS challenge timed out" block_id holder_id challenge_id; }
 o_unknown() { events_grep "$(node_log "$O")" "unknown challenge_id" challenge_id; }
-o_issue_ticks() { events_grep "$(node_log "$O")" "scheduler: PoS issue tick" elapsed_ms due issued; }
+# Fields: $3 elapsed_ms $4 due $5 issued $6 cpw_min $7 deferred $8 blocks $9 slowest_publish_ms
+# $10 in_flight $11 cut_blocks $12 scan_ms $13 slowest_block_ms (by name, so the order in
+# the log line does not matter).
+o_issue_ticks() { events_grep "$(node_log "$O")" "scheduler: PoS issue tick" elapsed_ms due issued cpw_min deferred blocks slowest_publish_ms in_flight cut_blocks scan_ms slowest_block_ms; }
 o_ledger_rows() { events_grep "$(node_log "$O")" "pair-ledger row" master; }
 
 # Holder-side events (the holder's own log).
@@ -316,17 +464,19 @@ h_polls() { events_grep "$(node_log "$1")" "mailbox_poll: poll done" elapsed_ms 
 count_in() { in_window "$1" "$2" | awk 'NF' | wc -l | tr -d ' '; }
 
 # unresolved_issues A B DEADLINE [HOLDER16] : O's issues in [A, B] (optionally to one
-# holder) without a `mailbox PosResponse resolved` for the same (block, holder) after the
-# issue and by DEADLINE. Prints "<count> <issued>".
+# holder) without a `mailbox PosResponse resolved` of the same challenge_id by DEADLINE.
+# Prints "<count> <issued>".
 unresolved_issues() {
     local a="$1" b="$2" dl="$3" h="${4:-}"
-    { o_resolved | awk '{ print "R", $1, $3, $4 }'
-      o_issues | in_window "$a" "$b" | awk -v h="$h" 'h == "" || $4 == h { print "I", $1, $3, $4 }'
+    { o_resolved | awk '{ print "R", $1, $6 }'
+      o_issues | in_window "$a" "$b" | awk -v h="$h" 'h == "" || $4 == h { print "I", $1, $5, $3, $4 }'
     } | awk -v dl="$dl" '
-        $1 == "R" { k = $3 " " $4; r[k] = r[k] " " $2; next }
-        $1 == "I" { n++; k = $3 " " $4; ok = 0; m = split(r[k], ts, " ")
-                    for (i = 1; i <= m; i++) if (ts[i] + 0 > $2 + 0 && ts[i] + 0 <= dl) { ok = 1; break }
-                    if (!ok) { bad++; if (bad <= 3) print "    unresolved: t=" $2 " block=" $3 " holder=" $4 > "/dev/stderr" } }
+        $1 == "R" { if (!($3 in r) || $2 + 0 < r[$3]) r[$3] = $2 + 0; next }
+        $1 == "I" { n++
+                    if ($3 == "-" || !($3 in r) || r[$3] > dl + 0) {
+                        bad++
+                        if (bad <= 3) print "    unresolved: t=" $2 " challenge=" $3 " block=" $4 " holder=" $5 > "/dev/stderr"
+                    } }
         END { print bad + 0, n + 0 }'
 }
 
@@ -580,6 +730,16 @@ elif awk -v g="$GAP" -v b="$BAR_LEDGER_GAP" 'BEGIN { exit !(g <= b) }'; then
 else
     fail "ledger accrual gap max = ${GAP} s > ${BAR_LEDGER_GAP} s"
 fi
+# pos-i7-a: a tick cut by its budget leaves the rest due (`deferred`). NOTE: how often the
+# budget cut, and the issue rate against the placements (the cadence the owner keeps).
+read -r N_T N_DEF MAX_DEF LAST_DEF ISS_W12 BLK_MEAN BLK_MAX <<< "$(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '
+    $7 ~ /^[0-9]+$/ { n++; if ($7 + 0 > 0) d++; if ($7 + 0 > m) m = $7 + 0; last = $7 + 0 }
+    $5 ~ /^[0-9]+$/ { iss += $5 }
+    $8 ~ /^[0-9]+$/ { nb++; sb += $8; if ($8 + 0 > mb) mb = $8 + 0 }
+    END { printf "%d %d %d %d %d %.1f %d\n", n, d, m, last, iss, (nb ? sb / nb : 0), mb }')"
+note "deferred (pos-i7-a/b): $N_DEF of $N_T ticks cut by the budget, max deferred $MAX_DEF, last tick $LAST_DEF; issued $ISS_W12 in W1+W2 = $(awk -v i="$ISS_W12" -v p="$PLACEMENTS_AT_1B" 'BEGIN { printf "%.2f", (p > 0 ? i / (2 * p) : 0) }') per placement per scaled week; blocks per tick mean $BLK_MEAN max $BLK_MAX"
+note "tick breakdown: scan_ms p95 = $(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '$12 ~ /^[0-9]+$/ { print $12 }' | p95), slowest_block_ms p95 = $(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '$13 ~ /^[0-9]+$/ { print $13 }' | p95), ticks with a cut block = $(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '$11 ~ /^[0-9]+$/ && $11 + 0 > 0' | awk 'NF' | wc -l | tr -d ' ')"
+note "publishes (settled between ticks): slowest_publish_ms p95 = $(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '$9 ~ /^[0-9]+$/ { print $9 }' | p95), in_flight at tick end p95 = $(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '$10 ~ /^[0-9]+$/ { print $10 }' | p95)"
 stop_point 2
 
 # ── STEP 3: every holder computed each challenge once in W2 ────────────────
@@ -674,8 +834,7 @@ TO=$(o_timeouts | count_in "$T_W2" $((T_W3 + HALF)))
 UNK=$(o_unknown | count_in "$T_W2" $((T_W3 + HALF)))
 DEFERRED=$(events_grep "$(node_log "$O")" "mailbox_poll: poll done" deferred_full \
     | in_window "$T_W2" $((T_W3 + HALF)) | awk '$3 != "-" { s += $3 } END { print s + 0 }')
-FULL_WARN=$(events_grep "$(node_log "$O")" "pos_response_tx full" | count_in "$T_W2" $((T_W3 + HALF)))
-note "deferred_full sum = $DEFERRED, 'pos_response_tx full' lines = $FULL_WARN"
+note "deferred_full sum = $DEFERRED"
 if [ "$ISSUED" -eq 0 ]; then
     fail "no challenge issued by O in W2 (nothing to judge)"
 elif [ "$UNRES" -eq 0 ]; then
@@ -754,13 +913,20 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 T_FIRST=""
-for _ in $(seq 1 180); do
+# Wait for the first poll with entries until just before W5 ends (the former 180 s was a
+# wait of this script, not a bar of the passport; see "Changes after run 20260929-193455").
+while [ "$(now_t)" -lt $((T_W5 - 10)) ]; do
     T_FIRST=$(h_polls "$H1" | in_window "$T_START" 999999999 | awk '$4 != "-" && $4 + 0 > 0 { print $1; exit }')
     [ -n "$T_FIRST" ] && break
     sleep 1
 done
 RC_FIRST=$(rchar_of "$H1")
 info "H1 killed t=$T_KILL, started t=$T_START, first poll with entries t=${T_FIRST:-none}"
+if [ -n "$T_FIRST" ]; then
+    FIRST_S=$(awk -v a="$T_START" -v b="$T_FIRST" 'BEGIN { printf "%.0f", b - a }')
+    [ "$FIRST_S" -gt "$H1_FIRST_POLL_NOTE" ] \
+        && note "H1's first poll with entries came ${FIRST_S} s after its start (> ${H1_FIRST_POLL_NOTE} s)"
+fi
 
 # ── STEP 7 runs until W4 ends; then step 8 stops O, and 5 and 7 are judged meanwhile ─
 sleep_until "$T_W5"
@@ -827,7 +993,7 @@ N_UP=$(echo "$UPS" | awk 'NF' | wc -l | tr -d ' ')
 [ "$N_UP" -ge "$H9_CYCLES" ] || fail "FAIL(setup): H9 started only $N_UP of $H9_CYCLES times"
 TO9=$(o_timeouts | in_window "$T_W1" "$T_W5" | awk -v h="${DEV[$H9]}" '$4 == h' | awk 'NF' | wc -l | tr -d ' ')
 [ "$TO9" -eq 0 ] && pass "0 timeouts to H9" || fail "$TO9 timeouts to H9"
-NO_PASS=""; SLOW=""; TUPS=""
+NO_PASS=""; SLOW=""; TUPS=""; EMPTY=""; N_JUDGED=0
 PASS9=$(o_resolved | awk -v h="${DEV[$H9]}" '$4 == h && $5 == "Pass" { print $1 }')
 ISS9=$(o_issues | awk -v h="${DEV[$H9]}" '$4 == h { print $1 }')
 COMP9=$(h_computes "$H9")
@@ -837,15 +1003,32 @@ while read -r c up; do
     end=$(awk -v n=$((c + 1)) '$1 == n && $2 == "kill" { print $3 }' "$TEST_DIR/h9_cycles.log")
     [ -n "$end" ] || end=$((up + H9_CYCLE - H9_OFF))
     np=$(echo "$PASS9" | awk -v a="$up" -v b="$((end + 8))" 'NF && $1 >= a && $1 <= b' | wc -l | tr -d ' ')
-    [ "$np" -ge 1 ] || NO_PASS="$NO_PASS $c"
+    # Something to answer: a challenge to H9 issued while it was off before this window, or
+    # early enough in the window to be answered in it. A window with none is not judged
+    # (NOTE): no Pass is possible there (see "Changes after run 20260930-021936").
+    off=$(awk -v n="$c" '$1 == n && $2 == "kill" { print $3 }' "$TEST_DIR/h9_cycles.log")
+    [ -n "$off" ] || off=$((up - H9_OFF))
+    todo=$(echo "$ISS9" | awk -v a="$off" -v b="$((end - H9_ANSWER_MARGIN))" 'NF && $1 >= a && $1 <= b' | wc -l | tr -d ' ')
+    if [ "$todo" -eq 0 ]; then
+        EMPTY="$EMPTY $c"
+    else
+        N_JUDGED=$((N_JUDGED + 1))
+        [ "$np" -ge 1 ] || NO_PASS="$NO_PASS $c:0/$todo"
+    fi
     live=$(echo "$ISS9" | awk -v a="$((up - WEEK))" -v b="$up" 'NF && $1 >= a && $1 <= b' | wc -l | tr -d ' ')
     comp=$(echo "$COMP9" | in_window "$up" "$end" | awk '{ print $3 }' | sort -u | awk 'NF' | wc -l | tr -d ' ')
     if [ "$live" -eq 0 ] || [ $((comp * 10)) -lt $((live * 9)) ]; then SLOW="$SLOW $c:$comp/$live"; fi
     tup=$(echo "$POLL9" | in_window "$up" "$end" | awk -v u="$up" '$4 != "-" && $4 + 0 > 0 { printf "%.0f", $1 - u; exit }')
     TUPS="$TUPS ${tup:-none}"
 done <<< "$UPS"
-[ -z "$NO_PASS" ] && pass "a Pass from H9 on O in every online window" \
-    || fail "no Pass from H9 on O in windows:$NO_PASS"
+if [ "$N_JUDGED" -lt $((H9_CYCLES / 2)) ]; then
+    fail "only $N_JUDGED of $H9_CYCLES windows had a challenge to H9 to answer (the Pass bar would be vacuous)"
+elif [ -z "$NO_PASS" ]; then
+    pass "a Pass from H9 on O in every window with something to answer ($N_JUDGED of $H9_CYCLES)"
+else
+    fail "no Pass from H9 on O in windows with something to answer (cycle:passes/to-answer):$NO_PASS"
+fi
+note "windows with nothing issued to H9 while it was off or early in the window (not judged):${EMPTY:- none}; longest gap between issues to H9 in W1..W4 = $(echo "$ISS9" | in_window "$T_W1" "$T_W5" | max_gap) s"
 [ -z "$SLOW" ] && pass "H9 computed >= 90 % of its live challenges in every window" \
     || fail "finding: the laptop does not keep up within the window (cycle:computed/live):$SLOW"
 note "T_up per window (s):$TUPS"
@@ -855,11 +1038,11 @@ note "H9 rchar per online window (bytes, cycles 2..): $(echo "$RCH9" | awk 'NF {
 # ── Steps 7a-7c (line A, 4r-i113): appended here by line A ─────────────────
 stop_point 7
 
-# ── STEP 8: the owner comes back after 3 scaled days ───────────────────────
+# ── STEP 8: the owner comes back after about a scaled week ─────────────────
 CUR_STEP=8
 echo ""
-echo "=== Step 8: O off 300 s, start; the first issue tick, then half a week ==="
-sleep_until $((T_O_KILL + 300))
+echo "=== Step 8: O off ${O_OFF} s, start; the first issue tick, then half a week ==="
+sleep_until $((T_O_KILL + O_OFF))
 start_node "$O"
 T_O_START=$(now_t)
 wait_daemon "$O" || { fail "O did not start again"; finish; }
@@ -873,18 +1056,39 @@ T8="$T_O_START"
 if [ -z "$FIRST_TICK" ]; then
     fail "no 'scheduler: PoS issue tick' on O within 180 s of its start (the line comes with СТ-0c)"
 else
-    read -r T8 _ FT_MS FT_DUE _ <<< "$FIRST_TICK"
+    read -r T8 _ FT_MS FT_DUE _ FT_CPW FT_DEF FT_BLOCKS FT_SLOWPUB FT_INFL FT_CUT FT_SCAN _ <<< "$FIRST_TICK"
     T8=${T8%.*}
-    note "first issue tick: elapsed_ms=$FT_MS due=$FT_DUE placements=$PLACEMENTS"
-    awk -v d="$FT_DUE" -v p="$PLACEMENTS" 'BEGIN { exit !(p > 0 && d >= 0.8 * p) }' \
-        && pass "first tick due=$FT_DUE >= 0.8 x $PLACEMENTS placements" \
-        || fail "first tick due=$FT_DUE < 0.8 x $PLACEMENTS placements"
+    T_OFF=$((T_O_START - T_O_KILL))
+    # Setup self-check: the bar needs every placement's challenge interval to have passed
+    # while O was off. cpw_min of a tick is over that tick's due entries only, so the first
+    # tick alone would miss placements it did not find due; the ticks of O's last scaled
+    # week before the kill cover every placement.
+    CPW_MIN=$( { o_issue_ticks | in_window $((T_O_KILL - WEEK)) "$T_O_KILL" | awk '{ print $6 }'
+                 echo "$FT_CPW"; } | awk '$1 ~ /^[0-9]+$/ && $1 > 0' | sort -n | head -1)
+    note "first issue tick: elapsed_ms=$FT_MS due=$FT_DUE deferred=$FT_DEF blocks=$FT_BLOCKS cut_blocks=$FT_CUT scan_ms=$FT_SCAN in_flight=$FT_INFL slowest_publish_ms=$FT_SLOWPUB placements=$PLACEMENTS; T_off=${T_OFF} s cpw_min=${CPW_MIN:-none}"
+    if [ -z "$CPW_MIN" ]; then
+        fail "FAIL(setup): no cpw_min on O's issue ticks (cannot check T_off)"
+    elif [ "$T_OFF" -lt $((604800 / (CPW_MIN * TIME_SCALE) + 30)) ]; then
+        fail "FAIL(setup): T_off ${T_OFF} s < 604800 / (${CPW_MIN} x ${TIME_SCALE}) + 30 s (not every placement due; raise O_OFF)"
+    else
+        awk -v d="$FT_DUE" -v p="$PLACEMENTS" 'BEGIN { exit !(p > 0 && d >= 0.8 * p) }' \
+            && pass "first tick due=$FT_DUE >= 0.8 x $PLACEMENTS placements" \
+            || fail "first tick due=$FT_DUE < 0.8 x $PLACEMENTS placements"
+    fi
 fi
-T8_END=$((T8 + HALF))
-sleep_until $((T8_END + STEP8_MARGIN))
-read -r UNRES8 ISSUED8 <<< "$(unresolved_issues "$T_O_START" "$T8_END" $((T8_END + STEP8_MARGIN)))"
-TO8A=$(o_timeouts | count_in "$T_O_START" $((T8_END + STEP8_MARGIN)))
-UNK8=$(o_unknown | count_in "$T_O_START" $((T8_END + STEP8_MARGIN)))
+T8_END=$((T8 + STEP8_RUN))
+T8_JUDGE=$((T8_END + STEP8_MARGIN))
+sleep_until "$T8_JUDGE"
+read -r UNRES8 ISSUED8 <<< "$(unresolved_issues "$T_O_START" "$T8_END" "$T8_JUDGE")"
+TO8A=$(o_timeouts | count_in "$T_O_START" "$T8_JUDGE")
+UNK8=$(o_unknown | count_in "$T_O_START" "$T8_JUDGE")
+TICKS8=$(o_issue_ticks | count_in "$T_O_START" "$T8_JUDGE")
+RES8=$(o_resolved | count_in "$T_O_START" "$T8_JUDGE")
+ROWS8=$(o_ledger_rows | count_in $((T8 + 30)) "$T8_JUDGE")
+note "after the restart: issue ticks=$TICKS8, resolutions=$RES8, ledger rows=$ROWS8"
+# pos-i7-a: the ~8 000 challenges due at once go out over many budget-bound ticks.
+DRAIN8=$(o_issue_ticks | in_window "$T8" "$T8_JUDGE" | awk -v t="$T8" '$7 == "0" { printf "%.0f", $1 - t; exit }')
+note "backlog after the restart: first tick with deferred=0 at T8 + ${DRAIN8:-never (within the window)} s"
 if [ "$ISSUED8" -eq 0 ]; then
     fail "no challenge issued by O after its restart (nothing to judge)"
 elif [ "$UNRES8" -eq 0 ]; then
@@ -892,15 +1096,26 @@ elif [ "$UNRES8" -eq 0 ]; then
 else
     fail "$UNRES8 of $ISSUED8 challenges issued after the restart not resolved"
 fi
-[ "$TO8A" -eq 0 ] && pass "0 timeouts after the restart" || fail "$TO8A timeouts after the restart"
-[ "$UNK8" -le "$TO8A" ] && pass "WARN unknown challenge_id = $UNK8 <= timeouts ($TO8A)" \
-    || fail "WARN unknown challenge_id = $UNK8 > timeouts ($TO8A) after the restart"
+# The timeout / unknown bars count bad events: with no issue tick or no resolution after
+# the restart they would pass on an owner that did nothing.
+if [ "$TICKS8" -eq 0 ] || [ "$RES8" -eq 0 ]; then
+    fail "nothing to judge after the restart: issue ticks=$TICKS8, resolutions=$RES8 (the timeout and unknown bars would pass vacuously)"
+else
+    [ "$TO8A" -eq 0 ] && pass "0 timeouts after the restart" || fail "$TO8A timeouts after the restart"
+    [ "$UNK8" -le "$TO8A" ] && pass "WARN unknown challenge_id = $UNK8 <= timeouts ($TO8A)" \
+        || fail "WARN unknown challenge_id = $UNK8 > timeouts ($TO8A) after the restart"
+fi
 GAP_FIRST=$(ledger_gap "$T_O_START" $((T8 + 30)))
 note "ledger gap around the first tick = ${GAP_FIRST} s (K-5, A's decision)"
-GAP8=$(ledger_gap $((T8 + 30)) $((T8_END + STEP8_MARGIN)))
-awk -v g="$GAP8" -v b="$BAR_LEDGER_GAP" 'BEGIN { exit !(g <= b) }' \
-    && pass "ledger accrual gap after the first tick = ${GAP8} s" \
-    || fail "ledger accrual gap after the first tick = ${GAP8} s > ${BAR_LEDGER_GAP} s"
+GAP8=$(ledger_gap $((T8 + 30)) "$T8_JUDGE")
+# ledger_gap is 0.0 for fewer than two rows: guard it, as step 2 guards ROWS = 0.
+if [ "$ROWS8" -lt 2 ]; then
+    fail "$ROWS8 'pair-ledger row' on O after the first tick (the gap bar needs >= 2)"
+elif awk -v g="$GAP8" -v b="$BAR_LEDGER_GAP" 'BEGIN { exit !(g <= b) }'; then
+    pass "ledger accrual gap after the first tick = ${GAP8} s ($ROWS8 rows)"
+else
+    fail "ledger accrual gap after the first tick = ${GAP8} s > ${BAR_LEDGER_GAP} s"
+fi
 stop_point 8
 
 finish

@@ -116,7 +116,7 @@ async fn store_one(
         .unwrap_or_else(|_| Err(anyhow::anyhow!("mailbox store timeout to {device}")));
     match answer {
         Ok(MailboxStoreResponse::Ack { .. }) => {
-            record_avail_contact(db, device, unix_now());
+            record_contact_off_runtime(db, device, unix_now());
             StoreAnswer::Ack
         }
         Ok(MailboxStoreResponse::Reject { reason, .. }) => {
@@ -163,6 +163,23 @@ pub(super) fn record_avail_contact(db: &Db, device_id: DeviceId, now_secs: u64) 
                 "mailbox router: failed to load peer for avail update"
             );
         }
+    }
+}
+
+/// `record_avail_contact` from an async task without holding an async worker (СТ-0c round
+/// 4). The contact is a durable redb commit, and a commit waits for redb's one write lock:
+/// a publication fans out to ~9 postmen and the issue tick keeps 9 publications in
+/// flight, so a burst of Acks parked dozens of workers in `begin_write` behind one slow
+/// commit, and the whole runtime — timers, the scheduler's issue tick — stalled until the
+/// commits drained. On the daemon's multi-thread runtime the write runs in
+/// `block_in_place`: the worker hands its other tasks to a fresh one first. Same order and
+/// timing for the caller as before (the contact is recorded before the answer counts). A
+/// current-thread runtime (tests) cannot hand off; there it is a plain call, as before.
+pub(super) fn record_contact_off_runtime(db: &Db, device_id: DeviceId, now_secs: u64) {
+    let record = || record_avail_contact(db, device_id, now_secs);
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(record),
+        _ => record(),
     }
 }
 
