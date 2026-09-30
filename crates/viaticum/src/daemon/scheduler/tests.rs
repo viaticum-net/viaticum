@@ -33,6 +33,8 @@ mod issue_budget;
 mod issue_order;
 // СТ-0c round 4: the tick keeps its budget when the database or a preparation stalls.
 mod issue_stall;
+// pos-i7-d-a: a preparation cut at the deadline finishes in the background and publishes.
+mod issue_prepare;
 // The shared owner / postman set-up of the issue-tick tests.
 mod issue_support;
 // backup-i7: the load-failure WARN of a PoS block once per day.

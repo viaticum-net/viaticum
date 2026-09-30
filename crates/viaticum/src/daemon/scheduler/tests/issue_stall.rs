@@ -68,13 +68,31 @@ async fn issue_tick_keeps_its_budget_while_a_commit_holds_the_database() {
     );
 }
 
-/// An encoder that sleeps in `encode_raw_ranges` from its `stall_from`-th call on (a block
-/// whose preparation is held up by the disk or the CPU).
-struct StallingEncoder {
+/// An encoder that sleeps in `encode_raw_ranges` in its calls `stall_from..stall_upto`
+/// (a block whose preparation is held up by the disk or the CPU), counting the calls and
+/// the most calls running at once.
+pub(super) struct StallingEncoder {
     inner: RaptorQEncoder,
-    calls: AtomicUsize,
+    pub(super) calls: AtomicUsize,
+    running: AtomicUsize,
+    pub(super) peak: AtomicUsize,
     stall_from: usize,
+    stall_upto: usize,
     stall: Duration,
+}
+
+impl StallingEncoder {
+    pub(super) fn new(stall_from: usize, stall_upto: usize, stall: Duration) -> Arc<Self> {
+        Arc::new(StallingEncoder {
+            inner: RaptorQEncoder::new(),
+            calls: AtomicUsize::new(0),
+            running: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            stall_from,
+            stall_upto,
+            stall,
+        })
+    }
 }
 
 impl ErasureEncoder for StallingEncoder {
@@ -123,10 +141,15 @@ impl ErasureEncoder for StallingEncoder {
         params: &ErasureParams,
         ranges: &[(u32, u32)],
     ) -> Result<Vec<Symbol>, ErasureError> {
-        if self.calls.fetch_add(1, Ordering::SeqCst) >= self.stall_from {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        if (self.stall_from..self.stall_upto).contains(&call) {
             std::thread::sleep(self.stall);
         }
-        self.inner.encode_raw_ranges(source_block, params, ranges)
+        let out = self.inner.encode_raw_ranges(source_block, params, ranges);
+        self.running.fetch_sub(1, Ordering::SeqCst);
+        out
     }
     fn apply_binding(
         &self,
@@ -140,16 +163,12 @@ impl ErasureEncoder for StallingEncoder {
 
 /// Block 1 prepares normally; block 2, admitted with headroom, takes 1.5 s to prepare.
 /// The tick stops waiting for it at its deadline and returns within the budget
-/// (tolerance 150 ms), the block reported cut and its placements and the rest deferred.
-/// Waiting for the preparation to finish, the tick takes ≈ 1.6 s.
+/// (tolerance 150 ms), the block reported cut (preparing in the background, pos-i7-d-a)
+/// and the block it did not reach deferred. Waiting for the preparation to finish, the
+/// tick takes ≈ 1.6 s.
 #[tokio::test]
 async fn a_block_still_preparing_at_the_deadline_is_cut() {
-    let encoder = Arc::new(StallingEncoder {
-        inner: RaptorQEncoder::new(),
-        calls: AtomicUsize::new(0),
-        stall_from: 1,
-        stall: Duration::from_millis(1500),
-    });
+    let encoder = StallingEncoder::new(1, usize::MAX, Duration::from_millis(1500));
     let owner = owner_with_encoder(
         900,
         SlowPostman::acking_after(Duration::from_millis(5)),
@@ -190,9 +209,14 @@ async fn a_block_still_preparing_at_the_deadline_is_cut() {
     assert_eq!(field(line, "cut_blocks"), Some(1), "{line}");
     assert_eq!(field(line, "issued"), Some(8), "block 1 only: {line}");
     assert_eq!(
+        field(line, "preparing"),
+        Some(1),
+        "block 2 prepares on: {line}"
+    );
+    assert_eq!(
         field(line, "deferred"),
-        Some(16),
-        "blocks 2 and 3 stay due: {line}"
+        Some(8),
+        "block 3 was not reached and stays due: {line}"
     );
     assert!(field(line, "scan_ms").is_some(), "{line}");
     assert!(field(line, "slowest_block_ms").is_some(), "{line}");

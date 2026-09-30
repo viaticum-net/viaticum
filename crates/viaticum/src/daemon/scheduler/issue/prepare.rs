@@ -5,7 +5,8 @@
 // СТ-0c round 4: the whole preparation — its database reads, the source file reads and
 // the encode — runs as ONE blocking task that the tick awaits with a deadline. No part of
 // it runs on the async thread, so a preparation held up by the disk or the database
-// cannot hold the tick past its budget: at the deadline the tick stops waiting for it.
+// cannot hold the tick past its budget: at the deadline the tick stops waiting for it and
+// hands the task over to `Preparing` (pos-i7-d-a), which the run loop drains.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -72,11 +73,13 @@ pub(crate) fn log_load_failure(
 }
 
 /// One challenge of a block, its expected answer computed.
-pub(super) struct PreparedChallenge {
+pub(crate) struct PreparedChallenge {
     pub(super) holder_id: DeviceId,
     challenge_id: [u8; 16],
     expected_chain_hash: [u8; 32],
-    esi_ranges: Vec<(u32, u32)>,
+    /// The ranges the expected hash covers: a publish is valid only for a placement that
+    /// still holds exactly these.
+    pub(super) esi_ranges: Vec<(u32, u32)>,
     /// The key the challenge is addressed to, resolved during the preparation (CS-POS-3:
     /// the response is verified against this same key).
     holder_master: IdentityPub,
@@ -104,8 +107,9 @@ struct HolderPrep {
 
 impl Scheduler {
     /// Start one block's preparation on the blocking pool (pos-i7: the honest cost, 1×
-    /// per block per tick). The result is empty when the block cannot be served this tick
-    /// (logged). Dropping the handle leaves the task to finish and its result unused.
+    /// per block per start). The result is empty when the block cannot be served (logged).
+    /// The tick that spawned it waits only until its deadline; the handle then moves to
+    /// `Preparing` (pos-i7-d-a), so the task is never abandoned.
     pub(super) fn spawn_prepare(
         &self,
         block_id: SourceBlockId,
