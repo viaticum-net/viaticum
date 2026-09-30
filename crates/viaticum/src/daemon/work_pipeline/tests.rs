@@ -139,6 +139,7 @@ fn make_config() -> WorkPipelineConfig {
         data_dir: std::path::PathBuf::new(),
         min_pool_size: 2,
         recheck_tx: None,
+        max_source_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     }
 }
 

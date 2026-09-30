@@ -12,7 +12,7 @@ use viaticum_core::constants::MAX_BLOCK_GENERATIONS;
 use viaticum_core::db::{Db, Serviceability};
 use viaticum_core::types::{SourceBlockId, SourceBlockRecord};
 
-use super::pipeline::seal_compressed;
+use super::pipeline::{seal_framed, unseal_framed};
 
 /// A plaintext sealed at the generation the packing may write.
 #[derive(Debug)]
@@ -28,26 +28,31 @@ pub(crate) struct Sealed {
 /// The lowest generation below [`MAX_BLOCK_GENERATIONS`] whose id is `Missing` or
 /// `Serviceable`; `Window` and `Releasing` ids are skipped. Past the limit → error (the
 /// caller keeps the files queued, ERROR in the log).
+///
+/// `framed` is the compressed block in the layout of `pipeline::compress_framed`; it is
+/// sealed IN PLACE (one buffer for the block, backup-i5) and returned as `Sealed::stored`.
+/// A generation that is skipped is unsealed again before the next one is tried.
 pub(crate) fn choose_generation(
     db: &Db,
-    compressed: &[u8],
+    mut framed: Vec<u8>,
     epoch_key: &[u8; 32],
 ) -> anyhow::Result<Sealed> {
     let mut skipped = Vec::new();
     for generation in 0..MAX_BLOCK_GENERATIONS {
-        let stored = seal_compressed(compressed, epoch_key, generation)?;
-        let block_id = SourceBlockId(*blake3::hash(&stored).as_bytes());
+        seal_framed(&mut framed, epoch_key, generation)?;
+        let block_id = SourceBlockId(*blake3::hash(&framed).as_bytes());
         match db.block_serviceability(&block_id)? {
             Serviceability::Missing | Serviceability::Serviceable => {
                 return Ok(Sealed {
                     generation,
-                    stored,
+                    stored: framed,
                     block_id,
                     skipped,
                 });
             }
             s @ (Serviceability::Window | Serviceability::Releasing) => {
                 skipped.push((block_id, s));
+                unseal_framed(&mut framed, epoch_key)?;
             }
         }
     }

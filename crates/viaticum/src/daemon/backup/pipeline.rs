@@ -3,8 +3,8 @@
 
 use std::sync::Arc;
 
-use chacha20poly1305::aead::Aead;
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+use chacha20poly1305::aead::{Aead, AeadInPlace};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, Tag};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use viaticum_core::constants::MIN_BATCH_BYTES;
@@ -25,6 +25,7 @@ use viaticum_core::types::{
 
 use super::generation::{Committed, before_commit, choose_generation, commit_block_record};
 use super::packing::build_plaintext;
+use super::source_read::{SourceReadError, read_source_bounded};
 use super::{BackupConfig, PipelineResult, QueuedFile};
 
 /// Derive the ChaCha20-Poly1305 key from an epoch key.
@@ -52,7 +53,7 @@ const NONCE_INFO_GENERATION: &[u8] = b"viaticum-block-nonce/generation";
 /// (INV-G0: its ids do not change); a later generation uses a distinct `info` carrying the
 /// generation, so its nonce — hence its block id — is independent of every other
 /// generation's (the salt is untouched: no concatenation that two messages could share).
-fn derive_nonce(epoch_key: &[u8; 32], compressed: &[u8], generation: u32) -> [u8; 12] {
+pub(super) fn derive_nonce(epoch_key: &[u8; 32], compressed: &[u8], generation: u32) -> [u8; 12] {
     let hash = blake3::hash(compressed);
     let hk = Hkdf::<Sha256>::new(Some(hash.as_bytes()), epoch_key);
     let mut nonce = [0u8; 12];
@@ -68,10 +69,77 @@ fn derive_nonce(epoch_key: &[u8; 32], compressed: &[u8], generation: u32) -> [u8
     nonce
 }
 
+/// Length of the nonce in front of a stored blob, and of the AEAD tag behind it.
+const NONCE_LEN: usize = 12;
+const TAG_LEN: usize = 16;
+
 /// zstd level 3. Deterministic: the same plaintext always compresses to the same bytes.
 pub fn compress_block(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
     zstd::encode_all(std::io::Cursor::new(plaintext), 3)
         .map_err(|e| anyhow::anyhow!("zstd compress: {e}"))
+}
+
+/// The compressed bytes of `plaintext` (zstd level 3, as [`compress_block`] gives them) in
+/// the buffer that sealing turns into the stored blob in place: `[12 bytes for the
+/// nonce][compressed][room for the tag]` (F3, backup-i5: one buffer per block, not one
+/// per stage). The room of `compress_bound` is reserved up front, so the buffer never
+/// reallocates while compressing, and given back down to the tag afterwards; untouched
+/// pages of it are never resident.
+pub(crate) fn compress_framed(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let bound = zstd::zstd_safe::compress_bound(plaintext.len());
+    let mut out = Vec::with_capacity(NONCE_LEN + bound + TAG_LEN);
+    out.resize(NONCE_LEN, 0);
+    // `copy_encode` into a `Vec` is what `encode_all` does inside: the same bytes.
+    zstd::stream::copy_encode(std::io::Cursor::new(plaintext), &mut out, 3)
+        .map_err(|e| anyhow::anyhow!("zstd compress: {e}"))?;
+    out.shrink_to(out.len() + TAG_LEN);
+    Ok(out)
+}
+
+/// Seal a [`compress_framed`] buffer in place at `generation`: the compressed bytes are
+/// encrypted where they lie, the tag is appended, the nonce fills its 12 bytes in front —
+/// `[nonce][ciphertext][tag]`, the stored blob. Byte for byte what encrypting the
+/// compressed bytes and prepending the nonce gives (ChaCha20-Poly1305, empty AAD).
+pub(super) fn seal_framed(
+    buf: &mut Vec<u8>,
+    epoch_key: &[u8; 32],
+    generation: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(buf.len() >= NONCE_LEN, "framed buffer shorter than a nonce");
+    let key = derive_block_key(epoch_key);
+    let cipher = ChaCha20Poly1305::new(&key.into());
+    let nonce_bytes = derive_nonce(epoch_key, &buf[NONCE_LEN..], generation);
+    let tag = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(&nonce_bytes), b"", &mut buf[NONCE_LEN..])
+        .map_err(|e| anyhow::anyhow!("chacha20poly1305 encrypt: {e}"))?;
+    buf.extend_from_slice(&tag);
+    buf[..NONCE_LEN].copy_from_slice(&nonce_bytes);
+    Ok(())
+}
+
+/// The inverse of [`seal_framed`]: a sealed blob back to the framed buffer (its nonce bytes
+/// stay in front, to be overwritten by the next seal). Used when the generation chosen
+/// turns out to be taken and the next one is sealed from the same buffer.
+pub(super) fn unseal_framed(buf: &mut Vec<u8>, epoch_key: &[u8; 32]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        buf.len() >= NONCE_LEN + TAG_LEN,
+        "sealed blob shorter than nonce and tag"
+    );
+    let tag_start = buf.len() - TAG_LEN;
+    let tag = Tag::clone_from_slice(&buf[tag_start..]);
+    buf.truncate(tag_start);
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    nonce_bytes.copy_from_slice(&buf[..NONCE_LEN]);
+    let key = derive_block_key(epoch_key);
+    let cipher = ChaCha20Poly1305::new(&key.into());
+    cipher
+        .decrypt_in_place_detached(
+            Nonce::from_slice(&nonce_bytes),
+            b"",
+            &mut buf[NONCE_LEN..],
+            &tag,
+        )
+        .map_err(|e| anyhow::anyhow!("chacha20poly1305 unseal: {e}"))
 }
 
 /// Encrypt an already compressed block at `generation` → `[nonce][ciphertext]`.
@@ -85,26 +153,31 @@ pub fn seal_compressed(
     epoch_key: &[u8; 32],
     generation: u32,
 ) -> anyhow::Result<Vec<u8>> {
-    let key = derive_block_key(epoch_key);
-    let cipher = ChaCha20Poly1305::new(&key.into());
-    let nonce_bytes = derive_nonce(epoch_key, compressed, generation);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(nonce, compressed)
-        .map_err(|e| anyhow::anyhow!("chacha20poly1305 encrypt: {e}"))?;
-
-    // Stored format: [nonce (12 bytes)][ciphertext]
-    let mut stored = Vec::with_capacity(12 + ciphertext.len());
-    stored.extend_from_slice(&nonce_bytes);
-    stored.extend_from_slice(&ciphertext);
+    // Stored format: [nonce (12 bytes)][ciphertext][tag], built in ONE buffer.
+    let mut stored = Vec::with_capacity(NONCE_LEN + compressed.len() + TAG_LEN);
+    stored.resize(NONCE_LEN, 0);
+    stored.extend_from_slice(compressed);
+    seal_framed(&mut stored, epoch_key, generation)?;
     Ok(stored)
+}
+
+/// Compress and seal `plaintext` at `generation` with one buffer (F3): the plaintext, and
+/// the stored blob it becomes — no separate compressed copy, no separate ciphertext copy.
+pub(crate) fn seal_plaintext(
+    plaintext: &[u8],
+    epoch_key: &[u8; 32],
+    generation: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let mut framed = compress_framed(plaintext)?;
+    seal_framed(&mut framed, epoch_key, generation)?;
+    Ok(framed)
 }
 
 /// Encrypt plaintext at generation 0: compress → encrypt → prepend nonce (SystemState
 /// blocks, tests). Returns `[12-byte nonce][ciphertext]`.
 /// Deterministic: same (plaintext, epoch_key) always produces same output.
 pub fn compress_and_encrypt(plaintext: &[u8], epoch_key: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
-    seal_compressed(&compress_block(plaintext)?, epoch_key, 0)
+    seal_plaintext(plaintext, epoch_key, 0)
 }
 
 /// Decrypt and decompress a stored block (output of `compress_and_encrypt`).
@@ -158,17 +231,22 @@ pub fn run_pipeline(
 ) -> anyhow::Result<PipelineResult> {
     assert!(!files.is_empty(), "run_pipeline called with empty files");
 
-    // 1. Build plaintext
-    let plaintext = match block_type_tag {
-        BlockTypeTag::Pack => build_plaintext(files),
-        BlockTypeTag::Single => {
+    // 1-2. Build the plaintext and compress it into the buffer the seal works on in place.
+    // A Single block borrows the file bytes (F2); a pack's plaintext copy is dropped as
+    // soon as it is compressed: at most the members, that copy and the compressed bytes
+    // exist together (backup-i5).
+    let mut framed = {
+        let built;
+        let plaintext: &[u8] = match block_type_tag {
+            BlockTypeTag::Pack => {
+                built = build_plaintext(files);
+                &built
+            }
             // Large file: use raw bytes directly (no pack index)
-            files[0].1.clone()
-        }
+            BlockTypeTag::Single => &files[0].1,
+        };
+        compress_framed(plaintext)?
     };
-
-    // 2. Compress once; seal at the generation the packing may write (N1, INV-N1).
-    let compressed = compress_block(&plaintext)?;
 
     // 3. The block type and the redundancy target do not depend on the generation.
     let block_type = match block_type_tag {
@@ -195,7 +273,8 @@ pub fn run_pipeline(
     // 4. Choose the generation, then write the record only if its id is still free (or keep
     // the record in service) inside the write transaction (Р-4: re-check, ≤ 3 attempts).
     for _ in 0..GENERATION_ATTEMPTS {
-        let sealed = choose_generation(db, &compressed, &config.epoch_key)?;
+        // The choice seals the buffer in place at the lowest usable generation.
+        let sealed = choose_generation(db, framed, &config.epoch_key)?;
         let stored_len = sealed.stored.len() as u64;
         let params = ErasureParams::compute(stored_len, pack_importance)
             .map_err(|e| anyhow::anyhow!("ErasureParams::compute failed: {e}"))?;
@@ -230,6 +309,9 @@ pub fn run_pipeline(
                     now = ?now,
                     "backup: chosen block id left service before the write; choosing again"
                 );
+                // Back to the compressed bytes, for the next choice.
+                framed = sealed.stored;
+                unseal_framed(&mut framed, &config.epoch_key)?;
                 continue;
             }
             Committed::Written => {
@@ -374,11 +456,16 @@ pub(crate) enum ReadAtFlush {
     /// Nothing to pack: the file is gone, unreadable, or now holds content that is
     /// already in the network (its event will point the path there without traffic).
     Skip,
+    /// The file is above the size limit now (it grew since enqueue): not read past the
+    /// limit; the caller marks the path (backup-i4). The size is the one `metadata` gave,
+    /// or `limit + 1` when the file grew during the read.
+    TooLarge(u64),
 }
 
 /// Re-read a queued (or large) file right before packing it (backup-i23).
 ///
-/// Vanished or unreadable → skipped (INFO / WARN), the rest of the batch goes on.
+/// Above `limit` → [`ReadAtFlush::TooLarge`], nothing read past the limit (J1). Vanished or
+/// unreadable → skipped (INFO / WARN), the rest of the batch goes on.
 /// Changed since enqueue → if the new content is already in the network
 /// (`in_network`), skipped; otherwise the bytes read are packed with their own hash,
 /// so a version is marked backed up only with the hash of the bytes in its block.
@@ -386,10 +473,12 @@ pub(crate) fn read_at_flush(
     path: &str,
     queued_hash: &[u8; 32],
     in_network: &dyn Fn(&[u8; 32]) -> bool,
+    limit: u64,
 ) -> ReadAtFlush {
-    let bytes = match std::fs::read(path) {
+    let bytes = match read_source_bounded(std::path::Path::new(path), limit, 0) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(SourceReadError::TooLarge { size, .. }) => return ReadAtFlush::TooLarge(size),
+        Err(e) if e.is_not_found() => {
             tracing::info!(path = %path, "flush: file vanished since enqueue; skipped");
             return ReadAtFlush::Skip;
         }
@@ -427,6 +516,12 @@ pub(crate) fn read_at_flush(
 /// file not yet processed back into `queued`, in order, and returns the error. After the
 /// commit nothing is requeued (see [`pack_batch`]).
 ///
+/// A file above `config.max_file_size_bytes` at flush time (it grew since enqueue) is not
+/// read past the limit; it is left out of the pack and reported in `too_large` as
+/// `(path, size)` for the caller to mark. A file whose size at flush time is
+/// `config.source_block_size` or more (it grew past the pack size) is not put in a pack:
+/// it goes at once to a block of its own, and the pack in hand goes on (J9).
+///
 /// Returns pipeline results for each emitted source block.
 /// If `force=false` and total bytes < MIN_BATCH_BYTES, returns empty vec.
 #[allow(clippy::too_many_arguments)]
@@ -439,6 +534,7 @@ pub fn flush_queue_inner(
     force: bool,
     candidates: &[HolderCandidate],
     in_network: &dyn Fn(&[u8; 32]) -> bool,
+    too_large: &mut Vec<(String, u64)>,
 ) -> anyhow::Result<Vec<PipelineResult>> {
     if queued.is_empty() {
         return Ok(vec![]);
@@ -473,7 +569,12 @@ pub fn flush_queue_inner(
     };
 
     while let Some(mut qf) = rest.next() {
-        let file_bytes = match read_at_flush(&qf.path, &qf.content_hash, in_network) {
+        let file_bytes = match read_at_flush(
+            &qf.path,
+            &qf.content_hash,
+            in_network,
+            config.max_file_size_bytes,
+        ) {
             ReadAtFlush::Pack {
                 bytes,
                 content_hash,
@@ -483,9 +584,40 @@ pub fn flush_queue_inner(
                 bytes
             }
             ReadAtFlush::Skip => continue,
+            ReadAtFlush::TooLarge(size) => {
+                too_large.push((qf.path, size));
+                continue;
+            }
         };
 
         let file_size = file_bytes.len() as u64;
+
+        // J9: a file that is a block by itself (at least the pack size now) is not put in a
+        // pack: it goes at once to a Single block of its own. The pack in hand is untouched.
+        if file_size >= config.source_block_size {
+            let single = [(qf, file_bytes)];
+            match run_pipeline(
+                db,
+                config,
+                encoder,
+                &single,
+                BlockTypeTag::Single,
+                candidates,
+                &[],
+                single[0].0.importance,
+            ) {
+                Ok(result) => {
+                    update_backed_up_at(db, &single, result.source_block_id, result.k, result.t);
+                    results.push(result);
+                }
+                Err(e) => {
+                    let [(qf, _)] = single;
+                    requeue(queued, &mut batch, Some(qf), rest);
+                    return Err(e);
+                }
+            }
+            continue;
+        }
 
         // Importance-change flush (BEFORE size-overflow check, per D2).
         // Fires when importance changes by more than IMPORTANCE_FLUSH_EPSILON (strict).
@@ -645,18 +777,19 @@ pub fn rebuild_blob_blocking(
     scope: &super::rebuild::RebuildScope,
 ) -> anyhow::Result<Vec<u8>> {
     use anyhow::Context;
-    let candidate =
-        super::rebuild::rebuild_candidate(db, block_record, scope).context("rebuild plaintext")?;
-    // N1: sealed at the record's generation (0 for every block before L1b).
-    let stored = seal_compressed(
-        &compress_block(&candidate.plaintext)?,
-        epoch_key,
-        block_record.seal_generation,
-    )
-    .map_err(|e| anyhow::anyhow!("seal at generation {}: {e}", block_record.seal_generation))?;
+    let super::rebuild::Candidate {
+        plaintext,
+        legacy_of,
+    } = super::rebuild::rebuild_candidate(db, block_record, scope).context("rebuild plaintext")?;
+    // N1: sealed at the record's generation (0 for every block before L1b). One buffer
+    // (F3), and the plaintext goes as soon as it is sealed: the blob check needs only the
+    // blob.
+    let stored = seal_plaintext(&plaintext, epoch_key, block_record.seal_generation)
+        .map_err(|e| anyhow::anyhow!("seal at generation {}: {e}", block_record.seal_generation))?;
+    drop(plaintext);
     let hash: [u8; 32] = *blake3::hash(&stored).as_bytes();
     if hash != block_record.block_id.0 {
-        if let Some(e) = candidate.legacy_of {
+        if let Some(e) = legacy_of {
             return Err(anyhow::Error::new(e).context("rebuild plaintext"));
         }
         anyhow::bail!(
@@ -665,7 +798,7 @@ pub fn rebuild_blob_blocking(
             block_record.block_id
         );
     }
-    if candidate.legacy_of.is_some() {
+    if legacy_of.is_some() {
         tracing::warn!(
             block_id = %block_record.block_id,
             "rebuild: member(s) read unchecked from their own path matched the block \

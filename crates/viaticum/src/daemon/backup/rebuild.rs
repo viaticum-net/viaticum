@@ -11,13 +11,16 @@
 // is reported on the recheck channel (the watcher decides whether it is a deletion).
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES;
 use viaticum_core::db::{Db, DbError};
 use viaticum_core::types::{
     DeviceId, FileId, FileRecord, LocalState, PackEntry, SourceBlockId, SourceBlockRecord,
     SourceBlockType, to_cbor_bytes,
 };
+
+use super::source_read::{SourceReadError, read_source_bounded};
 
 /// Paths a rebuild found gone, to the watcher's recheck (delete-i12 (в)). Bounded;
 /// senders use `try_send` and drop a path when it is full.
@@ -26,8 +29,9 @@ pub type RecheckTx = tokio::sync::mpsc::Sender<PathBuf>;
 /// Capacity of the recheck channel.
 pub const RECHECK_CHANNEL_CAPACITY: usize = 256;
 
-/// Who rebuilds: whose records may be read, and where gone paths are reported.
-#[derive(Clone, Default)]
+/// Who rebuilds: whose records may be read, where gone paths are reported, and how large a
+/// source file may be read.
+#[derive(Clone)]
 pub struct RebuildScope {
     /// This device: only records `Present` on it are read. `None` reads records Present
     /// on any device — the local restore tier and unit tests; the catalog holds only
@@ -36,6 +40,20 @@ pub struct RebuildScope {
     pub device: Option<DeviceId>,
     /// Where gone paths go. `None`: not reported (local restore tier, tests).
     pub recheck: Option<RecheckTx>,
+    /// The size limit of this machine (backup-i5, J1): a candidate file above it is not
+    /// read (DEBUG, next candidate — neither "gone" nor a recheck). Default: the RaptorQ
+    /// ceiling; the daemon sets the limit in force (`with_max_source_bytes`).
+    pub max_source_bytes: u64,
+}
+
+impl Default for RebuildScope {
+    fn default() -> Self {
+        Self {
+            device: None,
+            recheck: None,
+            max_source_bytes: MAX_FILE_SIZE_CEILING_BYTES,
+        }
+    }
 }
 
 impl RebuildScope {
@@ -43,7 +61,14 @@ impl RebuildScope {
         Self {
             device: Some(device),
             recheck,
+            ..Self::default()
         }
+    }
+
+    /// The same scope with the size limit `max_source_bytes`.
+    pub fn with_max_source_bytes(mut self, max_source_bytes: u64) -> Self {
+        self.max_source_bytes = max_source_bytes;
+        self
     }
 }
 
@@ -129,7 +154,7 @@ fn with_catalog<T>(
     f: impl FnOnce(&Catalog<'_>, &mut BTreeSet<String>) -> T,
 ) -> Result<T, RebuildError> {
     let files = db.list_all_files()?;
-    let catalog = Catalog::new(&files, scope.device);
+    let catalog = Catalog::new(&files, scope.device, scope.max_source_bytes);
     let mut gone = BTreeSet::new();
     let out = f(&catalog, &mut gone);
     if let Some(tx) = &scope.recheck {
@@ -168,7 +193,14 @@ fn unchecked(
     let mut ignored = BTreeSet::new();
     for entry in entries {
         let bytes = if missing.contains(&entry.file_id) {
-            std::fs::read(own_path(&entry.file_id)?).ok()?
+            let path = own_path(&entry.file_id)?;
+            match read_source_bounded(Path::new(path), catalog.limit, 0) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log_unreadable(path, &e, block.block_id);
+                    return None;
+                }
+            }
         } else {
             catalog.read_member(entry, block.block_id, &mut ignored)?
         };
@@ -192,7 +224,7 @@ fn rebuild(
                     .find(|v| v.source_block_id == block_id)
                     .map(|v| v.content_hash)
             });
-            let bytes = hash.and_then(|h| catalog.read_content(None, &h, gone));
+            let bytes = hash.and_then(|h| catalog.read_content(None, &h, block_id, gone));
             bytes.ok_or(RebuildError::SourceMissing {
                 block: block_id,
                 missing: Vec::new(),
@@ -245,10 +277,12 @@ struct Catalog<'a> {
     /// last version has that hash comes first, then path order.
     by_hash: HashMap<[u8; 32], Vec<&'a FileRecord>>,
     device: Option<DeviceId>,
+    /// `RebuildScope::max_source_bytes`.
+    limit: u64,
 }
 
 impl<'a> Catalog<'a> {
-    fn new(files: &'a [FileRecord], device: Option<DeviceId>) -> Self {
+    fn new(files: &'a [FileRecord], device: Option<DeviceId>, limit: u64) -> Self {
         let mut by_id = HashMap::with_capacity(files.len());
         let mut by_hash: HashMap<[u8; 32], Vec<&FileRecord>> = HashMap::new();
         for r in files {
@@ -276,6 +310,7 @@ impl<'a> Catalog<'a> {
             by_id,
             by_hash,
             device,
+            limit,
         }
     }
 
@@ -293,13 +328,19 @@ impl<'a> Catalog<'a> {
         };
         // The packing version: the first version of the member's record on this block.
         match owner.versions.iter().find(|v| v.source_block_id == block) {
-            Some(first) => self.read_content(Some(owner), &first.content_hash, gone),
+            Some(first) => self.read_content(Some(owner), &first.content_hash, block, gone),
             None => {
                 // No version of the record points here (not expected, A10): read its
                 // path as before, unchecked; the blob check against the block id decides.
                 tracing::debug!(block = %block, path = %owner.path,
                     "rebuild: member record has no version on this block; reading its path");
-                read_path(&owner.path, gone, present_on(owner, self.device))
+                read_path(
+                    &owner.path,
+                    self.limit,
+                    block,
+                    gone,
+                    present_on(owner, self.device),
+                )
             }
         }
     }
@@ -311,6 +352,7 @@ impl<'a> Catalog<'a> {
         &self,
         own: Option<&FileRecord>,
         hash: &[u8; 32],
+        block: SourceBlockId,
         gone: &mut BTreeSet<String>,
     ) -> Option<Vec<u8>> {
         let others = self.by_hash.get(hash).into_iter().flatten().copied();
@@ -321,7 +363,7 @@ impl<'a> Catalog<'a> {
             }
             tried.push(&candidate.path);
             let report_gone = present_on(candidate, self.device);
-            if let Some(bytes) = read_path(&candidate.path, gone, report_gone)
+            if let Some(bytes) = read_path(&candidate.path, self.limit, block, gone, report_gone)
                 && blake3::hash(&bytes).as_bytes() == hash
             {
                 return Some(bytes);
@@ -331,20 +373,41 @@ impl<'a> Catalog<'a> {
     }
 }
 
-/// Read `path`. NotFound → `None`, and the path goes to `gone` when `report_gone`;
-/// another error (permissions, a locked file) → `None` with DEBUG, next candidate (N3).
-fn read_path(path: &str, gone: &mut BTreeSet<String>, report_gone: bool) -> Option<Vec<u8>> {
-    match std::fs::read(path) {
+/// Read `path`, at most `limit` bytes. NotFound → `None`, and the path goes to `gone` when
+/// `report_gone`; above the limit → `None` with DEBUG, not "gone" and no recheck (the file
+/// is there, only too large for this machine; backup-i5); another error (permissions, a
+/// locked file) → `None` with DEBUG, next candidate (N3).
+fn read_path(
+    path: &str,
+    limit: u64,
+    block: SourceBlockId,
+    gone: &mut BTreeSet<String>,
+    report_gone: bool,
+) -> Option<Vec<u8>> {
+    match read_source_bounded(Path::new(path), limit, 0) {
         Ok(bytes) => Some(bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e) if e.is_not_found() => {
             if report_gone {
                 gone.insert(path.to_string());
             }
             None
         }
         Err(e) => {
-            tracing::debug!(path = %path, error = %e, "rebuild: candidate unreadable; next one");
+            log_unreadable(path, &e, block);
             None
+        }
+    }
+}
+
+/// DEBUG for a candidate that was not read: over the size limit, or unreadable.
+fn log_unreadable(path: &str, e: &SourceReadError, block: SourceBlockId) {
+    match e {
+        SourceReadError::TooLarge { size, limit } => {
+            tracing::debug!(path = %path, size, limit, block = %block,
+                "backup: source over the size limit, not read");
+        }
+        SourceReadError::Io { source, .. } => {
+            tracing::debug!(path = %path, error = %source, "rebuild: candidate unreadable; next one");
         }
     }
 }

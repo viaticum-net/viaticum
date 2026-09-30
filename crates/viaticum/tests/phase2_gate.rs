@@ -74,6 +74,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         peer_backoff: None,
         work_event_tx: None,
         resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     }
 }
 

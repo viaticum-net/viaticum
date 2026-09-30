@@ -73,6 +73,9 @@ pub struct WorkPipelineConfig {
     /// Where a rebuild reports gone paths (К2b, delete-i12 (в)); the watcher rechecks
     /// them. `None` in tests.
     pub recheck_tx: Option<crate::daemon::backup::rebuild::RecheckTx>,
+    /// The size limit of this machine: the rebuild reads no source file above it (J1,
+    /// backup-i5). Default: the RaptorQ ceiling; the daemon sets the limit in force.
+    pub max_source_bytes: u64,
 }
 
 impl Default for WorkPipelineConfig {
@@ -87,6 +90,7 @@ impl Default for WorkPipelineConfig {
             data_dir: std::path::PathBuf::new(),
             min_pool_size: 2,
             recheck_tx: None,
+            max_source_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
         }
     }
 }

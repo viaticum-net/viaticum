@@ -394,6 +394,7 @@ async fn restore_job_outlives_the_client_that_submitted_it() {
             peer_backoff: None,
             work_event_tx: None,
             resubmit_tx: None,
+            max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
         },
         Arc::new(RaptorQEncoder::new()),
     );

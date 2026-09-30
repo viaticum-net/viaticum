@@ -77,6 +77,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         peer_backoff: None,
         work_event_tx: None,
         resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     }
 }
 
@@ -147,6 +148,7 @@ fn config_source_block_size_drives_backup() {
             peer_backoff: None,
             work_event_tx: None,
             resubmit_tx: None,
+            max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
         },
         Arc::new(RaptorQEncoder::new()),
     );

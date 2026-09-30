@@ -609,7 +609,8 @@ pub(crate) async fn load_source_blob(
     let scope = crate::daemon::backup::rebuild::RebuildScope::new(
         config.device_id,
         config.recheck_tx.clone(),
-    );
+    )
+    .with_max_source_bytes(config.max_source_bytes);
     crate::daemon::backup::pipeline::rebuild_source_blob(db, block, &config.epoch_key, &scope)
         .await
         .context("rebuild_source_blob")

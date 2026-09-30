@@ -114,6 +114,11 @@ pub struct Scheduler {
     /// Default: any Present record, no recheck (tests); the daemon sets this device and
     /// the watcher's recheck channel.
     rebuild_scope: crate::daemon::backup::rebuild::RebuildScope,
+    /// When the WARN "cannot load source block for PoS" was last written per block
+    /// (backup-i7): once per `POS_LOAD_WARN_INTERVAL` per block, on the monotonic clock. A
+    /// block whose source outgrew the size limit fails every tick; the log must not.
+    /// Shared with the preparation task, which runs on the blocking pool.
+    pos_load_warned: Arc<std::sync::Mutex<HashMap<SourceBlockId, std::time::Instant>>>,
 }
 
 impl Scheduler {
@@ -146,6 +151,7 @@ impl Scheduler {
             data_dir,
             last_attempted: std::sync::Mutex::new(HashMap::new()),
             rebuild_scope: Default::default(),
+            pos_load_warned: Arc::default(),
         }
     }
 

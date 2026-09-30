@@ -47,6 +47,8 @@ impl BackupCoordinator {
     pub(super) fn handle_deleted(&mut self, event: &DirtyEvent) -> anyhow::Result<()> {
         let now = Timestamp::now();
         let device = event.device_id;
+        // backup-i4: a deleted path (or directory) is not a too-large file any more.
+        self.clear_too_large_of_deleted(&event.path);
         let mut known = false;
         if let Some(mut record) = self.db.get_file(&event.path)? {
             known = true;

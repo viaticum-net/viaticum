@@ -654,10 +654,12 @@ fn deleted_event_drops_pending_version_and_queue_entry() {
     assert!(queued_paths(&c).is_empty(), "queue entry dropped");
 }
 
-/// Large file: the second read (at packing) sees other bytes than the first — the
-/// version records the hash of what went into the block; a vanished one is skipped.
+/// Large file (F1, backup-i5, spec R1-d §0.4): the event's read is the only read. The block
+/// is built from the bytes passed in and the version records the hash of THOSE bytes, whatever
+/// the disk holds now — even nothing (there is no second read for it to fail or to see other
+/// bytes; the L1 rule for a second read is gone with the second read).
 #[test]
-fn large_file_changed_between_reads_is_recorded_with_real_hash() {
+fn process_large_file_uses_passed_bytes() {
     let db = Db::open_in_memory().unwrap();
     let dir = TempDir::new().unwrap();
     let mut c = coord(&db);
@@ -665,27 +667,27 @@ fn large_file_changed_between_reads_is_recorded_with_real_hash() {
         content(60, BLOCK as usize + 1024),
         content(61, BLOCK as usize + 1024),
     );
-    let p = write(&dir, "big.bin", &l1);
+    let p = write(&dir, "big.bin", &l2);
     let file_id = c.get_or_create_file_id(&p, &DEV, hash(&l1)).unwrap();
-    write(&dir, "big.bin", &l2);
 
     let result = c
-        .process_large_file(&p, file_id, hash(&l1), 0.5, &[])
-        .unwrap()
-        .expect("changed large file is packed");
+        .process_large_file(&p, file_id, hash(&l1), 0.5, &[], l1.clone())
+        .unwrap();
 
     let v = last(&db, &p);
-    assert_eq!(v.content_hash, hash(&l2), "hash of the packed bytes");
+    assert_eq!(v.content_hash, hash(&l1), "hash of the bytes passed in");
     assert_eq!(v.source_block_id, result.source_block_id);
     assert!(v.backed_up_at.is_some());
 
+    // The disk is not read: the file may be gone.
     let gone = write(&dir, "gone.bin", &l1);
-    let gone_id = c.get_or_create_file_id(&gone, &DEV, hash(&l1)).unwrap();
+    let gone_id = c.get_or_create_file_id(&gone, &DEV, hash(&l2)).unwrap();
     std::fs::remove_file(&gone).unwrap();
-    assert!(
-        c.process_large_file(&gone, gone_id, hash(&l1), 0.5, &[])
-            .unwrap()
-            .is_none(),
-        "vanished large file skipped"
-    );
+    let result = c
+        .process_large_file(&gone, gone_id, hash(&l2), 0.5, &[], l2.clone())
+        .unwrap();
+    let v = last(&db, &gone);
+    assert_eq!(v.content_hash, hash(&l2));
+    assert_eq!(v.source_block_id, result.source_block_id);
+    assert!(v.backed_up_at.is_some());
 }

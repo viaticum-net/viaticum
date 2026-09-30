@@ -62,6 +62,7 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         peer_backoff: None,
         work_event_tx: None,
         resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }

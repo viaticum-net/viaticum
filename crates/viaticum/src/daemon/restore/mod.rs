@@ -208,6 +208,9 @@ pub struct RestoreConfig {
     pub pressure: Option<HoldingsPressure>,
     /// Test clock acceleration: the no-answer pauses are divided by it (restore-i26).
     pub time_scale: u64,
+    /// The size limit of this machine: the local tier's rebuild reads no source file above
+    /// it (J1, backup-i5). Default: the RaptorQ ceiling; the daemon sets the limit in force.
+    pub max_source_bytes: u64,
 }
 
 impl RestoreConfig {
@@ -223,6 +226,7 @@ impl RestoreConfig {
             staging_status: Arc::default(),
             pressure: None,
             time_scale: 1,
+            max_source_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
         }
     }
 }
