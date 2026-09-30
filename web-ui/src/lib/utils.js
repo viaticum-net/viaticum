@@ -72,6 +72,12 @@ export function statusBadge(s) {
         tooltip: `${s.lost} of ${s.target} symbols lost; only ${s.live} alive. Repair pipeline is rebuilding from survivors.`,
       };
     }
+    case 'releasing':
+      return {
+        label: 'Being released',
+        kind: 'working',
+        tooltip: 'Friends are dropping this copy; if the file is still in your folder it will be backed up again.',
+      };
     default:
       return { label: s.kind ?? 'Unknown', kind: 'pending', tooltip: 'Unrecognised status.' };
   }
@@ -93,6 +99,12 @@ export function explainRestoreBlocker(b) {
       return {
         reason: 'All known holders for this block are offline.',
         hint: 'Wait for at least one holder to come online.',
+        eta: '',
+      };
+    case 'being_released':
+      return {
+        reason: 'This version is being released: friends are dropping their copies.',
+        hint: 'If the file is back in your folder, it is being backed up again under a new block.',
         eta: '',
       };
     default:

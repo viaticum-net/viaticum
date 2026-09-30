@@ -76,6 +76,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
     }
 }
 
@@ -145,6 +146,7 @@ fn config_source_block_size_drives_backup() {
             live_watch_configs: None,
             peer_backoff: None,
             work_event_tx: None,
+            resubmit_tx: None,
         },
         Arc::new(RaptorQEncoder::new()),
     );
@@ -236,6 +238,7 @@ fn deletion_cooldown_full_lifecycle() {
 
     // Active source block of type Single
     let block = SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 4,
         t: 65535,
@@ -336,6 +339,7 @@ fn deletion_cooldown_full_lifecycle() {
 
     // Update block to Deleting and both placements to Deleting
     let block_deleting = SourceBlockRecord {
+        seal_generation: 0,
         status: SourceBlockStatus::Deleting,
         ..block.clone()
     };

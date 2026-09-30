@@ -598,6 +598,13 @@ impl DaemonHandle {
         // of rechecks never blocks WatchAdmin commands (A21, N8).
         let (recheck_tx, recheck_rx) =
             mpsc::channel::<PathBuf>(crate::daemon::backup::rebuild::RECHECK_CHANNEL_CAPACITY);
+        // Resubmit channel (L1b, backup-i8, backup-i25): the backup reconcile hands paths to
+        // the watcher, which re-submits them under its roots and filters. The coordinator
+        // only `try_send`s, so neither side ever waits on the other.
+        let (resubmit_tx, resubmit_rx) =
+            mpsc::channel::<crate::daemon::backup::reconcile::ResubmitBatch>(
+                crate::daemon::backup::reconcile::RESUBMIT_CHANNEL_CAPACITY,
+            );
 
         // Create accepted_offers map shared between BackupCoordinator and Processor.
         let accepted_offers = crate::daemon::processor::make_empty_accepted_offers();
@@ -632,6 +639,7 @@ impl DaemonHandle {
                 live_watch_configs: Some(Arc::clone(&live_configs)),
                 peer_backoff: Some(Arc::clone(&peer_backoff)),
                 work_event_tx: Some(work_event_tx.clone()),
+                resubmit_tx: Some(resubmit_tx),
             },
             encoder.clone(),
         );
@@ -1079,6 +1087,7 @@ impl DaemonHandle {
                     .map(|a| Arc::clone(&a.watch_states)),
                 time_scale,
                 recheck_rx: Some(recheck_rx),
+                resubmit_rx: Some(resubmit_rx),
             };
             let dirty_tx_watcher = dirty_tx.clone();
             let cancel_watcher = cancel.clone();

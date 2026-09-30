@@ -326,9 +326,25 @@ pub struct SourceBlockRecord {
     /// Default: 0.0 (pre-migration sentinel).
     #[serde(default)]
     pub target_reliability: f64,
+
+    /// N1 (backup-i8, delete-i9): generation of this block's seal (not the SS ledger's
+    /// `generation`). 0 for every block sealed before L1b and whenever the id at generation
+    /// 0 is free or in service; content backed up again while the block of the same
+    /// plaintext is being released takes the next generation, so its id differs from the
+    /// one an old Delete addresses. Enters the nonce derivation
+    /// (`backup::pipeline::seal_compressed`); rides SystemState with the record. Not
+    /// serialized when 0, so records and SS plaintexts of generation 0 stay byte-identical
+    /// (INV-G0).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub seal_generation: u32,
     // B-4: worker cooldown (last_attempted_at / last_pool_signature) moved to the
     // RAM-only HotCache::block_cooldown — never persisted, resets on restart.
     // Old records may still carry these CBOR map keys; serde ignores them.
+}
+
+/// `skip_serializing_if` for [`SourceBlockRecord::seal_generation`] (INV-G0).
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 impl SourceBlockRecord {

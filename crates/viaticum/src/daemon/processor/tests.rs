@@ -1654,6 +1654,7 @@ async fn handle_symbol_drop_notice_does_not_panic() {
 /// target_reliability > 0 ensures next_work_item can pick it up.
 fn make_source_block(block_id: SourceBlockId) -> SourceBlockRecord {
     SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 10,
         t: 1,
@@ -3663,6 +3664,7 @@ async fn cluster_sync_response_from_non_cluster_peer_is_rejected() {
 /// Helper to create a minimal SourceBlockRecord for cached-fields tests.
 fn make_source_block_for_hook(block_id: SourceBlockId, importance: f64) -> SourceBlockRecord {
     SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 5,
         t: 1,

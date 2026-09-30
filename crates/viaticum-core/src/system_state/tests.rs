@@ -33,6 +33,7 @@ fn make_file(path: &str, id: u64) -> FileRecord {
 
 fn make_source_block(seed: u8) -> SourceBlockRecord {
     SourceBlockRecord {
+        seal_generation: 0,
         block_id: SourceBlockId([seed; 32]),
         k: 10,
         t: 65535,
@@ -979,4 +980,50 @@ fn merge_live_peer_takes_max_last_seen_and_live_x25519() {
         Some([1u8; 32]),
         "snapshot key kept when live has none"
     );
+}
+
+// ============================================================
+// L1b (N1, A8) [cross:B]: the seal generation rides the snapshot and the diffs
+// ============================================================
+
+/// A block sealed at generation 2 keeps its generation through snapshot → pack → unpack →
+/// restore (DR), and a diff carries a new block's generation (the worker and PoS of the
+/// restored node rebuild it at that generation).
+#[test]
+fn snapshot_and_diff_carry_block_generation() {
+    let db = test_db();
+    let key = make_key();
+    let mut sb = make_source_block(1);
+    sb.seal_generation = 2;
+    db.upsert_source_block(&sb).unwrap();
+    db.upsert_source_block(&make_source_block(2)).unwrap();
+
+    let state = snapshot_db(&db).unwrap();
+    let blob = pack_system_state(&state, &key).unwrap();
+    let unpacked = unpack_system_state(&blob, &key).unwrap();
+    let db2 = test_db();
+    restore_db(&db2, &unpacked).unwrap();
+    let generation = |db: &crate::db::Db, seed: u8| {
+        db.get_source_block(&SourceBlockId([seed; 32]))
+            .unwrap()
+            .unwrap()
+            .seal_generation
+    };
+    assert_eq!(generation(&db2, 1), 2);
+    assert_eq!(generation(&db2, 2), 0);
+
+    let base = base_state();
+    let mut target = base.clone();
+    let mut revived = make_source_block(3);
+    revived.seal_generation = 1;
+    target.source_blocks.push(revived);
+    let diff = diff_states(&base, &target);
+    let result = apply_diffs(base, std::slice::from_ref(&diff));
+    let carried = result
+        .source_blocks
+        .iter()
+        .find(|b| b.block_id == SourceBlockId([3; 32]))
+        .expect("the new block is in the applied state");
+    assert_eq!(carried.seal_generation, 1);
+    assert_states_eq(&result, &target);
 }

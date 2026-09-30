@@ -121,6 +121,7 @@ fn placement_in_status(
     last_verified: Option<Timestamp>,
 ) {
     let block = SourceBlockRecord {
+        seal_generation: 0,
         block_id: SourceBlockId([block_seed; 32]),
         k: 10,
         t: T_BYTES,

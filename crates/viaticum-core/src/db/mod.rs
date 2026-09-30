@@ -200,6 +200,17 @@ fn placement_key(block_id: &SourceBlockId, holder: &DeviceId) -> [u8; 64] {
     key
 }
 
+/// SYMBOL_PLACEMENTS key range of one block: keys are [block_id(32) || holder(32)], so
+/// [block_id||00..] to [block_id||FF..].
+fn placement_range(block_id: &SourceBlockId) -> ([u8; 64], [u8; 64]) {
+    let mut lo = [0u8; 64];
+    let mut hi = [0u8; 64];
+    lo[..32].copy_from_slice(&block_id.0);
+    hi[..32].copy_from_slice(&block_id.0);
+    hi[32..].fill(0xFF);
+    (lo, hi)
+}
+
 /// CONTENT_INDEX key: content_hash (32 bytes) ++ path bytes. The fixed-width hash
 /// prefix lets a range scan select all paths for a given content hash.
 fn content_index_key(content_hash: &[u8; 32], path: &str) -> Vec<u8> {
@@ -1471,12 +1482,7 @@ impl Db {
         let tx = self.inner.begin_read()?;
         let table = tx.open_table(SYMBOL_PLACEMENTS)?;
         let mut records = Vec::new();
-        // Keys are [block_id(32) || holder(32)]. Range: [block_id||00..] to [block_id||FF..].
-        let mut lo = [0u8; 64];
-        let mut hi = [0u8; 64];
-        lo[..32].copy_from_slice(&block_id.0);
-        hi[..32].copy_from_slice(&block_id.0);
-        hi[32..].fill(0xFF);
+        let (lo, hi) = placement_range(block_id);
         for item in table.range::<&[u8; 64]>(&lo..=&hi)? {
             let (_, v) = item?;
             let record: SymbolPlacement = from_cbor_bytes(v.value())?;
@@ -3370,6 +3376,9 @@ pub mod testutil {
 
 /// DN-1: applied signed letters by signature (`seen_signed_letters` + expiry index).
 mod seen_signed_letters;
+
+mod serviceability;
+pub use serviceability::{Serviceability, serviceability_of};
 
 /// В-0: 4R holder state (`four_r_state`: the relay latch row).
 mod four_r_state;

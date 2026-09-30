@@ -134,6 +134,7 @@ fn insert_file_with_block(
     };
     let block_id = SourceBlockId([7u8; 32]);
     let block = SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 4,
         t: 1024,
@@ -410,6 +411,7 @@ fn make_block(
     status: SourceBlockStatus,
 ) -> SourceBlockRecord {
     SourceBlockRecord {
+        seal_generation: 0,
         block_id: SourceBlockId([id; 32]),
         k: 10,
         t: 64,
@@ -1897,6 +1899,7 @@ fn held_ss_block(db: &Db, id: u8, holders: u8) -> viaticum_core::types::SourceBl
     };
     let block_id = SourceBlockId([id; 32]);
     db.upsert_source_block(&SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 1,
         t: 64,
@@ -2088,4 +2091,153 @@ async fn status_below_reserve_says_what_is_given_back_at_any_quota() {
     let data = status_of(&make_test_state_with(dir.path().to_path_buf(), 0, 0).await).await;
     assert_eq!(data.below_reserve_giving_back_bytes, None);
     assert!(data.quota_note.is_empty());
+}
+
+// ── L1b (backup-i8, backup-i21): a block not in service is never "safe" / "restorable" ──
+
+/// The file entry of `path` from `dispatch_files`.
+async fn file_entry(state: &DaemonState, path: &str) -> crate::cli::types::FileEntry {
+    let CliResponse::Files(entries) =
+        dispatch(CliRequest::Files { path_prefix: None }, state).await
+    else {
+        panic!("expected Files");
+    };
+    entries
+        .into_iter()
+        .find(|e| e.path == path)
+        .expect("file entry present")
+}
+
+/// The block of `insert_file_with_block`, its status set to `status`.
+fn set_block_status(state: &DaemonState, status: viaticum_core::types::SourceBlockStatus) {
+    let id = viaticum_core::types::SourceBlockId([7u8; 32]);
+    let mut block = state.db.get_source_block(&id).unwrap().unwrap();
+    block.status = status;
+    state.db.upsert_source_block(&block).unwrap();
+}
+
+/// A placement of the `insert_file_with_block` block at holder `holder` with `count` symbols.
+fn block_placement(
+    state: &DaemonState,
+    holder: u8,
+    count: u32,
+    status: viaticum_core::types::PlacementStatus,
+) {
+    use viaticum_core::types::{FileId, SourceBlockId, SymbolPlacement, Timestamp};
+    state
+        .db
+        .upsert_placement(&SymbolPlacement {
+            source_block_id: SourceBlockId([7u8; 32]),
+            holder_id: DeviceId([holder; 32]),
+            file_id: FileId(1),
+            esi_ranges: vec![(u32::from(holder) * 100, count)],
+            binding_seed: [0; 32],
+            status,
+            last_verified: None,
+            placed_at: Timestamp(1),
+            consecutive_misses: 0,
+        })
+        .unwrap();
+}
+
+/// M8: the cache says "at target" (it is not recomputed when the block turns `Deleting`),
+/// but the network is releasing the block.
+#[tokio::test]
+async fn is_safe_to_delete_false_when_block_is_deleting_even_if_cached_reliability_high() {
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "doc.pdf", 0.99, 0.95, true);
+    assert!(
+        safe_to_delete_flag(&state, "doc.pdf").await,
+        "control: in service"
+    );
+
+    set_block_status(&state, viaticum_core::types::SourceBlockStatus::Deleting);
+
+    assert!(!safe_to_delete_flag(&state, "doc.pdf").await);
+}
+
+#[tokio::test]
+async fn is_safe_to_delete_false_when_a_placement_is_deleting() {
+    use viaticum_core::types::PlacementStatus;
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "doc.pdf", 0.99, 0.95, true);
+    block_placement(&state, 0x51, 20, PlacementStatus::Alive);
+    assert!(safe_to_delete_flag(&state, "doc.pdf").await, "control");
+
+    block_placement(&state, 0x52, 20, PlacementStatus::Deleting);
+
+    assert!(!safe_to_delete_flag(&state, "doc.pdf").await);
+}
+
+/// M8: `effective_status` counts placements; a block being released is `Releasing` even
+/// with enough `Alive` symbols to decode.
+#[tokio::test]
+async fn effective_status_is_releasing_when_block_is_deleting_even_with_alive_placements() {
+    use crate::cli::types::EffectiveStatus;
+    use viaticum_core::types::{PlacementStatus, SourceBlockStatus};
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "doc.pdf", 0.99, 0.95, true);
+    block_placement(&state, 0x51, 50, PlacementStatus::Alive);
+    assert!(
+        matches!(
+            file_entry(&state, "doc.pdf").await.effective_status,
+            Some(EffectiveStatus::Restorable { .. })
+        ),
+        "control: restorable in service"
+    );
+
+    set_block_status(&state, SourceBlockStatus::Deleting);
+    assert_eq!(
+        file_entry(&state, "doc.pdf").await.effective_status,
+        Some(EffectiveStatus::Releasing)
+    );
+
+    // A Deleting placement alone (status still Active) is the same answer.
+    set_block_status(&state, SourceBlockStatus::Active);
+    block_placement(&state, 0x52, 1, PlacementStatus::Deleting);
+    assert_eq!(
+        file_entry(&state, "doc.pdf").await.effective_status,
+        Some(EffectiveStatus::Releasing)
+    );
+}
+
+async fn doc_versions(state: &DaemonState) -> Vec<crate::cli::types::VersionEntry> {
+    let CliResponse::Versions(v) = dispatch(
+        CliRequest::Versions {
+            path: "doc.pdf".into(),
+        },
+        state,
+    )
+    .await
+    else {
+        panic!("expected Versions");
+    };
+    v
+}
+
+/// restore-i3 (2026-09-30): a version whose block is being released shows the restore
+/// blocker "being released", not "restorable" with no blocker, although its `Alive`
+/// placements could decode it.
+#[tokio::test]
+async fn restore_blocker_is_being_released_when_block_is_deleting() {
+    use crate::cli::types::{EffectiveStatus, RestoreBlocker};
+    use viaticum_core::types::{PlacementStatus, SourceBlockStatus};
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "doc.pdf", 0.99, 0.95, true);
+    block_placement(&state, 0x51, 50, PlacementStatus::Alive);
+    let before = doc_versions(&state).await;
+    assert!(matches!(
+        before[0].effective_status,
+        EffectiveStatus::Restorable { .. }
+    ));
+    assert_eq!(before[0].restore_blocker, None, "control: in service");
+
+    set_block_status(&state, SourceBlockStatus::Deleting);
+
+    let after = doc_versions(&state).await;
+    assert_eq!(after[0].effective_status, EffectiveStatus::Releasing);
+    assert_eq!(
+        after[0].restore_blocker,
+        Some(RestoreBlocker::BeingReleased)
+    );
 }

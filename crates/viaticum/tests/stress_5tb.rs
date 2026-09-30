@@ -106,6 +106,7 @@ fn stress_5tb_metadata_scale() {
     // 1a. Insert N_BLOCKS SourceBlockRecords.
     for (i, &block_id) in block_ids.iter().enumerate() {
         let record = SourceBlockRecord {
+            seal_generation: 0,
             block_id,
             k: K,
             t: 65_535,

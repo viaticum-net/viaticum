@@ -626,6 +626,7 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
 
     // Source block: Active.
     let sb = SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 100,
         t: 65535,
@@ -1018,6 +1019,7 @@ async fn already_deleting_holder_is_not_republished() {
 
     // Source block: Active.
     let sb = SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 10,
         t: 65535,
@@ -1199,6 +1201,7 @@ fn make_multi_holder_file(
 fn make_active_block(block_id: SourceBlockId) -> viaticum_core::types::SourceBlockRecord {
     use viaticum_core::types::{SourceBlockRecord, SourceBlockStatus, SourceBlockType};
     SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 10,
         t: 65535,
@@ -1602,6 +1605,7 @@ async fn delete_not_marked_sent_when_publish_zero_acks() {
     db.upsert_file(&file).unwrap();
 
     let sb = SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 100,
         t: 65535,
@@ -1744,6 +1748,7 @@ async fn cleanup_block_removes_db_record() {
 
     // Source block: already in Deleting state.
     let sb = viaticum_core::types::SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 10,
         t: 65535,
@@ -1818,6 +1823,7 @@ fn make_block_for_hook(
     current_reliability: f64,
 ) -> viaticum_core::types::SourceBlockRecord {
     viaticum_core::types::SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 5,
         t: 1,
@@ -2096,6 +2102,7 @@ fn make_source_block_record(block_id: SourceBlockId) -> viaticum_core::types::So
     let k_eff = TEST_K + viaticum_core::constants::DECODE_OVERHEAD;
     let n = (k_eff as f64 * 1.5).ceil() as u32;
     SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: TEST_K,
         t: TEST_T,

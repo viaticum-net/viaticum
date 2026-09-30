@@ -125,6 +125,7 @@ pub fn ss_source_block_record(
         .map_err(|e| anyhow::anyhow!("erasure params for SystemState block: {e}"))?;
     let target_rel = viaticum_core::reliability::target_reliability(SYSTEM_STATE_IMPORTANCE);
     Ok(SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: params.k,
         t: params.t,

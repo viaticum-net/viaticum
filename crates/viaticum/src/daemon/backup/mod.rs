@@ -10,13 +10,18 @@
 //   events.rs   -- process_event helpers: handle_added_or_modified, dedup
 //   gone.rs     -- deletions, recheck, the root rule (L0: delete-i12, dr-i64)
 //   pipeline.rs -- compress/encrypt/encode/write-symbols inner pipeline
+//   generation.rs -- L1b N1: the seal generation a packed plaintext takes (delete-i9)
 //   packing.rs  -- PackIndex format: build_plaintext, parse_pack_index
 //   rebuild.rs  -- rebuild a block's plaintext from this device's files, by content (L0)
+//   reconcile.rs -- L1b: current version → serviceable block, pending → queued, by level
 //   tests.rs    -- test scenarios
 //   tests_current.rs -- L1: a path points at its current content; packing does
 //                       not abort on a vanished or changed file (backup-i9, i23)
 //   tests_rebuild.rs -- L0: rebuild by content after renames, copies, swaps
 //   tests_gone.rs    -- L0: deletion by event and recheck, the watch root rule
+//   tests_seal.rs    -- L1b: a generation-0 seal keeps the pre-L1b block id (INV-G0)
+//   tests_revive.rs  -- L1b: the serviceable-block dedup gate, the seal generation (N1)
+//   tests_reconcile.rs -- L1b: the reconcile hands paths to the watcher (backup-i8, i25)
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -33,10 +38,12 @@ use pipeline::{
 };
 
 pub mod events;
+mod generation;
 mod gone;
 pub mod packing;
 pub mod pipeline;
 pub mod rebuild;
+pub mod reconcile;
 
 pub(crate) use gone::path_gone;
 
@@ -48,6 +55,12 @@ mod tests_current;
 mod tests_gone;
 #[cfg(test)]
 mod tests_rebuild;
+#[cfg(test)]
+mod tests_reconcile;
+#[cfg(test)]
+mod tests_revive;
+#[cfg(test)]
+mod tests_seal;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -147,6 +160,9 @@ pub struct BackupConfig {
     /// WorkPipeline is not running. Without this signal, worker would wait up to
     /// 60s (tick_interval) before noticing new blocks.
     pub work_event_tx: Option<tokio::sync::mpsc::Sender<crate::daemon::work_pipeline::WorkEvent>>,
+    /// Paths the reconcile hands to the watcher (L1b, backup-i8, backup-i25). `None` in
+    /// unit tests without a watcher: a pass then sends nothing.
+    pub resubmit_tx: Option<reconcile::ResubmitTx>,
 }
 
 impl Default for BackupConfig {
@@ -165,6 +181,7 @@ impl Default for BackupConfig {
             live_watch_configs: None,
             peer_backoff: None,
             work_event_tx: None,
+            resubmit_tx: None,
         }
     }
 }
@@ -221,6 +238,8 @@ pub struct BackupCoordinator {
     /// it — so it accumulates (saturating) and is never read. Harmless zombie until
     /// the offer→accept accounting is re-homed to the worker in phase-4R.
     pub(crate) accepted_this_cycle: u32,
+    /// Reconcile backoff per path (RAM; L1b, backup-i8).
+    pub(crate) reconcile_backoff: HashMap<String, reconcile::Backoff>,
 }
 
 impl BackupCoordinator {
@@ -252,6 +271,7 @@ impl BackupCoordinator {
             next_file_id,
             offered_this_cycle: 0,
             accepted_this_cycle: 0,
+            reconcile_backoff: HashMap::new(),
         }
     }
 
@@ -715,6 +735,15 @@ impl BackupCoordinator {
         ));
         fallback_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+        // L1b reconcile (backup-i8, backup-i25): one pass now — its batch waits in the
+        // channel until the watcher has checked its roots at start — then by the timer.
+        let mut reconcile_timer = interval(Duration::from_secs(
+            (viaticum_core::constants::CURRENT_BLOCK_RECONCILE_SECS / scale).max(60),
+        ));
+        reconcile_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        reconcile_timer.tick().await; // the first tick is immediate: this pass
+        tokio::task::block_in_place(|| self.reconcile_pass());
+
         loop {
             tokio::select! {
                 maybe_event = rx.recv() => {
@@ -767,6 +796,9 @@ impl BackupCoordinator {
                         tracing::error!("fallback flush error: {e:#}");
                     }
                     self.persist_cycle_budget();
+                }
+                _ = reconcile_timer.tick() => {
+                    tokio::task::block_in_place(|| self.reconcile_pass());
                 }
                 maybe_backup = backup_event_rx.recv() => {
                     if let Some(event) = maybe_backup {
@@ -943,11 +975,13 @@ impl BackupCoordinator {
 // were removed in Wave 11b. Symbol delivery is now the WorkPipeline worker's responsibility.
 
 /// "Is this content already backed up?" for the flush-time check (backup-i23): a dedup
-/// source exists. A DB error answers "no" (WARN): the file is then packed — traffic,
+/// source on a block in service exists. A DB error answers "no" (WARN): the file is then packed — traffic,
 /// never a skipped backup.
 fn content_in_network(db: &Db, content_hash: &[u8; 32]) -> bool {
     match events::select_dedup_source(db, content_hash, None) {
-        Ok(src) => src.is_some(),
+        // Only content on a serviceable block (backup-i21): a file changed to content that
+        // lies only on a block being released is packed (К10).
+        Ok(lookup) => matches!(lookup, events::DedupLookup::Source(_)),
         Err(e) => {
             tracing::warn!("flush: dedup lookup failed, packing the file: {e:#}");
             false

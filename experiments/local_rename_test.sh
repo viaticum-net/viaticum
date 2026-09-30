@@ -32,7 +32,7 @@
 #               file-by-file move of a watch root (11-12).
 # Cannot close: real 4-week windows; macOS/Windows event shapes and root identity (unit tests);
 #               case-insensitive FS; an ancestor of a watch root renamed; restore from trash
-#               after the Delete was sent (backup-i8, L1b); cluster siblings; hard links; a
+#               after the Delete was sent (backup-i8: local_revive_test); cluster siblings; hard links; a
 #               file changed between enqueue and flush (unit tests); cp -r / mkdir races
 #               (R1-c2); DR side of dr-i64 (local_dr_test step 8); root self-heal on Scan (unit);
 #               a move longer than the owner window; a rollback while the edit is still queued

@@ -87,6 +87,7 @@ fn config(
         watch_states: states,
         time_scale: 1,
         recheck_rx: None,
+        resubmit_rx: None,
     };
     (cfg, data_dir)
 }

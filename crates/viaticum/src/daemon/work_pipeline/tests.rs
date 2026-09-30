@@ -110,6 +110,7 @@ fn make_block_record(
     target_reliability: f64,
 ) -> SourceBlockRecord {
     SourceBlockRecord {
+        seal_generation: 0,
         block_id: bid,
         k: 5,
         t: 1024,
@@ -2102,5 +2103,72 @@ fn bind_placement_symbols_when_a_placement_esi_is_missing_returns_error() {
     assert!(
         result.is_err(),
         "a missing ESI must fail the delivery, not shrink it silently"
+    );
+}
+
+/// repair-i16 (R1-f2, L1b): the worker picked the block while it was `Active`, and the
+/// deletion executor turned it `Deleting` before the offers were written — nothing is
+/// offered or delivered (0 rows, 0 attempts). Control: a block in service in the same pool
+/// gets its offers written and attempted.
+#[tokio::test]
+async fn worker_iteration_delivers_only_recorded_offers() {
+    use viaticum_core::types::SourceBlockStatus;
+
+    let data_dir = tempdir().unwrap();
+    let db = make_db();
+    let peers = [device_id(0x91), device_id(0x92)];
+    add_pool_peers(&db, &peers);
+    let pool = super::PoolSnapshot {
+        candidates: peers
+            .iter()
+            .map(|&device_id| HolderCandidate {
+                device_id,
+                trust: 0.9,
+            })
+            .collect(),
+        signature: 7,
+    };
+    let mut config = make_config();
+    config.data_dir = data_dir.path().to_path_buf();
+    let swarm = lonely_swarm(0x36).await;
+    let encoder =
+        Arc::new(RaptorQEncoder::new()) as Arc<dyn viaticum_core::erasure::ErasureEncoder>;
+    let run = |rec: SourceBlockRecord| {
+        let (db, config, encoder, swarm, pool) = (&db, &config, &encoder, &swarm, &pool);
+        async move {
+            super::worker::run_block_iteration(
+                db, config, encoder, swarm, None, None, None, &rec, pool,
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    let served = retained_block(data_dir.path(), 0x93, 1.0);
+    db.upsert_source_block(&served).unwrap();
+    let control = run(served.clone()).await;
+    assert!(control.offered > 0, "control: offers written");
+    assert_eq!(
+        control.failed, control.offered,
+        "control: delivery attempted"
+    );
+
+    let released = retained_block(data_dir.path(), 0x94, 1.0);
+    let mut in_db = released.clone();
+    in_db.status = SourceBlockStatus::Deleting;
+    db.upsert_source_block(&in_db).unwrap();
+    let outcome = run(released.clone()).await;
+
+    assert_eq!(outcome.offered, 0);
+    assert!(
+        outcome.left_service,
+        "parked as left service, not 'no candidates'"
+    );
+    assert!(!control.left_service);
+    assert_eq!((outcome.acked, outcome.failed), (0, 0), "nothing delivered");
+    assert!(
+        db.list_placements_for_block(&released.block_id)
+            .unwrap()
+            .is_empty()
     );
 }

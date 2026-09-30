@@ -7,6 +7,8 @@
 // the same path is superseded (at most one pending version per path, and it is the
 // last one).
 
+use std::collections::HashMap;
+
 use viaticum_core::config::derive_file_importance;
 use viaticum_core::db::Db;
 use viaticum_core::types::{
@@ -23,27 +25,59 @@ pub(crate) struct DedupSource {
     pub(crate) version: FileVersion,
 }
 
-/// The dedup source for `content_hash`, or `None` when no backed-up version holds it.
+/// The answer of the dedup lookup (backup-i21).
+#[derive(Debug, Clone)]
+pub(crate) enum DedupLookup {
+    /// A backed-up version with this content on a serviceable block: point the path there.
+    Source(DedupSource),
+    /// The content was backed up, but every block carrying it is not in service (window,
+    /// releasing, missing): back it up again.
+    Unserviceable { blocks: Vec<SourceBlockId> },
+    /// No backed-up version holds this content.
+    NotFound,
+}
+
+/// The dedup source for `content_hash` (backup-i9, backup-i21).
 ///
-/// Only a backed-up version qualifies (a pending one has no block yet). Among the
-/// records holding one: a record whose last backed-up version has this content comes
-/// first — `own_path` before the others, so a touch or a rescan of a path that already
-/// points at this content keeps its block — then path order. Within the record, its
-/// last backed-up version with this content. L1b adds its "serviceable block" gate here.
+/// Only a backed-up version qualifies (a pending one has no block yet), and only one whose
+/// block is in service: record `Active`, no placement `Deleting` (`Serviceability`,
+/// memoized per call). The gate filters every candidate BEFORE the ranking, so a returned
+/// path never pins itself to its own block being released. Among the records holding a
+/// serviceable version: a record whose last backed-up version has this content comes first
+/// — `own_path` before the others, so a touch or a rescan of a path that already points at
+/// this content keeps its block — then path order. Within the record, its last backed-up
+/// version with this content on a serviceable block.
 pub(crate) fn select_dedup_source(
     db: &Db,
     content_hash: &[u8; 32],
     own_path: Option<&str>,
-) -> anyhow::Result<Option<DedupSource>> {
+) -> anyhow::Result<DedupLookup> {
+    let mut serviceable: HashMap<SourceBlockId, bool> = HashMap::new();
+    let mut is_serviceable = |block: SourceBlockId| -> anyhow::Result<bool> {
+        if let Some(s) = serviceable.get(&block) {
+            return Ok(*s);
+        }
+        let s = db.block_serviceability(&block)?.is_serviceable();
+        serviceable.insert(block, s);
+        Ok(s)
+    };
+    let mut unserviceable: Vec<SourceBlockId> = Vec::new();
     let mut best: Option<((u8, String), DedupSource)> = None;
     for record in db.files_with_content_hash(content_hash)? {
-        let Some(version) = record
-            .versions
-            .iter()
-            .rev()
-            .find(|v| &v.content_hash == content_hash && v.backed_up_at.is_some())
-            .cloned()
-        else {
+        let mut version = None;
+        for v in record.versions.iter().rev() {
+            if &v.content_hash != content_hash || v.backed_up_at.is_none() {
+                continue;
+            }
+            if is_serviceable(v.source_block_id)? {
+                version = Some(v.clone());
+                break;
+            }
+            if !unserviceable.contains(&v.source_block_id) {
+                unserviceable.push(v.source_block_id);
+            }
+        }
+        let Some(version) = version else {
             continue;
         };
         let last_backed_up_is_this = record
@@ -65,7 +99,13 @@ pub(crate) fn select_dedup_source(
             best = Some((key, DedupSource { record, version }));
         }
     }
-    Ok(best.map(|(_, src)| src))
+    Ok(match best {
+        Some((_, src)) => DedupLookup::Source(src),
+        None if !unserviceable.is_empty() => DedupLookup::Unserviceable {
+            blocks: unserviceable,
+        },
+        None => DedupLookup::NotFound,
+    })
 }
 
 /// Mark `device` Present in `record`. Returns whether the record changed.
@@ -90,16 +130,29 @@ impl BackupCoordinator {
         let size_bytes = file_bytes.len() as u64;
         let content_hash: [u8; 32] = *blake3::hash(&file_bytes).as_bytes();
 
-        // Dedup: content already in the network → the path points at it, zero traffic.
-        // Indexed lookup (CONTENT_INDEX); the cluster branch that scanned every FILES
-        // record per event is gone (R1-f A19).
-        if let Some(src) = select_dedup_source(&self.db, &content_hash, Some(&event.path))? {
-            tracing::debug!(
-                path = %event.path,
-                source = %src.record.path,
-                "dedup: content already backed up"
-            );
-            return self.handle_dedup(event, &src, content_hash);
+        // Dedup: content already in the network on a block in service → the path points
+        // at it, zero traffic. Indexed lookup (CONTENT_INDEX); the cluster branch that
+        // scanned every FILES record per event is gone (R1-f A19). Content whose every
+        // block is being released is backed up again (backup-i8, backup-i21): the packing
+        // seals it at a new generation when the plaintext is the same (delete-i9).
+        match select_dedup_source(&self.db, &content_hash, Some(&event.path))? {
+            DedupLookup::Source(src) => {
+                tracing::debug!(
+                    path = %event.path,
+                    source = %src.record.path,
+                    "dedup: content already backed up"
+                );
+                return self.handle_dedup(event, &src, content_hash);
+            }
+            DedupLookup::Unserviceable { blocks } => {
+                let blocks: Vec<String> = blocks.iter().map(|b| b.to_string()).collect();
+                tracing::info!(
+                    path = %event.path,
+                    blocks = %blocks.join(","),
+                    "backup: content returned but its block is being released; backing up again"
+                );
+            }
+            DedupLookup::NotFound => {}
         }
 
         // Not a duplicate — classify and enqueue or process immediately (large file).
