@@ -447,9 +447,11 @@ o_resolved() { events_grep "$(node_log "$O")" "mailbox PosResponse resolved" blo
 o_timeouts() { events_grep "$(node_log "$O")" "PoS challenge timed out" block_id holder_id challenge_id; }
 o_unknown() { events_grep "$(node_log "$O")" "unknown challenge_id" challenge_id; }
 # Fields: $3 elapsed_ms $4 due $5 issued $6 cpw_min $7 deferred $8 blocks $9 slowest_publish_ms
-# $10 in_flight $11 cut_blocks $12 scan_ms $13 slowest_block_ms (by name, so the order in
-# the log line does not matter).
-o_issue_ticks() { events_grep "$(node_log "$O")" "scheduler: PoS issue tick" elapsed_ms due issued cpw_min deferred blocks slowest_publish_ms in_flight cut_blocks scan_ms slowest_block_ms; }
+# $10 in_flight $11 cut_blocks $12 scan_ms $13 slowest_block_ms $14 preparing (by name, so
+# the order in the log line does not matter).
+o_issue_ticks() { events_grep "$(node_log "$O")" "scheduler: PoS issue tick" elapsed_ms due issued cpw_min deferred blocks slowest_publish_ms in_flight cut_blocks scan_ms slowest_block_ms preparing; }
+# Late publishes of preparations that outlived their tick (pos-i7-d-a). Fields: $3 issued.
+o_late_published() { events_grep "$(node_log "$O")" "PoS late preparation published" issued; }
 o_ledger_rows() { events_grep "$(node_log "$O")" "pair-ledger row" master; }
 
 # Holder-side events (the holder's own log).
@@ -739,6 +741,14 @@ read -r N_T N_DEF MAX_DEF LAST_DEF ISS_W12 BLK_MEAN BLK_MAX <<< "$(o_issue_ticks
     END { printf "%d %d %d %d %d %.1f %d\n", n, d, m, last, iss, (nb ? sb / nb : 0), mb }')"
 note "deferred (pos-i7-a/b): $N_DEF of $N_T ticks cut by the budget, max deferred $MAX_DEF, last tick $LAST_DEF; issued $ISS_W12 in W1+W2 = $(awk -v i="$ISS_W12" -v p="$PLACEMENTS_AT_1B" 'BEGIN { printf "%.2f", (p > 0 ? i / (2 * p) : 0) }') per placement per scaled week; blocks per tick mean $BLK_MEAN max $BLK_MAX"
 note "tick breakdown: scan_ms p95 = $(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '$12 ~ /^[0-9]+$/ { print $12 }' | p95), slowest_block_ms p95 = $(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '$13 ~ /^[0-9]+$/ { print $13 }' | p95), ticks with a cut block = $(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '$11 ~ /^[0-9]+$/ && $11 + 0 > 0' | awk 'NF' | wc -l | tr -d ' ')"
+# pos-i7-d-a: what the preparations past their ticks contributed (K = MAX_PREPARATIONS = 2):
+# challenges issued by late publishes, ticks that found a preparation running, and ticks
+# that found every slot busy and started no block.
+read -r N_PREP N_SLOTS_BUSY <<< "$(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk -v k=2 '
+    $14 ~ /^[0-9]+$/ && $14 + 0 > 0 { p++ }
+    $14 ~ /^[0-9]+$/ && $14 + 0 == k && $8 ~ /^[0-9]+$/ && $8 + 0 == 0 { f++ }
+    END { printf "%d %d\n", p, f }')"
+note "late preparations (pos-i7-d-a): issued by late publishes $(o_late_published | in_window "$T_W1" "$T_W3" | awk '$3 ~ /^[0-9]+$/ { s += $3 } END { print s + 0 }') in W1+W2; ticks with preparing > 0: $N_PREP of $N_T; ticks with preparing = K and blocks = 0: $N_SLOTS_BUSY of $N_T"
 note "publishes (settled between ticks): slowest_publish_ms p95 = $(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '$9 ~ /^[0-9]+$/ { print $9 }' | p95), in_flight at tick end p95 = $(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '$10 ~ /^[0-9]+$/ { print $10 }' | p95)"
 stop_point 2
 
