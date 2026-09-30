@@ -147,6 +147,78 @@ pub fn rebuild_candidate(
     })?
 }
 
+/// What the files on this device allow, judged by `metadata` alone (R1-d-b, W3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceCheck {
+    /// Every source has a candidate file within the size limit: a rebuild may succeed.
+    Ready,
+    /// A source has no candidate file at all: a rebuild cannot succeed.
+    Missing,
+    /// A source has candidate files, all above the size limit of this machine (backup-i5).
+    OverLimit,
+}
+
+/// Whether [`rebuild_plaintext_from_db`] could succeed, without reading a byte: for each source
+/// (the file of a Single block; every member of a Pack) some candidate path must exist with
+/// `len ≤ scope.max_source_bytes`. Optimistic — a candidate may still have changed content — but
+/// never wrong the other way: `Missing` and `OverLimit` mean the rebuild fails. Reports no gone
+/// paths (the rebuild itself does). Blocking: one catalog pass and a `metadata` per candidate.
+pub fn precheck_sources(
+    db: &Db,
+    block: &SourceBlockRecord,
+    scope: &RebuildScope,
+) -> Result<SourceCheck, RebuildError> {
+    with_catalog(db, scope, |catalog, _gone| precheck(catalog, block))
+}
+
+fn precheck(catalog: &Catalog<'_>, block: &SourceBlockRecord) -> SourceCheck {
+    let block_id = block.block_id;
+    match &block.block_type {
+        SourceBlockType::Single => {
+            let hash = catalog.files.iter().find_map(|r| {
+                r.versions
+                    .iter()
+                    .find(|v| v.source_block_id == block_id)
+                    .map(|v| v.content_hash)
+            });
+            match hash {
+                Some(h) => catalog.candidates_ok(None, &h),
+                None => SourceCheck::Missing,
+            }
+        }
+        SourceBlockType::Pack { entries } => {
+            for entry in entries {
+                let verdict = match catalog.by_id.get(&entry.file_id).copied() {
+                    None => SourceCheck::Missing,
+                    Some(owner) => match owner
+                        .versions
+                        .iter()
+                        .find(|v| v.source_block_id == block_id)
+                    {
+                        Some(first) => catalog.candidates_ok(Some(owner), &first.content_hash),
+                        // No version on this block: the rebuild reads the record's own path.
+                        None => path_check(&owner.path, catalog.limit),
+                    },
+                };
+                if verdict != SourceCheck::Ready {
+                    return verdict;
+                }
+            }
+            SourceCheck::Ready
+        }
+    }
+}
+
+/// One candidate path by `metadata`: `Ready` if a file within `limit`, `OverLimit` if a file
+/// above it, `Missing` otherwise (absent or unreadable).
+fn path_check(path: &str, limit: u64) -> SourceCheck {
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() <= limit => SourceCheck::Ready,
+        Ok(_) => SourceCheck::OverLimit,
+        Err(_) => SourceCheck::Missing,
+    }
+}
+
 /// Run `f` over one pass of the catalog; the gone paths it met go to `scope.recheck`.
 fn with_catalog<T>(
     db: &Db,
@@ -342,6 +414,25 @@ impl<'a> Catalog<'a> {
                     present_on(owner, self.device),
                 )
             }
+        }
+    }
+
+    /// [`precheck_sources`] of one source: the same candidates `read_content` would try (`own`
+    /// first, then the records Present with a version of `hash`), by `metadata`.
+    fn candidates_ok(&self, own: Option<&FileRecord>, hash: &[u8; 32]) -> SourceCheck {
+        let others = self.by_hash.get(hash).into_iter().flatten().copied();
+        let mut over = false;
+        for candidate in own.into_iter().chain(others) {
+            match path_check(&candidate.path, self.limit) {
+                SourceCheck::Ready => return SourceCheck::Ready,
+                SourceCheck::OverLimit => over = true,
+                SourceCheck::Missing => {}
+            }
+        }
+        if over {
+            SourceCheck::OverLimit
+        } else {
+            SourceCheck::Missing
         }
     }
 

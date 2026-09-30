@@ -51,7 +51,7 @@ pub(crate) struct InFlight {
     set: JoinSet<Published>,
     keys: HashMap<Id, PendingKey>,
     /// Block preparations that outlived their tick (pos-i7-d-a).
-    pub(super) preparing: Preparing,
+    pub(in crate::daemon::scheduler) preparing: Preparing,
     pub(crate) settled: SettleStats,
 }
 

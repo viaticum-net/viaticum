@@ -763,6 +763,15 @@ pub async fn rebuild_source_blob(
         .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))?
 }
 
+/// The rebuilt blob is not the block: the source changed since the backup. A type of its own so a
+/// caller (the PoS preparation's `load_failed` term, NOTE 7) tells it from an I/O failure.
+#[derive(Debug, thiserror::Error)]
+#[error("rebuilt blob hash {got} != expected {expected}")]
+pub struct BlobHashMismatch {
+    pub got: String,
+    pub expected: viaticum_core::types::SourceBlockId,
+}
+
 /// Rebuild, seal and check the blob of `block_record` (blocking: reads files, compresses,
 /// encrypts). The plaintext is rebuilt by content (`rebuild::rebuild_candidate`, INV-RB);
 /// its error keeps its type under the "rebuild plaintext" context, so a caller can tell
@@ -792,11 +801,10 @@ pub fn rebuild_blob_blocking(
         if let Some(e) = legacy_of {
             return Err(anyhow::Error::new(e).context("rebuild plaintext"));
         }
-        anyhow::bail!(
-            "rebuilt blob hash {} != expected {}",
-            viaticum_core::types::hex_encode(&hash),
-            block_record.block_id
-        );
+        return Err(anyhow::Error::new(BlobHashMismatch {
+            got: viaticum_core::types::hex_encode(&hash),
+            expected: block_record.block_id,
+        }));
     }
     if legacy_of.is_some() {
         tracing::warn!(

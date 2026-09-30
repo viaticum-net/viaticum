@@ -1169,6 +1169,9 @@ impl DaemonHandle {
             epoch_key_bytes,
             cfg.data_dir.clone(),
         );
+        // backup-i24: PoS preparations share the block work memory budget with the worker and
+        // restore (R1-d-b): one permit per preparation, given back before publishing.
+        scheduler.set_mem_budget(Arc::clone(&mem_budget));
         // К2b: the PoS rebuild reads this device's records and reports gone paths.
         scheduler.set_rebuild_scope(
             crate::daemon::backup::rebuild::RebuildScope::new(device_id, Some(recheck_tx.clone()))

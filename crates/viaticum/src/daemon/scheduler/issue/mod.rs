@@ -14,12 +14,19 @@
 // handle moves into `InFlight::preparing`, the run loop collects it when it ends and only
 // then publishes its challenges (each stamped at its publish, pos-i7-a), after a re-check
 // that the holder's placement is still challengeable and not pending. While a block
-// prepares, ticks leave it alone; at most `MAX_PREPARATIONS` blocks prepare at once. So a
-// block whose preparation is longer than a tick budget is served, once per preparation,
-// not restarted by every tick.
+// prepares, ticks leave it alone; at most `MAX_PREPARATIONS` blocks the ticks started prepare at
+// once. So a block whose preparation is longer than a tick budget is served, once per
+// preparation, not restarted by every tick.
+//
+// Memory (R1-d-b, backup-i24, pos-i13): a preparation takes its permit from the block work
+// budget itself, by `try_acquire`, right after it has read the block's record, and gives it back
+// before anything is published. A busy budget ends it `Deferred`: the tick goes on to the next
+// block, and from the NEXT tick the deferred block waits for memory as an overdue preparation
+// (`Preparing::adopt_waiting`), ahead of the order and the tick's time budget.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, error, info, warn};
@@ -28,14 +35,20 @@ use viaticum_core::types::{DeviceId, PlacementStatus, SourceBlockId, SymbolPlace
 
 use super::{PendingKey, Scheduler, holder_trust_map, scaled_timer_secs};
 
+pub(super) mod fold;
 mod in_flight;
 mod prepare;
 mod preparing;
 
 use in_flight::publish_challenge;
 pub(crate) use in_flight::{Ended, InFlight};
+pub(crate) use prepare::PrepOutcome;
+#[cfg(test)]
+pub(crate) use prepare::load_failed_until;
 #[cfg(test)]
 pub(crate) use prepare::{POS_LOAD_WARN_INTERVAL, log_load_failure, should_warn};
+#[cfg(test)]
+pub(crate) use preparing::PrepDone;
 
 /// An issue tick may spend 1 / `ISSUE_BUDGET_DIVISOR` of the PoS tick period (pos-i7-a:
 /// ≈ 20 %, the bar of the tick's `elapsed_ms`).
@@ -52,18 +65,25 @@ const BLOCK_HEADROOM: u32 = 2;
 /// the budget, so the tick line comes before the bar whatever the disk or the network do.
 const WAIT_DEADLINE_PCT: u32 = 95;
 
-/// Block preparations in flight at once past their ticks (pos-i7-d-a). Each holds the
-/// source block, the raw symbols encoded for the union of its holders' ranges and the
-/// bound copies while hashing: memory ≈ K·(5 + R)·E, E the block size, R the number of
-/// holders of the block (pos-i7-d-a). Two: one can finish while the next starts, and no
-/// queue of big blocks sits in RAM. A block that would be the third stays due and counts
-/// in `deferred`.
+/// Block preparations a tick started that may run at once (pos-i7-d-a, pos-i7-d-c): the one in
+/// the tick and up to this many cut from earlier ticks. A bound on CPU, blocking-pool threads and
+/// the blocks excluded from the ticks — NOT on memory: memory is the budget's (backup-i24), each
+/// preparation holds a permit while it holds its source and symbols. A preparation that waits for
+/// memory (an overdue one, pos-i13) is not counted here; overdue ones that run are bounded apart
+/// (`MAX_OVERDUE_RUNNING`). Two: one can finish while the next starts. A block that would be the
+/// third stays due and counts in `deferred`.
 pub(crate) const MAX_PREPARATIONS: usize = 2;
 
 /// A preparation running longer than this many issue-tick periods (scaled like the tick
 /// itself) is named by a WARN, once per period per block (pos-i7-d-b). Its slot is not
 /// freed: memory matters more than liveness until hangs are seen in the field.
 pub(crate) const STUCK_PREPARATION_PERIODS: u32 = 10;
+
+/// pos-i7-d-d, variant (a) — the architect's recommendation, not Ilya's decision (Q-V7 is open):
+/// a preparation hung in its load phase for `STUCK_PREPARATION_PERIODS` periods is written off
+/// (its bytes return to the memory budget while it hangs), at most one at a time. `false` is
+/// variant (b): visibility only, the WARN of the stuck preparation.
+pub(crate) const WRITE_OFF_STUCK_LOADS: bool = true;
 
 /// Challenge publishes in flight at once (pos-i7-a), across ticks. About one block's
 /// holders (8 in the E2E) plus one: a block's re-encode (~110 ms at 1 MiB) is longer than
@@ -97,6 +117,9 @@ struct IssueTick {
     /// out (pos-i7-a) or `MAX_PREPARATIONS` blocks were already preparing (pos-i7-d-a).
     /// They stay due for the next tick. A block cut by this tick is not counted here.
     deferred: usize,
+    /// Due placements of the blocks the memory budget deferred in this tick (R1-d-b): they wait
+    /// for memory as overdue ones from the next tick.
+    deferred_mem: usize,
     /// Blocks whose preparation was still running at the deadline: the tick stopped
     /// waiting for it and left it to `InFlight::preparing` (pos-i7-d-a).
     cut_blocks: usize,
@@ -170,7 +193,20 @@ impl Scheduler {
     async fn publish_prepared(&self, done: preparing::PrepDone, in_flight: &mut InFlight) {
         let block_id = done.block_id;
         let prepared = match done.result {
-            Ok(p) => p,
+            Ok(PrepOutcome::Prepared(p)) => {
+                self.clear_mem_deferred(&block_id);
+                p
+            }
+            Ok(PrepOutcome::Unserved) => {
+                self.clear_mem_deferred(&block_id);
+                return;
+            }
+            // NOTE 5: a preparation cut from its tick can end deferred too: the block is deferred
+            // as of now, and waits for memory from the next tick.
+            Ok(PrepOutcome::Deferred) => {
+                self.note_mem_deferred(block_id, self.issue_seq.load(Ordering::SeqCst));
+                return;
+            }
             Err(e) => {
                 error!(
                     block_id = %block_id,
@@ -258,23 +294,30 @@ impl Scheduler {
     /// pending keys are a set, the placements are indexed by (block, holder), and a
     /// holder's trust is read once per tick. A tick with due challenges ends with one
     /// INFO line `scheduler: PoS issue tick`: due, issued, blocks, skipped_pending,
-    /// deferred, cut_blocks, preparing (blocks preparing past their ticks), oldest_prep_s
-    /// (age of the oldest of them, pos-i7-d-b), in_flight, elapsed_ms, scan_ms,
+    /// deferred, deferred_mem (placements of the blocks the memory budget deferred, pos-i13),
+    /// cut_blocks, preparing (preparations running past their ticks, and overdue ones running),
+    /// waiting_mem (overdue blocks waiting for memory), oldest_prep_s (age of the oldest running
+    /// one, pos-i7-d-b), oldest_wait_s (the longest wait for memory), in_flight, elapsed_ms, scan_ms,
     /// slowest_block_ms, cpw_min, cpw_max, and — over the publishes settled since the
     /// previous line — zero_ack and slowest_publish_ms.
     pub(crate) async fn issue_tick(&self, in_flight: &mut InFlight) -> anyhow::Result<()> {
         let started = Instant::now();
+        // The number of this tick (pos-i13): a block the budget defers on tick n waits for memory
+        // from tick n + 1, whatever the clock says.
+        let tick_no = self.issue_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let budget = issue_budget(self.config.pos_interval_secs, self.config.time_scale);
         // pos-i7-d-b: a preparation that hangs is named once per period, before any early
-        // return of the tick.
+        // return of the tick; pos-i7-d-d: a load that hangs gives its memory back.
         let period = Duration::from_secs(scaled_timer_secs(
             self.config.pos_interval_secs,
             self.config.time_scale,
         ));
-        in_flight.preparing.warn_stuck(
+        in_flight.preparing.watch_stuck(
             tokio::time::Instant::now(),
             period,
             STUCK_PREPARATION_PERIODS,
+            &self.mem_budget,
+            WRITE_OFF_STUCK_LOADS,
         );
         // Every wait of the tick ends here, short of the budget: a wait cut at the budget
         // itself would end the tick a timer tick past it (≥ 1 ms over the bar).
@@ -317,6 +360,8 @@ impl Scheduler {
 
         if challengeable.is_empty() {
             debug!("scheduler: no challengeable placements");
+            let preparing = in_flight.preparing.blocks();
+            self.retain_mem_deferred(|b| preparing.contains(b));
             return Ok(());
         }
 
@@ -340,6 +385,8 @@ impl Scheduler {
 
         if due.is_empty() {
             debug!("scheduler: no challenges due at this interval");
+            let preparing = in_flight.preparing.blocks();
+            self.retain_mem_deferred(|b| preparing.contains(b));
             return Ok(());
         }
         let mut tick = IssueTick {
@@ -364,13 +411,22 @@ impl Scheduler {
             .map(|p| ((p.source_block_id, p.holder_id), p))
             .collect();
 
-        let not_pending: Vec<&ChallengeScheduleEntry> = due
+        let mut not_pending: Vec<&ChallengeScheduleEntry> = due
             .iter()
             .filter(|e| {
                 !already_pending.contains(&(e.source_block_id, e.holder_id))
                     && !preparing_blocks.contains(&e.source_block_id)
             })
             .collect();
+        // pos-i13: a block the budget deferred on an EARLIER tick waits for memory now, as an
+        // overdue preparation — decided here, before the order and the tick's time budget, so
+        // neither can keep it from being queued. A deferral whose block is no longer due (or
+        // preparing) is forgotten: a later deferral starts its own count.
+        let overdue =
+            self.adopt_overdue(in_flight, tick_no, period, &mut not_pending, &placement_of);
+        if overdue > 0 {
+            debug!(overdue, "scheduler: deferred blocks now wait for memory");
+        }
         tick.skipped_pending = due.len() - not_pending.len();
         let blocks = {
             let mut attempted = self
@@ -404,7 +460,7 @@ impl Scheduler {
             }
             // pos-i7-d-a: memory bound. The block is not started (its attempt is not
             // moved: it keeps its place in the order) and stays due.
-            if in_flight.preparing.len() >= MAX_PREPARATIONS {
+            if in_flight.preparing.tick_started() >= MAX_PREPARATIONS {
                 tick.deferred +=
                     block_entries.len() + blocks.by_ref().map(|(_, e)| e.len()).sum::<usize>();
                 break;
@@ -433,10 +489,9 @@ impl Scheduler {
             // the deadline (СТ-0c round 4). Past it the block is cut from the tick: the
             // handle moves to `in_flight.preparing` and the run loop publishes the block's
             // challenges when it ends (pos-i7-d-a).
-            let prep_started = tokio::time::Instant::now();
-            let mut prep = self.spawn_prepare(block_id, &holder_placements);
-            let prepared = match tokio::time::timeout_at(deadline, &mut prep).await {
-                Ok(Ok(prepared)) => prepared,
+            let (mut prep, shared) = self.spawn_prepare(block_id, &holder_placements);
+            let outcome = match tokio::time::timeout_at(deadline, &mut prep).await {
+                Ok(Ok(outcome)) => outcome,
                 Ok(Err(join_err)) => {
                     // CS-POS-8: the blocking task panicked — log it loudly, skip the block
                     // this tick rather than re-panic the scheduler task.
@@ -445,18 +500,35 @@ impl Scheduler {
                         err = %join_err,
                         "scheduler: PoS hash compute task failed (panicked or cancelled) — skipping block this tick"
                     );
-                    Vec::new()
+                    PrepOutcome::Unserved
                 }
                 Err(_) => {
                     tick.cut_blocks += 1;
-                    in_flight
-                        .preparing
-                        .adopt(block_id, cpw_of, prep_started, prep);
+                    in_flight.preparing.adopt(block_id, cpw_of, prep, shared);
                     // The cut block itself is preparing, not deferred: only the blocks
                     // this tick did not reach are.
                     tick.deferred += blocks.by_ref().map(|(_, e)| e.len()).sum::<usize>();
                     slowest_block = slowest_block.max(block_started.elapsed());
                     break 'blocks;
+                }
+            };
+            let prepared = match outcome {
+                PrepOutcome::Prepared(prepared) => {
+                    self.clear_mem_deferred(&block_id);
+                    prepared
+                }
+                PrepOutcome::Unserved => {
+                    self.clear_mem_deferred(&block_id);
+                    Vec::new()
+                }
+                // The budget is busy (logged by the preparation): not a reason to stop. A small
+                // block behind a big one may fit (backup-i24), so the tick goes on, unlike at
+                // the time budget and K. The deferral is brief (a record read); it does not
+                // count as a slow block.
+                PrepOutcome::Deferred => {
+                    self.note_mem_deferred(block_id, tick_no);
+                    tick.deferred_mem += block_entries.len();
+                    continue 'blocks;
                 }
             };
             slowest_block = slowest_block.max(block_started.elapsed());
@@ -497,11 +569,17 @@ impl Scheduler {
             blocks = tick.blocks,
             skipped_pending = tick.skipped_pending,
             deferred = tick.deferred,
+            deferred_mem = tick.deferred_mem,
             cut_blocks = tick.cut_blocks,
-            preparing = in_flight.preparing.len(),
+            preparing = in_flight.preparing.running(),
+            waiting_mem = in_flight.preparing.waiting(),
             oldest_prep_s = in_flight
                 .preparing
                 .oldest_age(tokio::time::Instant::now())
+                .as_secs(),
+            oldest_wait_s = in_flight
+                .preparing
+                .oldest_wait(tokio::time::Instant::now())
                 .as_secs(),
             in_flight = in_flight.len(),
             zero_ack = settled.zero_ack,
@@ -515,5 +593,105 @@ impl Scheduler {
         );
 
         Ok(())
+    }
+}
+
+/// The deferral book of the memory budget (pos-i13): the tick a block was first deferred on.
+impl Scheduler {
+    /// `block` was deferred by the budget on tick `tick_no`; the first deferral of an episode
+    /// counts, a later one does not move it.
+    pub(super) fn note_mem_deferred(&self, block: SourceBlockId, tick_no: u64) {
+        self.mem_deferred_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(block)
+            .or_insert(tick_no);
+    }
+
+    /// `block` got its memory (or cannot be served): the episode is over.
+    pub(super) fn clear_mem_deferred(&self, block: &SourceBlockId) {
+        self.mem_deferred_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(block);
+    }
+
+    fn retain_mem_deferred(&self, keep: impl Fn(&SourceBlockId) -> bool) {
+        self.mem_deferred_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|b, _| keep(b));
+    }
+
+    /// Start the waiting for memory of every block deferred on an earlier tick than `tick_no`
+    /// (J11: deferred on n, waiting from n + 1): their due placements leave `not_pending` and go
+    /// to `in_flight.preparing` as overdue preparations. A block whose last load failed
+    /// (`load_failed`, backup-i7) is not among them: it stays in the ordinary flow, where
+    /// `try_acquire` decides. Returns the number of blocks adopted.
+    fn adopt_overdue(
+        &self,
+        in_flight: &mut InFlight,
+        tick_no: u64,
+        period: Duration,
+        not_pending: &mut Vec<&ChallengeScheduleEntry>,
+        placement_of: &HashMap<PendingKey, &SymbolPlacement>,
+    ) -> usize {
+        let due_blocks: HashSet<SourceBlockId> =
+            not_pending.iter().map(|e| e.source_block_id).collect();
+        let preparing = in_flight.preparing.blocks();
+        let candidates: HashSet<SourceBlockId> = {
+            let mut map = self
+                .mem_deferred_at
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            map.retain(|b, _| due_blocks.contains(b) || preparing.contains(b));
+            map.iter()
+                .filter(|(b, n)| **n < tick_no && due_blocks.contains(*b))
+                .map(|(b, _)| *b)
+                .collect()
+        };
+        let now = Instant::now();
+        let overdue: HashSet<SourceBlockId> = candidates
+            .into_iter()
+            .filter(|b| !self.load_failed_now(b, now))
+            .collect();
+        if overdue.is_empty() {
+            return 0;
+        }
+        // Their entries, block by block in the order the tick found them.
+        let mut order: Vec<SourceBlockId> = Vec::new();
+        let mut by_block: HashMap<SourceBlockId, Vec<&ChallengeScheduleEntry>> = HashMap::new();
+        not_pending.retain(|e| {
+            if !overdue.contains(&e.source_block_id) {
+                return true;
+            }
+            by_block
+                .entry(e.source_block_id)
+                .or_insert_with(|| {
+                    order.push(e.source_block_id);
+                    Vec::new()
+                })
+                .push(*e);
+            false
+        });
+        let slow_after = period * STUCK_PREPARATION_PERIODS;
+        for block_id in &order {
+            let entries = &by_block[block_id];
+            let cpw_of: HashMap<DeviceId, u32> =
+                entries.iter().map(|e| (e.holder_id, e.cpw)).collect();
+            let holder_placements: Vec<&SymbolPlacement> = entries
+                .iter()
+                .filter_map(|e| placement_of.get(&(e.source_block_id, e.holder_id)).copied())
+                .collect();
+            let prep = self.make_prep(*block_id, &holder_placements, None);
+            in_flight.preparing.adopt_waiting(
+                *block_id,
+                cpw_of,
+                prep,
+                Arc::clone(&self.mem_budget),
+                slow_after,
+            );
+        }
+        order.len()
     }
 }

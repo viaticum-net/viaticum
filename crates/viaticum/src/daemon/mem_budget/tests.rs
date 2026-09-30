@@ -542,3 +542,108 @@ fn test_env_sets_the_budget_with_a_warn_and_garbage_is_ignored() {
         );
     }
 }
+
+// ─── Queue count and write-off (R1-d-b, pos-i7-d-d) ──────────────────────────
+
+#[tokio::test]
+async fn queued_waiters_counts_only_callers_waiting_in_the_queue() {
+    let budget = MemBudget::new(4 * MIB);
+    assert_eq!(budget.queued_waiters(), 0);
+    let hold = budget.acquire(HolderKind::Worker, &block(1), 4 * MIB).await;
+    assert_eq!(budget.queued_waiters(), 0, "a grant at once is not a wait");
+    let waiter = {
+        let budget = Arc::clone(&budget);
+        tokio::spawn(async move { budget.acquire(HolderKind::Pos, &block(2), MIB).await })
+    };
+    until("the waiter queues", || budget.queued_waiters() == 1).await;
+    drop(hold);
+    let granted = waiter.await.unwrap();
+    assert_eq!(budget.queued_waiters(), 0);
+    drop(granted);
+
+    // A cancelled wait leaves the count.
+    let hold = budget.acquire(HolderKind::Worker, &block(1), 4 * MIB).await;
+    let cancelled = {
+        let budget = Arc::clone(&budget);
+        tokio::spawn(async move { budget.acquire(HolderKind::Pos, &block(3), MIB).await })
+    };
+    until("it queues", || budget.queued_waiters() == 1).await;
+    cancelled.abort();
+    let _ = cancelled.await;
+    assert_eq!(budget.queued_waiters(), 0);
+    drop(hold);
+}
+
+#[test]
+fn written_off_permit_gives_its_bytes_back_once_and_the_holder_returns_nothing_more() {
+    let budget = MemBudget::new(10 * MIB);
+    let mut stuck = budget
+        .try_acquire(HolderKind::Pos, &block(1), 6 * MIB)
+        .unwrap();
+    let handle = stuck.write_off_handle();
+    assert_eq!(handle.bytes(), 6 * MIB);
+    assert_eq!(budget.outstanding_bytes(), 6 * MIB);
+
+    let text = logged(|| {
+        assert_eq!(budget.write_off(&handle), Some(6 * MIB));
+    });
+    assert!(text.contains("released (written off)"), "{text}");
+    assert_eq!(budget.outstanding_bytes(), 0);
+    assert_eq!(budget.available_bytes(), 10 * MIB);
+    assert_eq!(budget.semaphore_free_bytes(), 10 * MIB);
+    // The bytes serve another holder now.
+    let other = budget
+        .try_acquire(HolderKind::Restore, &block(2), 10 * MIB)
+        .expect("the written-off bytes are free");
+    assert_eq!(budget.write_off(&handle), None, "not written off twice");
+
+    // The stuck holder finally ends: nothing goes back a second time.
+    drop(stuck);
+    assert_eq!(budget.outstanding_bytes(), 10 * MIB, "the other holder's");
+    assert_eq!(budget.semaphore_free_bytes(), 0, "no units returned twice");
+    drop(other);
+    assert_eq!(budget.semaphore_free_bytes(), 10 * MIB);
+    assert_eq!(budget.outstanding_bytes(), 0);
+}
+
+/// The overspend of a write-off is one holder's permit: a second stuck holder is not written off
+/// until the first one has ended.
+#[test]
+fn at_most_one_holder_is_written_off() {
+    let budget = MemBudget::new(10 * MIB);
+    let mut a = budget
+        .try_acquire(HolderKind::Pos, &block(1), 3 * MIB)
+        .unwrap();
+    let mut b = budget
+        .try_acquire(HolderKind::Pos, &block(2), 3 * MIB)
+        .unwrap();
+    let (ha, hb) = (a.write_off_handle(), b.write_off_handle());
+
+    assert_eq!(budget.write_off(&ha), Some(3 * MIB));
+    assert_eq!(budget.write_off(&hb), None, "one at a time");
+    assert_eq!(budget.outstanding_bytes(), 3 * MIB, "b still counts");
+
+    drop(a);
+    assert_eq!(budget.write_off(&hb), Some(3 * MIB), "the first has ended");
+    assert_eq!(budget.outstanding_bytes(), 0);
+    drop(b);
+    assert_eq!(budget.semaphore_free_bytes(), 10 * MIB);
+}
+
+#[test]
+fn a_permit_that_ended_cannot_be_written_off() {
+    let budget = MemBudget::new(10 * MIB);
+    let mut p = budget
+        .try_acquire(HolderKind::Pos, &block(1), 3 * MIB)
+        .unwrap();
+    let handle = p.write_off_handle();
+    drop(p);
+    assert_eq!(budget.write_off(&handle), None);
+    assert_eq!(budget.semaphore_free_bytes(), 10 * MIB);
+    assert_eq!(budget.outstanding_bytes(), 0);
+    // And it did not use up the one write-off the budget allows.
+    let mut q = budget
+        .try_acquire(HolderKind::Pos, &block(2), 3 * MIB)
+        .unwrap();
+    assert_eq!(budget.write_off(&q.write_off_handle()), Some(3 * MIB));
+}

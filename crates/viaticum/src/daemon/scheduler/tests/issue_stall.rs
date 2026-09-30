@@ -68,7 +68,7 @@ async fn issue_tick_keeps_its_budget_while_a_commit_holds_the_database() {
     );
 }
 
-/// An encoder that sleeps in `encode_raw_ranges` in its calls `stall_from..stall_upto`
+/// An encoder that sleeps in `encode_raw_ranges_each` in its calls `stall_from..stall_upto`
 /// (a block whose preparation is held up by the disk or the CPU), counting the calls and
 /// the most calls running at once.
 pub(super) struct StallingEncoder {
@@ -141,16 +141,10 @@ impl ErasureEncoder for StallingEncoder {
         params: &ErasureParams,
         ranges: &[(u32, u32)],
     ) -> Result<Vec<Symbol>, ErasureError> {
-        let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
-        self.peak.fetch_max(now, Ordering::SeqCst);
-        if (self.stall_from..self.stall_upto).contains(&call) {
-            std::thread::sleep(self.stall);
-        }
-        let out = self.inner.encode_raw_ranges(source_block, params, ranges);
-        self.running.fetch_sub(1, Ordering::SeqCst);
-        out
+        self.inner.encode_raw_ranges(source_block, params, ranges)
     }
+    /// The PoS preparation's entry point (F8'): counted, and stalled when its call is in the
+    /// stall window.
     fn encode_raw_ranges_each(
         &self,
         source_block: &[u8],
@@ -158,8 +152,17 @@ impl ErasureEncoder for StallingEncoder {
         ranges: &[(u32, u32)],
         f: &mut SymbolSink<'_>,
     ) -> Result<(), ErasureError> {
-        self.inner
-            .encode_raw_ranges_each(source_block, params, ranges, f)
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        if (self.stall_from..self.stall_upto).contains(&call) {
+            std::thread::sleep(self.stall);
+        }
+        let out = self
+            .inner
+            .encode_raw_ranges_each(source_block, params, ranges, f);
+        self.running.fetch_sub(1, Ordering::SeqCst);
+        out
     }
     fn apply_binding(
         &self,

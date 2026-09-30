@@ -17,7 +17,7 @@
 // The wrappers below are the only place in the daemon that calls the erasure entry points.
 #![allow(clippy::disallowed_methods)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -98,6 +98,15 @@ impl Drop for WaiterGuard {
     }
 }
 
+/// Takes a caller out of the queue count when its wait ends: granted, or the future dropped.
+struct QueuedGuard<'a>(&'a AtomicUsize);
+
+impl Drop for QueuedGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 // ─── The budget ───────────────────────────────────────────────────────────────
 
 /// The one owner of "how much RAM block work may hold at once" (backup-i24, J8).
@@ -110,6 +119,10 @@ pub struct MemBudget {
     held_mib: AtomicU64,
     waiters: Mutex<Waiters>,
     warned_over: AtomicBool,
+    /// Every caller now waiting in the semaphore's queue (plain and priority).
+    queued: AtomicUsize,
+    /// Permits written off (pos-i7-d-d) whose holder has not ended yet.
+    written_off_live: AtomicUsize,
     #[cfg(test)]
     grants: AtomicU64,
 }
@@ -124,6 +137,8 @@ impl MemBudget {
             held_mib: AtomicU64::new(0),
             waiters: Mutex::new(Waiters::default()),
             warned_over: AtomicBool::new(false),
+            queued: AtomicUsize::new(0),
+            written_off_live: AtomicUsize::new(0),
             #[cfg(test)]
             grants: AtomicU64::new(0),
         })
@@ -185,10 +200,11 @@ impl MemBudget {
         );
         MemPermit {
             budget: Arc::clone(self),
-            permit,
+            permit: Some(permit),
             kind,
             block: *block,
             mib,
+            shared: None,
         }
     }
 
@@ -219,6 +235,12 @@ impl MemBudget {
     }
 
     async fn take(&self, mib: u32) -> OwnedSemaphorePermit {
+        // Free at once: not a waiter (a waiter is counted only while it is queued).
+        if let Ok(p) = Arc::clone(&self.sem).try_acquire_many_owned(mib) {
+            return p;
+        }
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        let _counted = QueuedGuard(&self.queued);
         match Arc::clone(&self.sem).acquire_many_owned(mib).await {
             Ok(p) => p,
             // The semaphore is private and never closed.
@@ -266,6 +288,11 @@ impl MemBudget {
         granted
     }
 
+    /// Callers waiting in the queue now, of any kind (the DEBUG line of a deferred PoS block).
+    pub fn queued_waiters(&self) -> usize {
+        self.queued.load(Ordering::SeqCst)
+    }
+
     /// Priority waiters of `kind` queued now.
     pub fn priority_waiters(&self, kind: PriorityKind) -> usize {
         self.lock_waiters()
@@ -296,6 +323,43 @@ impl MemBudget {
         }
     }
 
+    /// Write a stuck holder's permit off (pos-i7-d-d, variant (a)): its bytes go back to the budget
+    /// now, while the holder still runs, and will not be returned a second time when it ends. At
+    /// most one permit is written off at a time — the overspend is bounded by one estimate. `None`
+    /// when another written-off holder has not ended yet, or this permit is already gone or
+    /// written off. Returns the bytes given back.
+    pub fn write_off(&self, handle: &WriteOffHandle) -> Option<u64> {
+        if self.written_off_live.fetch_add(1, Ordering::SeqCst) >= 1 {
+            self.written_off_live.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        if handle
+            .shared
+            .state
+            .compare_exchange(LIVE, WRITTEN_OFF, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            self.written_off_live.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        // The state flag is ours now: the holder's drop will only forget its semaphore units.
+        self.held_mib.fetch_sub(handle.mib as u64, Ordering::SeqCst);
+        self.sem.add_permits(handle.mib as usize);
+        tracing::debug!(
+            kind = %handle.kind.as_str(),
+            block = %handle.block,
+            bytes = handle.mib as u64 * MIB,
+            "mem_budget: released (written off)"
+        );
+        Some(handle.mib as u64 * MIB)
+    }
+
+    /// Units the semaphore itself has free (tests: nothing is returned twice).
+    #[cfg(test)]
+    pub(crate) fn semaphore_free_bytes(&self) -> u64 {
+        self.sem.available_permits() as u64 * MIB
+    }
+
     /// Permits granted so far (tests: "the worker takes exactly one").
     #[cfg(test)]
     pub(crate) fn grants(&self) -> u64 {
@@ -319,10 +383,42 @@ fn to_mib(bytes: u64) -> u64 {
 /// The right to hold `bytes()` of RAM for block work. Dropping it gives the bytes back.
 pub struct MemPermit {
     budget: Arc<MemBudget>,
-    permit: OwnedSemaphorePermit,
+    /// `None` only inside `drop`.
+    permit: Option<OwnedSemaphorePermit>,
     kind: HolderKind,
     block: SourceBlockId,
     mib: u32,
+    /// Set by [`write_off_handle`](Self::write_off_handle): the state another thread may change.
+    shared: Option<Arc<PermitShared>>,
+}
+
+/// State of a permit that can be written off: live, written off by [`MemBudget::write_off`], or
+/// dropped by its holder. The one atomic decides who returns the bytes.
+struct PermitShared {
+    state: AtomicU8,
+}
+
+const LIVE: u8 = 0;
+const WRITTEN_OFF: u8 = 1;
+const DROPPED: u8 = 2;
+
+/// What a watcher needs to write a permit off while its holder runs (see
+/// [`MemBudget::write_off`]).
+pub struct WriteOffHandle {
+    shared: Arc<PermitShared>,
+    kind: HolderKind,
+    block: SourceBlockId,
+    mib: u32,
+}
+
+impl WriteOffHandle {
+    pub fn kind(&self) -> HolderKind {
+        self.kind
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.mib as u64 * MIB
+    }
 }
 
 impl MemPermit {
@@ -334,6 +430,22 @@ impl MemPermit {
         self.kind
     }
 
+    /// A handle to write this permit off from another thread (pos-i7-d-d). Taken on a permit that
+    /// is not shrunk afterwards: the handle keeps the size it saw.
+    pub fn write_off_handle(&mut self) -> WriteOffHandle {
+        let shared = Arc::clone(self.shared.get_or_insert_with(|| {
+            Arc::new(PermitShared {
+                state: AtomicU8::new(LIVE),
+            })
+        }));
+        WriteOffHandle {
+            shared,
+            kind: self.kind,
+            block: self.block,
+            mib: self.mib,
+        }
+    }
+
     /// Release down to `keep_bytes` (whole MiB, rounded up, at least 1): the difference goes back
     /// to the budget and to whoever is queued. A no-op when the permit is already that small.
     pub fn shrink_to(&mut self, keep_bytes: u64) {
@@ -342,11 +454,15 @@ impl MemPermit {
         if diff == 0 {
             return;
         }
+        debug_assert!(
+            self.shared.is_none(),
+            "a permit with a write-off handle is not shrunk"
+        );
         // Count the bytes free before the semaphore hands them to a waiter.
         self.budget
             .held_mib
             .fetch_sub(diff as u64, Ordering::SeqCst);
-        if let Some(part) = self.permit.split(diff as usize) {
+        if let Some(part) = self.permit.as_mut().and_then(|p| p.split(diff as usize)) {
             drop(part);
         }
         self.mib = keep;
@@ -362,6 +478,23 @@ impl MemPermit {
 
 impl Drop for MemPermit {
     fn drop(&mut self) {
+        if let Some(shared) = &self.shared
+            && shared.state.swap(DROPPED, Ordering::SeqCst) == WRITTEN_OFF
+        {
+            // Written off while its holder ran: the budget already took the bytes back and
+            // counted them free. Forget the semaphore units instead of returning them twice.
+            if let Some(p) = self.permit.take() {
+                p.forget();
+            }
+            self.budget.written_off_live.fetch_sub(1, Ordering::SeqCst);
+            tracing::debug!(
+                kind = %self.kind.as_str(),
+                block = %self.block,
+                bytes = self.mib as u64 * MIB,
+                "mem_budget: released (holder ended after a write-off; nothing returned)"
+            );
+            return;
+        }
         self.budget
             .held_mib
             .fetch_sub(self.mib as u64, Ordering::SeqCst);
