@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use viaticum_core::db::Db;
+use viaticum_core::erasure::ErasureEncoder;
 use viaticum_core::messages::{
     MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse,
 };
@@ -111,6 +112,16 @@ pub(super) fn owner_with(
     postman: Arc<SlowPostman>,
     seed: impl FnOnce(&Db, &Path),
 ) -> Owner {
+    owner_with_encoder(time_scale, postman, make_test_encoder(), seed)
+}
+
+/// `owner_with`, encoding through `encoder`.
+pub(super) fn owner_with_encoder(
+    time_scale: u64,
+    postman: Arc<SlowPostman>,
+    encoder: Arc<dyn ErasureEncoder>,
+    seed: impl FnOnce(&Db, &Path),
+) -> Owner {
     let db = Db::open_in_memory().expect("db open");
     let data_dir = tempfile::TempDir::new().unwrap();
     let postman_key = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
@@ -140,7 +151,7 @@ pub(super) fn owner_with(
         dummy_master_pub(),
         ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng),
         crate::daemon::processor::make_empty_accepted_offers(),
-        make_test_encoder(),
+        encoder,
         TEST_EPOCH_KEY,
         data_dir.path().to_path_buf(),
     );
@@ -152,6 +163,17 @@ pub(super) fn owner_with(
     }
 }
 
+/// Every placement of `blocks` blocks × `holders` holders, never verified (all due).
+pub(super) fn seed_due(db: &Db, dir: &Path, blocks: u8, holders: u8) {
+    let holder_ids: Vec<DeviceId> = (0..holders).map(|h| make_identity(0x80 + h)).collect();
+    for b in 0..blocks {
+        let block_id = seed_retained_pos_block(dir, db, b);
+        for h in &holder_ids {
+            db.upsert_placement(&make_placement(block_id, *h)).unwrap();
+        }
+    }
+}
+
 /// An owner with `blocks` blocks × `holders` holders, every placement due (never verified).
 pub(super) fn owner_with_due(
     blocks: u8,
@@ -160,12 +182,6 @@ pub(super) fn owner_with_due(
     postman: Arc<SlowPostman>,
 ) -> Owner {
     owner_with(time_scale, postman, |db, dir| {
-        let holder_ids: Vec<DeviceId> = (0..holders).map(|h| make_identity(0x80 + h)).collect();
-        for b in 0..blocks {
-            let block_id = seed_retained_pos_block(dir, db, b);
-            for h in &holder_ids {
-                db.upsert_placement(&make_placement(block_id, *h)).unwrap();
-            }
-        }
+        seed_due(db, dir, blocks, holders)
     })
 }

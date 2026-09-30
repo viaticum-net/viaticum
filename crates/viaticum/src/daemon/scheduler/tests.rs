@@ -31,7 +31,9 @@ mod stale_verdict;
 mod issue_budget;
 // pos-i7-a, pos-i7-c: the order of due blocks (least recently tried first).
 mod issue_order;
-// The shared owner / postman set-up of the two above.
+// СТ-0c round 4: the tick keeps its budget when the database or a preparation stalls.
+mod issue_stall;
+// The shared owner / postman set-up of the issue-tick tests.
 mod issue_support;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
@@ -2074,13 +2076,13 @@ impl MailboxNetworkSender for AckMailboxSender {
 //
 // To exercise issue_due_challenges() end-to-end we need:
 //   1. A SourceBlockRecord with valid erasure params (k, t, n, overhead).
-//   2. The block's source bytes available to `load_source_block_data`.
+//   2. The block's source bytes available to `issue::prepare::load_source_block`.
 //   3. A SymbolPlacement for a holder with known ESI ranges.
 //   4. A PeerRecord for the holder (so trust lookup doesn't panic).
 //
 // Minimal params: k=10, t=64 → block size = 640 bytes; k_eff=13, n=20, overhead=1.5.
 //
-// PL-6: the on-disk `block.bin` tier of `load_source_block_data` was removed. These
+// PL-6: the on-disk `block.bin` tier of `issue::prepare::load_source_block` was removed. These
 // tests now serve the block's bytes via the SystemState retained-blob tier
 // (`<data_dir>/system_state/<hex>.bin`, verified blake3(blob) == block_id), which is a
 // live tier. Because that tier is content-addressed, the block_id is DERIVED from the
@@ -2119,7 +2121,7 @@ fn pos_block_bytes(seed: u8) -> Vec<u8> {
 }
 
 /// Seed a content-addressed source block for PoS tests: write the block bytes as a
-/// retained blob under `data_dir` (the live tier `load_source_block_data` reads first)
+/// retained blob under `data_dir` (the live tier `issue::prepare::load_source_block` reads first)
 /// and upsert a matching `SourceBlockRecord`. Returns the derived block_id.
 ///
 /// Replaces the old `write_block_bin` (which exploited the now-removed on-disk

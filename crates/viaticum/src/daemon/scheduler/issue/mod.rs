@@ -35,8 +35,10 @@ const ISSUE_BUDGET_DIVISOR: u32 = 5;
 /// (one spare block: a block up to 2× the slowest still ends within the budget).
 const BLOCK_HEADROOM: u32 = 2;
 
-/// A tick waits for a free publish slot until this share of its budget, in percent.
-const SLOT_WAIT_SHARE_PCT: u32 = 95;
+/// A tick waits — for a block's preparation or for a free publish slot — only until this
+/// share of its budget, in percent: every wait of the tick ends at one deadline short of
+/// the budget, so the tick line comes before the bar whatever the disk or the network do.
+const WAIT_DEADLINE_PCT: u32 = 95;
 
 /// Challenge publishes in flight at once (pos-i7-a), across ticks. About one block's
 /// holders (8 in the E2E) plus one: a block's re-encode (~110 ms at 1 MiB) is longer than
@@ -68,6 +70,9 @@ struct IssueTick {
     /// Due placements not pending whose challenge the tick did not start: the budget ran
     /// out (pos-i7-a). They stay due for the next tick.
     deferred: usize,
+    /// Blocks whose preparation was still running at the deadline: the tick stopped
+    /// waiting for it (its placements count in `deferred`).
+    cut_blocks: usize,
     cpw_min: u32,
     cpw_max: u32,
 }
@@ -126,10 +131,11 @@ impl Scheduler {
     ///   2. Skip placements with a challenge pending or being published (no double issue).
     ///   3. Order the blocks least recently tried first (fairness, pos-i7-c, see
     ///      `blocks_least_recently_tried_first`).
-    ///   4. Per block, while the budget lasts: encode_raw once (union of the holders' ESI
-    ///      ranges), per holder the binding + chain hash in spawn_blocking; then spawn one
-    ///      publish per holder into `in_flight`, waiting for a free slot at most until
-    ///      `SLOT_WAIT_SHARE_PCT` % of the budget.
+    ///   4. Per block, while the budget lasts: load the source, encode once (union of the
+    ///      holders' ESI ranges), per holder the binding + chain hash — one blocking task,
+    ///      waited for until the deadline (`WAIT_DEADLINE_PCT` % of the budget); then spawn
+    ///      one publish per holder into `in_flight`, a free slot waited for until the same
+    ///      deadline.
     ///   5. Each challenge takes its own time when it is published: `timestamp`,
     ///      `expires_at`, `stored_at` and the pending `issued_at` (pos-i7-a).
     ///   6. W-3: a challenge goes into pending ONLY after ≥ 1 MailboxStoreAck, when its
@@ -137,21 +143,24 @@ impl Scheduler {
     ///
     /// Budget: a block starts only if the time spent plus `BLOCK_HEADROOM` × the slowest
     /// block of this tick fits `issue_budget` (the first block always starts, so a block
-    /// slower than the budget is still issued). The tick does not wait for publishes: it
-    /// returns within the budget plus at most one block that outran the headroom.
+    /// slower than the headroom is still started). Every wait ends at the deadline — a
+    /// block still preparing then is cut — and the tick does not wait for publishes, so it
+    /// returns within the budget whatever the disk, the database or the network do (only
+    /// its synchronous scan, `scan_ms`, is not bounded).
     ///
     /// pos-i7: linear in the placements — `due_challenges` indexes `last_verified`, the
     /// pending keys are a set, the placements are indexed by (block, holder), and a
     /// holder's trust is read once per tick. A tick with due challenges ends with one
     /// INFO line `scheduler: PoS issue tick`: due, issued, blocks, skipped_pending,
-    /// deferred, in_flight, elapsed_ms, cpw_min, cpw_max, and — over the publishes settled
-    /// since the previous line — zero_ack and slowest_publish_ms.
+    /// deferred, cut_blocks, in_flight, elapsed_ms, scan_ms, slowest_block_ms, cpw_min,
+    /// cpw_max, and — over the publishes settled since the previous line — zero_ack and
+    /// slowest_publish_ms.
     pub(crate) async fn issue_tick(&self, in_flight: &mut InFlight) -> anyhow::Result<()> {
         let started = Instant::now();
         let budget = issue_budget(self.config.pos_interval_secs, self.config.time_scale);
-        // Waits for a publish slot end here, short of the budget: a wait cut at the budget
+        // Every wait of the tick ends here, short of the budget: a wait cut at the budget
         // itself would end the tick a timer tick past it (≥ 1 ms over the bar).
-        let deadline = tokio::time::Instant::now() + budget * SLOT_WAIT_SHARE_PCT / 100;
+        let deadline = tokio::time::Instant::now() + budget * WAIT_DEADLINE_PCT / 100;
         // Decides what is due; every challenge takes its own time at publish (pos-i7-a).
         let tick_now = Timestamp::now();
 
@@ -253,6 +262,9 @@ impl Scheduler {
             })
         };
 
+        // The fixed part of the tick: placements, due scan, order (СТ-0c round 4: the
+        // breakdown of `elapsed_ms` on the tick line).
+        let scan_ms = started.elapsed().as_millis() as u64;
         let mut slowest_block = Duration::ZERO;
         let mut blocks = blocks.into_iter();
         'blocks: while let Some((block_id, block_entries)) = blocks.next() {
@@ -287,7 +299,30 @@ impl Scheduler {
                 .filter_map(|e| placement_of.get(&(e.source_block_id, e.holder_id)).copied())
                 .collect();
 
-            let prepared = self.prepare_block(block_id, &holder_placements).await;
+            // The preparation runs on the blocking pool; the tick waits for it only until
+            // the deadline (СТ-0c round 4). Past it the block is cut — the task finishes
+            // on its own and its result is dropped; its placements stay due.
+            let prep = self.spawn_prepare(block_id, &holder_placements);
+            let prepared = match tokio::time::timeout_at(deadline, prep).await {
+                Ok(Ok(prepared)) => prepared,
+                Ok(Err(join_err)) => {
+                    // CS-POS-8: the blocking task panicked — log it loudly, skip the block
+                    // this tick rather than re-panic the scheduler task.
+                    error!(
+                        block_id = %block_id,
+                        err = %join_err,
+                        "scheduler: PoS hash compute task failed (panicked or cancelled) — skipping block this tick"
+                    );
+                    Vec::new()
+                }
+                Err(_) => {
+                    tick.cut_blocks += 1;
+                    tick.deferred +=
+                        block_entries.len() + blocks.by_ref().map(|(_, e)| e.len()).sum::<usize>();
+                    slowest_block = slowest_block.max(block_started.elapsed());
+                    break 'blocks;
+                }
+            };
             slowest_block = slowest_block.max(block_started.elapsed());
             let mut prepared = prepared.into_iter();
             while let Some(challenge) = prepared.next() {
@@ -326,10 +361,13 @@ impl Scheduler {
             blocks = tick.blocks,
             skipped_pending = tick.skipped_pending,
             deferred = tick.deferred,
+            cut_blocks = tick.cut_blocks,
             in_flight = in_flight.len(),
             zero_ack = settled.zero_ack,
             slowest_publish_ms = settled.slowest_publish.as_millis() as u64,
             elapsed_ms = started.elapsed().as_millis() as u64,
+            scan_ms,
+            slowest_block_ms = slowest_block.as_millis() as u64,
             cpw_min = tick.cpw_min,
             cpw_max = tick.cpw_max,
             "scheduler: PoS issue tick"

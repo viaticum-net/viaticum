@@ -81,11 +81,13 @@
 #   most ticks is the steady state, not a fault (pos-i7-b: demand ≈ 95-107 challenges per
 #   4 s tick against ≈ 40 issued: 5 blocks of 8, re-encode ~110 ms each, serial). A
 #   saturated tick starts its last block by 800 - 2 x 110 = 580 ms and ends by ≈ 700 ms;
-#   a wait for a publish slot ends at 760 ms (95 % of the budget); publishes no longer
-#   count. Expected elapsed_ms p95 ≈ 650-760 in step 2 and in 7b (H8 stopped: a publish
-#   still returns at the first Ack of another postman, and a slow one is settled by the
-#   loop, outside the tick). Over 800 only if a block takes over twice the slowest before
-#   it in its tick (CPU contention on the shared server). Step 8: DRAIN8 = "never" expected.
+#   every wait of the tick (a block's preparation, a publish slot) ends at 760 ms (95 % of
+#   the budget); publishes no longer count. Expected elapsed_ms p95 ≈ 650-770 in step 2
+#   and in 7b. Over 800 only if the scheduler's async thread itself is held: its own
+#   synchronous scan (`scan_ms`, 45-90 ms in run 20260929-224644) or a runtime stalled by
+#   synchronous database commits of OTHER tasks (the postman contact commits, the main
+#   one, are off the async workers since round 4; see below). Step 8: DRAIN8 = "never"
+#   expected.
 #   Before СТ-0c (СТ-0a only) steps 2, 7b, 8 were RED (no issue-tick line) and step 4 RED
 #   (every live answer forwarded, O's log tens of MB per minute: STOP_AFTER=4).
 #
@@ -135,6 +137,33 @@
 #     `in_flight`, `slowest_publish_ms`; `zero_ack` and `slowest_publish_ms` cover the
 #     publishes settled since the previous tick line. Step 2's NOTE reads them; step 8's
 #     first-tick `read` takes the three new fields.
+#
+# Changes after run 20260929-224644 (СТ-0c round 4; bars unchanged). The run: steps 3-8
+# PASS; step 2 FAIL p95 974 > 800, 7b FAIL p95 834; every one of 336 W1+W2 ticks cut by
+# the budget; slowest_publish_ms p95 1295 (predicted 20-100).
+#   - the cause, from O's log (node-00): of 1060 ticks, 111 over 800 ms, mostly with 2-3
+#     blocks (elapsed up to 2388 ms), i.e. after the start rule had admitted the last
+#     block with headroom. In those ticks the scheduler logged nothing for 0.5-2 s and
+#     then settled publishes that had finished long before, in one burst (2388 ms tick:
+#     silence 1.99 s, then 3 settles within 0.3 ms and the tick line) — it was not
+#     waiting in `join_next`, which wakes at each finished publish. Several ticks settled
+#     publishes 0.2-0.8 s past the 760 ms slot deadline: the deadline's timer did not
+#     fire. Overrun ticks had slow first Acks (slowest_publish_ms median 521, p90 992 vs
+#     216 / 641 in the others). The link: every Ack is recorded as a postman contact — a
+#     durable redb commit — on the async worker that got it; 9 publications × ~9 postmen
+#     put dozens of workers in `begin_write` behind one slow commit, the runtime (timers,
+#     the scheduler task) stalled until the commits drained, and the tick's last block
+#     finished a second late. Reproduced by the unit
+#     `issue_tick_keeps_its_budget_while_a_commit_holds_the_database` (a held write lock,
+#     2 workers: the tick took 2.0 s against 800 ms before the fix).
+#   - the product change: (1) the contact commit runs in `block_in_place` on the daemon's
+#     multi-thread runtime, so a waiting commit no longer holds an async worker (same
+#     order: the contact is still recorded before the Ack counts; [cross:B] routing);
+#     (2) a block's whole preparation (database reads, source read, encode) is one
+#     blocking task the tick waits for only until the 95 % deadline — past it the block is
+#     cut (`cut_blocks`) and stays due; (3) the tick line gains `cut_blocks`, `scan_ms`
+#     (the synchronous scan before the first block) and `slowest_block_ms`, so the next
+#     run breaks `elapsed_ms` down without guessing. Step 2's NOTE reads them.
 #
 # Implementation notes (how the passport is executed, not what it claims):
 #   - "ledger accrual" is measured on O's `pair-ledger row` lines (target viaticum::ledger,
@@ -382,8 +411,9 @@ o_resolved() { events_grep "$(node_log "$O")" "mailbox PosResponse resolved" blo
 o_timeouts() { events_grep "$(node_log "$O")" "PoS challenge timed out" block_id holder_id challenge_id; }
 o_unknown() { events_grep "$(node_log "$O")" "unknown challenge_id" challenge_id; }
 # Fields: $3 elapsed_ms $4 due $5 issued $6 cpw_min $7 deferred $8 blocks $9 slowest_publish_ms
-# $10 in_flight (by name, so the order in the log line does not matter).
-o_issue_ticks() { events_grep "$(node_log "$O")" "scheduler: PoS issue tick" elapsed_ms due issued cpw_min deferred blocks slowest_publish_ms in_flight; }
+# $10 in_flight $11 cut_blocks $12 scan_ms $13 slowest_block_ms (by name, so the order in
+# the log line does not matter).
+o_issue_ticks() { events_grep "$(node_log "$O")" "scheduler: PoS issue tick" elapsed_ms due issued cpw_min deferred blocks slowest_publish_ms in_flight cut_blocks scan_ms slowest_block_ms; }
 o_ledger_rows() { events_grep "$(node_log "$O")" "pair-ledger row" master; }
 
 # Holder-side events (the holder's own log).
@@ -672,6 +702,7 @@ read -r N_T N_DEF MAX_DEF LAST_DEF ISS_W12 BLK_MEAN BLK_MAX <<< "$(o_issue_ticks
     $8 ~ /^[0-9]+$/ { nb++; sb += $8; if ($8 + 0 > mb) mb = $8 + 0 }
     END { printf "%d %d %d %d %d %.1f %d\n", n, d, m, last, iss, (nb ? sb / nb : 0), mb }')"
 note "deferred (pos-i7-a/b): $N_DEF of $N_T ticks cut by the budget, max deferred $MAX_DEF, last tick $LAST_DEF; issued $ISS_W12 in W1+W2 = $(awk -v i="$ISS_W12" -v p="$PLACEMENTS_AT_1B" 'BEGIN { printf "%.2f", (p > 0 ? i / (2 * p) : 0) }') per placement per scaled week; blocks per tick mean $BLK_MEAN max $BLK_MAX"
+note "tick breakdown: scan_ms p95 = $(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '$12 ~ /^[0-9]+$/ { print $12 }' | p95), slowest_block_ms p95 = $(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '$13 ~ /^[0-9]+$/ { print $13 }' | p95), ticks with a cut block = $(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '$11 ~ /^[0-9]+$/ && $11 + 0 > 0' | awk 'NF' | wc -l | tr -d ' ')"
 note "publishes (settled between ticks): slowest_publish_ms p95 = $(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '$9 ~ /^[0-9]+$/ { print $9 }' | p95), in_flight at tick end p95 = $(o_issue_ticks | in_window "$T_W1" "$T_W3" | awk '$10 ~ /^[0-9]+$/ { print $10 }' | p95)"
 stop_point 2
 
@@ -972,7 +1003,7 @@ T8="$T_O_START"
 if [ -z "$FIRST_TICK" ]; then
     fail "no 'scheduler: PoS issue tick' on O within 180 s of its start (the line comes with СТ-0c)"
 else
-    read -r T8 _ FT_MS FT_DUE _ FT_CPW FT_DEF FT_BLOCKS FT_SLOWPUB FT_INFL <<< "$FIRST_TICK"
+    read -r T8 _ FT_MS FT_DUE _ FT_CPW FT_DEF FT_BLOCKS FT_SLOWPUB FT_INFL FT_CUT FT_SCAN _ <<< "$FIRST_TICK"
     T8=${T8%.*}
     T_OFF=$((T_O_START - T_O_KILL))
     # Setup self-check: the bar needs every placement's challenge interval to have passed
@@ -981,7 +1012,7 @@ else
     # week before the kill cover every placement.
     CPW_MIN=$( { o_issue_ticks | in_window $((T_O_KILL - WEEK)) "$T_O_KILL" | awk '{ print $6 }'
                  echo "$FT_CPW"; } | awk '$1 ~ /^[0-9]+$/ && $1 > 0' | sort -n | head -1)
-    note "first issue tick: elapsed_ms=$FT_MS due=$FT_DUE deferred=$FT_DEF blocks=$FT_BLOCKS in_flight=$FT_INFL slowest_publish_ms=$FT_SLOWPUB placements=$PLACEMENTS; T_off=${T_OFF} s cpw_min=${CPW_MIN:-none}"
+    note "first issue tick: elapsed_ms=$FT_MS due=$FT_DUE deferred=$FT_DEF blocks=$FT_BLOCKS cut_blocks=$FT_CUT scan_ms=$FT_SCAN in_flight=$FT_INFL slowest_publish_ms=$FT_SLOWPUB placements=$PLACEMENTS; T_off=${T_OFF} s cpw_min=${CPW_MIN:-none}"
     if [ -z "$CPW_MIN" ]; then
         fail "FAIL(setup): no cpw_min on O's issue ticks (cannot check T_off)"
     elif [ "$T_OFF" -lt $((604800 / (CPW_MIN * TIME_SCALE) + 30)) ]; then

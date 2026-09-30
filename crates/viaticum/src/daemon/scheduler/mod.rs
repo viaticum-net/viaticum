@@ -102,7 +102,7 @@ pub struct Scheduler {
     /// Epoch encryption key for rebuilding source block blobs.
     epoch_key: [u8; 32],
     /// Base data dir (`~/.viaticum`); SystemState retained block blobs live under
-    /// `<data_dir>/system_state/`. Used by `load_source_block_data` to serve PoS
+    /// `<data_dir>/system_state/`. Used by `issue::prepare::load_source_block` to serve PoS
     /// challenges for SS blocks (which have no backing watch-dir file).
     data_dir: std::path::PathBuf,
     /// When each placement's challenge was last tried (its block started by an issue
@@ -554,49 +554,6 @@ impl Scheduler {
 
         let effective = compute_effective_trust(device_trust.as_ref(), master_trust.as_ref());
         effective * s
-    }
-
-    /// Load source block data for PoS challenge computation.
-    ///
-    /// Resolution order (2-tier, post-Wave-11b):
-    ///   1. SystemState retained blob (`<data_dir>/system_state/<hex>.bin`) — SS blocks
-    ///      have no backing watch-dir file; the owner retains the blob for PoS re-encode.
-    ///      Corruption is propagated loudly; absence falls through.
-    ///   2. Rebuild from the owner's source files via compress_and_encrypt (same path as
-    ///      `Processor::rebuild_blob_for_pos`).
-    ///
-    /// PL-6: the old on-disk `{source_blocks_dir}/{block_hex}/block.bin` middle tier was
-    /// removed. Wave 11b never writes `block.bin` (the symbol pipeline persists nothing
-    /// to disk), so that `tokio::fs::read` was always NotFound and always fell through to
-    /// the rebuild path below — a dead tier.
-    async fn load_source_block_data(&self, block_id: &SourceBlockId) -> anyhow::Result<Vec<u8>> {
-        // SystemState blocks: serve the owner-retained blob (verified blake3 == block_id).
-        if let Some(blob) =
-            crate::daemon::system_state::block::try_load_retained_block(&self.data_dir, block_id)?
-        {
-            return Ok(blob);
-        }
-
-        let block_record = self
-            .db
-            .get_source_block(block_id)?
-            .ok_or_else(|| anyhow::anyhow!("source block record missing: {block_id}"))?;
-        let db = self.db.clone();
-        let epoch_key = self.epoch_key;
-        let expected_id = *block_id;
-
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-            let plaintext =
-                crate::daemon::backup::packing::rebuild_plaintext_from_db(&db, &block_record)?;
-            let blob =
-                crate::daemon::backup::pipeline::compress_and_encrypt(&plaintext, &epoch_key)?;
-            let rebuilt_id: [u8; 32] = *blake3::hash(&blob).as_bytes();
-            if rebuilt_id != expected_id.0 {
-                anyhow::bail!("rebuilt blob hash mismatch for {expected_id}");
-            }
-            Ok(blob)
-        })
-        .await?
     }
 
     /// Check all pending challenges for timeout.

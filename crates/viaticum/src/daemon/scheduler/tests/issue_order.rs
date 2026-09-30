@@ -104,15 +104,15 @@ async fn the_tick_publishes_the_least_recently_verified_blocks_first() {
     );
 }
 
-/// pos-i7-c: 60 blocks that cannot be served (every store fails after 150 ms) sit at the
+/// pos-i7-c: 150 blocks that cannot be served (every store fails after 150 ms) sit at the
 /// head (never verified); 5 servable blocks (verified long ago) behind them. A tick at
-/// time_scale 3600 (budget 200 ms) tries ≈ 2 waves of 9 before its budget ends, so the
-/// unservable take ⌈60 / ~18⌉ ≈ 4 ticks; the servable are issued within 8. Ordered by
-/// `last_verified` alone, every tick would retry the same unservable head and never
-/// reach them.
+/// time_scale 900 (its waits end at 760 ms) tries ≈ 5 waves of 9 before its budget ends,
+/// so the unservable take ⌈150 / ~45⌉ ≈ 4 ticks, fewer per tick on a loaded machine; the
+/// servable are issued within 10. Ordered by `last_verified` alone, every tick would
+/// retry the same unservable head (≈ 45 < 150) and never reach them.
 #[tokio::test]
 async fn unservable_blocks_at_the_head_do_not_starve_the_rest() {
-    const UNSERVABLE: u8 = 60;
+    const UNSERVABLE: u8 = 150;
     const SERVABLE: u8 = 5;
     let bad = make_identity(0xBA);
     let good = make_identity(0x60);
@@ -124,7 +124,7 @@ async fn unservable_blocks_at_the_head_do_not_starve_the_rest() {
             (Duration::from_millis(5), true)
         }
     });
-    let owner = owner_with(3600, postman, |db, dir| {
+    let owner = owner_with(900, postman, |db, dir| {
         for b in 0..UNSERVABLE {
             let id = seed_retained_pos_block(dir, db, b);
             db.upsert_placement(&make_placement(id, bad)).unwrap();
@@ -156,7 +156,7 @@ async fn unservable_blocks_at_the_head_do_not_starve_the_rest() {
             break;
         }
         assert!(
-            ticks < 8,
+            ticks < 10,
             "after {ticks} ticks {issued_good} of {SERVABLE} servable blocks issued: the \
              unservable head starves them"
         );
