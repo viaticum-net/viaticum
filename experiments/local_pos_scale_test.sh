@@ -46,7 +46,9 @@
 #                    the first true within one scaled week, else FAIL "premise: DR did not become
 #                    ready" (pos-i8)
 #               7.  H9, 28 cycles over W1..W4: 0 timeouts to H9; >= 1 Pass from H9 on O in every
-#                    online window; in every window H9 computes >= 90 % of its live challenges
+#                    online window with something to answer (a challenge to H9 issued while it
+#                    was off, or up to 15 s before the window's end), and >= 14 such windows;
+#                    windows with nothing to answer = NOTE; in every window H9 computes >= 90 % of its live challenges
 #                    (issued by O to H9 in the 672 s before its start), < 90 % = FAIL "finding:
 #                    the laptop does not keep up"; T_up = NOTE (4r-i113, pos-i5);
 #                    rchar per online window = NOTE (pos-i5-c, the price of a restart)
@@ -165,6 +167,39 @@
 #     (the synchronous scan before the first block) and `slowest_block_ms`, so the next
 #     run breaks `elapsed_ms` down without guessing. Step 2's NOTE reads them.
 #
+# Changes after run 20260930-021936 (step 7's Pass bar; written before the next run). The
+# run: every step PASS except step 7 "no Pass from H9 on O in windows: 7" (T_up 11 s, the
+# computed >= 90 % bar PASS).
+#   - evidence (O's log, H9 = node-09): O issued nothing to H9 from t=1784 to t=1913 (133 s,
+#     while it issued ~40 challenges a tick to the others): 0 challenges to H9 while it was
+#     off before window 7 (t 1788-1853) and 0 in the window. H9 did its part: it started at
+#     1853, fetched 712 live challenges and published 712 answers with an Ack (cached=false)
+#     by 1864 — all answers to challenges already resolved in earlier windows (H9's memory
+#     is lost at each SIGKILL, pos-i5-c), so O dropped them as not pending. Nothing to answer,
+#     so no Pass possible. Window 8 had 1 (one issue at t=1913).
+#   - why a gap: not starvation. The time from a Pass to the next challenge of the same
+#     placement is the same for H9 and the always-on H1 (p10/p50/p90 686/774/1391 s vs
+#     683/775/1434 s over the run): cpw 1 (interval 672 s) + the queue of the saturated owner
+#     (pos-i7-b). But H9 answers only in its 30 s windows, so its placements are verified in
+#     bursts and come due again in bursts ≈ 775 s ≈ 8.07 windows later: its challenge load
+#     is a pattern that repeats every ~8 windows. A slot of that pattern that happens to be
+#     empty stays empty — windows 7, 15 and 22-24 of this run dip (0, 36, 43/37/11 Passes;
+#     windows 8, 16, 24 are rescued by challenges issued during the window). The previous
+#     quiet run (d6c7182) had no empty slot (min 44 issued while off). Whether a slot is
+#     empty is set by the phase of the first weeks, so it is close to a coin flip per run;
+#     nothing in the product spreads a holder's challenges over its days.
+#   - the bar: >= 1 Pass is required only in a window where H9 had something to answer — a
+#     challenge issued while it was off before the window, or up to 15 s before its end; a
+#     window with none is a NOTE (with the longest gap between issues to H9); and at least
+#     half of the 28 windows must be judged, so the bar cannot pass on nothing. What the bar
+#     guards is unchanged: answers of the laptop lost on the owner's side (pre-СТ-0: the
+#     channel of 256) make a judged window red. 4r-i113's "credited every day" is the pair's
+#     confirmation (W_conf 14 d 3 h), which one challenge per scaled week keeps (7a-7c).
+#   - open question (proposed intent item, not decided): should an intermittent holder be
+#     challenged every day it is online? Today a holder with hundreds of placements can go
+#     an online day without a challenge. Recommendation: no — W_conf covers weeks; if yes,
+#     spread due times with jitter.
+#
 # Implementation notes (how the passport is executed, not what it claims):
 #   - "ledger accrual" is measured on O's `pair-ledger row` lines (target viaticum::ledger,
 #     enabled by O's RUST_LOG): `scheduler: pair-ledger accrual tick` is a debug line of the
@@ -246,6 +281,7 @@ ALIVE_MARGIN=60
 STEP8_MARGIN=120
 STEP8_RUN=600       # step 8: judged window past O's first tick, s (the backlog drains over ticks)
 H1_FIRST_POLL_NOTE=180  # step 5: a first poll of H1 later than this after its start = NOTE
+H9_ANSWER_MARGIN=15 # step 7: an issue this close to a window's end is not expected answered in it
 O_OFF=720           # step 8: O off, s (> one challenge interval 672 s at cpw 1, + 30 s)
 
 E2E_BASE="${E2E_BASE:-$HOME/e2e-runs}"
@@ -957,7 +993,7 @@ N_UP=$(echo "$UPS" | awk 'NF' | wc -l | tr -d ' ')
 [ "$N_UP" -ge "$H9_CYCLES" ] || fail "FAIL(setup): H9 started only $N_UP of $H9_CYCLES times"
 TO9=$(o_timeouts | in_window "$T_W1" "$T_W5" | awk -v h="${DEV[$H9]}" '$4 == h' | awk 'NF' | wc -l | tr -d ' ')
 [ "$TO9" -eq 0 ] && pass "0 timeouts to H9" || fail "$TO9 timeouts to H9"
-NO_PASS=""; SLOW=""; TUPS=""
+NO_PASS=""; SLOW=""; TUPS=""; EMPTY=""; N_JUDGED=0
 PASS9=$(o_resolved | awk -v h="${DEV[$H9]}" '$4 == h && $5 == "Pass" { print $1 }')
 ISS9=$(o_issues | awk -v h="${DEV[$H9]}" '$4 == h { print $1 }')
 COMP9=$(h_computes "$H9")
@@ -967,15 +1003,32 @@ while read -r c up; do
     end=$(awk -v n=$((c + 1)) '$1 == n && $2 == "kill" { print $3 }' "$TEST_DIR/h9_cycles.log")
     [ -n "$end" ] || end=$((up + H9_CYCLE - H9_OFF))
     np=$(echo "$PASS9" | awk -v a="$up" -v b="$((end + 8))" 'NF && $1 >= a && $1 <= b' | wc -l | tr -d ' ')
-    [ "$np" -ge 1 ] || NO_PASS="$NO_PASS $c"
+    # Something to answer: a challenge to H9 issued while it was off before this window, or
+    # early enough in the window to be answered in it. A window with none is not judged
+    # (NOTE): no Pass is possible there (see "Changes after run 20260930-021936").
+    off=$(awk -v n="$c" '$1 == n && $2 == "kill" { print $3 }' "$TEST_DIR/h9_cycles.log")
+    [ -n "$off" ] || off=$((up - H9_OFF))
+    todo=$(echo "$ISS9" | awk -v a="$off" -v b="$((end - H9_ANSWER_MARGIN))" 'NF && $1 >= a && $1 <= b' | wc -l | tr -d ' ')
+    if [ "$todo" -eq 0 ]; then
+        EMPTY="$EMPTY $c"
+    else
+        N_JUDGED=$((N_JUDGED + 1))
+        [ "$np" -ge 1 ] || NO_PASS="$NO_PASS $c:0/$todo"
+    fi
     live=$(echo "$ISS9" | awk -v a="$((up - WEEK))" -v b="$up" 'NF && $1 >= a && $1 <= b' | wc -l | tr -d ' ')
     comp=$(echo "$COMP9" | in_window "$up" "$end" | awk '{ print $3 }' | sort -u | awk 'NF' | wc -l | tr -d ' ')
     if [ "$live" -eq 0 ] || [ $((comp * 10)) -lt $((live * 9)) ]; then SLOW="$SLOW $c:$comp/$live"; fi
     tup=$(echo "$POLL9" | in_window "$up" "$end" | awk -v u="$up" '$4 != "-" && $4 + 0 > 0 { printf "%.0f", $1 - u; exit }')
     TUPS="$TUPS ${tup:-none}"
 done <<< "$UPS"
-[ -z "$NO_PASS" ] && pass "a Pass from H9 on O in every online window" \
-    || fail "no Pass from H9 on O in windows:$NO_PASS"
+if [ "$N_JUDGED" -lt $((H9_CYCLES / 2)) ]; then
+    fail "only $N_JUDGED of $H9_CYCLES windows had a challenge to H9 to answer (the Pass bar would be vacuous)"
+elif [ -z "$NO_PASS" ]; then
+    pass "a Pass from H9 on O in every window with something to answer ($N_JUDGED of $H9_CYCLES)"
+else
+    fail "no Pass from H9 on O in windows with something to answer (cycle:passes/to-answer):$NO_PASS"
+fi
+note "windows with nothing issued to H9 while it was off or early in the window (not judged):${EMPTY:- none}; longest gap between issues to H9 in W1..W4 = $(echo "$ISS9" | in_window "$T_W1" "$T_W5" | max_gap) s"
 [ -z "$SLOW" ] && pass "H9 computed >= 90 % of its live challenges in every window" \
     || fail "finding: the laptop does not keep up within the window (cycle:computed/live):$SLOW"
 note "T_up per window (s):$TUPS"
