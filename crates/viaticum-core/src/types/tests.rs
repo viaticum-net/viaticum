@@ -7,6 +7,7 @@ use super::*;
 #[test]
 fn erasure_params_returns_stored_values() {
     let record = SourceBlockRecord {
+        seal_generation: 0,
         block_id: SourceBlockId([0; 32]),
         k: 100,
         t: 65535,
@@ -36,6 +37,7 @@ fn erasure_params_legacy_fallback() {
     let k: u32 = 100;
     let t: u16 = 65535;
     let record = SourceBlockRecord {
+        seal_generation: 0,
         block_id: SourceBlockId([0; 32]),
         k,
         t,
@@ -63,6 +65,7 @@ fn erasure_params_legacy_fallback() {
 #[test]
 fn source_block_record_roundtrips_n_and_overhead() {
     let record = SourceBlockRecord {
+        seal_generation: 0,
         block_id: SourceBlockId([0xAB; 32]),
         k: 200,
         t: 65535,
@@ -345,6 +348,7 @@ fn cbor_roundtrip_event() {
 #[test]
 fn cbor_roundtrip_source_block_pack() {
     let sb = SourceBlockRecord {
+        seal_generation: 0,
         block_id: SourceBlockId([0; 32]),
         k: 2048,
         t: 65535,
@@ -390,6 +394,7 @@ fn cbor_roundtrip_source_block_pack() {
 #[test]
 fn source_block_record_round_trip_with_all_new_fields() {
     let original = SourceBlockRecord {
+        seal_generation: 0,
         block_id: SourceBlockId([0xAB; 32]),
         k: 100,
         t: 65535,
@@ -1201,4 +1206,97 @@ fn signed_letter_class_is_encoded_by_variant_name() {
     let mut want = vec![0x60 + 10u8]; // CBOR text string, length 10
     want.extend_from_slice(b"DropNotice");
     assert_eq!(bytes, want);
+}
+
+// ============================================================
+// L1b (N1, INV-G0): seal_generation
+// ============================================================
+
+/// The record as written before L1b: every field, no `seal_generation`.
+#[derive(serde::Serialize)]
+struct PreL1bSourceBlockRecord {
+    block_id: SourceBlockId,
+    k: u32,
+    t: u16,
+    block_type: SourceBlockType,
+    status: SourceBlockStatus,
+    created_at: Timestamp,
+    encrypted_size: Option<u64>,
+    n: Option<u32>,
+    overhead: Option<f64>,
+    drop_notice_sent_at: Option<Timestamp>,
+    importance: f64,
+    current_alive: u32,
+    current_reliability: f64,
+    target_reliability: f64,
+}
+
+fn pre_l1b_record() -> PreL1bSourceBlockRecord {
+    PreL1bSourceBlockRecord {
+        block_id: SourceBlockId([0x5E; 32]),
+        k: 7,
+        t: 65535,
+        block_type: SourceBlockType::Pack {
+            entries: vec![PackEntry {
+                file_id: FileId(3),
+                offset: 0,
+                size: 100,
+            }],
+        },
+        status: SourceBlockStatus::Deleting,
+        created_at: Timestamp(1234),
+        encrypted_size: Some(456_789),
+        n: Some(21),
+        overhead: Some(2.25),
+        drop_notice_sent_at: None,
+        importance: 0.5,
+        current_alive: 2,
+        current_reliability: 0.75,
+        target_reliability: 0.99,
+    }
+}
+
+fn record_of(pre: &PreL1bSourceBlockRecord, seal_generation: u32) -> SourceBlockRecord {
+    SourceBlockRecord {
+        seal_generation,
+        block_id: pre.block_id,
+        k: pre.k,
+        t: pre.t,
+        block_type: pre.block_type.clone(),
+        status: pre.status,
+        created_at: pre.created_at,
+        encrypted_size: pre.encrypted_size,
+        n: pre.n,
+        overhead: pre.overhead,
+        drop_notice_sent_at: pre.drop_notice_sent_at,
+        importance: pre.importance,
+        current_alive: pre.current_alive,
+        current_reliability: pre.current_reliability,
+        target_reliability: pre.target_reliability,
+    }
+}
+
+#[test]
+fn source_block_record_without_seal_generation_decodes_as_zero() {
+    let bytes = to_cbor_bytes(&pre_l1b_record());
+    let decoded: SourceBlockRecord = from_cbor_bytes(&bytes).unwrap();
+    assert_eq!(decoded.seal_generation, 0);
+    assert_eq!(decoded.k, 7);
+    assert_eq!(decoded.status, SourceBlockStatus::Deleting);
+}
+
+#[test]
+fn source_block_record_of_generation_zero_encodes_byte_identical_to_pre_l1b() {
+    let pre = pre_l1b_record();
+    assert_eq!(
+        to_cbor_bytes(&record_of(&pre, 0)),
+        to_cbor_bytes(&pre),
+        "INV-G0: a generation-0 record is written exactly as before L1b"
+    );
+    // A later generation is written and read back.
+    let g3 = record_of(&pre, 3);
+    let bytes = to_cbor_bytes(&g3);
+    assert_ne!(bytes, to_cbor_bytes(&pre));
+    let decoded: SourceBlockRecord = from_cbor_bytes(&bytes).unwrap();
+    assert_eq!(decoded.seal_generation, 3);
 }

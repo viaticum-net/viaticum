@@ -134,6 +134,7 @@ fn insert_file_with_block(
     };
     let block_id = SourceBlockId([7u8; 32]);
     let block = SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 4,
         t: 1024,
@@ -410,6 +411,7 @@ fn make_block(
     status: SourceBlockStatus,
 ) -> SourceBlockRecord {
     SourceBlockRecord {
+        seal_generation: 0,
         block_id: SourceBlockId([id; 32]),
         k: 10,
         t: 64,
@@ -1897,6 +1899,7 @@ fn held_ss_block(db: &Db, id: u8, holders: u8) -> viaticum_core::types::SourceBl
     };
     let block_id = SourceBlockId([id; 32]);
     db.upsert_source_block(&SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 1,
         t: 64,

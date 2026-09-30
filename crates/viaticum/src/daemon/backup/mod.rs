@@ -17,6 +17,7 @@
 //                       not abort on a vanished or changed file (backup-i9, i23)
 //   tests_rebuild.rs -- L0: rebuild by content after renames, copies, swaps
 //   tests_gone.rs    -- L0: deletion by event and recheck, the watch root rule
+//   tests_seal.rs    -- L1b: a generation-0 seal keeps the pre-L1b block id (INV-G0)
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -48,6 +49,8 @@ mod tests_current;
 mod tests_gone;
 #[cfg(test)]
 mod tests_rebuild;
+#[cfg(test)]
+mod tests_seal;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 

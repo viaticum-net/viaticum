@@ -110,6 +110,7 @@ fn make_block_record(
     target_reliability: f64,
 ) -> SourceBlockRecord {
     SourceBlockRecord {
+        seal_generation: 0,
         block_id: bid,
         k: 5,
         t: 1024,

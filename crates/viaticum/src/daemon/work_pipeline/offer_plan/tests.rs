@@ -44,6 +44,7 @@ fn block(db: &Db, k: u32) -> SourceBlockRecord {
     let mut id = [0u8; 32];
     id[0] = 0xB1;
     let record = SourceBlockRecord {
+        seal_generation: 0,
         block_id: SourceBlockId(id),
         k,
         t: SYMBOL as u16,

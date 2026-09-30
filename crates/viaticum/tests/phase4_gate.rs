@@ -236,6 +236,7 @@ fn deletion_cooldown_full_lifecycle() {
 
     // Active source block of type Single
     let block = SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 4,
         t: 65535,
@@ -336,6 +337,7 @@ fn deletion_cooldown_full_lifecycle() {
 
     // Update block to Deleting and both placements to Deleting
     let block_deleting = SourceBlockRecord {
+        seal_generation: 0,
         status: SourceBlockStatus::Deleting,
         ..block.clone()
     };

@@ -64,6 +64,24 @@ pub const OWNER_DELETE_COOLDOWN_SECS: u64 = 4 * SECS_PER_WEEK;
 /// Holder-side cooldown after receiving delete before physical removal (seconds).
 pub const HOLDER_DELETE_COOLDOWN_SECS: u64 = 4 * SECS_PER_WEEK;
 
+// delete-i9 (N1): a block id is free again only after CleanupBlock, which comes no earlier
+// than the holder window after the Delete was published (L2 W1); a Delete lives at a postman
+// at most its TTL plus one sweep. So no live Delete can address a reused id. The same holds
+// at every time_scale (each term is divided by it): unit
+// `delete_ttl_plus_sweep_below_holder_window_at_e2e_scales`.
+const _: () = assert!(
+    crate::mailbox::class_config::DELETE_REQUEST_TTL.as_secs() + MAILBOX_SWEEP_INTERVAL_SECS
+        < HOLDER_DELETE_COOLDOWN_SECS
+);
+
+/// N1: generations tried for one plaintext before the pack fails (backup-i8). Each delete →
+/// return cycle past the owner window takes one while the old block is being released.
+pub const MAX_BLOCK_GENERATIONS: u32 = 1024;
+
+/// Period of the reconcile "current version → serviceable block" (backup-i8, backup-i25);
+/// scaled by time_scale with a 60 s floor.
+pub const CURRENT_BLOCK_RECONCILE_SECS: u64 = 3600;
+
 /// Phase 2 disk pressure: notice window before holder drops symbols (seconds).
 pub const DROP_NOTICE_WINDOW_SECS: u64 = 7 * 24 * 3600; // 7 days
 

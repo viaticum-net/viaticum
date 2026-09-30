@@ -182,6 +182,7 @@ impl Fx {
         let block_id = SourceBlockId([id; 32]);
         self.db
             .upsert_source_block(&SourceBlockRecord {
+                seal_generation: 0,
                 block_id,
                 k: 1,
                 t: 64,

@@ -46,6 +46,7 @@ fn file_with_versions(path: &str, file_id: u64, versions: &[([u8; 32], bool)]) -
 
 fn make_source_block(seed: u8, status: SourceBlockStatus) -> SourceBlockRecord {
     SourceBlockRecord {
+        seal_generation: 0,
         block_id: block_id(seed),
         k: 10,
         t: 65535,
@@ -777,6 +778,7 @@ fn committed_bytes_sums_active_blocks() {
 
     // Block A: Active, encrypted_size=Some(1000)
     let block_a = SourceBlockRecord {
+        seal_generation: 0,
         block_id: block_id(10),
         k: 5,
         t: 100,
@@ -795,6 +797,7 @@ fn committed_bytes_sums_active_blocks() {
 
     // Block B: Active, encrypted_size=None → fallback to k*t = 10*100 = 1000
     let block_b = SourceBlockRecord {
+        seal_generation: 0,
         block_id: block_id(11),
         k: 10,
         t: 100,
@@ -813,6 +816,7 @@ fn committed_bytes_sums_active_blocks() {
 
     // Block C: Deleted, encrypted_size=Some(500) → must NOT be counted
     let block_c = SourceBlockRecord {
+        seal_generation: 0,
         block_id: block_id(12),
         k: 5,
         t: 100,
@@ -851,6 +855,7 @@ fn update_block_cached_fields_persists_to_db() {
 
     // Insert a block with default (zero) cached fields.
     let initial = SourceBlockRecord {
+        seal_generation: 0,
         block_id: bid,
         k: 5,
         t: 65535,
@@ -1432,6 +1437,7 @@ fn refresh_peer_storage_bytes_updates_trust_s() {
     // Source block t=1000 → bytes = 10 * 1000 = 10_000.
     let block_id_a = SourceBlockId([0xA0u8; 32]);
     let sb_a = SourceBlockRecord {
+        seal_generation: 0,
         block_id: block_id_a,
         k: 10,
         t: 1000,
@@ -1511,6 +1517,7 @@ fn refresh_peer_storage_bytes_neutral_when_we_store_nothing() {
     // Peer holds 5 symbols of ours (Alive).
     let block_id_b = SourceBlockId([0xC0u8; 32]);
     let sb = SourceBlockRecord {
+        seal_generation: 0,
         block_id: block_id_b,
         k: 5,
         t: 2000,
@@ -1567,6 +1574,7 @@ fn refresh_peer_storage_bytes_only_alive_and_active_count() {
     // Source block for placements.
     let block_id_c = SourceBlockId([0xD0u8; 32]);
     let sb = SourceBlockRecord {
+        seal_generation: 0,
         block_id: block_id_c,
         k: 10,
         t: 500,
@@ -2631,6 +2639,7 @@ fn make_block_with(
     target_reliability: f64,
 ) -> SourceBlockRecord {
     SourceBlockRecord {
+        seal_generation: 0,
         block_id: SourceBlockId([seed; 32]),
         k: 10,
         t: 65535,

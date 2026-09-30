@@ -1040,6 +1040,7 @@ async fn one_unrecoverable_block_does_not_abort_remaining_blocks() {
     })
     .unwrap();
     db.upsert_source_block(&SourceBlockRecord {
+        seal_generation: 0,
         block_id: bad_block,
         k: 2,
         t: 65_535,
@@ -1261,6 +1262,7 @@ async fn path_traversal_from_db_record_is_rejected() {
 
     // Insert a source block record.
     let source_block = SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 2,
         t: 65_535,

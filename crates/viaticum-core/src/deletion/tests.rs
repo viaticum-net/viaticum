@@ -66,6 +66,7 @@ fn make_block(
     block_type: SourceBlockType,
 ) -> SourceBlockRecord {
     SourceBlockRecord {
+        seal_generation: 0,
         block_id: bid,
         k: 1,
         t: 1024,
@@ -1210,4 +1211,27 @@ fn latest_deletion_per_block_takes_max_over_referencing_records() {
     assert_eq!(latest.get(&a), Some(&ts(90)));
     assert_eq!(latest.get(&b), Some(&ts(120)));
     assert_eq!(latest.get(&c), None);
+}
+
+/// delete-i9 (N1, L1b) [cross:B]: at every time_scale the E2E scenarios run with, a Delete
+/// outlives neither its scaled TTL plus one scaled sweep, and both stay below the scaled
+/// holder window — the formulas the daemon uses (`mailbox::scaled_ttl_secs`, the sweep's
+/// `(x / ts).max(1)`, the engine's `HOLDER_DELETE_COOLDOWN_SECS / ts`), so no live Delete
+/// can address an id freed by CleanupBlock. The `const assert` in `constants.rs` holds it at
+/// scale 1.
+#[test]
+fn delete_ttl_plus_sweep_below_holder_window_at_e2e_scales() {
+    use crate::constants::MAILBOX_SWEEP_INTERVAL_SECS;
+    use crate::mailbox::class_config::DELETE_REQUEST_TTL;
+    use crate::mailbox::scaled_ttl_secs;
+    for scale in [1u64, 100, 10_000, 20_000, 40_000, 100_000] {
+        let ttl = scaled_ttl_secs(DELETE_REQUEST_TTL.as_secs(), scale);
+        let sweep = (MAILBOX_SWEEP_INTERVAL_SECS / scale).max(1);
+        let holder_window = HOLDER_DELETE_COOLDOWN_SECS / scale;
+        assert!(
+            ttl + sweep < holder_window,
+            "scale {scale}: Delete TTL {ttl} s + sweep {sweep} s must stay below the holder \
+             window {holder_window} s"
+        );
+    }
 }

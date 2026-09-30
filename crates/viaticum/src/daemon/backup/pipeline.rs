@@ -228,6 +228,7 @@ pub fn run_pipeline(
     };
 
     let block_record = SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: params.k,
         t: params.t,
