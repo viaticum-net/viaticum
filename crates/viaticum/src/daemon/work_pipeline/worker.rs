@@ -13,6 +13,11 @@
 //   I5: Never overwrite a placement whose status `may_hold_symbols()` (Alive /
 //       Uncertain / PresumedLost): only PoS moves those (repair-i2, INV-1).
 //   I6: The source is read only when the allocation is non-empty (repair-i4).
+//   J8/J12-ex (backup-i24): one memory permit per iteration, taken after the plan and before
+//       the source is read, shrunk after the encode, held through the delivery (the named
+//       exception to "no network await under a permit"), released at the end. The worker
+//       takes no other permit; it yields the budget to an overdue PoS preparation (after
+//       at least one chunk this turn) and to a restore (after at least one holder).
 //
 // TODO: this function duplicates deliver_to_holder from BackupCoordinator.
 // See spec R6: duplication is intentional — worker context differs from coordinator.
@@ -23,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use viaticum_core::cluster::ClusterState;
 use viaticum_core::constants::DECODE_OVERHEAD;
 use viaticum_core::db::Db;
-use viaticum_core::erasure::ErasureEncoder;
+use viaticum_core::erasure::{ErasureEncoder, pad_for_encoding};
 use viaticum_core::types::{
     DeviceId, ErasureParams, PlacementStatus, SourceBlockId, SourceBlockRecord, SymbolPlacement,
     Timestamp,
@@ -31,6 +36,9 @@ use viaticum_core::types::{
 
 use super::offer_plan::{self, OfferPlan};
 use super::{WorkPipelineConfig, pool::PoolSnapshot};
+use crate::daemon::mem_budget::{
+    self, HolderKind, MemBudget, PriorityKind, estimate_worker, estimate_worker_delivery,
+};
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
 
@@ -53,6 +61,79 @@ pub(crate) struct WorkOutcome {
     /// The block left service between the plan and the write of the offers (repair-i16):
     /// no offer recorded, nothing delivered.
     pub left_service: bool,
+    /// The worker gave the memory budget away before it was done (overdue PoS or restore
+    /// waiting): the undelivered placements stay `Offered` and the next turn re-encodes the
+    /// block. Not a failure, not counted in `failed` (backup-i24-a).
+    pub yielded: bool,
+}
+
+/// How one holder's delivery ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryOutcome {
+    /// Every chunk acked; the placement is `Alive`.
+    Stored,
+    /// Attempted, not every chunk acked; the placement stays `Offered`.
+    NotStored,
+    /// The worker stopped before the next chunk to give the budget away (overdue PoS).
+    Yielded,
+}
+
+/// Who the worker gives the budget to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum YieldTo {
+    OverduePos,
+    Restore,
+}
+
+/// Progress of one turn (one `run_block_iteration`) — the yield rules need it: a turn always
+/// delivers at least one chunk before it yields to an overdue PoS, and at least one holder
+/// before it yields to a restore (J13, backup-i24-a).
+pub(super) struct Turn<'a> {
+    pub(super) budget: &'a MemBudget,
+    pub(super) chunk_budget_bytes: usize,
+    /// Holders whose delivery began this turn.
+    pub(super) holders_started: usize,
+    /// Chunks the holders acked this turn.
+    pub(super) chunks_stored: u32,
+}
+
+impl Turn<'_> {
+    /// Before a next chunk (never before the first of the turn).
+    pub(super) fn overdue_pos_wants_the_budget(&self) -> bool {
+        self.chunks_stored >= 1 && self.budget.priority_is_starved(PriorityKind::OverduePos)
+    }
+
+    /// Before a next holder.
+    pub(super) fn yield_before_next_holder(&self) -> Option<YieldTo> {
+        if self.overdue_pos_wants_the_budget() {
+            Some(YieldTo::OverduePos)
+        } else if self.holders_started >= 1
+            && self.budget.priority_is_starved(PriorityKind::Restore)
+        {
+            Some(YieldTo::Restore)
+        } else {
+            None
+        }
+    }
+}
+
+fn log_yield(to: YieldTo, block: &SourceBlockId, holders_done: usize, of: usize, yields: u32) {
+    match to {
+        YieldTo::OverduePos => tracing::info!(
+            block = %block,
+            holders_done,
+            of,
+            yields_for_block = yields,
+            "work_pipeline: yielding memory to overdue PoS"
+        ),
+        YieldTo::Restore => tracing::info!(
+            block = %block,
+            holders_done,
+            of,
+            yields_for_block = yields,
+            "work_pipeline: yielding memory to restore"
+        ),
+    }
 }
 
 /// Holders excluded from a new offer of one block (repair-i2).
@@ -75,14 +156,17 @@ pub(crate) struct ExcludedHolders {
 ///     `Offered` row (e.g. after `SymbolReject`) gets its own range back, fresh numbers only
 ///     for the rest (repair-i9).
 ///  3. Nobody to offer to → return `encoded = false` WITHOUT reading the source
-///     (repair-i4: cheap outcome).
-///  4. Load source blob via `rebuild_source_blob` (re-encodes from source files).
-///     The allocation never depends on the blob (sizes come from `encrypted_size`).
-///  5. `encode_raw_ranges` once for the union of the plan's ESIs (spawn_blocking —
-///     CPU-bound ~30s for 128MB).
+///     (repair-i4: cheap outcome) and without touching the memory budget. Otherwise take the
+///     memory permit (backup-i24), sized by the plan's symbol count; it waits its turn.
+///  4. Load source blob via `rebuild_source_blob` (re-encodes from source files), pad it to
+///     `k·t` in place. The allocation never depends on the blob (sizes come from
+///     `encrypted_size`).
+///  5. `encode_block` once for the union of the plan's ESIs (spawn_blocking — CPU-bound ~30s
+///     for 128MB), then shrink the permit to what delivery holds.
 ///  6. For each allocation: bind symbols inline, send SymbolOffer → SymbolAccept → SymbolTransfer.
-///     On `SymbolStored`: transition Offered→Alive + recompute cached fields.
-///  7. Drop raw symbols (no disk spill).
+///     On `SymbolStored`: transition Offered→Alive + recompute cached fields. Before a next
+///     holder or chunk, give the budget away to a waiting restore / overdue PoS (J13).
+///  7. Drop raw symbols (no disk spill), release the permit.
 ///
 /// The caller records the attempt after this returns (`last_attempted_at`,
 /// `last_pool_signature`): an ordinary cooldown when `offered > 0`, otherwise (or on
@@ -98,6 +182,7 @@ pub(crate) async fn run_block_iteration(
     cluster_state: Option<&Arc<Mutex<ClusterState>>>,
     block: &SourceBlockRecord,
     pool: &PoolSnapshot,
+    yields_before: u32,
 ) -> anyhow::Result<WorkOutcome> {
     // 1. Compute ErasureParams.
     let k = block.k;
@@ -138,6 +223,7 @@ pub(crate) async fn run_block_iteration(
                 encoded: false,
                 offered: 0,
                 left_service: false,
+                yielded: false,
             });
         }
         OfferPlan::EmptyAllocation => {
@@ -151,6 +237,7 @@ pub(crate) async fn run_block_iteration(
                 encoded: false,
                 offered: 0,
                 left_service: false,
+                yielded: false,
             });
         }
         OfferPlan::AllocationFailed(e) => {
@@ -164,33 +251,65 @@ pub(crate) async fn run_block_iteration(
                 encoded: false,
                 offered: 0,
                 left_service: false,
+                yielded: false,
             });
         }
     };
+
+    // 3b. The memory permit (J8): one for the whole iteration, taken now — after the plan, so
+    //     the early exits above never touch the budget, and before the source is read. It
+    //     waits its turn behind whoever is queued; nothing is held meanwhile. Sized by the
+    //     symbols this plan asks the encoder for (J10: at most 10·k_eff of them).
+    let encode_ranges = offer_plan::union_ranges(&offers);
+    let out_symbols: u64 = encode_ranges.iter().map(|&(_, count)| count as u64).sum();
+    debug_assert!(
+        out_symbols <= 10 * params.k_eff as u64,
+        "J10: {out_symbols} symbols in one iteration, k_eff = {}",
+        params.k_eff
+    );
+    let e_pad = k as u64 * t as u64;
+    let mut permit = config
+        .mem_budget
+        .acquire(
+            HolderKind::Worker,
+            &block.block_id,
+            estimate_worker(e_pad, out_symbols, t),
+        )
+        .await;
 
     // 4. Obtain the source blob — only now that someone can take symbols. SystemState
     //    blocks have no backing watch-dir file: their encoded blob is retained on disk
     //    (blake3 == block_id), so load it directly. All other blocks rebuild from
     //    source files (deterministic).
-    let source_data = load_source_blob(db, config, block).await?;
+    let mut source_data = load_source_blob(db, config, block).await?;
+    // The block id was checked by the load; padding changes the bytes the id is over.
+    // Padded IN PLACE to k·t: the encoder then borrows it instead of copying it (F5).
+    pad_for_encoding(&mut source_data, &params);
 
     // 5. Encode once for the union of every offer's ESIs (ascending, so the delivery
-    //    looks symbols up by ESI with a binary search).
-    let encode_ranges = offer_plan::union_ranges(&offers);
-    let source_data_arc = Arc::new(source_data);
-    let params_clone = params;
+    //    looks symbols up by ESI with a binary search). The task owns the permit and the
+    //    source while it runs and hands the permit back: whatever happens to this future,
+    //    the budget counts the encoder until the task is over.
     let encoder_clone = Arc::clone(encoder);
-    let source_clone = Arc::clone(&source_data_arc);
-
-    let raw_symbols = tokio::task::spawn_blocking(move || {
-        encoder_clone.encode_raw_ranges(&source_clone, &params_clone, &encode_ranges)
+    let (permit_back, encoded) = tokio::task::spawn_blocking(move || {
+        let result = mem_budget::encode_block(
+            &permit,
+            encoder_clone.as_ref(),
+            &source_data,
+            &params,
+            &encode_ranges,
+        );
+        // The source is no longer needed.
+        drop(source_data);
+        (permit, result)
     })
     .await
-    .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))?
-    .map_err(|e| anyhow::anyhow!("encode_raw: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))?;
+    permit = permit_back;
+    let raw_symbols = encoded.map_err(|e| anyhow::anyhow!("encode_raw: {e}"))?;
 
-    // Drop source data early — it's no longer needed.
-    drop(source_data_arc);
+    // The encoder is gone: keep what delivery needs, free the rest for the others.
+    permit.shrink_to(estimate_worker_delivery(e_pad, out_symbols, t));
 
     tracing::debug!(
         block_id = %block.block_id,
@@ -204,20 +323,36 @@ pub(crate) async fn run_block_iteration(
     let offers = offer_plan::record_offers(db, config.device_id, block, &offers, Timestamp::now())?;
     let offered = offers.len();
     if offers.is_empty() {
+        // `permit` and `raw_symbols` go with the scope.
         return Ok(WorkOutcome {
             acked: 0,
             failed: 0,
             encoded: true,
             offered: 0,
             left_service: true,
+            yielded: false,
         });
     }
 
     // 7. Deliver to each holder (binding applied inline at send time).
     let mut acked = 0usize;
     let mut failed = 0usize;
+    let mut yielded = false;
+    let mut turn = Turn {
+        budget: &config.mem_budget,
+        chunk_budget_bytes: config.chunk_budget_bytes,
+        holders_started: 0,
+        chunks_stored: 0,
+    };
 
-    for offer in &offers {
+    for (idx, offer) in offers.iter().enumerate() {
+        // J13: a restore (after this turn's first holder) or an overdue PoS (after its
+        // first chunk) that cannot run beside this permit gets the budget now.
+        if let Some(to) = turn.yield_before_next_holder() {
+            log_yield(to, &block.block_id, idx, offers.len(), yields_before + 1);
+            yielded = true;
+            break;
+        }
         // Load the Offered placement just inserted.
         let placement = match db.get_placement(&block.block_id, &offer.device_id) {
             Ok(Some(p)) => p,
@@ -241,6 +376,7 @@ pub(crate) async fn run_block_iteration(
             }
         };
 
+        turn.holders_started += 1;
         match deliver_to_holder_worker(
             db,
             encoder,
@@ -251,15 +387,29 @@ pub(crate) async fn run_block_iteration(
             &placement,
             &raw_symbols,
             block.importance,
+            &mut turn,
         )
         .await
         {
-            Ok(true) => {
+            Ok(DeliveryOutcome::Stored) => {
                 acked += 1;
             }
-            Ok(false) => {
+            Ok(DeliveryOutcome::NotStored) => {
                 // Delivery attempted but no full ack (placement left Offered).
                 failed += 1;
+            }
+            Ok(DeliveryOutcome::Yielded) => {
+                // Between two chunks: the placement stays Offered (the holder keeps what it
+                // got; a later turn sends again, A20), and this is not a failure.
+                log_yield(
+                    YieldTo::OverduePos,
+                    &block.block_id,
+                    idx,
+                    offers.len(),
+                    yields_before + 1,
+                );
+                yielded = true;
+                break;
             }
             Err(e) => {
                 tracing::warn!(
@@ -272,8 +422,9 @@ pub(crate) async fn run_block_iteration(
         }
     }
 
-    // 8. Drop raw symbols explicitly (no disk spill).
+    // 8. Drop raw symbols explicitly (no disk spill), then give the permit back.
     drop(raw_symbols);
+    drop(permit);
 
     Ok(WorkOutcome {
         acked,
@@ -281,14 +432,15 @@ pub(crate) async fn run_block_iteration(
         encoded: true,
         offered,
         left_service: false,
+        yielded,
     })
 }
 
 /// Deliver symbols for one (block, holder) pair using SymbolOffer/Accept/Transfer flow.
 ///
-/// Returns Ok(true) if the holder acked all chunks (Offered→Alive transitioned).
-/// Returns Ok(false) if delivery was attempted but not all chunks acked.
-/// Returns Err on network or DB error.
+/// Returns `Stored` if the holder acked all chunks (Offered→Alive transitioned), `NotStored`
+/// if delivery was attempted but not all chunks acked, `Yielded` if the worker stopped
+/// between two chunks to give the budget away. Returns Err on network or DB error.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_to_holder_worker(
     db: &Db,
@@ -300,7 +452,8 @@ async fn deliver_to_holder_worker(
     placement: &SymbolPlacement,
     raw_symbols: &[viaticum_core::erasure::Symbol],
     importance: f64,
-) -> anyhow::Result<bool> {
+    turn: &mut Turn<'_>,
+) -> anyhow::Result<DeliveryOutcome> {
     use viaticum_core::messages::Message;
 
     // If signing key is present, use SymbolOffer/Accept/Transfer handshake.
@@ -327,8 +480,16 @@ async fn deliver_to_holder_worker(
                     backoff.record_accept(&placement.holder_id);
                 }
                 // Holder accepted — send the actual symbols.
-                deliver_transfer_worker(db, encoder, swarm, &block.block_id, placement, raw_symbols)
-                    .await
+                deliver_transfer_worker(
+                    db,
+                    encoder,
+                    swarm,
+                    &block.block_id,
+                    placement,
+                    raw_symbols,
+                    turn,
+                )
+                .await
             }
             Message::SymbolReject(reject) => {
                 if let Some(backoff) = peer_backoff {
@@ -351,7 +512,16 @@ async fn deliver_to_holder_worker(
         }
     } else {
         // No signing key: fall back to direct SymbolTransfer.
-        deliver_transfer_worker(db, encoder, swarm, &block.block_id, placement, raw_symbols).await
+        deliver_transfer_worker(
+            db,
+            encoder,
+            swarm,
+            &block.block_id,
+            placement,
+            raw_symbols,
+            turn,
+        )
+        .await
     }
 }
 
@@ -394,7 +564,8 @@ pub(crate) fn bind_placement_symbols(
 /// Send SymbolTransfer chunks to a holder, wait for SymbolStored acks.
 ///
 /// On full ack: transitions placement Offered→Alive + runs W11a hook.
-/// Returns Ok(true) if all chunks were acked, Ok(false) otherwise.
+/// Before each chunk but the turn's first, an overdue PoS that cannot run beside this permit
+/// makes the worker stop (`Yielded`, backup-i24-a); the placement stays `Offered`.
 async fn deliver_transfer_worker(
     db: &Db,
     encoder: &Arc<dyn ErasureEncoder>,
@@ -402,8 +573,8 @@ async fn deliver_transfer_worker(
     block_id: &SourceBlockId,
     placement: &SymbolPlacement,
     raw_symbols: &[viaticum_core::erasure::Symbol],
-) -> anyhow::Result<bool> {
-    use viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES;
+    turn: &mut Turn<'_>,
+) -> anyhow::Result<DeliveryOutcome> {
     use viaticum_core::erasure::chunk_symbols_by_size;
     use viaticum_core::messages::{Message, SymbolTransferMsg};
 
@@ -411,12 +582,15 @@ async fn deliver_transfer_worker(
     let bound = bind_placement_symbols(encoder.as_ref(), block_id, placement, raw_symbols)?;
 
     let symbol_count = bound.len();
-    let chunks = chunk_symbols_by_size(bound, SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES);
+    let chunks = chunk_symbols_by_size(bound, turn.chunk_budget_bytes);
     let total_chunks = chunks.len();
     let mut stored_ok = 0usize;
     let mut saw_old_protocol = false;
 
     for (idx, chunk) in chunks.into_iter().enumerate() {
+        if turn.overdue_pos_wants_the_budget() {
+            return Ok(DeliveryOutcome::Yielded);
+        }
         let chunk_len = chunk.len();
         let msg = SymbolTransferMsg {
             v: 1,
@@ -439,6 +613,7 @@ async fn deliver_transfer_worker(
         match reply {
             Message::SymbolStored(_) => {
                 stored_ok += 1;
+                turn.chunks_stored += 1;
                 tracing::debug!(
                     holder = %placement.holder_id,
                     block_id = %block_id,
@@ -487,7 +662,7 @@ async fn deliver_transfer_worker(
                     "work_pipeline: symbols confirmed stored, placement Offered→Alive"
                 );
                 crate::daemon::processor::recompute_and_persist_block_cached_fields(db, block_id);
-                return Ok(true);
+                return Ok(DeliveryOutcome::Stored);
             }
             Ok(false) => {
                 tracing::debug!(
@@ -520,7 +695,7 @@ async fn deliver_transfer_worker(
         );
     }
 
-    Ok(false)
+    Ok(DeliveryOutcome::NotStored)
 }
 
 /// T-12 safety net: query the swarm for a holder's identify-received listen addrs

@@ -77,6 +77,7 @@ fn state_with(db: Db, jobs: RestoreJobs) -> (Arc<DaemonState>, mpsc::Receiver<Re
         mailbox_router: None,
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
+        block_work_budget_bytes: 0,
     });
     (state, restore_rx)
 }

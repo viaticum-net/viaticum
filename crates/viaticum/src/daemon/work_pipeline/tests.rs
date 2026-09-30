@@ -104,7 +104,7 @@ fn block_id(byte: u8) -> SourceBlockId {
     SourceBlockId(b)
 }
 
-fn make_block_record(
+pub(super) fn make_block_record(
     bid: SourceBlockId,
     importance: f64,
     target_reliability: f64,
@@ -128,7 +128,7 @@ fn make_block_record(
     }
 }
 
-fn make_config() -> WorkPipelineConfig {
+pub(super) fn make_config() -> WorkPipelineConfig {
     WorkPipelineConfig {
         cooldown: Duration::from_secs(30),
         tick_interval: Duration::from_secs(60),
@@ -140,6 +140,9 @@ fn make_config() -> WorkPipelineConfig {
         min_pool_size: 2,
         recheck_tx: None,
         max_source_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
+        // A budget no test of the old behaviour can exhaust; budget tests set their own.
+        mem_budget: crate::daemon::mem_budget::MemBudget::new(64 << 30),
+        chunk_budget_bytes: viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,
     }
 }
 
@@ -1787,7 +1790,7 @@ fn resolve_primary_file_id_single_block_without_placements_reverse_looks_up_file
 
 // ─── R1-e: harness for worker tests that need a (peerless) swarm ───────────────
 
-fn placement(
+pub(super) fn placement(
     bid: SourceBlockId,
     holder: DeviceId,
     status: viaticum_core::types::PlacementStatus,
@@ -1890,6 +1893,7 @@ async fn worker_iteration_does_not_overwrite_uncertain_placement() {
         None,
         &rec,
         &pool,
+        0,
     )
     .await
     .unwrap();
@@ -1940,6 +1944,7 @@ async fn worker_does_not_read_source_when_no_candidates() {
         None,
         &rec,
         &pool,
+        0,
     )
     .await
     .expect("no candidates must not touch the source");
@@ -2206,7 +2211,7 @@ async fn worker_iteration_delivers_only_recorded_offers() {
         let (db, config, encoder, swarm, pool) = (&db, &config, &encoder, &swarm, &pool);
         async move {
             super::worker::run_block_iteration(
-                db, config, encoder, swarm, None, None, None, &rec, pool,
+                db, config, encoder, swarm, None, None, None, &rec, pool, 0,
             )
             .await
             .unwrap()

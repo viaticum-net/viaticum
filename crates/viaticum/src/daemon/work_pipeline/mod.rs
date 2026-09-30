@@ -20,6 +20,7 @@ use viaticum_core::db::Db;
 use viaticum_core::erasure::ErasureEncoder;
 use viaticum_core::types::{DeviceId, SourceBlockId, SourceBlockRecord, Timestamp};
 
+use crate::daemon::mem_budget::MemBudget;
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
 
@@ -29,6 +30,8 @@ mod worker;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_budget;
 
 pub use pool::{PoolSnapshot, pool_signature, snapshot_pool};
 
@@ -76,6 +79,13 @@ pub struct WorkPipelineConfig {
     /// The size limit of this machine: the rebuild reads no source file above it (J1,
     /// backup-i5). Default: the RaptorQ ceiling; the daemon sets the limit in force.
     pub max_source_bytes: u64,
+    /// The block work budget (backup-i24): the worker takes one permit per iteration. The daemon
+    /// passes the one shared with the scheduler and restore (`handle`).
+    pub mem_budget: Arc<MemBudget>,
+    /// Bytes of symbols in one `SymbolTransfer` chunk. The production value is
+    /// `SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES`; tests shrink it to get several chunks out of a
+    /// small block (the worker yields between chunks).
+    pub chunk_budget_bytes: usize,
 }
 
 impl Default for WorkPipelineConfig {
@@ -91,6 +101,9 @@ impl Default for WorkPipelineConfig {
             min_pool_size: 2,
             recheck_tx: None,
             max_source_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
+            // Only for tests and `default()` users: the daemon always sets its own.
+            mem_budget: MemBudget::new(u64::MAX),
+            chunk_budget_bytes: viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,
         }
     }
 }
@@ -144,6 +157,20 @@ enum BlockAttempt {
     LeftService,
 }
 
+/// The yield counter of one block after a turn (RAM only, backup-i24-a): a yield counts, a
+/// delivery in full starts the count afresh, anything else leaves it.
+fn count_yields(
+    yields: &mut std::collections::HashMap<SourceBlockId, u32>,
+    block_id: SourceBlockId,
+    outcome: &worker::WorkOutcome,
+) {
+    if outcome.yielded {
+        *yields.entry(block_id).or_insert(0) += 1;
+    } else if outcome.failed == 0 && outcome.offered > 0 && outcome.acked == outcome.offered {
+        yields.remove(&block_id);
+    }
+}
+
 // ─── WorkPipeline ─────────────────────────────────────────────────────────────
 
 /// The unified work pipeline worker.
@@ -159,6 +186,9 @@ pub struct WorkPipeline {
     peer_backoff: Option<Arc<PeerBackoff>>,
     cluster_state: Option<Arc<Mutex<ClusterState>>>,
     event_rx: mpsc::Receiver<WorkEvent>,
+    /// How many times the worker gave the budget away on each block since it last delivered the
+    /// block in full (RAM only; the `yields_for_block` of the yield line, backup-i24-a).
+    yields: std::collections::HashMap<SourceBlockId, u32>,
 }
 
 impl WorkPipeline {
@@ -183,6 +213,7 @@ impl WorkPipeline {
             peer_backoff,
             cluster_state,
             event_rx,
+            yields: std::collections::HashMap::new(),
         }
     }
 
@@ -313,7 +344,7 @@ impl WorkPipeline {
     /// One attempt on one block: log the pick, run the encode+deliver cycle, record
     /// the cooldown (parked when nobody could take symbols).
     async fn work_on_block(
-        &self,
+        &mut self,
         block: &SourceBlockRecord,
         pool: &PoolSnapshot,
         now: Timestamp,
@@ -360,6 +391,7 @@ impl WorkPipeline {
             self.cluster_state.as_ref(),
             block,
             pool,
+            self.yields.get(&block.block_id).copied().unwrap_or(0),
         )
         .await;
 
@@ -372,8 +404,10 @@ impl WorkPipeline {
                     failed = wo.failed,
                     encoded = wo.encoded,
                     offered = wo.offered,
+                    yielded = wo.yielded,
                     "work_pipeline: iteration complete"
                 );
+                count_yields(&mut self.yields, block.block_id, &wo);
                 if wo.left_service {
                     self.update_block_cooldown(block, pool, now, Some(ParkReason::LeftService));
                     Ok(BlockAttempt::LeftService)

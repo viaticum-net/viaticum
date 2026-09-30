@@ -1,0 +1,11 @@
+# Heavy block work goes through the memory budget (backup-i24, J8): every encode and decode of a
+# block is a wrapper in `viaticum::daemon::mem_budget` that takes a `&MemPermit`. The wrappers are
+# the only callers; tests and the erasure implementation itself opt out with `#[allow]`.
+disallowed-methods = [
+    { path = "viaticum_core::erasure::ErasureEncoder::encode", reason = "use daemon::mem_budget (needs a MemPermit)" },
+    { path = "viaticum_core::erasure::ErasureEncoder::decode", reason = "use daemon::mem_budget::decode_block" },
+    { path = "viaticum_core::erasure::ErasureEncoder::generate_repair", reason = "use daemon::mem_budget (needs a MemPermit)" },
+    { path = "viaticum_core::erasure::ErasureEncoder::encode_raw", reason = "use daemon::mem_budget::encode_block" },
+    { path = "viaticum_core::erasure::ErasureEncoder::encode_raw_ranges", reason = "use daemon::mem_budget::encode_block" },
+    { path = "viaticum_core::erasure::ErasureEncoder::encode_raw_ranges_each", reason = "use daemon::mem_budget::encode_ranges_each" },
+]

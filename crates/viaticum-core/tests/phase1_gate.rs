@@ -1,6 +1,9 @@
 // Phase 1 gate integration test.
 // Verifies cross-module correctness — not just unit behaviour in isolation.
 
+// Exercises the erasure entry points directly.
+#![allow(clippy::disallowed_methods)]
+
 use viaticum_core::{
     budget::{estimate_budget, select_backup_batch},
     cluster::{

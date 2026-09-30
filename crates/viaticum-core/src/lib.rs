@@ -2,6 +2,9 @@
 // β version — RaptorQ, continuous importance, personal cluster.
 // See docs/beta/ for design docs.
 
+// Unit tests may call the erasure entry points directly (the daemon gate is clippy.toml).
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod budget;
 pub mod cluster;
 pub mod commitment;

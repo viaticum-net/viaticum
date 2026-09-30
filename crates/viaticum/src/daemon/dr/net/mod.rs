@@ -525,6 +525,9 @@ async fn try_dial_holder_via_kademlia(
 
 /// Fetch one SystemState block (base or diff) from its holder hints and return the
 /// decrypted plaintext.
+// К-b3: DR takes one permit per SS block (`mem_budget::decode_block`); until then the decode is
+// outside the budget (clippy `disallowed-methods`).
+#[allow(clippy::disallowed_methods)]
 pub(super) async fn fetch_ss_block(
     swarm: &Arc<SwarmHandle>,
     encoder: &Arc<dyn viaticum_core::erasure::ErasureEncoder>,

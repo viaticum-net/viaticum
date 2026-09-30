@@ -68,6 +68,7 @@ async fn make_test_state_with(
         mailbox_router: None,
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
+        block_work_budget_bytes: 0,
     })
 }
 
@@ -301,6 +302,7 @@ async fn dispatch_device_revoke_returns_device_revoked_with_no_router() {
         mailbox_router: None, // no router → revocation goes nowhere (best-effort)
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
+        block_work_budget_bytes: 0,
     });
 
     // Revoke device B.
@@ -932,6 +934,7 @@ async fn revocation_published_only_to_storage_relationship_peers() {
         mailbox_router: Some(router),
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
+        block_work_budget_bytes: 0,
     });
 
     // Revoke device.
@@ -1091,6 +1094,7 @@ async fn revocation_dedup_peer_is_holder_and_owner() {
         mailbox_router: Some(router),
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
+        block_work_budget_bytes: 0,
     });
 
     let revoked_hex: String = revoked_device_id
@@ -1330,6 +1334,7 @@ fn staging_test_state(
         mailbox_router: None,
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
+        block_work_budget_bytes: 0,
     })
 }
 
@@ -2369,6 +2374,7 @@ async fn status_counts_too_large_files_under_watch_dirs() {
     let inner = Arc::get_mut(&mut state).expect("state is not shared yet");
     inner.watch_admin = Some(Arc::new(admin));
     inner.max_file_size_bytes = 268_435_456;
+    inner.block_work_budget_bytes = 1 << 30;
 
     let inside = watch.join("huge.mkv").to_string_lossy().into_owned();
     let nested = watch.join("sub/big.bin").to_string_lossy().into_owned();
@@ -2392,7 +2398,11 @@ async fn status_counts_too_large_files_under_watch_dirs() {
         "the mark outside the watched folder is not counted"
     );
     assert_eq!(data.max_file_size_bytes, 268_435_456);
-    assert_eq!(data.block_work_budget_bytes, 0, "R1-d-b sets it");
+    assert_eq!(
+        data.block_work_budget_bytes,
+        1 << 30,
+        "status shows the budget in force"
+    );
 
     let json = serde_json::to_value(&*data).unwrap();
     assert_eq!(json["files_too_large"], 2, "the name the E2E reads");

@@ -301,6 +301,8 @@ impl Default for RaptorQEncoder {
     }
 }
 
+// The implementation calls its own entry points; the daemon goes through `mem_budget`.
+#[allow(clippy::disallowed_methods)]
 impl ErasureEncoder for RaptorQEncoder {
     fn encode(
         &self,

@@ -27,6 +27,9 @@ impl RestoreCoordinator {
     ///      budget `pauses` (restore-i26), abandoned only on the daemon's cancel token.
     ///
     /// Decrypts and decompresses the decoded data before returning.
+    // К-b3 / К-b5: the local tier takes a permit and skips the re-encode (T4); until then its
+    // `encode_raw` is outside the budget (clippy `disallowed-methods`).
+    #[allow(clippy::disallowed_methods)]
     pub(crate) async fn decode_block_local(
         &self,
         block_id: &SourceBlockId,
@@ -112,6 +115,9 @@ impl RestoreCoordinator {
 
     /// Erasure decode + decrypt + decompress: CPU-heavy, run on the blocking pool
     /// so the runtime keeps serving (review A1).
+    // К-b3: the network tier takes a permit around the decode; until then it is outside the budget
+    // (clippy `disallowed-methods`).
+    #[allow(clippy::disallowed_methods)]
     async fn decode_and_decrypt(
         &self,
         raw_symbols: Vec<Symbol>,

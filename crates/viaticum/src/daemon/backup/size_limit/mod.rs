@@ -206,13 +206,14 @@ impl SizeLimits {
     }
 
     /// The start line, and a WARN when the override is above the automatic limit.
-    /// The block work budget belongs to R1-d-b: until then it is "not set".
-    pub fn log_start(&self) {
+    /// `block_work_budget` is the budget in force (backup-i24).
+    pub fn log_start(&self, block_work_budget: u64) {
         let source = if self.overridden { "config" } else { "auto" };
         tracing::info!(
-            "memory: max file size {} ({source}, RAM {}), block work budget not set, pack size {}",
+            "memory: max file size {} ({source}, RAM {}), block work budget {}, pack size {}",
             format_size(self.max_file_size),
             format_size(self.ram_bytes),
+            format_size(block_work_budget),
             format_size(self.pack_size),
         );
         if self.overridden && self.max_file_size > self.auto_max_file_size {

@@ -203,6 +203,9 @@ impl Scheduler {
 
 impl BlockPrep {
     /// Load, encode once, and hash per holder. Blocking; runs on the blocking pool.
+    // К-b2b: the preparation takes its permit (`mem_budget`) and encodes through its wrappers;
+    // until then it is the one heavy call outside the budget (clippy `disallowed-methods`).
+    #[allow(clippy::disallowed_methods)]
     fn run(self) -> Vec<PreparedChallenge> {
         let block_id = self.block_id;
         if self.holders.is_empty() {

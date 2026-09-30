@@ -8,6 +8,8 @@
 
 // A counting GlobalAlloc is unsafe by definition; it only forwards to System.
 #![allow(unsafe_code)]
+// Measures the erasure entry points themselves.
+#![allow(clippy::disallowed_methods)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;

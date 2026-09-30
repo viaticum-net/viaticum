@@ -353,8 +353,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         dr_restores_state_of: dr.restores_state_of,
         files_too_large: count_too_large_under_watches(state),
         max_file_size_bytes: state.max_file_size_bytes,
-        // R1-d-b sets the block work budget.
-        block_work_budget_bytes: 0,
+        block_work_budget_bytes: state.block_work_budget_bytes,
     }))
 }
 

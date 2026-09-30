@@ -123,6 +123,8 @@ pub struct DaemonState {
         std::sync::Arc<crate::daemon::dispatch::missing_sources::MissingSourceCache>,
     /// backup-i4: this machine's file size limit in bytes (`status`, `files`).
     pub max_file_size_bytes: u64,
+    /// backup-i24: this machine's block work budget in bytes (`status`).
+    pub block_work_budget_bytes: u64,
 }
 
 /// Web API pieces prepared before the swarm starts (see step 9.4 of `start`).
@@ -542,7 +544,17 @@ impl DaemonHandle {
             app_config.backup.max_file_size_mb,
             viaticum_core::config::source_block_size_bytes(&app_config),
         );
-        size_limits.log_start();
+        // backup-i24: the one budget of block work (encode/decode), shared by the worker today and
+        // by the scheduler and restore in R1-d-b's later commits.
+        let mem_budget = crate::daemon::mem_budget::MemBudget::new(
+            crate::daemon::mem_budget::resolve_block_work_budget(
+                size_limits.ram_bytes,
+                std::env::var(crate::daemon::mem_budget::TEST_BUDGET_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
+        );
+        size_limits.log_start(mem_budget.total_bytes());
         let source_block_size = size_limits.pack_size;
         let max_file_size_bytes = size_limits.max_file_size;
 
@@ -757,6 +769,7 @@ impl DaemonHandle {
             mailbox_router: Some(std::sync::Arc::clone(&early_mailbox_router)),
             missing_sources: Default::default(),
             max_file_size_bytes,
+            block_work_budget_bytes: mem_budget.total_bytes(),
         });
 
         // Clone state for web API and metrics pusher.
@@ -1024,6 +1037,9 @@ impl DaemonHandle {
                     min_pool_size: 2,
                     recheck_tx: Some(recheck_tx.clone()),
                     max_source_bytes: max_file_size_bytes,
+                    mem_budget: Arc::clone(&mem_budget),
+                    chunk_budget_bytes:
+                        viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,
                 };
                 let worker = crate::daemon::work_pipeline::WorkPipeline::new(
                     db.clone(),
