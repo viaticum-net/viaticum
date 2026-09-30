@@ -322,6 +322,78 @@ fn extract_from_pack_unknown_file_id_returns_none() {
     assert!(result.is_none());
 }
 
+// ─── restore-i38: a member by file_id, else by content hash (К4) ─────────────
+
+/// Pack plaintext of members `(file_id, bytes)` in order.
+fn pack_of(members: &[(u64, &[u8])]) -> Vec<u8> {
+    let mut offset = 0u64;
+    let entries: Vec<PackEntry> = members
+        .iter()
+        .map(|(id, bytes)| {
+            let e = PackEntry {
+                file_id: FileId(*id),
+                offset,
+                size: bytes.len() as u64,
+            };
+            offset += bytes.len() as u64;
+            e
+        })
+        .collect();
+    let mut plaintext = to_cbor_bytes(&entries);
+    for (_, bytes) in members {
+        plaintext.extend_from_slice(bytes);
+    }
+    plaintext
+}
+
+/// A copy or a renamed path has a fresh `file_id` that is not in the pack: its bytes
+/// are found by the version's content hash.
+#[test]
+fn extract_by_file_id_absent_falls_back_to_content_hash() {
+    let plaintext = pack_of(&[(1, b"first member"), (2, b"second member")]);
+    let h = *blake3::hash(b"second member").as_bytes();
+
+    let got = super::pipeline::extract_member(&plaintext, FileId(77), &h).unwrap();
+
+    assert_eq!(got.as_deref(), Some(&b"second member"[..]));
+}
+
+/// After a swap inside one pack, the record's own member holds the other file's
+/// content: the member whose bytes have the version's hash is returned.
+#[test]
+fn extract_by_file_id_with_wrong_bytes_falls_back_to_content_hash() {
+    let plaintext = pack_of(&[(1, b"content of d1"), (2, b"content of d2")]);
+    let h_d2 = *blake3::hash(b"content of d2").as_bytes();
+
+    let got = super::pipeline::extract_member(&plaintext, FileId(1), &h_d2).unwrap();
+
+    assert_eq!(got.as_deref(), Some(&b"content of d2"[..]));
+}
+
+/// No member has the content and none has the record's `file_id`: `None` (restore
+/// reports it as `PackIndexParseFailed`).
+#[test]
+fn extract_fails_when_no_entry_matches_hash() {
+    let plaintext = pack_of(&[(1, b"aaa"), (2, b"bbb")]);
+    let h = *blake3::hash(b"ccc").as_bytes();
+
+    let got = super::pipeline::extract_member(&plaintext, FileId(7), &h).unwrap();
+
+    assert!(got.is_none());
+}
+
+/// A catalog from before L1: the version's hash is of other bytes than those packed.
+/// No member has it, so the member packed under the record's `file_id` is returned.
+#[test]
+fn extract_falls_back_to_file_id_member_when_no_member_has_the_hash() {
+    let plaintext = pack_of(&[(1, b"bytes packed at flush"), (2, b"bbb")]);
+    let h_at_enqueue = *blake3::hash(b"bytes seen at enqueue").as_bytes();
+
+    let got = super::pipeline::extract_member(&plaintext, FileId(1), &h_at_enqueue).unwrap();
+
+    assert_eq!(got.as_deref(), Some(&b"bytes packed at flush"[..]));
+}
+
 // ─── Roundtrip tests (backup → restore) ──────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1547,9 +1619,14 @@ async fn place_on_fake_holders_with_status(
         .get_source_block(&version.source_block_id)
         .unwrap()
         .unwrap();
-    let blob = crate::daemon::backup::pipeline::rebuild_source_blob(db, &block, &TEST_EPOCH_KEY)
-        .await
-        .unwrap();
+    let blob = crate::daemon::backup::pipeline::rebuild_source_blob(
+        db,
+        &block,
+        &TEST_EPOCH_KEY,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
     let params = block.erasure_params();
     let enc = RaptorQEncoder::new();
     let raws = enc.encode_raw(&blob, &params, 0, params.n).unwrap();

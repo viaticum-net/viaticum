@@ -37,6 +37,7 @@ struct BlockPrep {
     db: Db,
     data_dir: PathBuf,
     epoch_key: [u8; 32],
+    rebuild_scope: crate::daemon::backup::rebuild::RebuildScope,
     encoder: Arc<dyn ErasureEncoder>,
     block_id: SourceBlockId,
     holders: Vec<HolderPrep>,
@@ -72,6 +73,7 @@ impl Scheduler {
             db: self.db.clone(),
             data_dir: self.data_dir.clone(),
             epoch_key: self.epoch_key,
+            rebuild_scope: self.rebuild_scope.clone(),
             encoder: Arc::clone(&self.encoder),
             block_id,
             holders,
@@ -151,18 +153,23 @@ impl BlockPrep {
         }
 
         // Load source block data (retained SS blob, else rebuild from source files).
-        let source_data =
-            match load_source_block(&self.db, &self.data_dir, &self.epoch_key, &block_id) {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!(
-                        block_id = %block_id,
-                        err = %e,
-                        "scheduler: cannot load source block for PoS hash, skipping"
-                    );
-                    return Vec::new();
-                }
-            };
+        let source_data = match load_source_block(
+            &self.db,
+            &self.data_dir,
+            &self.epoch_key,
+            &self.rebuild_scope,
+            &block_id,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(
+                    block_id = %block_id,
+                    err = %format!("{e:#}"),
+                    "scheduler: cannot load source block for PoS hash, skipping"
+                );
+                return Vec::new();
+            }
+        };
 
         let block_record = match self.db.get_source_block(&block_id) {
             Ok(Some(r)) => r,
@@ -290,6 +297,7 @@ fn load_source_block(
     db: &Db,
     data_dir: &std::path::Path,
     epoch_key: &[u8; 32],
+    scope: &crate::daemon::backup::rebuild::RebuildScope,
     block_id: &SourceBlockId,
 ) -> anyhow::Result<Vec<u8>> {
     // SystemState blocks: serve the owner-retained blob (verified blake3 == block_id).
@@ -302,11 +310,5 @@ fn load_source_block(
     let block_record = db
         .get_source_block(block_id)?
         .ok_or_else(|| anyhow::anyhow!("source block record missing: {block_id}"))?;
-    let plaintext = crate::daemon::backup::packing::rebuild_plaintext_from_db(db, &block_record)?;
-    let blob = crate::daemon::backup::pipeline::compress_and_encrypt(&plaintext, epoch_key)?;
-    let rebuilt_id: [u8; 32] = *blake3::hash(&blob).as_bytes();
-    if rebuilt_id != block_id.0 {
-        anyhow::bail!("rebuilt blob hash mismatch for {block_id}");
-    }
-    Ok(blob)
+    crate::daemon::backup::pipeline::rebuild_blob_blocking(db, &block_record, epoch_key, scope)
 }

@@ -8,7 +8,8 @@
 #               its DR pointer is published. Then the machine is lost; the friend recovers with
 #               the phrase, first making the classic mistakes, then correctly, restores the files
 #               from the network and puts them back one by one.
-# Intent:       dr-i1, dr-i2, dr-i3, dr-i4, dr-i5, dr-i9, dr-i10, dr-i11, dr-i18, dr-i19, dr-i22,
+# Intent:       dr-i1, dr-i2, dr-i3, dr-i4, dr-i5, dr-i9, dr-i10, dr-i64 (step 8), dr-i11,
+#               dr-i18, dr-i19, dr-i22,
 #               restore-i1 (after DR), dr-i8 (step 9, skeleton: filled by CROWN-1 C4);
 #               CROWN-1 C3a: mailbox-i39, i40 (pointer only in the rendezvous box, never in
 #               the master box), mailbox-i56 (a restart's new base takes a place by
@@ -141,6 +142,10 @@
 #       (without dr-i19 f1 still lists the lost device as Present and no Delete goes out).
 #     Also within the deadline: a holder's PoS response for BLOCK2 (back in place) resolves Pass
 #     at node-00 ("mailbox PosResponse resolved … outcome=Pass", step 7's corroboration).
+#     dr-i64 (L0): the missing f3 reaches the watcher by a recheck (PoS rebuild of BLOCK3 does
+#     not find f3.bin): node-00 MUST log "watcher: recheck: path gone, treated as deletion
+#     path=…/f3.bin" (else the negative is blind), and the loop then runs at least to
+#     recheck + W + 20 (the unconfirmed record must survive it).
 #     — check: block_symbols_on, delete_marks_for, grep -c with block prefix, deadline loop
 #  9. (C4) holder node-03 offline during DR → a PoS challenge from node-00 lands in node-03's box
 #     by its MASTER (dr-i8). SKELETON ONLY: not implemented until CROWN-1 C4.
@@ -808,8 +813,22 @@ MARKS1_BEFORE=$(delete_marks_for "${BLOCK[f1]}" "${HOLDERS[@]}")
 rm "$FILES_DIR/f1.bin"
 T8=$(date +%s)
 DEADLINE=370
+# dr-i64 (L0): the missing f3 now reaches the watcher through the recheck (the PoS rebuild
+# of BLOCK3 does not find f3.bin → Recheck → the record is unconfirmed after DR → kept).
+# The negative below is blind unless that recheck happened: it must be logged, and a
+# wrong deletion by it would reach the holders no later than recheck + W, so the loop
+# runs at least to recheck + W + 20.
+OWNER_W8=$(( OWNER_DELETE_COOLDOWN_SECS / TIME_SCALE_DELETE ))
+RECHECK_F3=0
 POSITIVE=0; NEGATIVE=""; POS_PASS=0
 while [ $(( $(date +%s) - T8 )) -lt "$DEADLINE" ]; do
+    if [ "$RECHECK_F3" -eq 0 ] && log_since 0 "$L00" \
+        | grep -aF "watcher: recheck: path gone, treated as deletion" \
+        | grep -aqF "path=$FILES_DIR/f3.bin"; then
+        RECHECK_F3=$(( $(date +%s) - T8 ))
+        echo "  f3.bin reached the watcher by a recheck after ${RECHECK_F3}s (unconfirmed: must be kept)"
+        [ "$DEADLINE" -lt $(( RECHECK_F3 + OWNER_W8 + 20 )) ] && DEADLINE=$(( RECHECK_F3 + OWNER_W8 + 20 ))
+    fi
     if [ "$(delete_marks_for "${BLOCK[f3]}" "${HOLDERS[@]}")" -gt "$MARKS3_BEFORE" ]; then
         NEGATIVE="a holder marked BLOCK3 (missing f3) for deletion"; break
     fi
@@ -831,11 +850,20 @@ while [ $(( $(date +%s) - T8 )) -lt "$DEADLINE" ]; do
     if [ "$POSITIVE" -eq 0 ] && [ "$(delete_marks_for "${BLOCK[f1]}" "${HOLDERS[@]}")" -gt "$MARKS1_BEFORE" ]; then
         POSITIVE=$(( $(date +%s) - T8 ))
         echo "  positive control: a holder marked BLOCK1 for deletion after ${POSITIVE}s"
-        # A wrong delete of BLOCK3 would have gone out no later than f1's: 20 s grace.
-        DEADLINE=$(( POSITIVE + 20 ))
+        # A wrong delete of BLOCK3 would have gone out no later than f1's: 20 s grace
+        # (and no earlier than recheck + W + 20 once the recheck is seen, above).
+        NEW_DL=$(( POSITIVE + 20 ))
+        [ "$RECHECK_F3" -gt 0 ] && [ "$NEW_DL" -lt $(( RECHECK_F3 + OWNER_W8 + 20 )) ] \
+            && NEW_DL=$(( RECHECK_F3 + OWNER_W8 + 20 ))
+        DEADLINE=$NEW_DL
     fi
     sleep 5
 done
+if [ "$RECHECK_F3" -gt 0 ]; then
+    pass "dr-i64: the missing f3 reached the watcher by a recheck (${RECHECK_F3}s) — the negative below is not blind"
+else
+    fail "dr-i64: no 'recheck: path gone … path=$FILES_DIR/f3.bin' at node-00 within the deadline — the negative is blind"
+fi
 if [ -n "$NEGATIVE" ]; then
     fail "dr-i10: $NEGATIVE"
 else

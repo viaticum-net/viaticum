@@ -560,28 +560,53 @@ fn mark_backed_up(
 /// blob without any on-disk block.bin cache. It is also used by the restore path
 /// as a fallback when fetching symbols from holders fails.
 ///
-/// CPU-bound portion (`compress_and_encrypt`) runs inside `spawn_blocking`.
+/// The whole rebuild runs inside `spawn_blocking` ([`rebuild_blob_blocking`]).
 pub async fn rebuild_source_blob(
     db: &viaticum_core::db::Db,
     block_record: &viaticum_core::types::SourceBlockRecord,
     epoch_key: &[u8; 32],
+    scope: &super::rebuild::RebuildScope,
 ) -> anyhow::Result<Vec<u8>> {
-    let plaintext = crate::daemon::backup::packing::rebuild_plaintext_from_db(db, block_record)
-        .map_err(|e| anyhow::anyhow!("rebuild plaintext: {e}"))?;
+    let (db, block, key, scope) = (db.clone(), block_record.clone(), *epoch_key, scope.clone());
+    tokio::task::spawn_blocking(move || rebuild_blob_blocking(&db, &block, &key, &scope))
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))?
+}
 
-    let epoch_key_owned = *epoch_key;
-    let stored =
-        tokio::task::spawn_blocking(move || compress_and_encrypt(&plaintext, &epoch_key_owned))
-            .await
-            .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))?
-            .map_err(|e| anyhow::anyhow!("compress_and_encrypt: {e}"))?;
-
+/// Rebuild, seal and check the blob of `block_record` (blocking: reads files, compresses,
+/// encrypts). The plaintext is rebuilt by content (`rebuild::rebuild_candidate`, INV-RB);
+/// its error keeps its type under the "rebuild plaintext" context, so a caller can tell
+/// `RebuildError::SourceMissing` apart. Gone paths go to `scope.recheck`. A legacy
+/// candidate (members read unchecked, a catalog from before L1) is kept only when the
+/// sealed blob matches the block id (WARN); otherwise its `SourceMissing` is returned.
+/// The PoS issuance and the worker both come here.
+pub fn rebuild_blob_blocking(
+    db: &viaticum_core::db::Db,
+    block_record: &viaticum_core::types::SourceBlockRecord,
+    epoch_key: &[u8; 32],
+    scope: &super::rebuild::RebuildScope,
+) -> anyhow::Result<Vec<u8>> {
+    use anyhow::Context;
+    let candidate =
+        super::rebuild::rebuild_candidate(db, block_record, scope).context("rebuild plaintext")?;
+    let stored = compress_and_encrypt(&candidate.plaintext, epoch_key)
+        .map_err(|e| anyhow::anyhow!("compress_and_encrypt: {e}"))?;
     let hash: [u8; 32] = *blake3::hash(&stored).as_bytes();
     if hash != block_record.block_id.0 {
+        if let Some(e) = candidate.legacy_of {
+            return Err(anyhow::Error::new(e).context("rebuild plaintext"));
+        }
         anyhow::bail!(
             "rebuilt blob hash {} != expected {}",
             viaticum_core::types::hex_encode(&hash),
             block_record.block_id
+        );
+    }
+    if candidate.legacy_of.is_some() {
+        tracing::warn!(
+            block_id = %block_record.block_id,
+            "rebuild: member(s) read unchecked from their own path matched the block \
+             (a catalog from before L1: version hash differs from the packed bytes)"
         );
     }
     Ok(stored)

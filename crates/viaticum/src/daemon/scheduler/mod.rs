@@ -110,6 +110,10 @@ pub struct Scheduler {
     /// that cannot be served does not hold the head of every tick. Lost on restart — then
     /// the order falls back to `last_verified` alone for one round.
     last_attempted: std::sync::Mutex<HashMap<PendingKey, Timestamp>>,
+    /// Whose records the PoS rebuild reads and where it reports gone paths (К2b).
+    /// Default: any Present record, no recheck (tests); the daemon sets this device and
+    /// the watcher's recheck channel.
+    rebuild_scope: crate::daemon::backup::rebuild::RebuildScope,
 }
 
 impl Scheduler {
@@ -141,7 +145,13 @@ impl Scheduler {
             epoch_key,
             data_dir,
             last_attempted: std::sync::Mutex::new(HashMap::new()),
+            rebuild_scope: Default::default(),
         }
+    }
+
+    /// Set whose records the PoS rebuild reads and where gone paths go (К2b).
+    pub fn set_rebuild_scope(&mut self, scope: crate::daemon::backup::rebuild::RebuildScope) {
+        self.rebuild_scope = scope;
     }
 
     /// Main run loop. Fires on five independent timers:

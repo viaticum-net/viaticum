@@ -165,15 +165,7 @@ pub(crate) async fn run_block_iteration(
     //    blocks have no backing watch-dir file: their encoded blob is retained on disk
     //    (blake3 == block_id), so load it directly. All other blocks rebuild from
     //    source files (deterministic).
-    let source_data = match crate::daemon::system_state::block::try_load_retained_block(
-        &config.data_dir,
-        &block.block_id,
-    )? {
-        Some(blob) => blob,
-        None => crate::daemon::backup::pipeline::rebuild_source_blob(db, block, &config.epoch_key)
-            .await
-            .map_err(|e| anyhow::anyhow!("rebuild_source_blob: {e}"))?,
-    };
+    let source_data = load_source_blob(db, config, block).await?;
 
     // 5. Encode once for the union of every offer's ESIs (ascending, so the delivery
     //    looks symbols up by ESI with a binary search).
@@ -577,6 +569,31 @@ pub(crate) fn persist_holder_addrs_to_db(db: &Db, holder_id: DeviceId, addr_stri
             );
         }
     }
+}
+
+/// The source blob of `block` for encoding (step 4): a SystemState block's retained
+/// blob, else the rebuild from this device's files by content (К2b). The rebuild error
+/// keeps its type under the added context (`RebuildError::SourceMissing` stays
+/// recognisable); gone paths the rebuild met go to `config.recheck_tx`.
+pub(crate) async fn load_source_blob(
+    db: &Db,
+    config: &WorkPipelineConfig,
+    block: &SourceBlockRecord,
+) -> anyhow::Result<Vec<u8>> {
+    use anyhow::Context;
+    if let Some(blob) = crate::daemon::system_state::block::try_load_retained_block(
+        &config.data_dir,
+        &block.block_id,
+    )? {
+        return Ok(blob);
+    }
+    let scope = crate::daemon::backup::rebuild::RebuildScope::new(
+        config.device_id,
+        config.recheck_tx.clone(),
+    );
+    crate::daemon::backup::pipeline::rebuild_source_blob(db, block, &config.epoch_key, &scope)
+        .await
+        .context("rebuild_source_blob")
 }
 
 /// Resolve the `file_id` to stamp on placements this worker creates.

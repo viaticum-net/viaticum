@@ -1,5 +1,5 @@
-// Event processing: handle_deleted, handle_added_or_modified, handle_dedup,
-// get_or_create_file_id. Called from BackupCoordinator::process_event (mod.rs).
+// Event processing: handle_added_or_modified, handle_dedup, get_or_create_file_id.
+// Called from BackupCoordinator::process_event (mod.rs); deletions are in gone.rs.
 //
 // backup-i9: a path points at what is on disk now. An event for content that is
 // already in the network (a rollback, a restore put back in place, a copy over an
@@ -69,7 +69,7 @@ pub(crate) fn select_dedup_source(
 }
 
 /// Mark `device` Present in `record`. Returns whether the record changed.
-fn set_present(record: &mut FileRecord, device: DeviceId) -> bool {
+pub(super) fn set_present(record: &mut FileRecord, device: DeviceId) -> bool {
     match record.devices.iter_mut().find(|(d, _)| *d == device) {
         Some((_, state)) if *state == LocalState::Present => false,
         Some((_, state)) => {
@@ -84,43 +84,6 @@ fn set_present(record: &mut FileRecord, device: DeviceId) -> bool {
 }
 
 impl BackupCoordinator {
-    pub(super) fn handle_deleted(&mut self, event: &DirtyEvent) -> anyhow::Result<()> {
-        let now = Timestamp::now();
-        if let Some(mut record) = self.db.get_file(&event.path)? {
-            let mut found = false;
-            for (dev, state) in &mut record.devices {
-                if *dev == event.device_id {
-                    *state = LocalState::Deleted(now);
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                record
-                    .devices
-                    .push((event.device_id, LocalState::Deleted(now)));
-            }
-            // What was queued for this path is gone with it: no pending last version
-            // on a deleted record, no queue entry to pack.
-            self.supersede_pending(&mut record);
-            self.db.upsert_file(&record)?;
-        } else {
-            // File not in catalog — create a minimal record for the deletion.
-            let file_id = self.alloc_file_id();
-            let record = FileRecord {
-                file_id,
-                path: event.path.clone(),
-                importance: 0.5,
-                devices: vec![(event.device_id, LocalState::Deleted(now))],
-                versions: vec![],
-                first_seen: now,
-                on_disk_confirmed: false,
-            };
-            self.db.upsert_file(&record)?;
-        }
-        Ok(())
-    }
-
     pub(super) fn handle_added_or_modified(&mut self, event: &DirtyEvent) -> anyhow::Result<()> {
         let file_bytes = std::fs::read(&event.path)
             .map_err(|e| anyhow::anyhow!("read file {}: {e}", event.path))?;

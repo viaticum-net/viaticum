@@ -137,6 +137,7 @@ fn make_config() -> WorkPipelineConfig {
         epoch_key: [0u8; 32],
         data_dir: std::path::PathBuf::new(),
         min_pool_size: 2,
+        recheck_tx: None,
     }
 }
 
@@ -602,7 +603,7 @@ async fn rebuild_source_blob_produces_correct_block_id() {
 
     // Now rebuild the blob and verify hash.
     let block_record = db.get_source_block(&block_id).unwrap().unwrap();
-    let rebuilt = rebuild_source_blob(&db, &block_record, &epoch_key)
+    let rebuilt = rebuild_source_blob(&db, &block_record, &epoch_key, &Default::default())
         .await
         .unwrap();
 
@@ -660,11 +661,78 @@ async fn rebuild_source_blob_fails_gracefully_when_source_file_deleted() {
     std::fs::remove_file(&source_file).unwrap();
 
     let block_record = db.get_source_block(&block_id).unwrap().unwrap();
-    let result = rebuild_source_blob(&db, &block_record, &epoch_key).await;
+    let result = rebuild_source_blob(&db, &block_record, &epoch_key, &Default::default()).await;
     assert!(
         result.is_err(),
         "rebuild_source_blob must return Err when source file is deleted"
     );
+}
+
+// ─── К2b: the worker's source load reports gone paths, keeps the error type ────
+
+/// A pack whose member was renamed away with its event lost and whose content is on
+/// no other path: the worker's source load fails with `RebuildError::SourceMissing`
+/// still recognisable through the context, and the gone path went to the recheck.
+#[tokio::test]
+async fn worker_rebuild_of_pack_with_missing_member_sends_recheck_and_keeps_error_type() {
+    use crate::daemon::backup::rebuild::RebuildError;
+    use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
+
+    let db = make_db();
+    let dir = tempdir().unwrap();
+    let encoder =
+        Arc::new(RaptorQEncoder::new()) as Arc<dyn viaticum_core::erasure::ErasureEncoder>;
+    let epoch_key = [7u8; 32];
+    let mut coord = BackupCoordinator::new(
+        db.clone(),
+        BackupConfig {
+            symbols_dir: dir.path().to_path_buf(),
+            source_block_size: 1024 * 1024,
+            epoch_key,
+            device_id: device_id(0),
+            ..Default::default()
+        },
+        encoder,
+    );
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    std::fs::write(&a, b"member a of the pack").unwrap();
+    std::fs::write(&b, b"member b of the pack").unwrap();
+    for p in [&a, &b] {
+        coord
+            .process_event(DirtyEvent {
+                path: p.to_string_lossy().into_owned(),
+                kind: DirtyKind::Added,
+                device_id: device_id(0),
+            })
+            .unwrap();
+    }
+    let results = coord.flush_all(true, &Default::default()).unwrap();
+    assert_eq!(results.len(), 1, "setup: one pack");
+    let block = db
+        .get_source_block(&results[0].source_block_id)
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(&a).unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let mut config = make_config();
+    config.device_id = device_id(0);
+    config.epoch_key = epoch_key;
+    config.data_dir = dir.path().to_path_buf();
+    config.recheck_tx = Some(tx);
+    let err = super::worker::load_source_blob(&db, &config, &block)
+        .await
+        .expect_err("a's content is on no path");
+
+    assert!(
+        matches!(
+            err.downcast_ref::<RebuildError>(),
+            Some(RebuildError::SourceMissing { .. })
+        ),
+        "error type lost: {err:#}"
+    );
+    assert_eq!(rx.try_recv().ok(), Some(a.clone()));
 }
 
 // ─── PoS Lost re-queuing via next_work_item ───────────────────────────────────

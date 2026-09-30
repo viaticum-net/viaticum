@@ -593,6 +593,11 @@ impl DaemonHandle {
 
         // ── Step B: Create watcher command channel ────────────────────────────
         let (watcher_cmd_tx, watcher_cmd_rx) = mpsc::channel::<WatcherCommand>(64);
+        // Recheck channel (К2b/К3): the PoS rebuild and the worker report gone paths,
+        // the watcher decides whether each is a deletion. Its own channel, so a burst
+        // of rechecks never blocks WatchAdmin commands (A21, N8).
+        let (recheck_tx, recheck_rx) =
+            mpsc::channel::<PathBuf>(crate::daemon::backup::rebuild::RECHECK_CHANNEL_CAPACITY);
 
         // Create accepted_offers map shared between BackupCoordinator and Processor.
         let accepted_offers = crate::daemon::processor::make_empty_accepted_offers();
@@ -996,6 +1001,7 @@ impl DaemonHandle {
                     epoch_key: epoch_key_bytes,
                     data_dir: cfg.data_dir.clone(),
                     min_pool_size: 2,
+                    recheck_tx: Some(recheck_tx.clone()),
                 };
                 let worker = crate::daemon::work_pipeline::WorkPipeline::new(
                     db.clone(),
@@ -1071,6 +1077,8 @@ impl DaemonHandle {
                     .watch_admin
                     .as_ref()
                     .map(|a| Arc::clone(&a.watch_states)),
+                time_scale,
+                recheck_rx: Some(recheck_rx),
             };
             let dirty_tx_watcher = dirty_tx.clone();
             let cancel_watcher = cancel.clone();
@@ -1103,7 +1111,7 @@ impl DaemonHandle {
         // DaemonState.mailbox_router (for dispatch_device_revoke / T-13b-2).
         let mailbox_router = std::sync::Arc::clone(&early_mailbox_router);
 
-        let scheduler = Scheduler::new(
+        let mut scheduler = Scheduler::new(
             db.clone(),
             SchedulerConfig {
                 pos_interval_secs: 3600,
@@ -1122,6 +1130,11 @@ impl DaemonHandle {
             epoch_key_bytes,
             cfg.data_dir.clone(),
         );
+        // К2b: the PoS rebuild reads this device's records and reports gone paths.
+        scheduler.set_rebuild_scope(crate::daemon::backup::rebuild::RebuildScope::new(
+            device_id,
+            Some(recheck_tx.clone()),
+        ));
         let cancel_scheduler = cancel.clone();
         tasks.push((
             "scheduler",
