@@ -12,7 +12,7 @@ use viaticum_core::db::Db;
 use viaticum_core::types::{DeviceId, LocalState, SourceBlockId};
 
 use super::pipeline::rebuild_source_blob;
-use super::rebuild::{RebuildError, RebuildScope};
+use super::rebuild::{RebuildError, RebuildScope, rebuild_candidate};
 use super::tests_current::{DEV, content, coord, event, flush, hash, last, record};
 use super::{BackupCoordinator, DirtyEvent, DirtyKind};
 
@@ -479,5 +479,31 @@ async fn rebuild_of_edited_member_without_copy_stays_source_missing() {
             Some(RebuildError::SourceMissing { .. })
         ),
         "error type lost: {err:#}"
+    );
+}
+
+/// W3 (L0 review): the unchecked last candidate is attempted only when the member's own
+/// file has its packed size. An edit that changed the length gets no candidate (nothing
+/// re-read, nothing sealed); the same length does get one (the block-id check decides).
+#[test]
+fn rebuild_candidate_attempts_no_unchecked_read_when_length_differs() {
+    let (a, b) = (content(41, 4096), content(42, 4096));
+    let mut w = World::new();
+    let x = w.pack(&[("a.bin", &a), ("b.bin", &b)]);
+    let sb = w.db.get_source_block(&x).unwrap().unwrap();
+    let scope = RebuildScope::new(DEV, None);
+
+    w.put("a.bin", &content(43, 5000));
+    let longer = rebuild_candidate(&w.db, &sb, &scope);
+    assert!(
+        matches!(longer, Err(RebuildError::SourceMissing { .. })),
+        "a length change gets no unchecked candidate"
+    );
+
+    w.put("a.bin", &content(44, 4096));
+    let same_len = rebuild_candidate(&w.db, &sb, &scope).expect("same length: a candidate");
+    assert!(
+        same_len.legacy_of.is_some(),
+        "the candidate rests on an unchecked read"
     );
 }

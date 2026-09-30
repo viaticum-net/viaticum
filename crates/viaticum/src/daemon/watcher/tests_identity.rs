@@ -357,31 +357,50 @@ async fn root_changed_while_down_detected_at_start_from_watch_roots_json() {
     std::fs::write(root.join("b.bin"), b"y").unwrap();
 
     let mut second = H::start(std::slice::from_ref(&root), &data).await;
-    assert_eq!(second.drain(), vec![(s(&root), DirtyKind::RootChanged)]);
-    // Visible, like a lost root (W1 c): in error until a scan accepts it.
+    // The rule runs first (the backup undoes and unconfirms), then the start accepts the
+    // non-empty directory (Р-13, dr-i64): new identity, error cleared, scanned.
     assert_eq!(
-        second.status(&root),
-        (
-            WatcherStatusSignal::Error,
-            Some(ROOT_LOST_ERROR.to_string())
-        )
+        second.drain(),
+        vec![
+            (s(&root), DirtyKind::RootChanged),
+            (s(&root.join("b.bin")), DirtyKind::Added),
+        ]
     );
-    assert!(second.lp.lost.contains(&root));
+    assert!(second.lp.lost.is_empty());
+    assert_eq!(second.status(&root).0, WatcherStatusSignal::Idle);
 
-    // Not accepted yet: the next start reports it again.
+    // Recorded: the next start does not fire again.
     drop(second);
     let mut third = H::start(std::slice::from_ref(&root), &data).await;
-    assert_eq!(third.drain(), vec![(s(&root), DirtyKind::RootChanged)]);
-    // A Scan accepts it; from then on it is the recorded root.
-    third
-        .lp
-        .on_command(WatcherCommand::Scan { path: root.clone() })
-        .await
-        .unwrap();
-    assert!(third.lp.lost.is_empty());
-    drop(third);
-    let mut fourth = H::start(std::slice::from_ref(&root), &data).await;
-    assert_eq!(fourth.drain(), vec![]);
+    assert_eq!(third.drain(), vec![]);
+}
+
+/// The same at the periodic scan: a root replaced by another non-empty directory without
+/// an event reaching the loop gets the rule and is accepted in that scan; the next scan
+/// only scans.
+#[tokio::test]
+async fn root_changed_at_periodic_scan_is_accepted_when_not_empty() {
+    let (tmp, root, data) = setup();
+    std::fs::write(root.join("a.bin"), b"x").unwrap();
+    let mut h = H::start(std::slice::from_ref(&root), &data).await;
+    std::fs::rename(&root, tmp.path().join("root.old")).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    let b = root.join("b.bin");
+    std::fs::write(&b, b"y").unwrap();
+
+    h.lp.periodic_scan().await.unwrap();
+
+    assert_eq!(
+        h.drain(),
+        vec![
+            (s(&root), DirtyKind::RootChanged),
+            (s(&b), DirtyKind::Added)
+        ]
+    );
+    assert!(h.lp.lost.is_empty());
+    assert_eq!(h.status(&root).0, WatcherStatusSignal::Idle);
+    h.lp.periodic_scan().await.unwrap();
+    assert_eq!(h.drain(), vec![(s(&b), DirtyKind::Added)], "no second rule");
 }
 
 /// Self-heal on Scan: the root is back and not empty → identity renewed, error

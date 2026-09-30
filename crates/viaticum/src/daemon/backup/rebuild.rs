@@ -86,8 +86,12 @@ pub struct Candidate {
     pub legacy_of: Option<RebuildError>,
 }
 
-/// As [`rebuild_plaintext_from_db`], with a last candidate when the content of a member
-/// is nowhere by hash: its own record's path, read unchecked (see [`Candidate`]).
+/// As [`rebuild_plaintext_from_db`], with a last candidate when the content of a pack
+/// member is nowhere by hash: its own record's path, read unchecked (see [`Candidate`]) —
+/// only when that file's length is the member's packed size (W3 of the L0 review: an
+/// edited member, the common `SourceMissing`, usually changes length, and re-reading and
+/// sealing a doomed candidate would double the cost of a PoS prepare). `Err` means no
+/// candidate was attempted.
 pub fn rebuild_candidate(
     db: &Db,
     block: &SourceBlockRecord,
@@ -99,14 +103,21 @@ pub fn rebuild_candidate(
                 plaintext,
                 legacy_of: None,
             }),
-            Err(e @ RebuildError::SourceMissing { .. }) => match unchecked(catalog, block) {
-                Some(plaintext) => Ok(Candidate {
-                    plaintext,
-                    legacy_of: Some(e),
-                }),
-                None => Err(e),
-            },
-            Err(e) => Err(e),
+            Err(e) => {
+                let plaintext = match &e {
+                    RebuildError::SourceMissing { missing, .. } => {
+                        unchecked(catalog, block, missing)
+                    }
+                    RebuildError::Db(_) => None,
+                };
+                match plaintext {
+                    Some(plaintext) => Ok(Candidate {
+                        plaintext,
+                        legacy_of: Some(e),
+                    }),
+                    None => Err(e),
+                }
+            }
         }
     })?
 }
@@ -131,29 +142,39 @@ fn with_catalog<T>(
     Ok(out)
 }
 
-/// The legacy candidate: each member as the checked rebuild finds it, else the bytes at
-/// its own record's path, unchecked. `None` when a member has neither.
-fn unchecked(catalog: &Catalog<'_>, block: &SourceBlockRecord) -> Option<Vec<u8>> {
-    let block_id = block.block_id;
-    let own_path = |record: &FileRecord| std::fs::read(&record.path).ok();
-    match &block.block_type {
-        SourceBlockType::Single => catalog
-            .files
-            .iter()
-            .find(|r| r.versions.iter().any(|v| v.source_block_id == block_id))
-            .and_then(own_path),
-        SourceBlockType::Pack { entries } => {
-            let mut members = Vec::with_capacity(entries.len());
-            let mut ignored = BTreeSet::new();
-            for entry in entries {
-                let bytes = catalog
-                    .read_member(entry, block_id, &mut ignored)
-                    .or_else(|| catalog.by_id.get(&entry.file_id).and_then(|r| own_path(r)))?;
-                members.push((entry.file_id, bytes));
-            }
-            Some(pack_plaintext(&members))
+/// The legacy candidate of a pack: the `missing` members read UNCHECKED from their own
+/// record's path, the others as the checked rebuild finds them. Nothing is read unless
+/// every missing member's own file has exactly its packed size (a cheap `metadata` gate).
+/// A Single block gets no legacy candidate: its plaintext size is not recorded, so the
+/// gate is not available, and re-reading a large file for a doomed candidate is the most
+/// expensive case (the pre-L1 mismatch there needed a change between two reads of one
+/// event — rare).
+fn unchecked(
+    catalog: &Catalog<'_>,
+    block: &SourceBlockRecord,
+    missing: &[FileId],
+) -> Option<Vec<u8>> {
+    let SourceBlockType::Pack { entries } = &block.block_type else {
+        return None;
+    };
+    let own_path = |file_id: &FileId| catalog.by_id.get(file_id).map(|r| r.path.as_str());
+    for entry in entries.iter().filter(|e| missing.contains(&e.file_id)) {
+        let len = std::fs::metadata(own_path(&entry.file_id)?).ok()?.len();
+        if len != entry.size {
+            return None;
         }
     }
+    let mut members = Vec::with_capacity(entries.len());
+    let mut ignored = BTreeSet::new();
+    for entry in entries {
+        let bytes = if missing.contains(&entry.file_id) {
+            std::fs::read(own_path(&entry.file_id)?).ok()?
+        } else {
+            catalog.read_member(entry, block.block_id, &mut ignored)?
+        };
+        members.push((entry.file_id, bytes));
+    }
+    Some(pack_plaintext(&members))
 }
 
 fn rebuild(

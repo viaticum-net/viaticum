@@ -13,9 +13,11 @@
 //   undone, confirmations dropped), unwatch, the folder in error, and events under it
 //   dropped until it heals (manual Scan, periodic scan: the root exists and is not empty
 //   → new identity, error cleared, scan);
-// - the same check runs at start and before every scan: a recorded root missing or
-//   replaced gets the root rule (a loss whose event died with a shutdown inside the
-//   debounce, or happened while the daemon was down); a new root is recorded only when
+// - the same check runs at start and before every periodic scan: a recorded root
+//   missing or replaced gets the root rule (a loss whose event died with a shutdown
+//   inside the debounce, or happened while the daemon was down); a missing one stays in
+//   error until it is back, a replaced one that is not empty is accepted at once (the
+//   rule ran first, so its records are unconfirmed); a new root is recorded only when
 //   it is not empty (an unmounted mount point is never an identity);
 // - an inotify overflow (`Rescan` flag) → WARN and a full scan after a quiet window;
 // - a recheck (a rebuild did not find a path) → `GoneOnRecheck` when the root is intact,
@@ -166,16 +168,22 @@ impl WatchLoop {
     }
 
     /// Compare every root with `watch_roots.json` (BLOCK-2 of the L0 review): a recorded
-    /// root that is missing, or another directory, gets the root rule — it may have gone
-    /// while the daemon was down, or within the debounce before a shutdown, after its
-    /// first files were already marked deleted. A root seen for the first time is
-    /// recorded, unless it is empty (an unmounted mount point is never taken as a root).
-    pub(crate) async fn check_roots_at_start(&mut self) -> Result<(), Closed> {
+    /// root that is missing gets the root rule — it may have gone while the daemon was
+    /// down, or within the debounce before a shutdown, after its first files were already
+    /// marked deleted — and stays in error until it is back. A root that is another
+    /// directory gets the rule too, and is then accepted at once when it is not empty
+    /// (Р-13, dr-i64: the start accepts the new identity). A root seen for the first time
+    /// is recorded, unless it is empty (an unmounted mount point is never taken as a
+    /// root). Returns the accepted roots: their heal already scanned them.
+    pub(crate) async fn check_roots_at_start(&mut self) -> Result<Vec<PathBuf>, Closed> {
         self.roots.retain(&self.watch_dirs);
+        let mut accepted = Vec::new();
         for dir in self.watch_dirs.clone() {
-            self.verify_root(&dir).await?;
+            if self.verify_and_accept(&dir).await? {
+                accepted.push(dir);
+            }
         }
-        Ok(())
+        Ok(accepted)
     }
 
     // ── Events ─────────────────────────────────────────────────────────────────
@@ -391,6 +399,20 @@ impl WatchLoop {
         }
     }
 
+    /// Start and periodic scan (W1 of the L0 review round 2): [`Self::verify_root`], then
+    /// a root that is another directory, not empty, is accepted at once (`try_heal`: new
+    /// identity, error cleared, scanned). Safe by К7: the rule ran first, so every record
+    /// under the root is unconfirmed and no recheck can delete what the new directory
+    /// lacks. A missing root stays in error. Returns whether it was accepted.
+    async fn verify_and_accept(&mut self, root: &Path) -> Result<bool, Closed> {
+        let check = self.check_root(root);
+        self.verify_root(root).await?;
+        if check == RootCheck::Changed && self.lost.contains(root) {
+            return self.try_heal(root, false).await;
+        }
+        Ok(false)
+    }
+
     /// The root rule (Р-4, dr-i64), once per loss: `kind` (`RootLost` or `RootChanged`)
     /// to the backup (no deletion, recent deletions undone, confirmations dropped),
     /// unwatch, the same visible folder error for both (W1 c), events under it dropped
@@ -510,8 +532,9 @@ impl WatchLoop {
     }
 
     /// The periodic scan: folders already in error try to heal (and are scanned by the
-    /// heal); every other root is checked against its record (BLOCK-2: a missing or
-    /// replaced root gets the root rule and waits for the next scan to heal), then scanned.
+    /// heal); every other root is checked against its record — a missing one gets the
+    /// root rule and waits in error until it is back (BLOCK-2), another directory gets
+    /// the rule and is accepted at once when not empty (W1 round 2) — then scanned.
     pub(crate) async fn periodic_scan(&mut self) -> Result<u64, Closed> {
         let mut healed = Vec::new();
         for root in self.lost.clone() {
@@ -520,8 +543,8 @@ impl WatchLoop {
             }
         }
         for root in self.active_roots() {
-            if !healed.contains(&root) {
-                self.verify_root(&root).await?;
+            if !healed.contains(&root) && self.verify_and_accept(&root).await? {
+                healed.push(root);
             }
         }
         let roots: Vec<PathBuf> = self

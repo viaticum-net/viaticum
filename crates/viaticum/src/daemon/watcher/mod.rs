@@ -276,7 +276,8 @@ pub(crate) fn absolute_watch_dir(dir: &Path) -> PathBuf {
 /// Spawns a tokio task that:
 /// 1. Creates a `notify::RecommendedWatcher` posting to a std channel.
 /// 2. Checks every watch root against `watch_roots.json` (a recorded root missing or
-///    replaced → the root rule), then runs the initial scan when due.
+///    replaced → the root rule; a replaced one that is not empty is accepted at once),
+///    then runs the initial scan when due.
 /// 3. Drains the std channel on a poll interval into the `WatchLoop` (debounce, moves
 ///    resolved by the disk, root rule, overflow rescan) which sends `DirtyEvent`s.
 /// 4. Processes `WatcherCommand` messages from `control_rx` (add/remove/scan) and paths
@@ -342,15 +343,20 @@ pub async fn start_watcher(
         watch_dirs,
     );
     lp.register_all();
-    if lp.check_roots_at_start().await.is_err() {
+    let Ok(accepted) = lp.check_roots_at_start().await else {
         return Ok(());
-    }
+    };
 
     // ── Initial / periodic scan ────────────────────────────────────────────
     let scan_marker = config.data_dir.join("last_scan");
     let needs_scan = should_run_scan(&scan_marker, config.rescan_interval_secs);
     if needs_scan && !lp.watch_dirs.is_empty() {
-        let roots = lp.active_roots();
+        // A root accepted at start was scanned by its heal.
+        let roots: Vec<PathBuf> = lp
+            .active_roots()
+            .into_iter()
+            .filter(|r| !accepted.contains(r))
+            .collect();
         let Ok(count) = lp.scan_roots(&roots).await else {
             return Ok(());
         };
