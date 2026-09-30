@@ -432,3 +432,85 @@ fn fail_then_repair_to_same_device_gets_fresh_range() {
     assert_eq!(rewritten.status, PlacementStatus::Offered);
     assert_eq!(rewritten.esi_ranges, offers[0].esi_ranges);
 }
+
+// ─── repair-i16 (R1-f2, L1b): no offer for a block that left service ────────────
+
+/// `SymbolsPlaced` events of `block` in the log.
+fn placed_events(db: &Db, block: &SourceBlockRecord) -> usize {
+    db.events_after(0, 10_000)
+        .unwrap()
+        .iter()
+        .filter(|(_, e)| {
+            matches!(
+                e.event,
+                viaticum_core::types::Event::SymbolsPlaced { source_block_id, .. }
+                    if source_block_id == block.block_id
+            )
+        })
+        .count()
+}
+
+fn planned(db: &Db, block: &SourceBlockRecord) -> Vec<PlannedOffer> {
+    let pool = [candidate(1, 0.9), candidate(2, 0.9), candidate(3, 0.9)];
+    match plan_offers(db, block, &pool, NS).unwrap() {
+        OfferPlan::Planned { offers, .. } => offers,
+        other => panic!("expected a plan, got {other:?}"),
+    }
+}
+
+/// M9: the deletion executor turns the block `Deleting` between the plan and the write —
+/// 0 `Offered` rows, 0 `SymbolsPlaced` events, nothing to deliver.
+#[test]
+fn record_offers_writes_nothing_when_block_left_service() {
+    let db = make_db();
+    let block = block(&db, 5);
+    let offers = planned(&db, &block);
+    assert!(!offers.is_empty(), "setup: a plan");
+    let mut deleting = block.clone();
+    deleting.status = SourceBlockStatus::Deleting;
+    db.upsert_source_block(&deleting).unwrap();
+
+    let recorded = record_offers(&db, owner(), &block, &offers, Timestamp::now()).unwrap();
+
+    assert!(recorded.is_empty());
+    assert!(
+        db.list_placements_for_block(&block.block_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(placed_events(&db, &block), 0);
+}
+
+/// M9: a `Deleting` placement (a Delete published for one holder) is the same answer; the
+/// other rows are untouched.
+#[test]
+fn record_offers_writes_nothing_when_a_placement_is_deleting() {
+    let db = make_db();
+    let block = block(&db, 5);
+    let offers = planned(&db, &block);
+    let deleting = row(&block, device(9), PlacementStatus::Deleting, vec![(0, 5)]);
+    db.upsert_placement(&deleting).unwrap();
+
+    let recorded = record_offers(&db, owner(), &block, &offers, Timestamp::now()).unwrap();
+
+    assert!(recorded.is_empty());
+    let rows = db.list_placements_for_block(&block.block_id).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, PlacementStatus::Deleting);
+    assert_eq!(placed_events(&db, &block), 0);
+
+    // Control: in service, every planned offer is written and returned.
+    let other = {
+        let mut b = block.clone();
+        b.block_id = SourceBlockId([0xB2; 32]);
+        db.upsert_source_block(&b).unwrap();
+        b
+    };
+    let offers = planned(&db, &other);
+    let recorded = record_offers(&db, owner(), &other, &offers, Timestamp::now()).unwrap();
+    assert_eq!(recorded, offers);
+    assert_eq!(
+        placed_events(&db, &other),
+        offers.iter().map(|o| o.esi_ranges.len()).sum::<usize>()
+    );
+}

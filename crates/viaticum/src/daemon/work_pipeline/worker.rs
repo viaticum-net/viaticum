@@ -46,7 +46,8 @@ pub(crate) struct WorkOutcome {
     /// was not read.
     pub encoded: bool,
     /// Number of holders an offer was actually sent to (Offered records written).
-    /// `0` = nobody to take symbols (always with `encoded = false`) — the caller
+    /// `0` = nobody to take symbols (with `encoded = false`), or the block left service
+    /// between the plan and the write (with `encoded = true`, repair-i16) — the caller
     /// parks the block (repair-i4).
     pub offered: usize,
 }
@@ -191,9 +192,19 @@ pub(crate) async fn run_block_iteration(
         "work_pipeline: encoded raw symbols"
     );
 
-    // 6. Insert all Offered placements before delivery (so retries see them).
-    offer_plan::record_offers(db, config.device_id, block, &offers, Timestamp::now())?;
+    // 6. Insert all Offered placements before delivery (so retries see them). The write
+    //    re-checks that the block is still in service (repair-i16); only the offers it
+    //    wrote are delivered.
+    let offers = offer_plan::record_offers(db, config.device_id, block, &offers, Timestamp::now())?;
     let offered = offers.len();
+    if offers.is_empty() {
+        return Ok(WorkOutcome {
+            acked: 0,
+            failed: 0,
+            encoded: true,
+            offered: 0,
+        });
+    }
 
     // 7. Deliver to each holder (binding applied inline at send time).
     let mut acked = 0usize;

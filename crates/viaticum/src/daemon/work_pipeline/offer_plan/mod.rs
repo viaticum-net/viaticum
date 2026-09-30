@@ -237,15 +237,29 @@ pub(crate) fn union_ranges(offers: &[PlannedOffer]) -> Vec<(u32, u32)> {
 /// Write the plan's rows as `Offered` (one txn) plus a `SymbolsPlaced` event per range.
 /// Overwrites the holder's previous non-may-hold row of this block (repair-i2 keeps
 /// `Alive`/`Uncertain`/`PresumedLost` holders out of the plan).
+///
+/// repair-i16 (R1-f2): the same transaction re-reads the block and its placements first; a
+/// block that left service since the worker picked it (`Deleting`, a placement `Deleting`,
+/// the record gone — `Serviceability`, backup-i21) gets no offer. Returns the offers written;
+/// only those are delivered.
 pub(crate) fn record_offers(
     db: &Db,
     owner_device: DeviceId,
     block: &SourceBlockRecord,
     offers: &[PlannedOffer],
     now: Timestamp,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<PlannedOffer>> {
     let file_id = resolve_primary_file_id(db, block)?;
     let mut txn = db.write_txn()?;
+    let now_serviceability = txn.block_serviceability(&block.block_id)?;
+    if !now_serviceability.is_serviceable() {
+        tracing::debug!(
+            block_id = %block.block_id,
+            now = ?now_serviceability,
+            "work_pipeline: block left service before the offers; none recorded"
+        );
+        return Ok(Vec::new());
+    }
     for offer in offers {
         txn.upsert_placement(&SymbolPlacement {
             source_block_id: block.block_id,
@@ -271,5 +285,5 @@ pub(crate) fn record_offers(
         }
     }
     txn.commit()?;
-    Ok(())
+    Ok(offers.to_vec())
 }
