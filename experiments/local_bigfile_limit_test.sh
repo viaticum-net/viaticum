@@ -473,6 +473,10 @@ for p in "$DOC" "$OKB" "$GROW"; do
         fail "backup-i1: $(basename "$p"): holders hold $OH_ON of ${OH_BLOCK:0:16}.., need k_eff ${OH_TARGET:-?}"; exit 1
     fi
 done
+# Positive control of step 1: the line step 1 counted to zero is the one blocks are sealed with.
+PC2=$(count_lines "$(owner_lines_since "$LINE1" "backup: pipeline complete")")
+[ "$PC2" -ge 1 ] && pass "control of step 1: node-00 logged $PC2 'pipeline complete' line(s) for the step 2 blocks" \
+    || fail "control of step 1: no 'pipeline complete' line for the step 2 blocks — step 1's zero proves nothing"
 GB=$(file_block_hex 0 "$GROW")
 [ -n "$GB" ] || { fail "setup: grow.bin has no block"; exit 1; }
 T_GB_READY=$(date +%s)
