@@ -77,7 +77,8 @@
 #   10. wait until T_markR2 + TTL + W + 30 → 0 "holding marked for deletion" for XR2' after
 #       LINE_H2 (the old Delete was replayed until T_pub + TTL); XR2' >= k_eff; the owner sent
 #       no DeleteMsg for XR2' or XR' (delete-i9, delete-i6)
-#   11. SERVED_XR, SERVED_XR2; rm R R2 dl/Y-again m2 S → deleted <= 15 s (T_fin); restore each
+#   11. SERVED_XR, SERVED_XR2; rm R R2 dl/Y-again m2 S and dl/S-copy (no copy of a restored
+#       content may stay on disk: FAIL setup otherwise) → deleted <= 15 s (T_fin); restore each
 #       from the network; before each window_left T_fin > 0, else ROUGH "timing" and the rest
 #       is skipped → sha matches for all five; RestoreResponse >= 1 for XR', XR2', XY', YM2,
 #       XS; RestoreResponse growth for XR and XR2 = 0 (informational: the old generations are
@@ -751,9 +752,18 @@ for spec in "R.bin:R:${XRN:-}" "R2.bin:R2:${XR2N:-}" "dl/Y-again.bin:Y:${XYN:-}"
     SERVED0[$rel]=$(restore_responses_for "$hex" "${HOLDERS[@]}")
 done
 T_FIN=$(date +%s)
-rm -f "$FILES/R.bin" "$FILES/R2.bin" "$FILES/dl/Y-again.bin" "$FILES/m2.bin" "$FILES/S.bin"
-for rel in R.bin R2.bin dl/Y-again.bin m2.bin S.bin; do
+# Every on-disk copy of a restored content goes too (dl/S-copy holds S's content): otherwise
+# the owner's local tier rebuilds the block from the copy and the network is never used.
+rm -f "$FILES/R.bin" "$FILES/R2.bin" "$FILES/dl/Y-again.bin" "$FILES/m2.bin" "$FILES/S.bin" \
+    "$FILES/dl/S-copy.bin"
+for rel in R.bin R2.bin dl/Y-again.bin m2.bin S.bin dl/S-copy.bin; do
     wait_file_deleted 0 "$FILES/$rel" 15 || fail "setup: $rel not deleted within 15s"
+done
+LEFT_SHAS=$(find "$FILES" -type f -exec sha256sum {} + 2>/dev/null | awk '{print $1}')
+for n in R R2 Y m2 S; do
+    if has "$LEFT_SHAS" "${H[$n]}"; then
+        fail "setup: a copy of $n's content is still under files/ — its restore would not use the network"
+    fi
 done
 for spec in "R.bin:R" "R2.bin:R2" "dl/Y-again.bin:Y" "m2.bin:m2" "S.bin:S"; do
     rel=${spec%%:*}; n=${spec##*:}
