@@ -1,7 +1,8 @@
 // Challenge publishes in flight (pos-i7-c, W-1 of СТ-0c round 3).
 //
 // The issue tick spawns the publishes and returns; they end later and are settled by the
-// scheduler's run loop (a `join_next` arm of its `select!`). So a slow publish — up to
+// scheduler's run loop (a `join_next_any` arm of its `select!`, which also collects the
+// block preparations that outlived their tick, `preparing.rs`). So a slow publish — up to
 // PEER_REQUEST_TIMEOUT (15 s) when no postman answers — never holds the loop: the loop
 // keeps resolving responses, accruing the ledger and checking timeouts meanwhile.
 
@@ -17,7 +18,14 @@ use viaticum_core::mailbox::MailboxEntry;
 use viaticum_core::types::hex_encode;
 
 use super::super::{PendingHashChallenge, PendingKey, Scheduler};
+use super::preparing::{PrepDone, Preparing};
 use crate::daemon::mailbox::routing::MailboxRouter;
+
+/// What ended in `InFlight`: a publish, or a block preparation that outlived its tick.
+pub(crate) enum Ended {
+    Published(Result<Published, JoinError>),
+    Prepared(PrepDone),
+}
 
 /// A challenge publish that ended: what goes into pending on an Ack.
 pub(crate) struct Published {
@@ -42,6 +50,8 @@ pub(crate) struct SettleStats {
 pub(crate) struct InFlight {
     set: JoinSet<Published>,
     keys: HashMap<Id, PendingKey>,
+    /// Block preparations that outlived their tick (pos-i7-d-a).
+    pub(super) preparing: Preparing,
     pub(crate) settled: SettleStats,
 }
 
@@ -50,8 +60,9 @@ impl InFlight {
         self.set.len()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.set.is_empty()
+    /// Nothing to wait for: no publish in flight and no preparation running.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.set.is_empty() && self.preparing.is_empty()
     }
 
     /// The (block, holder) of every publish in flight.
@@ -80,9 +91,20 @@ impl InFlight {
         Some(self.forget(done))
     }
 
-    /// Abort every publish in flight and wait for them to go (shutdown). An aborted
-    /// publish's challenge was never put in pending; the placement is due at restart.
+    /// The next publish or preparation to end (None when none is in flight).
+    pub(crate) async fn join_next_any(&mut self) -> Option<Ended> {
+        tokio::select! {
+            Some(prepared) = self.preparing.join_next() => Some(Ended::Prepared(prepared)),
+            Some(done) = self.set.join_next_with_id() => Some(Ended::Published(self.forget(done))),
+            else => None,
+        }
+    }
+
+    /// Abort every publish in flight and wait for them to go, and stop waiting for the
+    /// preparations (shutdown). An aborted publish's challenge was never put in pending;
+    /// the placement is due at restart.
     pub(crate) async fn shutdown(&mut self) {
+        self.preparing.shutdown().await;
         self.set.shutdown().await;
         self.keys.clear();
     }

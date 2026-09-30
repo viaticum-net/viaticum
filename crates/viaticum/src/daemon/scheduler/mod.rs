@@ -232,8 +232,9 @@ impl Scheduler {
                         error!("scheduler: issue_tick error: {e}");
                     }
                 }
-                Some(done) = in_flight.join_next(), if !in_flight.is_empty() => {
-                    self.settle_publish(done, &mut in_flight.settled).await;
+                // A publish that ended, or a block preparation that outlived its tick.
+                Some(ended) = in_flight.join_next_any(), if !in_flight.is_idle() => {
+                    self.settle_ended(ended, &mut in_flight).await;
                 }
                 _ = timeout_timer.tick() => {
                     if let Err(e) = self.check_timeouts().await {
@@ -341,7 +342,8 @@ impl Scheduler {
             }
         }
 
-        // Abort the publishes in flight; their challenges never reached pending.
+        // Abort the publishes in flight and stop waiting for the preparations; their
+        // challenges never reached pending.
         in_flight.shutdown().await;
 
         Ok(())
