@@ -145,7 +145,8 @@ impl DeletionEngine {
     ///   pack member deleted later keeps its full undo window (restore-i9).
     ///
     /// A block already in `Deleting` that becomes live-referenced again gets no further
-    /// actions; undoing a sent DropNotice is out of scope (line C, backup-iN).
+    /// actions: a returned file is backed up again under a new block generation (backup-i8,
+    /// delete-i9), the old block stays `Deleting` until L2 releases it by the block rule.
     ///
     /// `time_scale` accelerates cooldowns: effective cooldown = constant / time_scale.
     /// Pass 1 for real-time.

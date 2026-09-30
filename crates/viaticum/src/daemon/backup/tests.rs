@@ -575,6 +575,8 @@ fn dedup_skips_file_already_backed_up() {
         on_disk_confirmed: true,
     };
     db.upsert_file(&existing_record).unwrap();
+    // L1b: the dedup target is a block in service (backup-i21).
+    super::tests_current::active_block(&db, SourceBlockId([1u8; 32]));
 
     // Write the file locally and process the event.
     let path = write_file(&files_dir, "local_copy.txt", content);

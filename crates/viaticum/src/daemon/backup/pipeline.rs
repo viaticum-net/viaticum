@@ -23,6 +23,7 @@ use viaticum_core::types::{
     Timestamp,
 };
 
+use super::generation::{Committed, choose_generation, commit_block_record};
 use super::packing::build_plaintext;
 use super::{BackupConfig, PipelineResult, QueuedFile};
 
@@ -37,39 +38,59 @@ pub fn derive_block_key(epoch_key: &[u8; 32]) -> [u8; 32] {
     key
 }
 
-/// Derive a deterministic 12-byte nonce from epoch_key and compressed data.
+/// HKDF `info` of the nonce at generation 0: the derivation every block had before L1b.
+const NONCE_INFO: &[u8] = b"viaticum-block-nonce";
+/// HKDF `info` prefix of the nonce at generation > 0, followed by the generation (LE).
+const NONCE_INFO_GENERATION: &[u8] = b"viaticum-block-nonce/generation";
+
+/// Derive a deterministic 12-byte nonce from epoch_key, compressed data and the seal
+/// generation (N1, delete-i9).
 ///
-/// Uses HKDF-SHA256 with `blake3(compressed)` as salt and epoch_key as IKM.
-/// This is a SIV-like construction: nonce depends on message content,
-/// so the same plaintext always produces the same blob.
-fn derive_nonce(epoch_key: &[u8; 32], compressed: &[u8]) -> [u8; 12] {
+/// HKDF-SHA256 with `blake3(compressed)` as salt and epoch_key as IKM. This is a SIV-like
+/// construction: the nonce depends on the message content, so the same plaintext at the
+/// same generation always produces the same blob. Generation 0 uses the pre-L1b `info`
+/// (INV-G0: its ids do not change); a later generation uses a distinct `info` carrying the
+/// generation, so its nonce — hence its block id — is independent of every other
+/// generation's (the salt is untouched: no concatenation that two messages could share).
+fn derive_nonce(epoch_key: &[u8; 32], compressed: &[u8], generation: u32) -> [u8; 12] {
     let hash = blake3::hash(compressed);
     let hk = Hkdf::<Sha256>::new(Some(hash.as_bytes()), epoch_key);
     let mut nonce = [0u8; 12];
-    hk.expand(b"viaticum-block-nonce", &mut nonce)
-        .expect("12 is a valid HKDF-SHA256 output length");
+    let expanded = if generation == 0 {
+        hk.expand(NONCE_INFO, &mut nonce)
+    } else {
+        hk.expand_multi_info(
+            &[NONCE_INFO_GENERATION, &generation.to_le_bytes()],
+            &mut nonce,
+        )
+    };
+    expanded.expect("12 is a valid HKDF-SHA256 output length");
     nonce
 }
 
-/// Encrypt plaintext: compress → encrypt → prepend nonce.
-///
-/// Returns `[12-byte nonce][ciphertext]`.
-/// Deterministic: same (plaintext, epoch_key) always produces same output.
-pub fn compress_and_encrypt(plaintext: &[u8], epoch_key: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
-    // zstd compress (level 3)
-    let compressed = zstd::encode_all(std::io::Cursor::new(plaintext), 3)
-        .map_err(|e| anyhow::anyhow!("zstd compress: {e}"))?;
+/// zstd level 3. Deterministic: the same plaintext always compresses to the same bytes.
+pub fn compress_block(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+    zstd::encode_all(std::io::Cursor::new(plaintext), 3)
+        .map_err(|e| anyhow::anyhow!("zstd compress: {e}"))
+}
 
-    // Derive encryption key
+/// Encrypt an already compressed block at `generation` → `[nonce][ciphertext]`.
+///
+/// Nonce = HKDF-SHA256(salt = blake3(compressed), ikm = epoch_key, info), info =
+/// "viaticum-block-nonce" for generation 0 (the pre-L1b derivation, INV-G0) and
+/// "viaticum-block-nonce/generation" || generation (LE) otherwise. Decryption reads the
+/// nonce from the blob, so restore and DR never need the generation.
+pub fn seal_compressed(
+    compressed: &[u8],
+    epoch_key: &[u8; 32],
+    generation: u32,
+) -> anyhow::Result<Vec<u8>> {
     let key = derive_block_key(epoch_key);
     let cipher = ChaCha20Poly1305::new(&key.into());
-
-    // Deterministic nonce derived from epoch_key + blake3(compressed)
-    let nonce_bytes = derive_nonce(epoch_key, &compressed);
+    let nonce_bytes = derive_nonce(epoch_key, compressed, generation);
     let nonce = Nonce::from_slice(&nonce_bytes);
-
     let ciphertext = cipher
-        .encrypt(nonce, compressed.as_ref())
+        .encrypt(nonce, compressed)
         .map_err(|e| anyhow::anyhow!("chacha20poly1305 encrypt: {e}"))?;
 
     // Stored format: [nonce (12 bytes)][ciphertext]
@@ -77,6 +98,13 @@ pub fn compress_and_encrypt(plaintext: &[u8], epoch_key: &[u8; 32]) -> anyhow::R
     stored.extend_from_slice(&nonce_bytes);
     stored.extend_from_slice(&ciphertext);
     Ok(stored)
+}
+
+/// Encrypt plaintext at generation 0: compress → encrypt → prepend nonce (SystemState
+/// blocks, tests). Returns `[12-byte nonce][ciphertext]`.
+/// Deterministic: same (plaintext, epoch_key) always produces same output.
+pub fn compress_and_encrypt(plaintext: &[u8], epoch_key: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
+    seal_compressed(&compress_block(plaintext)?, epoch_key, 0)
 }
 
 /// Decrypt and decompress a stored block (output of `compress_and_encrypt`).
@@ -139,35 +167,10 @@ pub fn run_pipeline(
         }
     };
 
-    // 2. Compress + encrypt → stored blob = [nonce][ciphertext]
-    let stored = compress_and_encrypt(&plaintext, &config.epoch_key)?;
+    // 2. Compress once; seal at the generation the packing may write (N1, INV-N1).
+    let compressed = compress_block(&plaintext)?;
 
-    // 3. source_block_id = blake3(stored)
-    let block_id_raw: [u8; 32] = *blake3::hash(&stored).as_bytes();
-    let block_id = SourceBlockId(block_id_raw);
-
-    // 4. Compute ErasureParams (for k, k_eff, t, overhead; n comes from dynamic solver)
-    // Guard: compress_and_encrypt always produces at least 12 bytes (nonce) + auth
-    // tag, so stored.len() > 0 in practice. The check is explicit for correctness.
-    if stored.is_empty() {
-        anyhow::bail!("compressed+encrypted block is empty — cannot compute erasure params");
-    }
-    let params = ErasureParams::compute(stored.len() as u64, pack_importance)
-        .map_err(|e| anyhow::anyhow!("ErasureParams::compute failed: {e}"))?;
-
-    // 5. (Wave 11b / A4) Backup does NOT place or deliver. It only records the
-    // SourceBlockRecord. The WorkPipeline worker is the sole creator of placements
-    // and the sole deliverer — it re-encodes from source on its next iteration and
-    // owns the ESI namespace. Backup therefore needs neither an ESI offset nor a
-    // placement allocation here. The `candidates` slice is used only to derive a
-    // principled target-based N (below) so the stored record carries a meaningful
-    // redundancy target for the worker and for future repair.
-
-    // 6. (Wave 11b) No disk writes — raw symbols are not persisted.
-    // The WorkPipeline worker re-encodes from source on its next iteration.
-    // block.bin and raw/{esi}.bin are never written after Wave 11b.
-
-    // 7. DB: upsert SourceBlockRecord
+    // 3. The block type and the redundancy target do not depend on the generation.
     let block_type = match block_type_tag {
         BlockTypeTag::Pack => {
             let entries = files
@@ -186,90 +189,143 @@ pub fn run_pipeline(
         }
         BlockTypeTag::Single => SourceBlockType::Single,
     };
-
     // Wave 9: set importance and target_reliability at creation from pack_importance.
     let target_rel = reliability::target_reliability(pack_importance);
 
-    // Effective N: principled, target-based redundancy target from the current pool.
-    // Backup no longer derives N from a phantom allocation it never delivers (A4).
-    // Instead it solves for the smallest N reaching `target_rel` using a binomial
-    // mean-survival-probability model (`solve_n_for_target`). NOTE: this is an
-    // *approximation*, not a prediction of what the worker delivers — the worker
-    // places via the holder-correlated `solve_placement_for_target` (live-or-die per
-    // holder, capped at full replicas), which diverges from the independent-binomial
-    // assumption in small / heterogeneous pools. The survival-prob bridge and `k_eff`
-    // below DO match the worker exactly; only the solver model differs. `record.n`
-    // is a redundancy target / priority heuristic (not a correctness input — repair
-    // eligibility is reliability-gated, not n-gated), so the approximation is benign.
-    // With no candidates we fall back to the static params.n.
-    let k_eff = params.k + viaticum_core::constants::DECODE_OVERHEAD; // mirror worker.rs
-    let effective_n: u32 = if candidates.is_empty() {
-        params.n
-    } else {
-        // Convert placement candidates → reliability candidates via the same
-        // commitment_to_survival_prob bridge compute_allocation_with_importance uses,
-        // so the per-holder survival probability feeding the solver matches the
-        // worker's placement model (the solver *aggregation* still differs — see above).
-        let solver_candidates: Vec<reliability::HolderCandidate> = candidates
-            .iter()
-            .map(|c| reliability::HolderCandidate {
-                survival_prob: reliability::commitment_to_survival_prob(
-                    viaticum_core::commitment::CommitmentScore::new(c.trust),
-                ),
-            })
-            .collect();
-        match reliability::solve_n_for_target(k_eff, &solver_candidates, target_rel) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!("solve_n_for_target failed ({e}); falling back to params.n");
-                params.n
+    // 4. Choose the generation, then write the record only if its id is still free (or keep
+    // the record in service) inside the write transaction (Р-4: re-check, ≤ 3 attempts).
+    for _ in 0..GENERATION_ATTEMPTS {
+        let sealed = choose_generation(db, &compressed, &config.epoch_key)?;
+        let stored_len = sealed.stored.len() as u64;
+        let params = ErasureParams::compute(stored_len, pack_importance)
+            .map_err(|e| anyhow::anyhow!("ErasureParams::compute failed: {e}"))?;
+        let effective_n = effective_n(candidates, &params, target_rel);
+        let block_record = SourceBlockRecord {
+            seal_generation: sealed.generation,
+            block_id: sealed.block_id,
+            k: params.k,
+            t: params.t,
+            block_type: block_type.clone(),
+            status: SourceBlockStatus::Active,
+            created_at: Timestamp::now(),
+            encrypted_size: Some(stored_len),
+            n: Some(effective_n),
+            overhead: Some(params.overhead),
+            drop_notice_sent_at: None,
+            // Wave 9: set at creation from pack importance.
+            importance: pack_importance,
+            target_reliability: target_rel,
+            current_alive: 0,
+            current_reliability: 0.0,
+        };
+        // 5. DB: the source block record only (A4). Backup creates no placements and emits
+        // no SymbolsPlaced events — the WorkPipeline worker is their sole creator, and it
+        // re-encodes from source (Wave 11b: no symbols on disk).
+        let result = match commit_block_record(db, &block_record)? {
+            Committed::Changed(now) => {
+                tracing::debug!(
+                    block_id = %sealed.block_id,
+                    seal_generation = sealed.generation,
+                    now = ?now,
+                    "backup: chosen block id left service before the write; choosing again"
+                );
+                continue;
             }
+            Committed::Written => {
+                tracing::info!(
+                    block_id = %sealed.block_id,
+                    k = params.k,
+                    n = effective_n,
+                    importance = pack_importance,
+                    target_reliability = target_rel,
+                    seal_generation = sealed.generation,
+                    "backup: pipeline complete (block record only; worker places)"
+                );
+                PipelineResult {
+                    source_block_id: sealed.block_id,
+                    k: params.k,
+                    n: effective_n,
+                    t: params.t,
+                    stored_size: stored_len,
+                    importance: pack_importance,
+                }
+            }
+            Committed::Kept(existing) => {
+                tracing::debug!(
+                    block_id = %sealed.block_id,
+                    seal_generation = sealed.generation,
+                    "backup: block already in service; record kept"
+                );
+                PipelineResult {
+                    source_block_id: existing.block_id,
+                    k: existing.k,
+                    n: existing.n.unwrap_or(effective_n),
+                    t: existing.t,
+                    stored_size: existing.encrypted_size.unwrap_or(stored_len),
+                    importance: existing.importance,
+                }
+            }
+        };
+        if !sealed.skipped.is_empty() {
+            let released: Vec<String> = sealed
+                .skipped
+                .iter()
+                .map(|(id, s)| format!("{id}:{s:?}"))
+                .collect();
+            tracing::info!(
+                block_id = %sealed.block_id,
+                seal_generation = sealed.generation,
+                released = %released.join(","),
+                "backup: sealed as a new generation; the earlier id is being released"
+            );
         }
-    };
+        return Ok(result);
+    }
+    anyhow::bail!(
+        "block generation choice changed {GENERATION_ATTEMPTS} times inside the write \
+         transaction; files stay queued"
+    )
+}
 
-    let block_record = SourceBlockRecord {
-        seal_generation: 0,
-        block_id,
-        k: params.k,
-        t: params.t,
-        block_type,
-        status: SourceBlockStatus::Active,
-        created_at: Timestamp::now(),
-        encrypted_size: Some(stored.len() as u64),
-        n: Some(effective_n),
-        overhead: Some(params.overhead),
-        drop_notice_sent_at: None,
-        // Wave 9: set at creation from pack importance.
-        importance: pack_importance,
-        target_reliability: target_rel,
-        current_alive: 0,
-        current_reliability: 0.0,
-    };
-    // 8. DB: write the source block record only (A4). Backup creates no placements
-    // and emits no SymbolsPlaced events — those belong to the WorkPipeline worker,
-    // the sole creator of placements. A single write transaction keeps block-record
-    // creation atomic.
-    let mut txn = db.write_txn()?;
-    txn.upsert_source_block(&block_record)?;
-    txn.commit()?;
+/// Attempts of "choose a generation, re-check it in the write transaction" (Р-4).
+const GENERATION_ATTEMPTS: usize = 3;
 
-    tracing::info!(
-        block_id = %block_id,
-        k = params.k,
-        n = effective_n,
-        importance = pack_importance,
-        target_reliability = target_rel,
-        "backup: pipeline complete (block record only; worker places)"
-    );
-
-    Ok(PipelineResult {
-        source_block_id: block_id,
-        k: params.k,
-        n: effective_n,
-        t: params.t,
-        stored_size: stored.len() as u64,
-        importance: pack_importance,
-    })
+/// Effective N: principled, target-based redundancy target from the current pool.
+/// Backup no longer derives N from a phantom allocation it never delivers (A4).
+/// Instead it solves for the smallest N reaching `target_rel` using a binomial
+/// mean-survival-probability model (`solve_n_for_target`). NOTE: this is an
+/// *approximation*, not a prediction of what the worker delivers — the worker
+/// places via the holder-correlated `solve_placement_for_target` (live-or-die per
+/// holder, capped at full replicas), which diverges from the independent-binomial
+/// assumption in small / heterogeneous pools. The survival-prob bridge and `k_eff`
+/// below DO match the worker exactly; only the solver model differs. `record.n`
+/// is a redundancy target / priority heuristic (not a correctness input — repair
+/// eligibility is reliability-gated, not n-gated), so the approximation is benign.
+/// With no candidates we fall back to the static params.n.
+fn effective_n(candidates: &[HolderCandidate], params: &ErasureParams, target_rel: f64) -> u32 {
+    let k_eff = params.k + viaticum_core::constants::DECODE_OVERHEAD; // mirror worker.rs
+    if candidates.is_empty() {
+        return params.n;
+    }
+    // Convert placement candidates → reliability candidates via the same
+    // commitment_to_survival_prob bridge compute_allocation_with_importance uses,
+    // so the per-holder survival probability feeding the solver matches the
+    // worker's placement model (the solver *aggregation* still differs — see above).
+    let solver_candidates: Vec<reliability::HolderCandidate> = candidates
+        .iter()
+        .map(|c| reliability::HolderCandidate {
+            survival_prob: reliability::commitment_to_survival_prob(
+                viaticum_core::commitment::CommitmentScore::new(c.trust),
+            ),
+        })
+        .collect();
+    match reliability::solve_n_for_target(k_eff, &solver_candidates, target_rel) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("solve_n_for_target failed ({e}); falling back to params.n");
+            params.n
+        }
+    }
 }
 
 /// Whether this pipeline run produces a Pack or Single block.
@@ -590,8 +646,13 @@ pub fn rebuild_blob_blocking(
     use anyhow::Context;
     let candidate =
         super::rebuild::rebuild_candidate(db, block_record, scope).context("rebuild plaintext")?;
-    let stored = compress_and_encrypt(&candidate.plaintext, epoch_key)
-        .map_err(|e| anyhow::anyhow!("compress_and_encrypt: {e}"))?;
+    // N1: sealed at the record's generation (0 for every block before L1b).
+    let stored = seal_compressed(
+        &compress_block(&candidate.plaintext)?,
+        epoch_key,
+        block_record.seal_generation,
+    )
+    .map_err(|e| anyhow::anyhow!("seal at generation {}: {e}", block_record.seal_generation))?;
     let hash: [u8; 32] = *blake3::hash(&stored).as_bytes();
     if hash != block_record.block_id.0 {
         if let Some(e) = candidate.legacy_of {

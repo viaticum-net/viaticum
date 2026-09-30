@@ -11,9 +11,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use viaticum_core::constants::OWNER_DELETE_COOLDOWN_SECS;
-use viaticum_core::types::{
-    DeviceId, FileRecord, LocalState, PlacementStatus, SourceBlockId, SourceBlockStatus, Timestamp,
-};
+use viaticum_core::db::Serviceability;
+use viaticum_core::types::{DeviceId, FileRecord, LocalState, SourceBlockId, Timestamp};
 
 use super::{BackupCoordinator, DirtyEvent, DirtyKind};
 
@@ -191,7 +190,8 @@ impl BackupCoordinator {
     }
 
     /// A block that reviving `record` makes live is in deletion: its record is gone, its
-    /// status is `Deleting`/`Deleted`, or a placement of it is `Deleting`. Only the block
+    /// status is `Deleting`/`Deleted`, or a placement of it is `Deleting` (Serviceability
+    /// `Missing` or `Releasing`). Only the block
     /// of the last version and of the last backed-up version count (delete-i12 (а), L0
     /// review BLOCK-1): an older, superseded version may point at a block long released —
     /// `CleanupBlock` strips versions only from the record the block is attributed to —
@@ -212,19 +212,12 @@ impl BackupCoordinator {
             let deleting = match cache.get(&block) {
                 Some(d) => *d,
                 None => {
-                    let d = match self.db.get_source_block(&block)? {
-                        None => true,
-                        Some(sb) => {
-                            matches!(
-                                sb.status,
-                                SourceBlockStatus::Deleting | SourceBlockStatus::Deleted
-                            ) || self
-                                .db
-                                .list_placements_for_block(&block)?
-                                .iter()
-                                .any(|p| p.status == PlacementStatus::Deleting)
-                        }
-                    };
+                    // Р-10: the one serviceability rule (backup-i21); "in deletion" is its
+                    // `Releasing` or `Missing`.
+                    let d = matches!(
+                        self.db.block_serviceability(&block)?,
+                        Serviceability::Releasing | Serviceability::Missing
+                    );
                     cache.insert(block, d);
                     d
                 }

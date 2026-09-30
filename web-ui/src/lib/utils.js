@@ -72,6 +72,12 @@ export function statusBadge(s) {
         tooltip: `${s.lost} of ${s.target} symbols lost; only ${s.live} alive. Repair pipeline is rebuilding from survivors.`,
       };
     }
+    case 'releasing':
+      return {
+        label: 'Being released',
+        kind: 'working',
+        tooltip: 'Friends are dropping this copy; if the file is still in your folder it will be backed up again.',
+      };
     default:
       return { label: s.kind ?? 'Unknown', kind: 'pending', tooltip: 'Unrecognised status.' };
   }

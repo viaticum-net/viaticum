@@ -10,6 +10,7 @@
 //   events.rs   -- process_event helpers: handle_added_or_modified, dedup
 //   gone.rs     -- deletions, recheck, the root rule (L0: delete-i12, dr-i64)
 //   pipeline.rs -- compress/encrypt/encode/write-symbols inner pipeline
+//   generation.rs -- L1b N1: the seal generation a packed plaintext takes (delete-i9)
 //   packing.rs  -- PackIndex format: build_plaintext, parse_pack_index
 //   rebuild.rs  -- rebuild a block's plaintext from this device's files, by content (L0)
 //   tests.rs    -- test scenarios
@@ -18,6 +19,7 @@
 //   tests_rebuild.rs -- L0: rebuild by content after renames, copies, swaps
 //   tests_gone.rs    -- L0: deletion by event and recheck, the watch root rule
 //   tests_seal.rs    -- L1b: a generation-0 seal keeps the pre-L1b block id (INV-G0)
+//   tests_revive.rs  -- L1b: the serviceable-block dedup gate, the seal generation (N1)
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -34,6 +36,7 @@ use pipeline::{
 };
 
 pub mod events;
+mod generation;
 mod gone;
 pub mod packing;
 pub mod pipeline;
@@ -49,6 +52,8 @@ mod tests_current;
 mod tests_gone;
 #[cfg(test)]
 mod tests_rebuild;
+#[cfg(test)]
+mod tests_revive;
 #[cfg(test)]
 mod tests_seal;
 
@@ -946,11 +951,13 @@ impl BackupCoordinator {
 // were removed in Wave 11b. Symbol delivery is now the WorkPipeline worker's responsibility.
 
 /// "Is this content already backed up?" for the flush-time check (backup-i23): a dedup
-/// source exists. A DB error answers "no" (WARN): the file is then packed — traffic,
+/// source on a block in service exists. A DB error answers "no" (WARN): the file is then packed — traffic,
 /// never a skipped backup.
 fn content_in_network(db: &Db, content_hash: &[u8; 32]) -> bool {
     match events::select_dedup_source(db, content_hash, None) {
-        Ok(src) => src.is_some(),
+        // Only content on a serviceable block (backup-i21): a file changed to content that
+        // lies only on a block being released is packed (К10).
+        Ok(lookup) => matches!(lookup, events::DedupLookup::Source(_)),
         Err(e) => {
             tracing::warn!("flush: dedup lookup failed, packing the file: {e:#}");
             false

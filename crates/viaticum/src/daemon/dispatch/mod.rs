@@ -476,12 +476,17 @@ pub(crate) fn waiting_words(reason: WaitingReason) -> &'static str {
 /// version is not backed up, the block record is missing, or it is below target
 /// (a target of 0.0 is the pre-migration sentinel and never counts as safe).
 /// "At target" is `reliability::meets_target` — the one tolerance-aware definition
-/// (repair-i3).
+/// (repair-i3). A block not in service (being released, in the window, missing) is never
+/// safe, whatever its cached reliability says (backup-i8, backup-i21: the cache is not
+/// recomputed when the block turns `Deleting`).
 fn compute_is_safe_to_delete(state: &DaemonState, file: &FileRecord) -> bool {
     let Some(version) = file.versions.last() else {
         return false;
     };
     if version.backed_up_at.is_none() {
+        return false;
+    }
+    if !block_in_service(state, &version.source_block_id) {
         return false;
     }
     match state.db.get_source_block(&version.source_block_id) {
@@ -496,10 +501,26 @@ fn compute_is_safe_to_delete(state: &DaemonState, file: &FileRecord) -> bool {
     }
 }
 
+/// The block is in service (`Serviceability::Serviceable`, backup-i21). A DB error answers
+/// "no": the conservative side for both readers.
+fn block_in_service(state: &DaemonState, block: &viaticum_core::types::SourceBlockId) -> bool {
+    state
+        .db
+        .block_serviceability(block)
+        .is_ok_and(|s| s.is_serviceable())
+}
+
 fn compute_effective_status(state: &DaemonState, version: &FileVersion) -> EffectiveStatus {
     // backed_up_at == None means the encoder pipeline hasn't produced a block yet.
     if version.backed_up_at.is_none() {
         return EffectiveStatus::Queued;
+    }
+    // A block not in service is never "restorable / on target", whatever its placements
+    // count (backup-i8): the network is releasing it; the file is backed up again.
+    match state.db.block_serviceability(&version.source_block_id) {
+        Ok(s) if s.is_serviceable() => {}
+        Ok(_) => return EffectiveStatus::Releasing,
+        Err(_) => return EffectiveStatus::Queued, // Conservative on DB error.
     }
 
     let target = version.k + viaticum_core::constants::DECODE_OVERHEAD;

@@ -14,7 +14,7 @@ use viaticum_core::types::{
     DeviceId, FileCategory, FileId, FileRecord, FileVersion, LocalState, SourceBlockId, Timestamp,
 };
 
-use super::events::select_dedup_source;
+use super::events::{DedupLookup, select_dedup_source};
 use super::pipeline::update_backed_up_at;
 use super::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind, QueuedFile};
 
@@ -100,6 +100,29 @@ pub(super) fn backed_up(
     let v = last(db, path);
     assert!(v.backed_up_at.is_some(), "setup: {path} backed up");
     v.source_block_id
+}
+
+/// An `Active` record for a synthetic block `id` with no placement: a block in service,
+/// so a version on it is a dedup source (L1b gate, backup-i21).
+pub(super) fn active_block(db: &Db, id: SourceBlockId) {
+    db.upsert_source_block(&viaticum_core::types::SourceBlockRecord {
+        seal_generation: 0,
+        block_id: id,
+        k: 3,
+        t: 1024,
+        block_type: viaticum_core::types::SourceBlockType::Single,
+        status: viaticum_core::types::SourceBlockStatus::Active,
+        created_at: Timestamp(100),
+        encrypted_size: Some(3072),
+        n: Some(6),
+        overhead: Some(1.5),
+        drop_notice_sent_at: None,
+        importance: 0.5,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.9,
+    })
+    .unwrap();
 }
 
 fn backed_version(h: [u8; 32], block: SourceBlockId, at: u64) -> FileVersion {
@@ -260,7 +283,10 @@ fn dedup_source_is_a_backed_up_version_not_a_pending_one() {
     let a = content(9, 4096);
     let q = write(&dir, "q.bin", &a);
     c.process_event(event(&q, DirtyKind::Added)).unwrap();
-    assert!(select_dedup_source(&db, &hash(&a), None).unwrap().is_none());
+    assert!(matches!(
+        select_dedup_source(&db, &hash(&a), None).unwrap(),
+        DedupLookup::NotFound
+    ));
 
     let p = write(&dir, "p.bin", &a);
     c.process_event(event(&p, DirtyKind::Added)).unwrap();
@@ -288,6 +314,8 @@ fn dedup_rescan_keeps_own_block_when_same_content_is_on_another_block() {
     let a = content(10, 4096);
     let p = write(&dir, "p.bin", &a);
     let (x1, x2) = (SourceBlockId([0x11; 32]), SourceBlockId([0x22; 32]));
+    active_block(&db, x1);
+    active_block(&db, x2);
     for (id, path, block) in [(1, "/aaa/q.bin".to_string(), x1), (2, p.clone(), x2)] {
         db.upsert_file(&FileRecord {
             file_id: FileId(id),
@@ -320,6 +348,7 @@ fn event_for_existing_file_sets_on_disk_confirmed() {
     let a = content(11, 4096);
     let p = write(&dir, "restored.bin", &a);
     let x = SourceBlockId([0x33; 32]);
+    active_block(&db, x);
     db.upsert_file(&FileRecord {
         file_id: FileId(1),
         path: p.clone(),

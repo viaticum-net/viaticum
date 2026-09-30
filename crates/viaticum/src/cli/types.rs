@@ -484,6 +484,10 @@ pub enum EffectiveStatus {
     /// We had `target` Alive at some point; now `live < target` after losses.
     /// Repair pipeline is responsible for bringing it back.
     Degraded { live: u32, lost: u32, target: u32 },
+    /// The version's block is not in service (being released, in the release window, or
+    /// missing): the network is dropping it, whatever the placements count; a file still
+    /// on disk is backed up again under a new block (backup-i8, backup-i21).
+    Releasing,
 }
 
 /// Owner-side estimate of why restoring a version would not succeed right now
