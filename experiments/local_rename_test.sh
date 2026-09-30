@@ -352,9 +352,12 @@ wait_block() {
     return 1
 }
 
-# events_between IDX PATTERN FROM TO: node IDX's log lines with PATTERN stamped in [FROM, TO].
-events_between() {
-    events "$(node_log "$1")" "$2" | awk -v a="$3" -v b="$4" '$1 >= a && $1 <= b' | wc -l
+# log_between IDX LINE_FROM LINE_TO: node IDX's log lines (LINE_FROM, LINE_TO], ANSI stripped.
+# Line-based, not time-based: a line logged in the same second before an action is not in
+# its window (the first run counted step 4's flush of S.bin, logged 0.5 s before the
+# renames, into the rename window).
+log_between() {
+    log_since "$1" "$2" | head -n "$(( $3 - $2 ))"
 }
 
 # block_events_between PATTERN BLOCK FROM TO: holder log lines with PATTERN and
@@ -736,7 +739,7 @@ if run_b; then
         fi
         mv "$FILES/$ALBUM" "$FILES/$NEW_ALBUM"
         sleep 15
-        T_REN15=$(date +%s)
+        LINE_REN15=$(log_line_count 0)
         if ! assert_no_periodic_since "$LINE_REN"; then
             info "attempt $attempt: a periodic rescan ran in the window; repeating the directory rename"
             ALBUM=$NEW_ALBUM
@@ -767,9 +770,25 @@ if run_b; then
         '[.[] | select((.path | startswith($d)) and .local_state != "deleted")] | length' 2>/dev/null || echo "?")
     if [ "$OLD_ALBUM_LIVE" = 0 ]; then pass "no live record left under the old album directory"
     else fail "delete-i12: $OLD_ALBUM_LIVE live record(s) under the old album directory"; fi
-    PIPE_REN=$(events_between 0 "backup: pipeline complete" "$T_REN" "$T_REN15")
-    if [ "$PIPE_REN" -eq 0 ]; then pass "no new block at node-00 in the rename window (0 'pipeline complete')"
-    else fail "backup-i22: $PIPE_REN 'pipeline complete' line(s) at node-00 in the rename window"; fi
+    # No new block for a renamed / moved path: a 'pipeline complete' line of the rename
+    # window whose block holds a version of one of them (a re-pack gives the path a
+    # version on the new block). Any other flush in the window is reported, not failed.
+    REN_PATHS=("$FILES/m1-renamed.bin" "$PHOTOS/m2.bin" "$FILES/R1.bin"
+        "$FILES/$ALBUM/p1.bin" "$FILES/$ALBUM/p2.bin" "$FILES/$ALBUM/p3.bin")
+    REN_BLOCKS=$(for p in "${REN_PATHS[@]}"; do
+        api_get 0 "/api/versions?path=$(urlencode "$p")" | jq -r '.[].source_block_id_hex' 2>/dev/null
+    done | cut -c1-16 | grep -v '^0*$' | sort -u || true)
+    [ -n "$REN_BLOCKS" ] || fail "setup: no block known for the renamed paths — the re-pack check would be blind"
+    WIN_PIPE=$(log_between 0 "$LINE_REN" "$LINE_REN15" | grep -a "backup: pipeline complete" || true)
+    PIPE_REN=0
+    for b in $REN_BLOCKS; do
+        has "$WIN_PIPE" "block_id=$b" && PIPE_REN=$((PIPE_REN + 1))
+    done
+    PIPE_OTHER=$(grep -c "pipeline complete" <<< "$WIN_PIPE" || true)
+    [ "${PIPE_OTHER:-0}" -eq "$PIPE_REN" ] \
+        || info "rename window: $((PIPE_OTHER - PIPE_REN)) block(s) of other files flushed: $(grep -oE 'block_id=[0-9a-f]+' <<< "$WIN_PIPE" | tr '\n' ' ')"
+    if [ "$PIPE_REN" -eq 0 ]; then pass "no new block for a renamed / moved path in the rename window"
+    else fail "backup-i22: $PIPE_REN new block(s) holding a renamed / moved path in the rename window: $(grep -oE 'block_id=[0-9a-f]+' <<< "$WIN_PIPE" | tr '\n' ' ')"; fi
 
     echo ""
     echo "=== Step 5b: ADVERSARIAL d1, d2 of one pack swapped via tmp (backup-i22) ==="
