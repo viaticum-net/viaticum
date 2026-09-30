@@ -15,7 +15,8 @@
 # Intent:       a: backup-i4, backup-i5, backup-i7 (backup-i1 for normal files)
 #               b: backup-i24, pos-i13, pos-i14, restore-i39
 # Proves:       a: an over-limit file is refused before any read and shown in files/status/
-#               watches; OTHER nodes get nothing for it; a grown protected file keeps its old
+#               watches; no block is made for it (owner logs no "pipeline complete", no version), so the
+#               other nodes get nothing; a grown protected file keeps its old
 #               version, is not re-read, is no longer safe to delete, and holders stop getting
 #               PoS for it; shrink / limit raise back it up; the start pass drops the mark of a
 #               file removed while down.
@@ -30,7 +31,10 @@
 #               (mmap threshold is set for measurement); >3.44 GiB encode (never, RaptorQ guard
 #               is a unit test); cgroup limits (unit); a file growing during the read (unit);
 #               cluster siblings; DR onto a smaller machine; DR SS decode under the budget (unit);
-#               4R ledger credit of anchor holders (T7).
+#               4R ledger credit of anchor holders (T7); holders' disks are not compared in
+#               step 1 (SystemState blocks land there any time; the owner's pipeline log is the
+#               proof); step 4 memory: ok.bin / doc.txt are removed and the peak is reset right
+#               after a fresh GB answer, a PoS of another block in flight is not excluded.
 # Steps:        private/beta-planning/tasks/r1_bigfile_refusal.md §0.3
 #
 # Implemented here: PHASE=a (R1-d-a: steps 0a, 1, 1b, 2a, 4, 5, 6, 7, 8, 9). The steps of
@@ -385,12 +389,6 @@ echo ""
 echo "=== Step 1: ADVERSARIAL sparse 4 GiB file above the limit (backup-i4, backup-i5) ==="
 HUGE="$FILES/huge.mkv"
 HUGE_SIZE=$((4 * 1024 * MIB))
-declare -A HB0 HF0 HD0
-for i in "${HOLDERS[@]}"; do
-    HB0[$i]=$(status_num "$i" holding_bytes)
-    HF0[$i]=$(find "$(node_dir "$i")/holdings" -type f 2>/dev/null | wc -l)
-    HD0[$i]=$(find "$(node_dir "$i")/holdings" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-done
 hwm_reset "${DPID[0]}" || { fail "setup: VmHWM reset failed"; exit 1; }
 LINE1=$(log_line_count 0)
 make_sparse "$HUGE" "$HUGE_SIZE"
@@ -425,16 +423,17 @@ if poll 90 watch_not_green; then
 else
     fail "backup-i4: /api/watches: files/ still green 90s after a too-large file appeared"
 fi
-for i in "${HOLDERS[@]}"; do
-    HB=$(status_num "$i" holding_bytes)
-    HF=$(find "$(node_dir "$i")/holdings" -type f 2>/dev/null | wc -l)
-    HD=$(find "$(node_dir "$i")/holdings" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-    if [ "$HB" = "${HB0[$i]}" ] && [ "$HF" = "${HF0[$i]}" ] && [ "$HD" = "${HD0[$i]}" ]; then
-        pass "node-0$i holds nothing new (holding_bytes $HB, $HF files, $HD block dirs)"
-    else
-        fail "backup-i5: node-0$i changed while only huge.mkv existed: holding_bytes ${HB0[$i]} -> $HB, files ${HF0[$i]} -> $HF, block dirs ${HD0[$i]} -> $HD"
-    fi
-done
+# Nothing was packed or sent for huge.mkv. The check is on the owner: the pipeline logs
+# "backup: pipeline complete" for every block it seals (INFO, no path), and nothing but
+# huge.mkv is in a watched folder in this window, so any such line is huge.mkv's. The holders'
+# disks are NOT compared: SystemState blocks (base after ~60 s, diffs every 60 s) land in
+# their holdings/ at any time (local_delete_test does not use holding_bytes for that reason).
+PC1=$(count_lines "$(owner_lines_since "$LINE1" "backup: pipeline complete")")
+[ "$PC1" -eq 0 ] && pass "backup-i5: 0 'pipeline complete' lines on node-00 while only huge.mkv existed (no block was made, nothing went to the other nodes)" \
+    || fail "backup-i5: $PC1 'pipeline complete' line(s) on node-00 while only huge.mkv existed: a block was made for the refused file"
+V1=$(versions_count "$HUGE")
+[ "$V1" -eq 0 ] && pass "huge.mkv has no version" \
+    || fail "backup-i5: huge.mkv has $V1 version(s), want 0"
 
 # ── STEP 1b: THE MARK IS NOT RE-EVALUATED LOUDLY ─────────────────
 echo ""
@@ -504,6 +503,13 @@ for _ in $(seq 1 120); do
 done
 if [ "$GB_ANSWERED" -ge 1 ]; then pass "4 control: holders answered PoS for GB ($GB_ANSWERED answers)"
 else rough "4 blind: no holder PoS answer for GB within 120s: 'no PoS after growth' cannot be proven"; fi
+# Quiet the owner before the memory measurement: ok.bin (100 MiB) and doc.txt may share a pack,
+# and a PoS issue for that pack re-reads it (a legitimate 100 MiB+ peak that would swamp the
+# ΔVmHWM check). Both files served step 2; remove them now: the PoS rebuild of their block
+# then fails cheaply on the missing member.
+rm -f "$OKB" "$DOC"
+wait_file_deleted 0 "$OKB" 60 && wait_file_deleted 0 "$DOC" 60 \
+    || note "4: ok.bin / doc.txt not both registered as deleted in 60 s (the memory check may be noisy)"
 # Positive control 2: the protected file is safe to delete before it grows.
 safe_true() { [ "$(file_field 0 "$GROW" '.is_safe_to_delete')" = true ]; }
 if poll 120 safe_true; then
@@ -514,6 +520,11 @@ fi
 D=$(file_field 0 "$GROW" '.last_backed_up')
 V_BEFORE=$(versions_count "$GROW")
 info "grow.bin before: last_backed_up $D, $V_BEFORE version(s), block ${GB:0:16}.."
+# Reset the peak right after a fresh holder answer for GB: the owner has just finished a PoS
+# issue for GB (the 200 MiB rebuild), so none is likely to be mid-flight at the reset.
+T_F=$(date +%s)
+fresh_gb_answer() { [ "$(pos_answers_since "$GB" $((T_F + 1)))" -ge 1 ]; }
+poll 90 fresh_gb_answer || note "4: no fresh PoS answer for GB in 90 s before the growth (the memory check may include a PoS in flight)"
 hwm_reset "${DPID[0]}" || { fail "setup: VmHWM reset failed"; exit 1; }
 LINE4=$(log_line_count 0)
 T4=$(date +%s)
@@ -547,10 +558,17 @@ fi
 # Window [LINE, +180 s]: exactly one WARN for GB; no PoS answers in [+60, +180].
 while [ "$(date +%s)" -lt $((T4 + 180)) ]; do sleep 2; done
 hwm_delta_check "backup-i5 (grown grow.bin not read)" $((64 * 1024))
-WARN4=$(count_lines "$(owner_lines_since "$LINE4" "cannot load source block for PoS" | grep -aF "block_id=${GB:0:16}" || true)")
-if [ "$WARN4" -eq 1 ]; then pass "backup-i7: exactly 1 WARN 'cannot load source block for PoS' for GB in 180s"
-elif [ "$WARN4" -eq 0 ]; then fail "backup-i7: no WARN 'cannot load source block for PoS' for GB in 180s (PoS not issued for GB, or the refusal is silent)"
-else fail "backup-i7: $WARN4 WARN 'cannot load source block for PoS' for GB in 180s, want 1 (one per unscaled day)"; fi
+# The same text is logged at WARN (once per unscaled day per block) and at DEBUG (every other
+# tick), so the level decides. tracing's fmt prints the level as " WARN " / "DEBUG".
+PWARN_TXT="cannot load source block for PoS"
+PLINES4=$(owner_lines_since "$LINE4" "$PWARN_TXT" | grep -aF "block_id=${GB:0:16}" || true)
+WARN4=$(count_lines "$(grep -aE '[[:space:]]WARN[[:space:]]' <<< "$PLINES4" || true)")
+DBG4=$(count_lines "$(grep -aE '[[:space:]]DEBUG[[:space:]]' <<< "$PLINES4" || true)")
+if [ "$DBG4" -ge 2 ]; then pass "4 control: $DBG4 DEBUG '$PWARN_TXT' for GB (the PoS issue kept trying, the refusals were quiet)"
+else fail "backup-i7: only $DBG4 DEBUG '$PWARN_TXT' for GB in 180s, want >= 2 (the issue did not run every tick, so 'exactly 1 WARN' proves nothing)"; fi
+if [ "$WARN4" -eq 1 ]; then pass "backup-i7: exactly 1 WARN '$PWARN_TXT' for GB in 180s"
+elif [ "$WARN4" -eq 0 ]; then fail "backup-i7: no WARN '$PWARN_TXT' for GB in 180s (PoS not issued for GB, or the refusal is silent)"
+else fail "backup-i7: $WARN4 WARN '$PWARN_TXT' for GB in 180s, want 1 (one per unscaled day)"; fi
 ANS4=$(pos_answers_since "$GB" $((T4 + 60)) $((T4 + 180)))
 if [ "$ANS4" -eq 0 ]; then pass "backup-i7: 0 holder PoS answers for GB in [+60, +180] s (holders stopped being challenged for the grown file)"
 else fail "backup-i7: $ANS4 holder PoS answers for GB in [+60, +180] s after the growth"; fi
