@@ -65,6 +65,7 @@ HOLDERS=(1 2 3 4)
 
 MIB=1048576
 LIMIT_MB_0=256                 # node-00's max_file_size_mb (raised to 512 in step 6)
+PACK_MB_0=32                   # node-00's source_block_size_mb (B_eff = 32 MiB)
 CEILING_MB=3072                # MAX_FILE_SIZE_CEILING (2A.1)
 # Automatic limit: clamp(floor(M / RAM_DIVISOR), 32 MiB, 1 GiB). 32 = 2 * (14 + 2) with R1-d-b;
 # 76 for R1-d-a alone (spec 2A.6). Set RAM_DIVISOR=76 to match a build without R1-d-b.
@@ -307,6 +308,11 @@ write_config() {
         echo 'upload_limit_mbit = 0'      # R1-u2 junction: no rate limit in this scenario
         if [ "$i" -eq 0 ]; then
             echo "max_file_size_mb = $LIMIT_MB_0"
+            # Pack size 32 MiB (B_eff = min(32, N/2)): grow.bin (64 MiB, importance 0) takes
+            # the large-file path — the pack queue never selects importance-0 files
+            # (select_backup_batch) — and its PoS rebuild fits the issue tick's time budget
+            # at time_scale 20000 (a 200 MiB block is always cut there: pos-i7-d boundary).
+            echo "source_block_size_mb = $PACK_MB_0"
             echo '[[watch]]'
             echo "path = \"$FILES\""
             echo '[[watch]]'
@@ -415,6 +421,8 @@ W1=$(count_lines "$(owner_lines_since "$LINE1" "file too large to back up" | gre
 hwm_delta_check "backup-i5 (huge.mkv not read)" $((64 * 1024))
 # The watch folder is not green (backup-i4 observable).
 watch_not_green() {
+    # Folder rollups are recomputed every 5 min; ask for a recompute first.
+    api_post 0 /api/watches/refresh '{}' > /dev/null
     api_get 0 /api/watches | jq -e --arg p "$FILES" \
         '.[] | select(.path == $p) | .traffic_light != "green"' > /dev/null 2>&1
 }
@@ -458,11 +466,11 @@ W1B=$(count_lines "$(owner_lines_since "$LINE1" "file too large to back up" | gr
 
 # ── STEP 2 (a): NORMAL FILES ─────────────────────────────────────
 echo ""
-echo "=== Step 2 (a): doc.txt 10 KB, ok.bin 100 MiB, bulk/grow.bin 200 MiB (backup-i1) ==="
+echo "=== Step 2 (a): doc.txt 10 KB, ok.bin 100 MiB, bulk/grow.bin 64 MiB (backup-i1) ==="
 DOC="$FILES/doc.txt"; OKB="$FILES/ok.bin"; GROW="$BULK/grow.bin"
 make_random "$DOC" 10240
 make_random "$OKB" $((100 * MIB))
-make_random "$GROW" $((200 * MIB))
+make_random "$GROW" $((64 * MIB))
 for p in "$DOC" "$OKB" "$GROW"; do
     if ! wait_file_restorable 0 "$p" 300; then
         fail "backup-i1: $(basename "$p") not restorable per node-00 after 300s"; exit 1
@@ -525,7 +533,7 @@ D=$(file_field 0 "$GROW" '.last_backed_up')
 V_BEFORE=$(versions_count "$GROW")
 info "grow.bin before: last_backed_up $D, $V_BEFORE version(s), block ${GB:0:16}.."
 # Reset the peak right after a fresh holder answer for GB: the owner has just finished a PoS
-# issue for GB (the 200 MiB rebuild), so none is likely to be mid-flight at the reset.
+# issue for GB (the 64 MiB rebuild), so none is likely to be mid-flight at the reset.
 T_F=$(date +%s)
 fresh_gb_answer() { [ "$(pos_answers_since "$GB" $((T_F + 1)))" -ge 1 ]; }
 poll 90 fresh_gb_answer || note "4: no fresh PoS answer for GB in 90 s before the growth (the memory check may include a PoS in flight)"
@@ -581,11 +589,13 @@ P4=$(count_lines "$(log_since 0 "$LINE4" | grep -a "panicked" || true)")
 
 # ── STEP 5: SHRINK UNDER THE LIMIT ───────────────────────────────
 echo ""
-echo "=== Step 5: grow.bin shrinks to 100 MiB: the mark goes, a new version is backed up (backup-i4) ==="
+echo "=== Step 5: grow.bin shrinks to 48 MiB: the mark goes, a new version is backed up (backup-i4) ==="
 LINE5=$(log_line_count 0)
-truncate -s 100M "$GROW"
+# 48 MiB: >= B_eff (large-file path, importance 0 never leaves the pack queue) and a prefix
+# of the original 64 MiB, so new content (not a dedup back onto GB).
+truncate -s 48M "$GROW"
 if poll 90 tl_gone 0 "$GROW"; then pass "grow.bin: too_large mark removed"
-else fail "backup-i4: grow.bin still marked too_large 90s after shrinking to 100 MiB"; fi
+else fail "backup-i4: grow.bin still marked too_large 90s after shrinking to 48 MiB"; fi
 if [ -n "$(owner_lines_since "$LINE5" "file is within the size limit again")" ]; then
     pass "INFO 'file is within the size limit again' logged"
 else
