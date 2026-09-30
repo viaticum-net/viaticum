@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use viaticum_core::erasure::{ErasureEncoder, ErasureError, RaptorQEncoder, Symbol};
+use viaticum_core::erasure::{ErasureEncoder, ErasureError, RaptorQEncoder, Symbol, SymbolSink};
 use viaticum_core::types::{DeviceId, ErasureParams, SourceBlockId};
 
 use super::issue_support::{SlowPostman, owner_with_due, owner_with_encoder, seed_due};
@@ -150,6 +150,16 @@ impl ErasureEncoder for StallingEncoder {
         let out = self.inner.encode_raw_ranges(source_block, params, ranges);
         self.running.fetch_sub(1, Ordering::SeqCst);
         out
+    }
+    fn encode_raw_ranges_each(
+        &self,
+        source_block: &[u8],
+        params: &ErasureParams,
+        ranges: &[(u32, u32)],
+        f: &mut SymbolSink<'_>,
+    ) -> Result<(), ErasureError> {
+        self.inner
+            .encode_raw_ranges_each(source_block, params, ranges, f)
     }
     fn apply_binding(
         &self,

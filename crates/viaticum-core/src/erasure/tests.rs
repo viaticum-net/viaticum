@@ -2,6 +2,7 @@ use rand::Rng;
 
 use super::{
     ErasureEncoder, ErasureError, RaptorQEncoder, Symbol, binding_seed, chunk_symbols_by_size,
+    pad_for_encoding,
 };
 use crate::types::{DeviceId, ErasureParams, SourceBlockId};
 
@@ -930,4 +931,158 @@ fn decode_with_k_above_max_returns_err() {
         enc.decode(&symbols, &params),
         Err(ErasureError::TooManySourceSymbols { .. })
     ));
+}
+
+// ─── R1-d-b: F5 (padding without a copy), F6 (source ESIs are slices), private plan, F8' ────
+
+/// F5: a blob padded in place by `pad_for_encoding` encodes to the same symbols as the unpadded one
+/// (which `encode_raw` pads by copy); a blob already k*t long is used as is.
+#[test]
+fn encode_raw_padded_input_gives_same_symbols_as_unpadded() {
+    let enc = encoder();
+    for size in [1usize, 65_535, 65_536, 3 * 65_535 - 7, 3 * 65_535] {
+        let source = test_data(size);
+        let params = ErasureParams::compute(size as u64, 0.5).unwrap();
+        let mut padded = source.clone();
+        pad_for_encoding(&mut padded, &params);
+        assert_eq!(padded.len(), params.k as usize * params.t as usize);
+        assert_eq!(&padded[..size], &source[..], "padding keeps the content");
+        assert!(padded[size..].iter().all(|&b| b == 0), "padding is zeros");
+
+        let count = params.k + 4;
+        let a = enc.encode_raw(&source, &params, 0, count).unwrap();
+        let b = enc.encode_raw(&padded, &params, 0, count).unwrap();
+        assert_eq!(a, b, "size {size}");
+    }
+}
+
+#[test]
+fn pad_for_encoding_leaves_a_full_or_longer_blob_alone() {
+    let params = ErasureParams::compute(65_535, 0.5).unwrap();
+    let mut full = test_data(65_535);
+    pad_for_encoding(&mut full, &params);
+    assert_eq!(full.len(), 65_535);
+    let mut longer = test_data(65_535 + 3);
+    pad_for_encoding(&mut longer, &params);
+    assert_eq!(
+        longer.len(),
+        65_535 + 3,
+        "never truncates the caller's blob"
+    );
+}
+
+/// F6: source ESIs are read off the input; they must equal what raptorq's own source_packets say.
+#[test]
+fn encode_raw_source_esis_equal_source_packets() {
+    let enc = encoder();
+    let (source, params) = multi_symbol_params();
+    let mut padded = source.clone();
+    pad_for_encoding(&mut padded, &params);
+    let config = RaptorQEncoder::make_config(&params);
+    let reference = raptorq::SourceBlockEncoder::new(0, &config, &padded);
+    let packets = reference.source_packets();
+    assert_eq!(packets.len(), params.k as usize);
+
+    let raw = enc.encode_raw(&source, &params, 0, params.k).unwrap();
+    assert_eq!(raw.len(), packets.len());
+    for (sym, packet) in raw.iter().zip(packets.iter()) {
+        assert_eq!(sym.data, packet.data(), "ESI {}", sym.esi);
+    }
+}
+
+/// W2: the private plan gives the same symbols as raptorq's cached one.
+#[test]
+fn encode_with_private_plan_equals_cached_plan() {
+    let enc = encoder();
+    let (source, params) = multi_symbol_params();
+    let mut padded = source.clone();
+    pad_for_encoding(&mut padded, &params);
+    let config = RaptorQEncoder::make_config(&params);
+    let cached = raptorq::SourceBlockEncoder::new(0, &config, &padded);
+    let expected = cached.repair_packets(0, 6);
+
+    let raw = enc.encode_raw(&source, &params, params.k, 6).unwrap();
+    for (sym, packet) in raw.iter().zip(expected.iter()) {
+        assert_eq!(sym.data, packet.data(), "ESI {}", sym.esi);
+    }
+}
+
+fn each_collect(
+    enc: &RaptorQEncoder,
+    source: &[u8],
+    params: &ErasureParams,
+    ranges: &[(u32, u32)],
+) -> Result<Vec<Symbol>, ErasureError> {
+    let mut out = Vec::new();
+    enc.encode_raw_ranges_each(source, params, ranges, &mut |esi, data| {
+        out.push(Symbol {
+            esi,
+            data: data.to_vec(),
+        });
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+#[test]
+fn encode_raw_ranges_each_yields_same_symbols_in_ascending_order() {
+    let enc = encoder();
+    let size = 3 * 65_535usize;
+    let source = test_data(size);
+    let params = ErasureParams::compute(size as u64, 0.5).unwrap();
+    assert_eq!(params.k, 3);
+    // Source and repair ESIs, an empty range, non-adjacent ranges.
+    let ranges = [(0u32, 2u32), (2, 0), (2, 3), (9, 2), (20, 1)];
+    let each = each_collect(&enc, &source, &params, &ranges).unwrap();
+    let together = enc.encode_raw_ranges(&source, &params, &ranges).unwrap();
+    assert_eq!(each, together);
+    let esis: Vec<u32> = each.iter().map(|s| s.esi).collect();
+    assert_eq!(esis, vec![0, 1, 2, 3, 4, 9, 10, 20]);
+}
+
+#[test]
+fn encode_raw_ranges_each_rejects_unordered_or_overlapping_ranges() {
+    let enc = encoder();
+    let (source, params) = multi_symbol_params();
+    for ranges in [[(5u32, 2u32), (1, 2)], [(0, 4), (3, 2)]] {
+        let mut called = false;
+        let err = enc
+            .encode_raw_ranges_each(&source, &params, &ranges, &mut |_, _| {
+                called = true;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, ErasureError::RangesNotAscending),
+            "{ranges:?}"
+        );
+        assert!(!called, "nothing is encoded before the check");
+    }
+}
+
+#[test]
+fn encode_raw_ranges_each_stops_at_the_first_callback_error() {
+    let enc = encoder();
+    let (source, params) = multi_symbol_params();
+    let mut seen = 0;
+    let err = enc
+        .encode_raw_ranges_each(&source, &params, &[(0, 10)], &mut |_, _| {
+            seen += 1;
+            if seen == 3 {
+                Err(ErasureError::DecodeFailed)
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+    assert!(matches!(err, ErasureError::DecodeFailed));
+    assert_eq!(seen, 3);
+}
+
+#[test]
+fn encode_raw_ranges_each_empty_block_returns_error() {
+    let enc = encoder();
+    let (_, params) = multi_symbol_params();
+    let err = each_collect(&enc, &[], &params, &[(0, 1)]).unwrap_err();
+    assert!(matches!(err, ErasureError::EmptyBlock));
 }

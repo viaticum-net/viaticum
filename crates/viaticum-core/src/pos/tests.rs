@@ -1,7 +1,7 @@
 use crate::constants::POS_BASE_CHALLENGES_PER_WEEK;
 use crate::pos::{
-    PosError, VerifyOutcome, apply_pos_outcome, challenges_per_week, compute_chain_hash,
-    due_challenges, outcome_from_verify, verify_hash_response,
+    ChainHasher, PosError, VerifyOutcome, apply_pos_outcome, challenges_per_week,
+    compute_chain_hash, due_challenges, outcome_from_verify, verify_hash_response,
 };
 use crate::types::{DeviceId, FileId, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp};
 
@@ -774,4 +774,62 @@ fn apply_pos_outcome_ignores_offered_placement() {
 #[test]
 fn apply_pos_outcome_ignores_accepted_placement() {
     assert_every_outcome_is_noop(PlacementStatus::Accepted);
+}
+
+// ─── ChainHasher (R1-d-b, F8') ──────────────────────────────────────────────
+
+/// Both sides of a challenge hash through one code path; the incremental hasher must give the
+/// same bytes as `compute_chain_hash` for 1, 2 and many symbols of different lengths.
+#[test]
+fn chain_hasher_equals_compute_chain_hash() {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    for n in [1usize, 2, 3, 17, 200] {
+        for _round in 0..5 {
+            let mut challenge_id = [0u8; 16];
+            rng.fill(&mut challenge_id);
+            let symbols: Vec<(u32, Vec<u8>)> = (0..n)
+                .map(|i| {
+                    let len = rng.random_range(0..3000usize);
+                    let data: Vec<u8> = (0..len).map(|_| rng.random::<u8>()).collect();
+                    (i as u32 * 3, data)
+                })
+                .collect();
+            let refs: Vec<(u32, &[u8])> = symbols.iter().map(|(e, d)| (*e, d.as_slice())).collect();
+            let expected = compute_chain_hash(&challenge_id, &refs).unwrap();
+
+            let mut hasher = ChainHasher::new(&challenge_id);
+            for (esi, data) in &symbols {
+                hasher.push(*esi, data);
+            }
+            assert_eq!(hasher.finish().unwrap(), expected, "n = {n}");
+        }
+    }
+}
+
+#[test]
+fn chain_hasher_without_symbols_is_an_error() {
+    let hasher = ChainHasher::new(&[1u8; 16]);
+    assert!(matches!(
+        hasher.finish(),
+        Err(PosError::ChainHashEmptyInput)
+    ));
+}
+
+/// A repeated ESI is hashed once per push (owner and holder both expand ranges without dedup).
+#[test]
+fn chain_hasher_hashes_a_repeated_symbol_each_time_it_is_pushed() {
+    let id = [9u8; 16];
+    let data = [5u8; 40];
+    let mut once = ChainHasher::new(&id);
+    once.push(4, &data);
+    let mut twice = ChainHasher::new(&id);
+    twice.push(4, &data);
+    twice.push(4, &data);
+    assert_ne!(once.finish().unwrap(), twice.finish().unwrap());
+    let doubled = compute_chain_hash(&id, &[(4, &data[..]), (4, &data[..])]).unwrap();
+    let mut again = ChainHasher::new(&id);
+    again.push(4, &data);
+    again.push(4, &data);
+    assert_eq!(again.finish().unwrap(), doubled);
 }

@@ -134,3 +134,10 @@ opt-level = 2
 
 [profile.dev.package.viaticum-sim]
 opt-level = 3
+
+# raptorq's debug assertions make its encoding-plan generation cubic in K (K = 1024: 9 s,
+# K = 2048: 35-70 s; release: 4 ms at 1024). The plan tests of R1-d-b (K = 4096, 16384) need it
+# as fast as in production; the library's checks are not what our tests exercise.
+[profile.dev.package.raptorq]
+opt-level = 3
+debug-assertions = false
