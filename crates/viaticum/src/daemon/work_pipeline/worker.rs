@@ -47,9 +47,12 @@ pub(crate) struct WorkOutcome {
     pub encoded: bool,
     /// Number of holders an offer was actually sent to (Offered records written).
     /// `0` = nobody to take symbols (with `encoded = false`), or the block left service
-    /// between the plan and the write (with `encoded = true`, repair-i16) — the caller
-    /// parks the block (repair-i4).
+    /// between the plan and the write (`left_service`, repair-i16) — the caller parks the
+    /// block (repair-i4).
     pub offered: usize,
+    /// The block left service between the plan and the write of the offers (repair-i16):
+    /// no offer recorded, nothing delivered.
+    pub left_service: bool,
 }
 
 /// Holders excluded from a new offer of one block (repair-i2).
@@ -134,6 +137,7 @@ pub(crate) async fn run_block_iteration(
                 failed: 0,
                 encoded: false,
                 offered: 0,
+                left_service: false,
             });
         }
         OfferPlan::EmptyAllocation => {
@@ -146,6 +150,7 @@ pub(crate) async fn run_block_iteration(
                 failed: 0,
                 encoded: false,
                 offered: 0,
+                left_service: false,
             });
         }
         OfferPlan::AllocationFailed(e) => {
@@ -158,6 +163,7 @@ pub(crate) async fn run_block_iteration(
                 failed: 0,
                 encoded: false,
                 offered: 0,
+                left_service: false,
             });
         }
     };
@@ -203,6 +209,7 @@ pub(crate) async fn run_block_iteration(
             failed: 0,
             encoded: true,
             offered: 0,
+            left_service: true,
         });
     }
 
@@ -273,6 +280,7 @@ pub(crate) async fn run_block_iteration(
         failed,
         encoded: true,
         offered,
+        left_service: false,
     })
 }
 

@@ -2200,3 +2200,44 @@ async fn effective_status_is_releasing_when_block_is_deleting_even_with_alive_pl
         Some(EffectiveStatus::Releasing)
     );
 }
+
+async fn doc_versions(state: &DaemonState) -> Vec<crate::cli::types::VersionEntry> {
+    let CliResponse::Versions(v) = dispatch(
+        CliRequest::Versions {
+            path: "doc.pdf".into(),
+        },
+        state,
+    )
+    .await
+    else {
+        panic!("expected Versions");
+    };
+    v
+}
+
+/// restore-i3 (2026-09-30): a version whose block is being released shows the restore
+/// blocker "being released", not "restorable" with no blocker, although its `Alive`
+/// placements could decode it.
+#[tokio::test]
+async fn restore_blocker_is_being_released_when_block_is_deleting() {
+    use crate::cli::types::{EffectiveStatus, RestoreBlocker};
+    use viaticum_core::types::{PlacementStatus, SourceBlockStatus};
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "doc.pdf", 0.99, 0.95, true);
+    block_placement(&state, 0x51, 50, PlacementStatus::Alive);
+    let before = doc_versions(&state).await;
+    assert!(matches!(
+        before[0].effective_status,
+        EffectiveStatus::Restorable { .. }
+    ));
+    assert_eq!(before[0].restore_blocker, None, "control: in service");
+
+    set_block_status(&state, SourceBlockStatus::Deleting);
+
+    let after = doc_versions(&state).await;
+    assert_eq!(after[0].effective_status, EffectiveStatus::Releasing);
+    assert_eq!(
+        after[0].restore_blocker,
+        Some(RestoreBlocker::BeingReleased)
+    );
+}

@@ -651,6 +651,9 @@ fn dispatch_versions(state: &DaemonState, path: &str) -> CliResponse {
                         holders_offline,
                     })
                 }
+                // restore-i3 (2026-09-30): holders that got the block's Delete no longer
+                // serve it; never shown as restorable.
+                EffectiveStatus::Releasing => Some(RestoreBlocker::BeingReleased),
                 _ => None,
             };
             VersionEntry {

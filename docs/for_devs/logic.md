@@ -117,7 +117,10 @@ choice is re-checked inside the write transaction. `g` is stored in the block re
 (`seal_generation`, omitted when 0, so blocks and SystemState from before are unchanged)
 and rides SystemState; every rebuild (worker, PoS, local restore tier) seals at it.
 Decryption reads the nonce from the blob and needs no generation. An id becomes free only
-after `CleanupBlock`, no earlier than the holder window after the Delete, and a Delete
+after `CleanupBlock`, no earlier than the holder window after the Delete (until L2 that
+window is counted from the theoretical release time — owner deletion + owner window — not
+from the moment the Delete was actually published; a node that was off longer than the
+owner window can therefore free an id while its late Delete still lives), and a Delete
 lives at a postman at most its TTL plus one sweep: `TTL + sweep < holder window` is a
 compile-time assertion.
 

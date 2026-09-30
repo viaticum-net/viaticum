@@ -98,6 +98,8 @@ enum ParkReason {
     NoSwarm,
     NoCandidates,
     IterationError,
+    /// The block left service before its offers were written (repair-i16).
+    LeftService,
 }
 
 impl ParkReason {
@@ -107,6 +109,7 @@ impl ParkReason {
             ParkReason::NoSwarm => "no swarm",
             ParkReason::NoCandidates => "no candidates",
             ParkReason::IterationError => "iteration error",
+            ParkReason::LeftService => "left service (being released)",
         }
     }
 }
@@ -132,6 +135,9 @@ enum BlockAttempt {
     PoolUnusable,
     /// The iteration failed (e.g. unreadable source); parked.
     Error,
+    /// The block left service before its offers were written (repair-i16); parked; the
+    /// next block may do better.
+    LeftService,
 }
 
 // ─── WorkPipeline ─────────────────────────────────────────────────────────────
@@ -290,7 +296,10 @@ impl WorkPipeline {
             picked_any = true;
 
             let attempt = self.work_on_block(&block, &pool, now).await?;
-            if attempt != BlockAttempt::NoCandidates {
+            if !matches!(
+                attempt,
+                BlockAttempt::NoCandidates | BlockAttempt::LeftService
+            ) {
                 break;
             }
         }
@@ -361,7 +370,10 @@ impl WorkPipeline {
                     offered = wo.offered,
                     "work_pipeline: iteration complete"
                 );
-                if wo.offered > 0 {
+                if wo.left_service {
+                    self.update_block_cooldown(block, pool, now, Some(ParkReason::LeftService));
+                    Ok(BlockAttempt::LeftService)
+                } else if wo.offered > 0 {
                     // Offers went out (accepted or not): retry after the normal
                     // cooldown — a network failure is not "nobody can take it".
                     self.update_block_cooldown(block, pool, now, None);
@@ -414,6 +426,11 @@ impl WorkPipeline {
                 block_id = %block.block_id,
                 reason = reason.as_str(),
                 "work_pipeline: block parked (nobody can take symbols)"
+            ),
+            Some(reason @ ParkReason::LeftService) => tracing::info!(
+                block_id = %block.block_id,
+                reason = reason.as_str(),
+                "work_pipeline: block parked (left service before the offers)"
             ),
             Some(reason) => tracing::info!(
                 block_id = %block.block_id,

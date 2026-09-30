@@ -28,7 +28,7 @@
 #               unrebuildable member as a dedup target (L2 K-5); cluster siblings; the worker race
 #               (units, repair-i16); is_safe_to_delete (units); a file put back while the node is
 #               off in production (weekly startup scan, Q2).
-# Expectation:  RED on vps/l0 baaf3eb (before L1b): 1b (Q waits for the 60 s periodic rescan), 5,
+# Expectation:  RED on vps/l1b base 635ef2d (before L1b): 1b (Q waits for the 60 s periodic rescan), 5,
 #               6, 7, 8 (the returned file dedups onto the block being released: last block = the
 #               old id), 9 (no symbols of the returned files after the windows), 10 (no new id),
 #               11 (restore of R, R2, Y-again, m2 fails: holders wiped or do not serve the block).
@@ -41,10 +41,10 @@
 #       XS pairwise different; m1..m3 on one PM (else FAIL "setup: pack not built"); each block
 #       >= k_eff on holder disks
 #   1b. ADVERSARIAL kill -9 before the flush: wait for node-00's "periodic rescan complete"
-#       (<= 70 s) → mv Q.bin in; sleep 0.4; kill -9; start (a fresh Qn.bin on each repeat).
-#       setup: no "pipeline complete" after LINE_Q before the kill (else repeat with sleep 0.2,
-#       <= 2 times; FAIL setup); Q in the catalog <= 5 s (else the kill beat the event: repeat
-#       with sleep 0.6); "scan skipped (last scan recent enough)" in the new instance (else
+#       (<= 90 s) → mv Q.bin in; sleep 0.2; kill -9; start (a fresh Qn.bin on each repeat).
+#       setup: no "pipeline complete" after LINE_Q before the kill (else restart node-00 and
+#       repeat with sleep 0.1; FAIL setup after 5 attempts); Q in the catalog <= 5 s (else the
+#       kill beat the event: repeat with sleep 0.4); "scan skipped (last scan recent enough)" in the new instance (else
 #       repeat, <= 2 times, then ROUGH); <= 10 s from the start Q backed up and "reconcile:
 #       resubmitted root=…/files … pending=N", N >= 1; <= 20 s after wait_auth_peers 4, Q >=
 #       k_eff on holders; no periodic rescan in the window (else repeat) (backup-i25)
@@ -439,7 +439,8 @@ PIPE_SEED=$(owner_since 0 "backup: pipeline complete")
 echo ""
 echo "=== Step 1b: ADVERSARIAL kill -9 between enqueue and flush (backup-i25) ==="
 STEP1B_DONE=0
-pause=0.4
+# The idle flush runs every 1 s: a short pause keeps Q queued at the kill.
+pause=0.2
 SCAN_REPEATS=0
 for attempt in 1 2 3 4 5; do
     QN="Q$attempt.bin"; [ "$attempt" -eq 1 ] && QN="Q.bin"
@@ -448,19 +449,21 @@ for attempt in 1 2 3 4 5; do
     LINE_P=$(log_line_count 0)
     # Right after a periodic rescan: the restart then skips its start scan.
     SAW_RESCAN=0
-    for _ in $(seq 1 70); do
+    for _ in $(seq 1 90); do
         if has "$(log_since 0 "$LINE_P")" "periodic rescan complete"; then SAW_RESCAN=1; break; fi
         sleep 1
     done
-    [ "$SAW_RESCAN" -eq 1 ] || { fail "setup: no periodic rescan at node-00 within 70s"; break; }
+    [ "$SAW_RESCAN" -eq 1 ] || { fail "setup: no periodic rescan at node-00 within 90s"; break; }
     LINE_Q=$(log_line_count 0)
     mv "$SRC/$QN" "$Q"
     sleep "$pause"
     kill -9 "${DPID[0]}"
     wait "${DPID[0]}" 2>/dev/null || true
     if [ "$(owner_since "$LINE_Q" "backup: pipeline complete")" -ge 1 ]; then
-        info "attempt $attempt: Q was packed before the kill; repeating with sleep 0.2"
-        pause=0.2; continue
+        info "attempt $attempt: Q was packed before the kill; restarting node-00, repeating with a fresh file and sleep 0.1"
+        start_node 0
+        wait_daemon 0 || { fail "node-00 did not restart after kill -9"; exit 1; }
+        pause=0.1; continue
     fi
     LINE_START=$(log_line_count 0)
     start_node 0
@@ -472,8 +475,8 @@ for attempt in 1 2 3 4 5; do
         sleep 1
     done
     if [ "$IN_CAT" -eq 0 ]; then
-        info "attempt $attempt: Q not in the catalog: the kill beat the event; repeating with sleep 0.6"
-        pause=0.6; continue
+        info "attempt $attempt: Q not in the catalog: the kill beat the event; repeating with sleep 0.4"
+        pause=0.4; continue
     fi
     if ! has "$(log_since 0 "$LINE_START")" "scan skipped (last scan recent enough)"; then
         SCAN_REPEATS=$((SCAN_REPEATS + 1))

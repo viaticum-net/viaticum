@@ -101,6 +101,12 @@ export function explainRestoreBlocker(b) {
         hint: 'Wait for at least one holder to come online.',
         eta: '',
       };
+    case 'being_released':
+      return {
+        reason: 'This version is being released: friends are dropping their copies.',
+        hint: 'If the file is back in your folder, it is being backed up again under a new block.',
+        eta: '',
+      };
     default:
       return { reason: b.kind, hint: '', eta: '' };
   }

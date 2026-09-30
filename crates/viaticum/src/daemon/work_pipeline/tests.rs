@@ -2160,6 +2160,11 @@ async fn worker_iteration_delivers_only_recorded_offers() {
     let outcome = run(released.clone()).await;
 
     assert_eq!(outcome.offered, 0);
+    assert!(
+        outcome.left_service,
+        "parked as left service, not 'no candidates'"
+    );
+    assert!(!control.left_service);
     assert_eq!((outcome.acked, outcome.failed), (0, 0), "nothing delivered");
     assert!(
         db.list_placements_for_block(&released.block_id)

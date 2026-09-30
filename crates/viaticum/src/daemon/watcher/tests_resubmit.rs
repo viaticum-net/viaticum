@@ -177,6 +177,23 @@ async fn resubmit_skips_path_under_errored_root() {
     assert_eq!(counts_of(&counts, &root).root_unavailable, 1);
 }
 
+/// backup-i25 / backup-i8 (2026-09-30): a root whose watch failed (inotify limit, an
+/// unreadable subfolder) but is the recorded directory is scanned, so it takes a resubmit.
+#[tokio::test]
+async fn resubmit_emits_for_watch_failed_root_with_same_identity() {
+    let (_tmp, root, data) = setup();
+    let a = root.join("a.bin");
+    std::fs::write(&a, b"a").unwrap();
+    let mut h = H::start(std::slice::from_ref(&root), &data).await;
+    // What `register_all` records when `watch()` fails.
+    h.lp.watch_failed.insert(root.clone());
+
+    let (counts, sent) = h.resubmit(&[(&a, ResubmitReason::Pending)]).await;
+
+    assert_eq!(sent, vec![(s(&a), DirtyKind::Modified)]);
+    assert_eq!(counts_of(&counts, &root).pending, 1);
+}
+
 /// dr-i64: another directory stands at the root (not noticed by an event yet): its files
 /// are not taken for the recorded folder's.
 #[tokio::test]

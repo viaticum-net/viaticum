@@ -23,7 +23,7 @@ use viaticum_core::types::{
     Timestamp,
 };
 
-use super::generation::{Committed, choose_generation, commit_block_record};
+use super::generation::{Committed, before_commit, choose_generation, commit_block_record};
 use super::packing::build_plaintext;
 use super::{BackupConfig, PipelineResult, QueuedFile};
 
@@ -221,6 +221,7 @@ pub fn run_pipeline(
         // 5. DB: the source block record only (A4). Backup creates no placements and emits
         // no SymbolsPlaced events — the WorkPipeline worker is their sole creator, and it
         // re-encodes from source (Wave 11b: no symbols on disk).
+        before_commit(db, sealed.block_id);
         let result = match commit_block_record(db, &block_record)? {
             Committed::Changed(now) => {
                 tracing::debug!(
@@ -232,6 +233,19 @@ pub fn run_pipeline(
                 continue;
             }
             Committed::Written => {
+                if !sealed.skipped.is_empty() {
+                    let released: Vec<String> = sealed
+                        .skipped
+                        .iter()
+                        .map(|(id, s)| format!("{id}:{s:?}"))
+                        .collect();
+                    tracing::info!(
+                        block_id = %sealed.block_id,
+                        seal_generation = sealed.generation,
+                        released = %released.join(","),
+                        "backup: sealed as a new generation; the earlier id is being released"
+                    );
+                }
                 tracing::info!(
                     block_id = %sealed.block_id,
                     k = params.k,
@@ -266,19 +280,6 @@ pub fn run_pipeline(
                 }
             }
         };
-        if !sealed.skipped.is_empty() {
-            let released: Vec<String> = sealed
-                .skipped
-                .iter()
-                .map(|(id, s)| format!("{id}:{s:?}"))
-                .collect();
-            tracing::info!(
-                block_id = %sealed.block_id,
-                seal_generation = sealed.generation,
-                released = %released.join(","),
-                "backup: sealed as a new generation; the earlier id is being released"
-            );
-        }
         return Ok(result);
     }
     anyhow::bail!(

@@ -57,6 +57,28 @@ pub(crate) fn choose_generation(
     )
 }
 
+/// The test seam's callback.
+#[cfg(test)]
+pub(crate) type CommitHook = Box<dyn FnMut(&Db, SourceBlockId)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam between the choice and the write transaction (`run_pipeline`): simulates
+    /// the deletion executor writing the chosen id meanwhile.
+    pub(crate) static BEFORE_COMMIT: std::cell::RefCell<Option<CommitHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs the test seam, if one is set (no-op outside tests).
+pub(crate) fn before_commit(_db: &Db, _block_id: SourceBlockId) {
+    #[cfg(test)]
+    BEFORE_COMMIT.with(|h| {
+        if let Some(f) = h.borrow_mut().as_mut() {
+            f(_db, _block_id);
+        }
+    });
+}
+
 /// What the write transaction found at the chosen id.
 #[derive(Debug)]
 pub(crate) enum Committed {

@@ -504,6 +504,10 @@ pub enum RestoreBlocker {
     },
     /// All `Alive` holders are unreachable (last_seen too old).
     AllHoldersOffline { last_seen_secs_ago: u64 },
+    /// The version's block is being released (`EffectiveStatus::Releasing`): holders
+    /// that got its Delete stop serving it, whatever the placements count (restore-i3,
+    /// 2026-09-30).
+    BeingReleased,
 }
 
 /// File entry for `viaticum files`.

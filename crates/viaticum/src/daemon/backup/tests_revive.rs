@@ -529,3 +529,91 @@ fn flush_packs_file_changed_to_content_only_on_releasing_block() {
     assert_eq!(v.content_hash, hash(&b));
     assert_ne!(v.source_block_id, xb);
 }
+
+/// backup-i8 (2026-09-30): a whole folder returned by one `mv` and packed from the same
+/// members in the same order is the same plaintext as the pack being released: it takes the
+/// next generation of the pack, and every member points at it.
+#[test]
+fn returned_pack_of_same_members_takes_next_generation() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let mut c = coord(&db);
+    let members: Vec<(String, Vec<u8>)> = (0..3u8)
+        .map(|i| {
+            let bytes = content(40 + i, 4096);
+            (write(&dir, &format!("m{i}.bin"), &bytes), bytes)
+        })
+        .collect();
+    for (p, _) in &members {
+        c.process_event(event(p, DirtyKind::Added)).unwrap();
+    }
+    assert_eq!(flush(&mut c), 1, "setup: one pack");
+    let pm = last(&db, &members[0].0).source_block_id;
+    for (p, _) in &members {
+        assert_eq!(
+            last(&db, p).source_block_id,
+            pm,
+            "setup: members on one pack"
+        );
+        delete(&mut c, p);
+    }
+    release(&db, pm);
+
+    for (p, bytes) in &members {
+        std::fs::write(p, bytes).unwrap();
+        c.process_event(event(p, DirtyKind::Added)).unwrap();
+    }
+    assert_eq!(flush(&mut c), 1);
+
+    let again = last(&db, &members[0].0).source_block_id;
+    assert_ne!(again, pm);
+    assert_eq!(block(&db, again).seal_generation, 1, "the same plaintext");
+    for (p, _) in &members {
+        let v = last(&db, p);
+        assert_eq!(v.source_block_id, again);
+        assert!(v.backed_up_at.is_some());
+    }
+    assert_eq!(block(&db, pm).status, SourceBlockStatus::Deleting);
+}
+
+/// Р-4 through `run_pipeline`: the deletion executor writes the chosen id between the choice
+/// and the write transaction → nothing is written over it, the loop chooses again and takes
+/// the next generation.
+#[test]
+fn run_pipeline_takes_next_generation_when_chosen_id_turns_releasing_before_the_write() {
+    use super::generation::BEFORE_COMMIT;
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let mut c = coord(&db);
+    let p = write(&dir, "race.bin", &content(50, 4096));
+    c.process_event(event(&p, DirtyKind::Added)).unwrap();
+    let seen: std::rc::Rc<std::cell::RefCell<Vec<SourceBlockId>>> = Default::default();
+    let seen_in_hook = std::rc::Rc::clone(&seen);
+    BEFORE_COMMIT.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move |db: &Db, id: SourceBlockId| {
+            if seen_in_hook.borrow().is_empty() {
+                active_block(db, id);
+                release(db, id);
+            }
+            seen_in_hook.borrow_mut().push(id);
+        }));
+    });
+
+    let packed = flush(&mut c);
+    BEFORE_COMMIT.with(|h| *h.borrow_mut() = None);
+
+    assert_eq!(packed, 1);
+    let ids = seen.borrow().clone();
+    assert_eq!(ids.len(), 2, "chosen twice: {ids:?}");
+    assert_ne!(ids[0], ids[1]);
+    let v = last(&db, &p);
+    assert_eq!(v.source_block_id, ids[1]);
+    assert_eq!(block(&db, ids[1]).seal_generation, 1);
+    let raced = block(&db, ids[0]);
+    assert_eq!(
+        raced.status,
+        SourceBlockStatus::Deleting,
+        "not written over"
+    );
+    assert_eq!(raced.seal_generation, 0);
+}

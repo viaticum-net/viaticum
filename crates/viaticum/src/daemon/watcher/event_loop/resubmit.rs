@@ -1,8 +1,8 @@
 // The backup reconcile's paths (L1b: backup-i8, backup-i25; W2 of the intent review).
 //
 // The reconcile knows the catalog, the watcher knows the roots: a path comes back as
-// `Modified` only when its root is watched, not in error, its identity is the recorded one
-// (`RootCheck::Same`), it passes the scan filters (`should_watch_path`, no Viaticum data dir
+// `Modified` only when its root is not under the root rule and its identity is the recorded
+// one (`RootCheck::Same`; a root whose watch failed is scanned and takes it too), it passes the scan filters (`should_watch_path`, no Viaticum data dir
 // between the root and it, a symlink only to a file outside data dirs) and it is a file on
 // disk. Everything else is only counted (INV-RC: the reconcile never deletes, and a root in
 // error or replaced never re-reads or confirms what lies under it, dr-i64).
@@ -26,7 +26,7 @@ pub(crate) struct ResubmitCounts {
     pub gone: u32,
     /// Outside every root, ignored, hidden, in a data dir, or not a regular file.
     pub filtered: u32,
-    /// The root is in error, not watched, or not the recorded directory.
+    /// The root is under the root rule (lost) or not the recorded directory.
     pub root_unavailable: u32,
 }
 
@@ -95,10 +95,10 @@ impl WatchLoop {
         ig: &super::super::IgnoreSet,
         data_dirs: &mut HashMap<PathBuf, bool>,
     ) -> Verdict {
-        if self.lost.contains(root)
-            || self.watch_failed.contains(root)
-            || self.check_root(root) != RootCheck::Same
-        {
+        // A root whose watch failed (inotify limit, an unreadable subfolder) but is the
+        // recorded directory is scanned, so it takes a resubmit too (backup-i25 / backup-i8,
+        // 2026-09-30); a lost or replaced root does not (dr-i64).
+        if self.lost.contains(root) || self.check_root(root) != RootCheck::Same {
             return Verdict::RootUnavailable;
         }
         if !should_watch_path(path, ig) || data_dir_between(root, path, data_dirs) {

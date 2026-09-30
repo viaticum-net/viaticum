@@ -917,8 +917,8 @@ impl Scheduler {
     ///   1. SystemState retained blob (`<data_dir>/system_state/<hex>.bin`) — SS blocks
     ///      have no backing watch-dir file; the owner retains the blob for PoS re-encode.
     ///      Corruption is propagated loudly; absence falls through.
-    ///   2. Rebuild from the owner's source files via compress_and_encrypt (same path as
-    ///      `Processor::rebuild_blob_for_pos`).
+    ///   2. Rebuild from the owner's source files via `rebuild_blob_blocking`, sealed at the
+    ///      record's `seal_generation` (the worker rebuilds through the same function).
     ///
     /// PL-6: the old on-disk `{source_blocks_dir}/{block_hex}/block.bin` middle tier was
     /// removed. Wave 11b never writes `block.bin` (the symbol pipeline persists nothing
