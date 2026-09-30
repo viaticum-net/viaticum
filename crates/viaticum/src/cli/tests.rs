@@ -298,6 +298,9 @@ fn make_status_zero_peers() -> StatusData {
         dr_waiting_since: 0,
         dr_waiting: String::new(),
         dr_restores_state_of: 0,
+        files_too_large: 0,
+        max_file_size_bytes: 0,
+        block_work_budget_bytes: 0,
     }
 }
 
@@ -516,6 +519,9 @@ fn format_status_top_peers_printed() {
         dr_waiting_since: 0,
         dr_waiting: String::new(),
         dr_restores_state_of: 0,
+        files_too_large: 0,
+        max_file_size_bytes: 0,
+        block_work_budget_bytes: 0,
     };
     let rendered = output::render_status(&data);
     assert!(rendered.contains("a1b2c3d4"), "got: {rendered}");
@@ -545,6 +551,7 @@ fn format_files_single_entry_singular_version() {
         local_state: "present".into(),
         effective_status: None,
         is_safe_to_delete: false,
+        too_large: None,
     }];
     let rendered = output::render_files(&files);
     assert!(rendered.contains("1 version"), "got: {rendered}");
@@ -566,6 +573,7 @@ fn format_files_multiple_versions_plural() {
         local_state: "present".into(),
         effective_status: None,
         is_safe_to_delete: false,
+        too_large: None,
     }];
     let rendered = output::render_files(&files);
     assert!(rendered.contains("5 versions"), "got: {rendered}");
@@ -976,6 +984,9 @@ fn cli_response_roundtrips_cbor() {
             dr_waiting_since: 0,
             dr_waiting: String::new(),
             dr_restores_state_of: 0,
+            files_too_large: 0,
+            max_file_size_bytes: 0,
+            block_work_budget_bytes: 0,
         })),
         CliResponse::DeviceList(vec![]),
         CliResponse::Error("oops".into()),
@@ -1772,4 +1783,75 @@ fn restore_job_wire_omits_waiting_field_unless_waiting() {
     assert_eq!(waiting["waiting_for_holders_until"], "2026-09-27T10:05:00Z");
     let back: RestoreJob = serde_json::from_value(plain).unwrap();
     assert_eq!(back.waiting_for_holders_until, None);
+}
+
+// ============================================================
+// R1-d-a (backup-i4, backup-i7): too-large files
+// ============================================================
+
+fn too_large_entry(last_backed_up: &str, versions: u32) -> FileEntry {
+    FileEntry {
+        path: "movies/huge.mkv".into(),
+        versions,
+        last_backed_up: last_backed_up.into(),
+        size_bytes: 0,
+        local_state: "present".into(),
+        effective_status: None,
+        is_safe_to_delete: false,
+        too_large: Some(crate::cli::types::TooLargeInfo {
+            size_bytes: 4 * 1024 * 1024 * 1024,
+            limit_bytes: 256 * 1024 * 1024,
+            since: "2026-09-30".into(),
+        }),
+    }
+}
+
+#[test]
+fn render_files_shows_too_large_instead_of_date() {
+    let rendered = output::render_files(&[too_large_entry("never", 0)]);
+    assert!(
+        rendered.contains("too large for this machine (4.00 GB > 256.0 MB)"),
+        "got: {rendered}"
+    );
+    assert!(
+        rendered.contains("not supported yet, not backed up"),
+        "got: {rendered}"
+    );
+    assert!(!rendered.contains("never"), "no date column: {rendered}");
+    assert!(!rendered.contains("0 versions"), "got: {rendered}");
+}
+
+#[test]
+fn render_files_names_the_kept_version_of_a_grown_file() {
+    let rendered = output::render_files(&[too_large_entry("2026-09-01", 2)]);
+    assert!(
+        rendered.contains("too large for this machine"),
+        "got: {rendered}"
+    );
+    assert!(
+        rendered.contains("the version of 2026-09-01 is kept in the network but no longer checked"),
+        "got: {rendered}"
+    );
+}
+
+#[test]
+fn render_status_reports_too_large_files_and_the_limit() {
+    let mut data = make_status_zero_peers();
+    let quiet = output::render_status(&data);
+    assert!(!quiet.contains("too large:"), "got: {quiet}");
+    assert!(!quiet.contains("size limit:"), "got: {quiet}");
+
+    data.files_too_large = 2;
+    data.max_file_size_bytes = 256 * 1024 * 1024;
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("size limit:     256.0 MB per file on this machine"),
+        "got: {rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "too large:      2 file(s) above the limit: not supported yet, not backed up"
+        ),
+        "got: {rendered}"
+    );
 }

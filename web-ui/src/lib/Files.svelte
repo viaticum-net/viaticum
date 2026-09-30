@@ -1,7 +1,7 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
   import {
-    formatBytes, formatTime, statusBadge, restoreAction,
+    formatBytes, formatTime, statusBadge, tooLargeBadge, isBackedUp, restoreAction,
     explainRestoreRejection, describeRestoreJob,
   } from './utils.js';
 
@@ -103,7 +103,7 @@
     // Roll up counts (DFS).
     function roll(n) {
       let total = n.files.length;
-      let backed = n.files.filter(x => x.last_backed_up !== 'pending').length;
+      let backed = n.files.filter(isBackedUp).length;
       let size = n.files.reduce((s, x) => s + (x.size_bytes || 0), 0);
       for (const child of Object.values(n.dirs)) {
         roll(child);
@@ -132,7 +132,7 @@
         const sub = visit(child);
         if (sub.total > 0) out.dirs[k] = sub;
       }
-      let total = out.files.length, backed = out.files.filter(x => x.last_backed_up !== 'pending').length;
+      let total = out.files.length, backed = out.files.filter(isBackedUp).length;
       let size = out.files.reduce((s, x) => s + (x.size_bytes || 0), 0);
       for (const c of Object.values(out.dirs)) { total += c.total; backed += c.backed_up; size += c.size; }
       out.total = total; out.backed_up = backed; out.size = size;
@@ -283,7 +283,8 @@
 {/snippet}
 
 {#snippet renderFile(f, depth)}
-  {@const b = statusBadge(f.effective_status)}
+  {@const tl = tooLargeBadge(f.too_large, f.last_backed_up)}
+  {@const b = tl ?? statusBadge(f.effective_status)}
   <div class="row file-row" style="--depth: {depth}" onclick={() => fetchVersions(f.path)} role="button" tabindex="0" onkeydown={(e) => e.key === 'Enter' && fetchVersions(f.path)}>
     <span class="caret"> </span>
     <span class="name file-name">{f.name}</span>
@@ -291,18 +292,23 @@
       <span class="badge badge-{b.kind}" title={b.tooltip}>
         {b.label}
       </span>
-      {#if f.local_state === 'present'}
+      {#if f.local_state === 'present' && !tl}
         {#if f.is_safe_to_delete}
           <!-- delete-i7: the network keeps the current state of your files, not a history;
                a file deleted from this computer leaves the network after the deletion window. Never
                suggest the local copy can go. -->
           <span class="badge badge-ok" title="Reached its target reliability on the network. Keep your local copy: a file deleted from this computer is removed from the network too after the deletion window.">at target</span>
-        {:else if f.last_backed_up !== 'pending'}
+        {:else if f.last_backed_up !== 'pending' && f.last_backed_up !== 'never'}
           <span class="badge badge-working" title="Below its target reliability — the network is still adding redundancy.">below target</span>
         {/if}
       {/if}
-      {formatBytes(f.size_bytes)}
-      <span class="muted">· {formatTime(f.last_backed_up)}</span>
+      {#if tl}
+        {formatBytes(f.too_large.size_bytes)}
+        <span class="muted">· {f.last_backed_up === 'never' ? 'not backed up' : `last backed up ${formatTime(f.last_backed_up)}`}</span>
+      {:else}
+        {formatBytes(f.size_bytes)}
+        <span class="muted">· {formatTime(f.last_backed_up)}</span>
+      {/if}
     </span>
   </div>
 {/snippet}

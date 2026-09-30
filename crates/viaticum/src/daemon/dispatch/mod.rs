@@ -351,7 +351,42 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         dr_waiting_since: dr.waiting_since,
         dr_waiting: dr.waiting,
         dr_restores_state_of: dr.restores_state_of,
+        files_too_large: count_too_large_under_watches(state),
+        max_file_size_bytes: state.max_file_size_bytes,
+        // R1-d-b sets the block work budget.
+        block_work_budget_bytes: 0,
     }))
+}
+
+/// backup-i4: the too-large marks of files under the watch directories now. A mark left
+/// by a folder that was unwatched since is not counted (the start pass drops it). Without a
+/// watch admin (web API off; tests) every mark counts. A DB error counts none.
+fn count_too_large_under_watches(state: &DaemonState) -> u32 {
+    let marks = match state.db.list_too_large() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(err = %e, "status: cannot list the too-large marks");
+            return 0;
+        }
+    };
+    let Some(admin) = state.watch_admin.as_ref() else {
+        return marks.len() as u32;
+    };
+    let roots: Vec<std::path::PathBuf> = admin
+        .live_configs
+        .read()
+        .expect("live_configs lock poisoned")
+        .iter()
+        .map(|wc| viaticum_core::config::expand_watch_path(&wc.path))
+        .collect();
+    marks
+        .iter()
+        .filter(|(path, _)| {
+            roots
+                .iter()
+                .any(|root| std::path::Path::new(path).starts_with(root))
+        })
+        .count() as u32
 }
 
 /// Status fields about DR readiness (dr-i9, dr-i39, dr-i41, dr-i49; mailbox-i49, i54)
@@ -480,6 +515,11 @@ pub(crate) fn waiting_words(reason: WaitingReason) -> &'static str {
 /// safe, whatever its cached reliability says (backup-i8, backup-i21: the cache is not
 /// recomputed when the block turns `Deleting`).
 fn compute_is_safe_to_delete(state: &DaemonState, file: &FileRecord) -> bool {
+    // backup-i4: a file whose current content is above the limit is not protected, whatever
+    // its older version says. A DB error answers "no".
+    if !matches!(state.db.get_too_large(&file.path), Ok(None)) {
+        return false;
+    }
     let Some(version) = file.versions.last() else {
         return false;
     };
@@ -568,6 +608,14 @@ fn compute_effective_status(state: &DaemonState, version: &FileVersion) -> Effec
     }
 }
 
+fn too_large_info(mark: &viaticum_core::types::TooLargeMark) -> crate::cli::types::TooLargeInfo {
+    crate::cli::types::TooLargeInfo {
+        size_bytes: mark.size_bytes,
+        limit_bytes: mark.limit_bytes,
+        since: timestamp_to_iso_date(mark.first_seen),
+    }
+}
+
 fn dispatch_files(state: &DaemonState, path_prefix: Option<String>) -> CliResponse {
     let records = match path_prefix {
         Some(ref prefix) => state.db.list_files_with_prefix(prefix),
@@ -580,7 +628,15 @@ fn dispatch_files(state: &DaemonState, path_prefix: Option<String>) -> CliRespon
         }
     };
 
-    let entries: Vec<FileEntry> = records
+    let marks: std::collections::HashMap<String, viaticum_core::types::TooLargeMark> =
+        match state.db.list_too_large() {
+            Ok(m) => m.into_iter().collect(),
+            Err(e) => {
+                return CliResponse::Error(format!("db error listing too-large marks: {e}"));
+            }
+        };
+
+    let mut entries: Vec<FileEntry> = records
         .iter()
         .map(|f| {
             let latest = f.versions.last();
@@ -609,9 +665,34 @@ fn dispatch_files(state: &DaemonState, path_prefix: Option<String>) -> CliRespon
                 local_state,
                 effective_status,
                 is_safe_to_delete,
+                too_large: marks.get(&f.path).map(too_large_info),
             }
         })
         .collect();
+
+    // A marked file with no catalog record was never backed up: the mark is all there is.
+    let listed: std::collections::HashSet<&str> = records.iter().map(|f| f.path.as_str()).collect();
+    let mut synthetic: Vec<FileEntry> = marks
+        .iter()
+        .filter(|(path, _)| {
+            !listed.contains(path.as_str())
+                && path_prefix.as_ref().is_none_or(|p| path.starts_with(p))
+        })
+        .map(|(path, mark)| FileEntry {
+            path: path.clone(),
+            versions: 0,
+            last_backed_up: "never".to_string(),
+            size_bytes: 0,
+            local_state: "present".to_string(),
+            effective_status: None,
+            is_safe_to_delete: false,
+            too_large: Some(too_large_info(mark)),
+        })
+        .collect();
+    if !synthetic.is_empty() {
+        entries.append(&mut synthetic);
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+    }
 
     CliResponse::Files(entries)
 }

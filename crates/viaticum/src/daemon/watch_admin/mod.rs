@@ -135,6 +135,10 @@ pub struct WatchEntry {
     pub at_risk: u64,
     /// Files with all placements in Lost status.
     pub lost: u64,
+    /// backup-i4: files above this machine's size limit, not backed up (an earlier
+    /// version, if any, is not counted in `backed_up`).
+    #[serde(default)]
+    pub too_large: u64,
     /// Files with placements currently in Offered or Accepted status.
     pub encoding: u64,
     /// Files queued in BackupCoordinator for upload. MVP: always 0 (not wired yet).
@@ -211,6 +215,7 @@ pub struct FolderRollup {
     pub backed_up: u64,
     pub at_risk: u64,
     pub lost: u64,
+    pub too_large: u64,
     pub encoding: u64,
     pub queued: u64, // MVP: always 0
 }
@@ -301,6 +306,16 @@ impl WatchAdmin {
                 .push(p.status);
         }
 
+        let marks: HashMap<String, viaticum_core::types::TooLargeMark> = self
+            .db
+            .list_too_large()
+            .map_err(|e| WatchAdminError::Db(e.to_string()))?
+            .into_iter()
+            .collect();
+
+        let catalog_paths: std::collections::HashSet<&str> =
+            all_files.iter().map(|f| f.path.as_str()).collect();
+
         let now = std::time::Instant::now();
 
         let mut new_rollups: HashMap<PathBuf, CachedRollup> = HashMap::new();
@@ -329,9 +344,16 @@ impl WatchAdmin {
                 if let Some(latest_version) = file_record.versions.last() {
                     rollup.total_bytes += latest_version.k as u64 * latest_version.t as u64;
 
-                    if latest_version.backed_up_at.is_some() {
+                    // A file whose current content is too large is not backed up, even
+                    // when an earlier version is (backup-i4, backup-i7).
+                    if latest_version.backed_up_at.is_some()
+                        && !marks.contains_key(&file_record.path)
+                    {
                         rollup.backed_up += 1;
                     }
+                }
+                if marks.contains_key(&file_record.path) {
+                    rollup.too_large += 1;
                 }
 
                 // Placement stats.
@@ -361,6 +383,17 @@ impl WatchAdmin {
                     if all_lost {
                         rollup.lost += 1;
                     }
+                }
+            }
+
+            // A marked file with no catalog record was never backed up: it is a file of the
+            // folder, and it is too large.
+            for path in marks.keys() {
+                if (path.starts_with(&prefix_with_sep) || path == &prefix)
+                    && !catalog_paths.contains(path.as_str())
+                {
+                    rollup.total_files += 1;
+                    rollup.too_large += 1;
                 }
             }
 
@@ -722,6 +755,7 @@ impl WatchAdmin {
             backed_up: rollup.backed_up,
             at_risk: rollup.at_risk,
             lost: rollup.lost,
+            too_large: rollup.too_large,
             encoding: rollup.encoding,
             queued: rollup.queued,
             rollup_age_secs,
@@ -782,6 +816,8 @@ pub fn traffic_light(status: &WatchStatus, rollup: &FolderRollup) -> String {
         "orange".to_string()
     } else if rollup.lost > 0 {
         "red".to_string()
+    } else if rollup.too_large > 0 {
+        "orange".to_string()
     } else if *status == WatchStatus::Working
         || *status == WatchStatus::Scanning
         || rollup.at_risk > 0

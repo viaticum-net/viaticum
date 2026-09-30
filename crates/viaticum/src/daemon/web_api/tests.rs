@@ -76,6 +76,7 @@ fn state_with(db: Db, jobs: RestoreJobs) -> (Arc<DaemonState>, mpsc::Receiver<Re
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: None,
         missing_sources: Default::default(),
+        max_file_size_bytes: 0,
     });
     (state, restore_rx)
 }

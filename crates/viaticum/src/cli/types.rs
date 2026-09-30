@@ -213,6 +213,16 @@ pub struct StatusData {
     /// restore (the newest restorable pointer place); 0 = DR not ready.
     #[serde(default)]
     pub dr_restores_state_of: u64,
+    /// backup-i4: files under the watched folders that are above this machine's size
+    /// limit and so not backed up (current marks, not history).
+    #[serde(default)]
+    pub files_too_large: u32,
+    /// backup-i4: this machine's file size limit in bytes.
+    #[serde(default)]
+    pub max_file_size_bytes: u64,
+    /// backup-i24: this machine's block work budget in bytes; 0 until R1-d-b sets one.
+    #[serde(default)]
+    pub block_work_budget_bytes: u64,
 }
 
 /// Peer summary shown in `viaticum status`.
@@ -530,6 +540,21 @@ pub struct FileEntry {
     /// local source, so deleting the local copy is safe. Conservative: false when
     /// not backed up, no block found, or below target.
     pub is_safe_to_delete: bool,
+    /// backup-i4: the file's current content is above this machine's size limit and is not
+    /// backed up. An earlier version, if any, is still kept (backup-i7).
+    #[serde(default)]
+    pub too_large: Option<TooLargeInfo>,
+}
+
+/// A too-large mark as shown to the user (`files`, web UI).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TooLargeInfo {
+    /// Size of the file when last seen.
+    pub size_bytes: u64,
+    /// This machine's limit at that time.
+    pub limit_bytes: u64,
+    /// ISO-8601 date the file was first seen above the limit.
+    pub since: String,
 }
 
 /// Version entry for `viaticum versions <path>`.

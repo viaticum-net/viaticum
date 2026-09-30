@@ -121,6 +121,8 @@ pub struct DaemonState {
     /// dr-i11: background-counted "files without a local source" for `status`.
     pub missing_sources:
         std::sync::Arc<crate::daemon::dispatch::missing_sources::MissingSourceCache>,
+    /// backup-i4: this machine's file size limit in bytes (`status`, `files`).
+    pub max_file_size_bytes: u64,
 }
 
 /// Web API pieces prepared before the swarm starts (see step 9.4 of `start`).
@@ -754,6 +756,7 @@ impl DaemonHandle {
             // T-13b-2: router shared with dispatch_device_revoke for directed revocation publish.
             mailbox_router: Some(std::sync::Arc::clone(&early_mailbox_router)),
             missing_sources: Default::default(),
+            max_file_size_bytes,
         });
 
         // Clone state for web API and metrics pusher.
