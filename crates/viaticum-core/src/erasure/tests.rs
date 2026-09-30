@@ -877,3 +877,57 @@ fn chunk_symbols_realistic_scenario_2300_full_size_symbols() {
         );
     }
 }
+
+fn params_with_k_above_max() -> ErasureParams {
+    let k = crate::constants::RAPTORQ_MAX_SOURCE_SYMBOLS + 1;
+    ErasureParams {
+        k,
+        t: 65535,
+        overhead: 1.5,
+        n: k + 10,
+        k_eff: k + 3,
+    }
+}
+
+#[test]
+fn encode_raw_with_k_above_max_returns_err_without_allocating() {
+    // The source is 1 byte: padding it to k*t (> 3.6 GB) would allocate and the raptorq
+    // crate would panic. The guard must answer before either happens.
+    let enc = encoder();
+    let params = params_with_k_above_max();
+    let expected = ErasureError::TooManySourceSymbols {
+        k: params.k,
+        max: crate::constants::RAPTORQ_MAX_SOURCE_SYMBOLS,
+    };
+    let err = enc.encode_raw(&[1u8], &params, 0, 1).unwrap_err();
+    assert_eq!(err.to_string(), expected.to_string());
+    assert!(matches!(err, ErasureError::TooManySourceSymbols { .. }));
+    assert!(matches!(
+        enc.encode_raw_ranges(&[1u8], &params, &[(0, 1)]),
+        Err(ErasureError::TooManySourceSymbols { .. })
+    ));
+    assert!(matches!(
+        enc.encode(&[1u8], &params, 0, 1, &block_id(1), &holder(1)),
+        Err(ErasureError::TooManySourceSymbols { .. })
+    ));
+    assert!(matches!(
+        enc.generate_repair(&[1u8], &params, 0, &block_id(1), &holder(1)),
+        Err(ErasureError::TooManySourceSymbols { .. })
+    ));
+}
+
+#[test]
+fn decode_with_k_above_max_returns_err() {
+    let enc = encoder();
+    let params = params_with_k_above_max();
+    let symbols: Vec<Symbol> = (0..params.k_eff)
+        .map(|esi| Symbol {
+            esi,
+            data: vec![0u8; 1],
+        })
+        .collect();
+    assert!(matches!(
+        enc.decode(&symbols, &params),
+        Err(ErasureError::TooManySourceSymbols { .. })
+    ));
+}

@@ -77,6 +77,7 @@ fn config_roundtrips_all_fields() {
     let original = AppConfig {
         backup: BackupCfg {
             source_block_size_mb: 64,
+            max_file_size_mb: 512,
             max_versions: 10,
             max_version_age_days: 180,
         },
@@ -111,6 +112,7 @@ fn config_roundtrips_all_fields() {
     let loaded = AppConfig::load(f.path()).unwrap();
 
     assert_eq!(loaded.backup.source_block_size_mb, 64);
+    assert_eq!(loaded.backup.max_file_size_mb, 512);
     assert_eq!(loaded.backup.max_versions, 10);
     assert_eq!(loaded.backup.max_version_age_days, 180);
     assert_eq!(loaded.storage.soft_quota_gb, 500.0);
@@ -1416,4 +1418,40 @@ fn network_explicit_false_when_set_then_ipfs_bootstrap_enabled() {
     let f = write_toml("[network]\nkademlia_disable_ipfs_bootstrap = false\n");
     let cfg = AppConfig::load(f.path()).unwrap();
     assert!(!cfg.network.kademlia_disable_ipfs_bootstrap);
+}
+
+#[test]
+fn config_rejects_max_file_size_above_ceiling() {
+    let mut cfg = AppConfig::default();
+    assert_eq!(cfg.backup.max_file_size_mb, 0, "0 = automatic by default");
+    cfg.backup.max_file_size_mb = 3072;
+    cfg.validate().unwrap();
+    cfg.backup.max_file_size_mb = 3073;
+    let err = cfg.validate().unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, ref reason }
+            if field == "backup.max_file_size_mb" && reason.contains("must be <= 3072")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn config_without_max_file_size_key_reads_as_automatic() {
+    let f = write_toml("[backup]\nsource_block_size_mb = 32\n");
+    let cfg = AppConfig::load(f.path()).unwrap();
+    assert_eq!(cfg.backup.max_file_size_mb, 0);
+}
+
+#[test]
+fn config_rejects_source_block_size_above_1024() {
+    let mut cfg = AppConfig::default();
+    cfg.backup.source_block_size_mb = 1024;
+    cfg.validate().unwrap();
+    cfg.backup.source_block_size_mb = 2048;
+    let err = cfg.validate().unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Validation { ref field, ref reason }
+            if field == "backup.source_block_size_mb" && reason.contains("1024")),
+        "got {err:?}"
+    );
 }
