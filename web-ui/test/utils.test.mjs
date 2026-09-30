@@ -115,6 +115,9 @@ assert(neverBadge.label === 'Too large' && neverBadge.kind === 'bad', 'too-large
 assert(neverBadge.tooltip.includes('4.0 GB > 256.0 MB') && neverBadge.tooltip.includes('not backed up'), 'tooltip names sizes');
 assert(!neverBadge.tooltip.includes('kept in the network'), 'never backed up: no kept version');
 assert(tooLargeBadge(big, '2026-09-01').tooltip.includes('version of 2026-09-01 is kept'), 'grown file names its kept version');
+const deletedBadge = tooLargeBadge(big, '2026-09-01', 'deleted');
+assert(deletedBadge.tooltip.includes('copies are released after the deletion window') && !deletedBadge.tooltip.includes('is kept in the network'), 'deleted grown file: released, not kept');
+assert(tooLargeBadge(big, '2026-09-01', 'present').tooltip.includes('is kept in the network'), 'present grown file: kept');
 assert(isBackedUp({ last_backed_up: '2026-09-01', too_large: null }) === true, 'backed up file counts');
 assert(isBackedUp({ last_backed_up: '2026-09-01', too_large: big }) === false, 'grown file does not count');
 assert(isBackedUp({ last_backed_up: 'never' }) === false, 'never does not count');

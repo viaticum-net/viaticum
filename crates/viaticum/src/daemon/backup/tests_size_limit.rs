@@ -200,6 +200,33 @@ fn deleted_marked_file_clears_mark() {
 }
 
 #[test]
+fn recheck_deletion_of_grown_file_clears_mark_and_starts_the_window() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let mut c = limited(&db, &dir);
+    let p = write(&dir, "g.bin", &content(10, 4096));
+    c.process_event(event(&p, DirtyKind::Added)).unwrap();
+    assert_eq!(flush(&mut c), 1);
+    write(&dir, "g.bin", &big(11));
+    c.process_event(event(&p, DirtyKind::Modified)).unwrap();
+    assert!(
+        db.get_too_large(&p).unwrap().is_some(),
+        "setup: grown, marked"
+    );
+
+    std::fs::remove_file(&p).unwrap();
+    c.process_event(event(&p, DirtyKind::GoneOnRecheck))
+        .unwrap();
+
+    assert!(db.get_too_large(&p).unwrap().is_none(), "mark cleared");
+    let deleted = record(&db, &p)
+        .devices
+        .iter()
+        .any(|(d, s)| *d == DEV && matches!(s, viaticum_core::types::LocalState::Deleted(_)));
+    assert!(deleted, "the deletion window runs");
+}
+
+#[test]
 fn deleted_directory_clears_marks_under_it() {
     let db = Db::open_in_memory().unwrap();
     let dir = TempDir::new().unwrap();
@@ -456,9 +483,6 @@ fn rebuild_skips_candidate_over_limit_without_reading_and_without_recheck() {
         ),
         "{err:#}"
     );
-    assert!(!crate::daemon::backup::source_read::chain_is_not_found(
-        &err
-    ));
     assert_eq!(
         count(&logs, "source over the size limit, not read"),
         1,
@@ -483,21 +507,27 @@ fn rebuild_skips_candidate_over_limit_without_reading_and_without_recheck() {
 
 // ─── F3: one buffer, the same bytes ─────────────────────────────────────────
 
-/// The implementation before R1-d: compress, encrypt into a second buffer, prepend the
-/// nonce into a third.
-fn reference_compress_and_encrypt(plaintext: &[u8], key: &[u8; 32]) -> Vec<u8> {
+/// The stored blob of `compressed` at `generation`, built by hand as before R1-d: the
+/// nonce, the ciphertext into a second buffer, the nonce prepended into a third. Calls
+/// neither `seal_framed` nor `seal_compressed`.
+fn reference_seal(compressed: &[u8], key: &[u8; 32], generation: u32) -> Vec<u8> {
     use chacha20poly1305::aead::Aead;
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
-    let compressed = zstd::encode_all(std::io::Cursor::new(plaintext), 3).unwrap();
     let cipher = ChaCha20Poly1305::new(&derive_block_key(key).into());
-    let nonce = derive_nonce(key, &compressed, 0);
+    let nonce = derive_nonce(key, compressed, generation);
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), compressed.as_slice())
+        .encrypt(Nonce::from_slice(&nonce), compressed)
         .unwrap();
     let mut stored = Vec::with_capacity(12 + ciphertext.len());
     stored.extend_from_slice(&nonce);
     stored.extend_from_slice(&ciphertext);
     stored
+}
+
+/// The implementation before R1-d: compress, then seal at generation 0.
+fn reference_compress_and_encrypt(plaintext: &[u8], key: &[u8; 32]) -> Vec<u8> {
+    let compressed = zstd::encode_all(std::io::Cursor::new(plaintext), 3).unwrap();
+    reference_seal(&compressed, key, 0)
 }
 
 /// Incompressible bytes, deterministic per `seed` (blake3 in XOF mode: fast even unoptimised).
@@ -563,10 +593,15 @@ fn compress_framed_and_in_place_seal_match_the_two_step_form_at_every_generation
     let mut buf = framed.clone();
     for generation in [0u32, 1, 2, 0] {
         seal_framed(&mut buf, &KEY, generation).unwrap();
+        let reference = reference_seal(&compressed, &KEY, generation);
         assert_eq!(
-            buf,
+            buf, reference,
+            "generation {generation}: the hand-built blob"
+        );
+        assert_eq!(
             seal_compressed(&compressed, &KEY, generation).unwrap(),
-            "generation {generation}"
+            reference,
+            "generation {generation}: the two-step form"
         );
         unseal_framed(&mut buf, &KEY).unwrap();
         assert_eq!(&buf[12..], compressed.as_slice(), "unsealed back");

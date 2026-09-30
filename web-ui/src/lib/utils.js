@@ -85,14 +85,18 @@ export function statusBadge(s) {
 
 // A file above this machine's size limit (FileEntry.too_large, backup-i4, backup-i7): the
 // badge and the words for it. `lastBackedUp` is FileEntry.last_backed_up: "never", or the
-// date of an earlier version that the network keeps but no longer checks.
+// date of an earlier version that the network keeps but no longer checks. `localState` is
+// FileEntry.local_state: a deleted file's copies are being released, not kept.
 // Returns null for a file that is not too large, else { label, kind, tooltip }.
-export function tooLargeBadge(tooLarge, lastBackedUp) {
+export function tooLargeBadge(tooLarge, lastBackedUp, localState) {
   if (!tooLarge) return null;
   const range = `${formatBytes(tooLarge.size_bytes)} > ${formatBytes(tooLarge.limit_bytes)}`;
-  const kept = lastBackedUp && lastBackedUp !== 'never' && lastBackedUp !== 'pending'
-    ? ` The version of ${lastBackedUp} is kept in the network but is no longer checked.`
-    : '';
+  const hasEarlier = lastBackedUp && lastBackedUp !== 'never' && lastBackedUp !== 'pending';
+  const kept = !hasEarlier
+    ? ''
+    : localState === 'deleted'
+      ? ' Deleted; its copies are released after the deletion window.'
+      : ` The version of ${lastBackedUp} is kept in the network but is no longer checked.`;
   return {
     label: 'Too large',
     kind: 'bad',

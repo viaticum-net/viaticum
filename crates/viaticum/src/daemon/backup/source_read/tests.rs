@@ -3,9 +3,7 @@ use std::path::Path;
 
 use tempfile::TempDir;
 
-use super::{
-    SourceReadError, chain_is_not_found, read_at_most, read_source_bounded, source_exceeds_limit,
-};
+use super::{SourceReadError, read_at_most, read_source_bounded, source_exceeds_limit};
 
 fn file(dir: &TempDir, name: &str, len: usize) -> std::path::PathBuf {
     let p = dir.path().join(name);
@@ -91,30 +89,4 @@ fn read_at_most_rejects_stream_longer_than_limit() {
         }) => {}
         other => panic!("expected TooLarge, got {other:?}"),
     }
-}
-
-#[test]
-fn chain_is_not_found_sees_io_not_found_behind_context() {
-    let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
-    let e = anyhow::Error::new(not_found)
-        .context("read file x")
-        .context("process event");
-    assert!(chain_is_not_found(&e));
-
-    let wrapped = anyhow::Error::new(SourceReadError::Io {
-        path: "x".into(),
-        source: std::io::Error::from(std::io::ErrorKind::NotFound),
-    })
-    .context("rebuild plaintext");
-    assert!(chain_is_not_found(&wrapped));
-
-    let denied = anyhow::Error::new(SourceReadError::Io {
-        path: "x".into(),
-        source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-    })
-    .context("rebuild plaintext");
-    assert!(!chain_is_not_found(&denied));
-    let too_large = anyhow::Error::new(SourceReadError::TooLarge { size: 2, limit: 1 });
-    assert!(!chain_is_not_found(&too_large));
-    assert!(!chain_is_not_found(&anyhow::anyhow!("something else")));
 }

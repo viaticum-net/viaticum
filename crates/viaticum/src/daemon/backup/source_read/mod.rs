@@ -29,20 +29,6 @@ impl SourceReadError {
     }
 }
 
-/// True if any error in the chain is a NotFound `io::Error` or a `SourceReadError::Io`
-/// carrying one. Callers wrap read errors in `anyhow` context, so a `downcast_ref` on the
-/// outermost error would miss it; the chain is walked instead.
-pub fn chain_is_not_found(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            return io.kind() == std::io::ErrorKind::NotFound;
-        }
-        cause
-            .downcast_ref::<SourceReadError>()
-            .is_some_and(SourceReadError::is_not_found)
-    })
-}
-
 /// The whole file, or an error.
 ///
 /// 1) `metadata().len() > limit` → `TooLarge`, the file is not opened;

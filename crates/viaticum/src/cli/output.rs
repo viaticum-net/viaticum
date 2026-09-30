@@ -533,7 +533,8 @@ pub fn render_files(files: &[FileEntry]) -> String {
             format!("{} versions", file.versions)
         };
         // backup-i4, backup-i7: a too-large file says so instead of a backup date; an earlier
-        // version, if there is one, is named as kept but no longer checked.
+        // version, if there is one, is named as kept but no longer checked; when the file
+        // is deleted (the deletion window runs) the copies are being released instead.
         if let Some(tl) = &file.too_large {
             let limits = format!(
                 "too large for this machine ({} > {}): not supported yet, not backed up",
@@ -542,6 +543,11 @@ pub fn render_files(files: &[FileEntry]) -> String {
             );
             if file.last_backed_up == "never" {
                 out.push_str(&format!("  {}   {}\n", file.path, limits));
+            } else if file.local_state == "deleted" {
+                out.push_str(&format!(
+                    "  {}   {}   {}; deleted; its copies are released after the deletion window\n",
+                    file.path, version_label, limits
+                ));
             } else {
                 out.push_str(&format!(
                     "  {}   {}   {}; the version of {} is kept in the network but no longer checked\n",

@@ -44,6 +44,33 @@ pub(crate) fn should_warn(
     true
 }
 
+/// backup-i7: a block whose source outgrew the size limit fails to load every tick; one
+/// WARN per block per day, the rest DEBUG. The clock is injected.
+pub(crate) fn log_load_failure(
+    warned: &Mutex<HashMap<SourceBlockId, Instant>>,
+    block_id: SourceBlockId,
+    now: Instant,
+    err: &anyhow::Error,
+) {
+    let loud = {
+        let mut map = warned.lock().unwrap_or_else(|p| p.into_inner());
+        should_warn(&mut map, block_id, now)
+    };
+    if loud {
+        warn!(
+            block_id = %block_id,
+            err = %format!("{err:#}"),
+            "scheduler: cannot load source block for PoS hash, skipping"
+        );
+    } else {
+        debug!(
+            block_id = %block_id,
+            err = %format!("{err:#}"),
+            "scheduler: cannot load source block for PoS hash, skipping"
+        );
+    }
+}
+
 /// One challenge of a block, its expected answer computed.
 pub(super) struct PreparedChallenge {
     pub(super) holder_id: DeviceId,
@@ -188,25 +215,7 @@ impl BlockPrep {
         ) {
             Ok(d) => d,
             Err(e) => {
-                // backup-i7: a block whose source outgrew the size limit fails every tick;
-                // one WARN per block per day, the rest DEBUG.
-                let loud = {
-                    let mut map = self.load_warned.lock().unwrap_or_else(|p| p.into_inner());
-                    should_warn(&mut map, block_id, Instant::now())
-                };
-                if loud {
-                    warn!(
-                        block_id = %block_id,
-                        err = %format!("{e:#}"),
-                        "scheduler: cannot load source block for PoS hash, skipping"
-                    );
-                } else {
-                    debug!(
-                        block_id = %block_id,
-                        err = %format!("{e:#}"),
-                        "scheduler: cannot load source block for PoS hash, skipping"
-                    );
-                }
+                log_load_failure(&self.load_warned, block_id, Instant::now(), &e);
                 return Vec::new();
             }
         };

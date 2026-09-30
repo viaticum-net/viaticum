@@ -737,6 +737,74 @@ async fn worker_rebuild_of_pack_with_missing_member_sends_recheck_and_keeps_erro
     assert_eq!(rx.try_recv().ok(), Some(a.clone()));
 }
 
+/// backup-i5 (J1): the worker's source load passes the machine's size limit to the rebuild.
+/// The file is there, one byte over the limit: it is not read (`SourceMissing`), not
+/// reported gone; with the limit at the file's size the same load succeeds.
+#[tokio::test]
+async fn worker_source_load_does_not_read_a_file_over_max_source_bytes() {
+    use crate::daemon::backup::rebuild::RebuildError;
+    use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
+
+    let db = make_db();
+    let dir = tempdir().unwrap();
+    let encoder =
+        Arc::new(RaptorQEncoder::new()) as Arc<dyn viaticum_core::erasure::ErasureEncoder>;
+    let epoch_key = [7u8; 32];
+    let mut coord = BackupCoordinator::new(
+        db.clone(),
+        BackupConfig {
+            symbols_dir: dir.path().to_path_buf(),
+            source_block_size: 1024 * 1024,
+            epoch_key,
+            device_id: device_id(0),
+            ..Default::default()
+        },
+        encoder,
+    );
+    let a = dir.path().join("a.txt");
+    let bytes = b"the file the worker must not read over the limit".repeat(20);
+    std::fs::write(&a, &bytes).unwrap();
+    coord
+        .process_event(DirtyEvent {
+            path: a.to_string_lossy().into_owned(),
+            kind: DirtyKind::Added,
+            device_id: device_id(0),
+        })
+        .unwrap();
+    let results = coord.flush_all(true, &Default::default()).unwrap();
+    assert_eq!(results.len(), 1, "setup: one block");
+    let block = db
+        .get_source_block(&results[0].source_block_id)
+        .unwrap()
+        .unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let mut config = make_config();
+    config.device_id = device_id(0);
+    config.epoch_key = epoch_key;
+    config.data_dir = dir.path().to_path_buf();
+    config.recheck_tx = Some(tx);
+
+    config.max_source_bytes = bytes.len() as u64;
+    let blob = super::worker::load_source_blob(&db, &config, &block)
+        .await
+        .expect("control: the limit admits the file");
+    assert_eq!(blake3::hash(&blob).as_bytes(), &block.block_id.0);
+
+    config.max_source_bytes = bytes.len() as u64 - 1;
+    let err = super::worker::load_source_blob(&db, &config, &block)
+        .await
+        .expect_err("the only candidate is over the limit");
+    assert!(
+        matches!(
+            err.downcast_ref::<RebuildError>(),
+            Some(RebuildError::SourceMissing { .. })
+        ),
+        "{err:#}"
+    );
+    assert!(rx.try_recv().is_err(), "a file that is there is not gone");
+}
+
 // ─── PoS Lost re-queuing via next_work_item ───────────────────────────────────
 
 #[tokio::test]

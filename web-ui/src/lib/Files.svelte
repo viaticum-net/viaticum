@@ -283,7 +283,7 @@
 {/snippet}
 
 {#snippet renderFile(f, depth)}
-  {@const tl = tooLargeBadge(f.too_large, f.last_backed_up)}
+  {@const tl = tooLargeBadge(f.too_large, f.last_backed_up, f.local_state)}
   {@const b = tl ?? statusBadge(f.effective_status)}
   <div class="row file-row" style="--depth: {depth}" onclick={() => fetchVersions(f.path)} role="button" tabindex="0" onkeydown={(e) => e.key === 'Enter' && fetchVersions(f.path)}>
     <span class="caret"> </span>

@@ -1835,6 +1835,21 @@ fn render_files_names_the_kept_version_of_a_grown_file() {
 }
 
 #[test]
+fn render_files_says_a_deleted_grown_file_is_being_released() {
+    let mut entry = too_large_entry("2026-09-01", 2);
+    entry.local_state = "deleted".into();
+    let rendered = output::render_files(&[entry]);
+    assert!(
+        rendered.contains("deleted; its copies are released after the deletion window"),
+        "got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("is kept in the network"),
+        "a deleted file's copies are not kept: {rendered}"
+    );
+}
+
+#[test]
 fn render_status_reports_too_large_files_and_the_limit() {
     let mut data = make_status_zero_peers();
     let quiet = output::render_status(&data);

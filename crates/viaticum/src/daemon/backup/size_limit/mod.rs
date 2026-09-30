@@ -1,7 +1,7 @@
 // The size limit of this machine (backup-i4, backup-i5): the largest file the daemon backs
 // up, derived from the RAM the daemon may use, and the pack size that follows from it.
 //
-// `M = min(MemTotal, cgroup v2 memory.max)`. Heavy block work (encode, PoS re-encode, decode)
+// `M = min(MemTotal, cgroup v2 memory.max, cgroup v1 memory.limit_in_bytes)`. Heavy block work (encode, PoS re-encode, decode)
 // holds up to `BLOCK_WORK_PEAK_FACTOR` block volumes, a backup `BACKUP_PEAK_FACTOR`; the
 // daemon may take half of the RAM: `RAM_DIVISOR = 2·(14 + 2) = 32`, `N = clamp(M / 32,
 // 32 MiB, 1 GiB)` (7.6 GiB → 243 MiB). The factor 14 holds only with the memory budget of
@@ -10,8 +10,6 @@
 // The machine's RAM is read from `/proc/meminfo` and the cgroup files directly (a few lines
 // of parsing), not through a crate: only the total is needed, and the parsers are pure
 // functions the unit tests feed with text.
-
-use std::path::PathBuf;
 
 use viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES;
 
@@ -75,6 +73,29 @@ pub(crate) fn parse_cgroup_v2_path(text: &str) -> Option<&str> {
     text.lines().find_map(|l| l.strip_prefix("0::"))
 }
 
+/// The content of a cgroup v1 `memory.limit_in_bytes`: a number of bytes; the kernel writes
+/// a value near `i64::MAX` (page-rounded) for "no limit", which counts as none.
+pub(crate) fn parse_cgroup_v1_memory_limit(text: &str) -> Option<u64> {
+    let v: u64 = text.trim().parse().ok()?;
+    (v < CGROUP_V1_UNLIMITED_FROM).then_some(v)
+}
+
+/// A cgroup v1 limit at or above this is "no limit" (2^62 bytes, far beyond any RAM).
+const CGROUP_V1_UNLIMITED_FROM: u64 = 1 << 62;
+
+/// The cgroup v1 path of the `memory` controller in `/proc/self/cgroup` text (a line
+/// `<id>:<controllers>:<path>` whose controller list has `memory`).
+pub(crate) fn parse_cgroup_v1_memory_path(text: &str) -> Option<&str> {
+    text.lines().find_map(|l| {
+        let mut parts = l.splitn(3, ':');
+        let (_id, controllers, path) = (parts.next()?, parts.next()?, parts.next()?);
+        controllers
+            .split(',')
+            .any(|c| c == "memory")
+            .then_some(path)
+    })
+}
+
 /// The lesser of the two known values.
 pub(crate) fn combine_ram(meminfo: Option<u64>, cgroup: Option<u64>) -> Option<u64> {
     match (meminfo, cgroup) {
@@ -83,17 +104,19 @@ pub(crate) fn combine_ram(meminfo: Option<u64>, cgroup: Option<u64>) -> Option<u
     }
 }
 
-/// The lowest `memory.max` from this process's cgroup up to the cgroup root (a limit of
+/// The lowest limit `file` holds from this process's cgroup `rel` up to `root` (a limit of
 /// a parent binds the child too).
-fn read_cgroup_limit() -> Option<u64> {
-    let root = PathBuf::from("/sys/fs/cgroup");
-    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let rel = parse_cgroup_v2_path(&own)?.trim_start_matches('/');
-    let mut dir = root.join(rel);
+fn lowest_up_the_chain(
+    root: &std::path::Path,
+    rel: &str,
+    file: &str,
+    parse: fn(&str) -> Option<u64>,
+) -> Option<u64> {
+    let mut dir = root.join(rel.trim_start_matches('/'));
     let mut lowest: Option<u64> = None;
     loop {
-        if let Ok(text) = std::fs::read_to_string(dir.join("memory.max"))
-            && let Some(v) = parse_cgroup_memory_max(&text)
+        if let Ok(text) = std::fs::read_to_string(dir.join(file))
+            && let Some(v) = parse(&text)
         {
             lowest = Some(lowest.map_or(v, |l| l.min(v)));
         }
@@ -102,6 +125,29 @@ fn read_cgroup_limit() -> Option<u64> {
         }
     }
     lowest
+}
+
+/// The lowest limit of the cgroup v2 `memory.max` and of the cgroup v1
+/// `memory.limit_in_bytes` chains of this process.
+fn read_cgroup_limit() -> Option<u64> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let v2 = parse_cgroup_v2_path(&own).and_then(|rel| {
+        lowest_up_the_chain(
+            std::path::Path::new("/sys/fs/cgroup"),
+            rel,
+            "memory.max",
+            parse_cgroup_memory_max,
+        )
+    });
+    let v1 = parse_cgroup_v1_memory_path(&own).and_then(|rel| {
+        lowest_up_the_chain(
+            std::path::Path::new("/sys/fs/cgroup/memory"),
+            rel,
+            "memory.limit_in_bytes",
+            parse_cgroup_v1_memory_limit,
+        )
+    });
+    combine_ram(v2, v1)
 }
 
 /// `M`: the RAM the daemon may use, `None` when it cannot be read.

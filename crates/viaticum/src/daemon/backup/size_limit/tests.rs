@@ -94,3 +94,62 @@ fn format_size_prints_mib_below_a_gib_and_gib_above() {
     assert_eq!(format_size(GIB), "1.0 GiB");
     assert_eq!(format_size((7.6 * GIB as f64) as u64), "7.6 GiB");
 }
+
+#[test]
+fn cgroup_v1_limit_parses_and_unlimited_is_none() {
+    assert_eq!(parse_cgroup_v1_memory_limit("2147483648\n"), Some(2 * GIB));
+    // The kernel's "no limit": LONG_MAX rounded down to a page, and anything from 2^62.
+    assert_eq!(parse_cgroup_v1_memory_limit("9223372036854771712\n"), None);
+    assert_eq!(parse_cgroup_v1_memory_limit("9223372036854775807"), None);
+    assert_eq!(
+        parse_cgroup_v1_memory_limit(&(1u64 << 62).to_string()),
+        None
+    );
+    assert_eq!(
+        parse_cgroup_v1_memory_limit(&((1u64 << 62) - 1).to_string()),
+        Some((1u64 << 62) - 1)
+    );
+    assert_eq!(parse_cgroup_v1_memory_limit("max"), None);
+    assert_eq!(parse_cgroup_v1_memory_limit(""), None);
+}
+
+#[test]
+fn cgroup_v1_path_is_the_memory_controller_line() {
+    let text = "12:cpu,cpuacct:/a\n11:memory:/docker/abc\n1:name=systemd:/x\n0::/\n";
+    assert_eq!(parse_cgroup_v1_memory_path(text), Some("/docker/abc"));
+    let combined = "5:cpu,memory,blkio:/svc\n";
+    assert_eq!(parse_cgroup_v1_memory_path(combined), Some("/svc"));
+    assert_eq!(parse_cgroup_v1_memory_path("0::/user.slice\n"), None);
+    assert_eq!(parse_cgroup_v1_memory_path("4:memory_x:/nope\n"), None);
+    assert_eq!(parse_cgroup_v1_memory_path("garbage"), None);
+    // A v2 path is not a v1 path.
+    assert_eq!(parse_cgroup_v2_path(text), Some("/"));
+}
+
+#[test]
+fn cgroup_chain_takes_the_lowest_limit_up_to_the_root() {
+    let root = tempfile::TempDir::new().unwrap();
+    let child = root.path().join("parent/child");
+    std::fs::create_dir_all(&child).unwrap();
+    let put = |dir: &std::path::Path, text: &str| {
+        std::fs::write(dir.join("memory.limit_in_bytes"), text).unwrap()
+    };
+    put(root.path(), "9223372036854771712\n");
+    put(&root.path().join("parent"), "4294967296\n");
+    put(&child, "8589934592\n");
+    let lowest = |rel: &str| {
+        lowest_up_the_chain(
+            root.path(),
+            rel,
+            "memory.limit_in_bytes",
+            parse_cgroup_v1_memory_limit,
+        )
+    };
+    assert_eq!(
+        lowest("/parent/child"),
+        Some(4 * GIB),
+        "the parent binds the child"
+    );
+    assert_eq!(lowest("/parent"), Some(4 * GIB));
+    assert_eq!(lowest("/"), None, "the root has no limit");
+}
