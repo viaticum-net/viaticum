@@ -546,6 +546,7 @@ async fn recheck_channel_full_does_not_block_watch_admin_commands() {
         watch_states: None,
         time_scale: 1,
         recheck_rx: Some(recheck_rx),
+        resubmit_rx: None,
     };
     // Full before the watcher runs: the next send is refused, not awaited.
     recheck_tx.try_send(root.join("x1")).unwrap();

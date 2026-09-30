@@ -393,6 +393,7 @@ async fn restore_job_outlives_the_client_that_submitted_it() {
             live_watch_configs: None,
             peer_backoff: None,
             work_event_tx: None,
+            resubmit_tx: None,
         },
         Arc::new(RaptorQEncoder::new()),
     );

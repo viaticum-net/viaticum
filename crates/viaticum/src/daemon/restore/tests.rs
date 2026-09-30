@@ -61,6 +61,7 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }

@@ -68,6 +68,8 @@ mod tests;
 mod tests_exclude;
 #[cfg(all(test, unix))]
 mod tests_identity;
+#[cfg(all(test, unix))]
+mod tests_resubmit;
 
 // ─── Error ────────────────────────────────────────────────────────────────────
 
@@ -249,6 +251,10 @@ pub struct WatcherConfig {
     /// Paths a rebuild did not find (К2b): the watcher decides whether each is a
     /// deletion. `None` in tests that do not exercise rechecks.
     pub recheck_rx: Option<mpsc::Receiver<PathBuf>>,
+    /// Paths the backup reconcile hands over (L1b, backup-i8, backup-i25): re-submitted as
+    /// `Modified` only under an active accepted root and through the scan filters. `None`
+    /// in tests that do not exercise it.
+    pub resubmit_rx: Option<mpsc::Receiver<crate::daemon::backup::reconcile::ResubmitBatch>>,
 }
 
 /// Compute the watcher debounce window (ms) for a given `time_scale`.
@@ -280,8 +286,9 @@ pub(crate) fn absolute_watch_dir(dir: &Path) -> PathBuf {
 ///    then runs the initial scan when due.
 /// 3. Drains the std channel on a poll interval into the `WatchLoop` (debounce, moves
 ///    resolved by the disk, root rule, overflow rescan) which sends `DirtyEvent`s.
-/// 4. Processes `WatcherCommand` messages from `control_rx` (add/remove/scan) and paths
-///    from `config.recheck_rx` (a rebuild did not find them).
+/// 4. Processes `WatcherCommand` messages from `control_rx` (add/remove/scan), paths
+///    from `config.recheck_rx` (a rebuild did not find them) and batches from
+///    `config.resubmit_rx` (the backup reconcile, L1b).
 /// 5. Exits cleanly when `cancel` is triggered.
 ///
 /// Starts cleanly with an empty watch directory list (receives `Add` commands later).
@@ -383,6 +390,7 @@ pub async fn start_watcher(
         None
     };
     let mut recheck_rx = config.recheck_rx.take();
+    let mut resubmit_rx = config.resubmit_rx.take();
 
     loop {
         let step = tokio::select! {
@@ -412,6 +420,12 @@ pub async fn start_watcher(
                     None => std::future::pending::<Option<PathBuf>>().await,
                 }
             } => lp.on_recheck(path, Instant::now()).await,
+            Some(batch) = async {
+                match resubmit_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending::<Option<_>>().await,
+                }
+            } => lp.on_resubmit(batch).await.map(|_| ()),
             _ = poll_timer.tick() => {
                 // Drain all pending std-channel messages.
                 let mut disconnected = false;

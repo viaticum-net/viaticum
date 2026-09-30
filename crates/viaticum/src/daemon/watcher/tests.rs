@@ -76,6 +76,7 @@ fn config_for(dir: &TempDir) -> WatcherConfig {
         watch_states: None,
         time_scale: 1,
         recheck_rx: None,
+        resubmit_rx: None,
     }
 }
 
@@ -259,6 +260,7 @@ async fn watcher_starts_with_empty_dir_list_without_error() {
         watch_states: None,
         time_scale: 1,
         recheck_rx: None,
+        resubmit_rx: None,
     };
     let cancel_clone = cancel.clone();
     let handle = tokio::spawn(async move {
@@ -296,6 +298,7 @@ async fn debounce_multiple_changes_emit_one_event() {
         watch_states: None,
         time_scale: 1,
         recheck_rx: None,
+        resubmit_rx: None,
     };
 
     let cancel_clone = cancel.clone();
@@ -357,6 +360,7 @@ async fn file_deleted_before_debounce_emits_deleted_event() {
         watch_states: None,
         time_scale: 1,
         recheck_rx: None,
+        resubmit_rx: None,
     };
 
     let cancel_clone = cancel.clone();
@@ -473,6 +477,7 @@ async fn rapid_changes_no_panic() {
         watch_states: None,
         time_scale: 1,
         recheck_rx: None,
+        resubmit_rx: None,
     };
 
     let cancel_clone = cancel.clone();
@@ -639,6 +644,7 @@ async fn watcher_initial_scan_respects_viaticumignore() {
         watch_states: None,
         time_scale: 1,
         recheck_rx: None,
+        resubmit_rx: None,
     };
 
     let cancel_clone = cancel.clone();
@@ -757,6 +763,7 @@ async fn watcher_add_command_registers_new_dir_and_emits_dirty_events() {
         watch_states: None,
         time_scale: 1,
         recheck_rx: None,
+        resubmit_rx: None,
     };
     tokio::spawn(async move {
         start_watcher(config, dirty_tx, ctrl_rx, cancel_clone)
@@ -917,6 +924,7 @@ async fn watcher_keeps_watching_other_dirs_when_one_is_missing() {
         watch_states: Some(Arc::clone(&states)),
         time_scale: 1,
         recheck_rx: None,
+        resubmit_rx: None,
     };
 
     let (dirty_tx, mut dirty_rx) = mpsc::channel(64);

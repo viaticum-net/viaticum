@@ -21,7 +21,10 @@
 //   it is not empty (an unmounted mount point is never an identity);
 // - an inotify overflow (`Rescan` flag) → WARN and a full scan after a quiet window;
 // - a recheck (a rebuild did not find a path) → `GoneOnRecheck` when the root is intact,
-//   not in error, the path is gone and its parent exists and is not empty.
+//   not in error, the path is gone and its parent exists and is not empty;
+// - a resubmit (the backup reconcile, L1b) → `Modified` for an existing file under an
+//   active, accepted root with the recorded identity, through the scan filters
+//   (`event_loop/resubmit.rs`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -40,6 +43,10 @@ use super::{
 };
 use crate::daemon::backup::{DirtyEvent, DirtyKind, path_gone};
 use crate::daemon::watch_admin::{WatchEntryState, WatcherStatusSignal};
+
+mod resubmit;
+#[cfg(test)]
+pub(crate) use resubmit::ResubmitCounts;
 
 /// Error shown for a watch folder under the root rule (dr-i64).
 pub(crate) const ROOT_LOST_ERROR: &str = "folder was moved, renamed or removed; its files stay \

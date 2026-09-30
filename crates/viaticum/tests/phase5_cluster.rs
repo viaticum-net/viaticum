@@ -97,6 +97,7 @@ fn backup_cfg_for(symbols_dir: &TempDir, device_id: DeviceId) -> BackupConfig {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
     }
 }
 

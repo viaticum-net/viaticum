@@ -76,6 +76,7 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
     }
 }
 
@@ -145,6 +146,7 @@ fn config_source_block_size_drives_backup() {
             live_watch_configs: None,
             peer_backoff: None,
             work_event_tx: None,
+            resubmit_tx: None,
         },
         Arc::new(RaptorQEncoder::new()),
     );
