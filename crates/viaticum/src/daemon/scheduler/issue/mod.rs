@@ -8,6 +8,15 @@
 // publishes end later and are settled by the run loop. The tick runs inside the
 // scheduler's `select!` loop, so while it runs no response is resolved, no ledger accrues
 // and no timeout is checked: the budget is what keeps the loop's other work going.
+//
+// A block's preparation (source load, encode, hashes) is waited for only until the tick's
+// deadline. One still running then is CUT from the tick but not dropped (pos-i7-d-a): its
+// handle moves into `InFlight::preparing`, the run loop collects it when it ends and only
+// then publishes its challenges (each stamped at its publish, pos-i7-a), after a re-check
+// that the holder's placement is still challengeable and not pending. While a block
+// prepares, ticks leave it alone; at most `MAX_PREPARATIONS` blocks prepare at once. So a
+// block whose preparation is longer than a tick budget is served, once per preparation,
+// not restarted by every tick.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -21,9 +30,10 @@ use super::{PendingKey, Scheduler, holder_trust_map, scaled_timer_secs};
 
 mod in_flight;
 mod prepare;
+mod preparing;
 
-pub(crate) use in_flight::InFlight;
 use in_flight::publish_challenge;
+pub(crate) use in_flight::{Ended, InFlight};
 
 /// An issue tick may spend 1 / `ISSUE_BUDGET_DIVISOR` of the PoS tick period (pos-i7-a:
 /// ≈ 20 %, the bar of the tick's `elapsed_ms`).
@@ -39,6 +49,14 @@ const BLOCK_HEADROOM: u32 = 2;
 /// share of its budget, in percent: every wait of the tick ends at one deadline short of
 /// the budget, so the tick line comes before the bar whatever the disk or the network do.
 const WAIT_DEADLINE_PCT: u32 = 95;
+
+/// Block preparations in flight at once past their ticks (pos-i7-d-a). Each holds the
+/// source block, the raw symbols encoded for the union of its holders' ranges and the
+/// bound copies while hashing: memory ≈ K·(5 + R)·E, E the block size, R the number of
+/// holders of the block (pos-i7-d-a). Two: one can finish while the next starts, and no
+/// queue of big blocks sits in RAM. A block that would be the third stays due and counts
+/// in `deferred`.
+pub(crate) const MAX_PREPARATIONS: usize = 2;
 
 /// Challenge publishes in flight at once (pos-i7-a), across ticks. About one block's
 /// holders (8 in the E2E) plus one: a block's re-encode (~110 ms at 1 MiB) is longer than
@@ -65,13 +83,14 @@ struct IssueTick {
     issued: usize,
     /// Blocks this tick started (re-encoded).
     blocks: usize,
-    /// Due placements skipped because a challenge is pending or being published for them.
+    /// Due placements skipped because a challenge is pending or being published for them,
+    /// or their block is preparing (pos-i7-d-a).
     skipped_pending: usize,
     /// Due placements not pending whose challenge the tick did not start: the budget ran
     /// out (pos-i7-a). They stay due for the next tick.
     deferred: usize,
     /// Blocks whose preparation was still running at the deadline: the tick stopped
-    /// waiting for it (its placements count in `deferred`).
+    /// waiting for it and left it to `InFlight::preparing` (pos-i7-d-a).
     cut_blocks: usize,
     cpw_min: u32,
     cpw_max: u32,
@@ -117,10 +136,85 @@ impl Scheduler {
     pub async fn issue_due_challenges(&self) -> anyhow::Result<()> {
         let mut in_flight = InFlight::default();
         let result = self.issue_tick(&mut in_flight).await;
-        while let Some(done) = in_flight.join_next().await {
-            self.settle_publish(done, &mut in_flight.settled).await;
+        while let Some(ended) = in_flight.join_next_any().await {
+            self.settle_ended(ended, &mut in_flight).await;
         }
         result
+    }
+
+    /// Account one thing that ended in `InFlight`: a publish is settled, a preparation
+    /// that outlived its tick has its challenges published.
+    pub(crate) async fn settle_ended(&self, ended: Ended, in_flight: &mut InFlight) {
+        match ended {
+            Ended::Published(done) => self.settle_publish(done, &mut in_flight.settled).await,
+            Ended::Prepared(done) => self.publish_prepared(done, in_flight).await,
+        }
+    }
+
+    /// Publish the challenges of a preparation that ended after its tick (pos-i7-d-a).
+    /// The time passed since the placements were read, so each holder is re-checked
+    /// against the database first: its placement must still exist, be challengeable, hold
+    /// the ranges the hash was computed for, and have no challenge pending or in flight.
+    /// The rest gets no challenge (it is due again by the usual rule). The publishes are
+    /// spawned at once, past `ISSUE_PUBLISH_CONCURRENCY` by at most one block's holders:
+    /// waiting for a slot here would hold the run loop.
+    async fn publish_prepared(&self, done: preparing::PrepDone, in_flight: &mut InFlight) {
+        let block_id = done.block_id;
+        let prepared = match done.result {
+            Ok(p) => p,
+            Err(e) => {
+                error!(
+                    block_id = %block_id,
+                    err = %e,
+                    "scheduler: PoS hash compute task failed (panicked or cancelled) — skipping block"
+                );
+                return;
+            }
+        };
+        let pending_keys: HashSet<PendingKey> = {
+            let guard = self.pending.lock().await;
+            guard.keys().copied().collect()
+        };
+        let (mut issued, mut dropped) = (0usize, 0usize);
+        for challenge in prepared {
+            let key = (block_id, challenge.holder_id);
+            let still_due = !pending_keys.contains(&key)
+                && !in_flight.keys().any(|k| *k == key)
+                && match self.db.get_placement(&block_id, &challenge.holder_id) {
+                    Ok(Some(p)) => {
+                        matches!(
+                            p.status,
+                            PlacementStatus::Alive
+                                | PlacementStatus::Uncertain
+                                | PlacementStatus::PresumedLost
+                        ) && p.esi_ranges == challenge.esi_ranges
+                    }
+                    Ok(None) => false,
+                    Err(e) => {
+                        warn!(block_id = %block_id, err = %e, "scheduler: get_placement failed; late challenge dropped");
+                        false
+                    }
+                };
+            if !still_due {
+                dropped += 1;
+                continue;
+            }
+            let cpw = done.cpw_of.get(&challenge.holder_id).copied().unwrap_or(0);
+            if let Some((entry, pending)) = self.challenge_entry(block_id, challenge) {
+                in_flight.spawn(
+                    key,
+                    publish_challenge(Arc::clone(&self.mailbox_router), entry, pending, cpw),
+                );
+                issued += 1;
+            }
+        }
+        info!(
+            block_id = %block_id,
+            issued,
+            dropped,
+            in_flight = in_flight.len(),
+            "scheduler: PoS late preparation published"
+        );
     }
 
     /// Start the PoS hash challenges of the holders that are due, within the tick's budget.
@@ -131,11 +225,13 @@ impl Scheduler {
     ///   2. Skip placements with a challenge pending or being published (no double issue).
     ///   3. Order the blocks least recently tried first (fairness, pos-i7-c, see
     ///      `blocks_least_recently_tried_first`).
-    ///   4. Per block, while the budget lasts: load the source, encode once (union of the
-    ///      holders' ESI ranges), per holder the binding + chain hash — one blocking task,
-    ///      waited for until the deadline (`WAIT_DEADLINE_PCT` % of the budget); then spawn
-    ///      one publish per holder into `in_flight`, a free slot waited for until the same
-    ///      deadline.
+    ///   4. Per block, while the budget lasts and fewer than `MAX_PREPARATIONS` blocks are
+    ///      preparing: load the source, encode once (union of the holders' ESI ranges), per
+    ///      holder the binding + chain hash — one blocking task, waited for until the
+    ///      deadline (`WAIT_DEADLINE_PCT` % of the budget); then spawn one publish per
+    ///      holder into `in_flight`, a free slot waited for until the same deadline. A
+    ///      preparation still running at the deadline is handed to `in_flight.preparing`
+    ///      (pos-i7-d-a); the run loop publishes its challenges when it ends.
     ///   5. Each challenge takes its own time when it is published: `timestamp`,
     ///      `expires_at`, `stored_at` and the pending `issued_at` (pos-i7-a).
     ///   6. W-3: a challenge goes into pending ONLY after ≥ 1 MailboxStoreAck, when its
@@ -144,7 +240,8 @@ impl Scheduler {
     /// Budget: a block starts only if the time spent plus `BLOCK_HEADROOM` × the slowest
     /// block of this tick fits `issue_budget` (the first block always starts, so a block
     /// slower than the headroom is still started). Every wait ends at the deadline — a
-    /// block still preparing then is cut — and the tick does not wait for publishes, so it
+    /// block still preparing then is cut from the tick, not dropped — and the tick does
+    /// not wait for publishes or for preparations past their tick, so it
     /// returns within the budget whatever the disk, the database or the network do (only
     /// its synchronous scan, `scan_ms`, is not bounded).
     ///
@@ -152,7 +249,7 @@ impl Scheduler {
     /// pending keys are a set, the placements are indexed by (block, holder), and a
     /// holder's trust is read once per tick. A tick with due challenges ends with one
     /// INFO line `scheduler: PoS issue tick`: due, issued, blocks, skipped_pending,
-    /// deferred, cut_blocks, in_flight, elapsed_ms, scan_ms, slowest_block_ms, cpw_min,
+    /// deferred, cut_blocks, preparing (blocks preparing past their ticks), in_flight, elapsed_ms, scan_ms, slowest_block_ms, cpw_min,
     /// cpw_max, and — over the publishes settled since the previous line — zero_ack and
     /// slowest_publish_ms.
     pub(crate) async fn issue_tick(&self, in_flight: &mut InFlight) -> anyhow::Result<()> {
@@ -237,6 +334,8 @@ impl Scheduler {
             guard.keys().copied().collect()
         };
         already_pending.extend(in_flight.keys().copied());
+        // A block preparing past its tick is not started again (pos-i7-d-a).
+        already_pending.extend(in_flight.preparing.keys().copied());
 
         // The challengeable placements by (block, holder), built once per tick.
         let placement_of: HashMap<PendingKey, &SymbolPlacement> = challengeable
@@ -279,6 +378,13 @@ impl Scheduler {
                     block_entries.len() + blocks.by_ref().map(|(_, e)| e.len()).sum::<usize>();
                 break;
             }
+            // pos-i7-d-a: memory bound. The block is not started (its attempt is not
+            // moved: it keeps its place in the order) and stays due.
+            if in_flight.preparing.len() >= MAX_PREPARATIONS {
+                tick.deferred +=
+                    block_entries.len() + blocks.by_ref().map(|(_, e)| e.len()).sum::<usize>();
+                break;
+            }
             tick.blocks += 1;
             // pos-i7-c: an attempt moves the block back in the order, served or not.
             {
@@ -300,10 +406,11 @@ impl Scheduler {
                 .collect();
 
             // The preparation runs on the blocking pool; the tick waits for it only until
-            // the deadline (СТ-0c round 4). Past it the block is cut — the task finishes
-            // on its own and its result is dropped; its placements stay due.
-            let prep = self.spawn_prepare(block_id, &holder_placements);
-            let prepared = match tokio::time::timeout_at(deadline, prep).await {
+            // the deadline (СТ-0c round 4). Past it the block is cut from the tick: the
+            // handle moves to `in_flight.preparing` and the run loop publishes the block's
+            // challenges when it ends (pos-i7-d-a).
+            let mut prep = self.spawn_prepare(block_id, &holder_placements);
+            let prepared = match tokio::time::timeout_at(deadline, &mut prep).await {
                 Ok(Ok(prepared)) => prepared,
                 Ok(Err(join_err)) => {
                     // CS-POS-8: the blocking task panicked — log it loudly, skip the block
@@ -317,8 +424,14 @@ impl Scheduler {
                 }
                 Err(_) => {
                     tick.cut_blocks += 1;
-                    tick.deferred +=
-                        block_entries.len() + blocks.by_ref().map(|(_, e)| e.len()).sum::<usize>();
+                    let keys = block_entries
+                        .iter()
+                        .map(|e| (e.source_block_id, e.holder_id))
+                        .collect();
+                    in_flight.preparing.adopt(block_id, cpw_of, keys, prep);
+                    // The cut block itself is preparing, not deferred: only the blocks
+                    // this tick did not reach are.
+                    tick.deferred += blocks.by_ref().map(|(_, e)| e.len()).sum::<usize>();
                     slowest_block = slowest_block.max(block_started.elapsed());
                     break 'blocks;
                 }
@@ -362,6 +475,7 @@ impl Scheduler {
             skipped_pending = tick.skipped_pending,
             deferred = tick.deferred,
             cut_blocks = tick.cut_blocks,
+            preparing = in_flight.preparing.len(),
             in_flight = in_flight.len(),
             zero_ack = settled.zero_ack,
             slowest_publish_ms = settled.slowest_publish.as_millis() as u64,
