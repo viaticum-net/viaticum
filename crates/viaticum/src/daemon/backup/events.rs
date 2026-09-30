@@ -8,6 +8,7 @@
 // last one).
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use viaticum_core::config::derive_file_importance;
 use viaticum_core::db::Db;
@@ -15,6 +16,7 @@ use viaticum_core::types::{
     DeviceId, FileCategory, FileId, FileRecord, FileVersion, LocalState, SourceBlockId, Timestamp,
 };
 
+use super::source_read::{SourceReadError, read_source_bounded};
 use super::{BackupCoordinator, DirtyEvent, QueuedFile};
 
 /// A backed-up version holding some content: where a path whose bytes have that
@@ -125,10 +127,24 @@ pub(super) fn set_present(record: &mut FileRecord, device: DeviceId) -> bool {
 
 impl BackupCoordinator {
     pub(super) fn handle_added_or_modified(&mut self, event: &DirtyEvent) -> anyhow::Result<()> {
-        let file_bytes = std::fs::read(&event.path)
-            .map_err(|e| anyhow::anyhow!("read file {}: {e}", event.path))?;
+        // backup-i4, backup-i5: the size is judged by `metadata` before the file is opened;
+        // the read itself is capped at the limit + 1 byte (a file that grows while it is
+        // read is cut and refused). Above the limit: a mark, no read, no version.
+        let file_bytes =
+            match read_source_bounded(Path::new(&event.path), self.config.max_file_size_bytes, 0) {
+                Ok(bytes) => bytes,
+                Err(SourceReadError::TooLarge { size, .. }) => {
+                    self.mark_too_large(&event.path, size);
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e).context(format!("read file {}", event.path)));
+                }
+            };
         let size_bytes = file_bytes.len() as u64;
         let content_hash: [u8; 32] = *blake3::hash(&file_bytes).as_bytes();
+        // At or under the limit: an earlier mark of this path is over.
+        self.clear_too_large(&event.path);
 
         // Dedup: content already in the network on a block in service → the path points
         // at it, zero traffic. Indexed lookup (CONTENT_INDEX); the cluster branch that
@@ -186,7 +202,14 @@ impl BackupCoordinator {
             let candidates = self.get_candidates(&Default::default())?;
             // A4: backup creates only the block record; the WorkPipeline worker
             // offers and delivers. No offer count to tally here.
-            self.process_large_file(&event.path, file_id, content_hash, importance, &candidates)?;
+            self.process_large_file(
+                &event.path,
+                file_id,
+                content_hash,
+                importance,
+                &candidates,
+                file_bytes,
+            )?;
             return Ok(());
         }
 

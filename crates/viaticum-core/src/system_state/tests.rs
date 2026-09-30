@@ -1027,3 +1027,34 @@ fn snapshot_and_diff_carry_block_generation() {
     assert_eq!(carried.seal_generation, 1);
     assert_states_eq(&result, &target);
 }
+
+/// backup-i4: a too-large mark is node-local. With a mark present the snapshot is the
+/// same as without it, and restoring it gives a database without the mark.
+#[test]
+fn system_state_snapshot_excludes_too_large_marks() {
+    let db = test_db();
+    db.upsert_source_block(&make_source_block(1)).unwrap();
+    let before = snapshot_db(&db).unwrap();
+
+    db.put_too_large(
+        "/w/huge.mkv",
+        &crate::types::TooLargeMark {
+            size_bytes: 4_294_967_296,
+            limit_bytes: 268_435_456,
+            first_seen: Timestamp(1),
+            last_seen: Timestamp(2),
+        },
+    )
+    .unwrap();
+    let mut after = snapshot_db(&db).unwrap();
+    after.created_at = before.created_at;
+    assert_eq!(
+        crate::types::to_cbor_bytes(&before),
+        crate::types::to_cbor_bytes(&after),
+        "a too-large mark must not change the snapshot"
+    );
+
+    let restored = test_db();
+    restore_db(&restored, &after).unwrap();
+    assert!(restored.list_too_large().unwrap().is_empty());
+}

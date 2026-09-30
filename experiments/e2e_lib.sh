@@ -467,3 +467,49 @@ sleep_until() {
     [ "$d" -gt 0 ] && sleep "$d"
     return 0
 }
+
+# ── Peak-memory and log-window helpers (R1-d, local_bigfile_limit_test) ──────
+
+# hwm_reset PID : reset the process's peak RSS (VmHWM) to its current RSS
+# (`echo 5 > /proc/PID/clear_refs`) and remember that RSS in HWM_RSS0_KB.
+# Returns 1 when the reset is not possible (process gone, no permission).
+HWM_RSS0_KB=0
+hwm_reset() {
+    HWM_RSS0_KB=$(rss_kb "$1")
+    [ -n "$HWM_RSS0_KB" ] || { HWM_RSS0_KB=0; return 1; }
+    echo 5 > "/proc/$1/clear_refs" 2>/dev/null || return 1
+}
+
+# rss_kb PID / hwm_kb PID : VmRSS / VmHWM of the process in KiB ("" when unreadable).
+rss_kb() { awk '/^VmRSS:/ { print $2 }' "/proc/$1/status" 2>/dev/null || true; }
+hwm_kb() { awk '/^VmHWM:/ { print $2 }' "/proc/$1/status" 2>/dev/null || true; }
+
+# hwm_delta_kb PID : peak RSS since the last hwm_reset minus the RSS at that reset (KiB).
+hwm_delta_kb() {
+    local h; h=$(hwm_kb "$1")
+    [ -n "$h" ] || { echo ""; return 0; }
+    echo $(( h - HWM_RSS0_KB ))
+}
+
+# owner_lines_since LINE0 PATTERN : node-00's log lines after line LINE0 containing the fixed
+# string PATTERN, ANSI colours stripped, one per line (empty when none). Count with
+# `grep -ac .`; narrow with `grep -aF`.
+owner_lines_since() {
+    log_since 0 "$1" | grep -aF -- "$2" || true
+}
+
+# pos_answers_since BLOCK_HEX FROM [TO] : how many times the holders answered a PoS challenge
+# for BLOCK_HEX (processor/pos.rs DEBUG "responding with chain hash", block_id = first 16
+# hex) with a log time in [FROM, TO] (unix seconds; TO defaults to "no upper bound").
+# Holders are the nodes of ${HOLDERS[@]}; the sourcing script sets T_BASE=0 so that
+# `events` times are unix seconds, and starts the holders with the pos target at DEBUG.
+pos_answers_since() {
+    local hex="${1:0:16}" from="$2" to="${3:-9999999999}" total=0 n i
+    [ -n "$hex" ] || { echo 0; return; }
+    for i in "${HOLDERS[@]}"; do
+        n=$(events "$(node_log "$i")" "responding with chain hash" block_id \
+            | awk -v a="$from" -v b="$to" -v h="$hex" '$1 >= a && $1 <= b && $3 == h' | wc -l)
+        total=$((total + n))
+    done
+    echo "$total"
+}

@@ -196,24 +196,39 @@ fn erasure_params_compute_rejects_empty_block() {
 
 #[test]
 fn erasure_params_compute_handles_max_size() {
-    // Max valid size: k must stay below u32::MAX / 4 to leave headroom for
-    // DECODE_OVERHEAD and the importance multiplier without overflow.
-    let k_limit: u64 = (u32::MAX / 4) as u64;
+    // Largest valid size: k == RAPTORQ_MAX_SOURCE_SYMBOLS exactly.
     let t: u64 = super::SYMBOL_SIZE as u64;
-    let max_ok_size: u64 = k_limit * t;
+    let max_ok_size: u64 = crate::constants::RAPTORQ_MAX_SOURCE_SYMBOLS as u64 * t;
     let result = ErasureParams::compute(max_ok_size, 0.0);
     assert!(
         result.is_ok(),
         "expected Ok for max valid size, got {result:?}"
     );
 
-    let too_large: u64 = max_ok_size + t + 1;
+    let too_large: u64 = max_ok_size + 1;
     let result = ErasureParams::compute(too_large, 0.0);
     assert!(
         matches!(result, Err(ErasureParamsError::TooLarge(_))),
         "expected TooLarge, got {result:?}"
     );
 }
+
+#[test]
+fn erasure_params_reject_k_above_raptorq_max() {
+    let t = super::SYMBOL_SIZE as u64;
+    let max = crate::constants::RAPTORQ_MAX_SOURCE_SYMBOLS;
+    let at_limit = ErasureParams::compute(max as u64 * t, 1.0).unwrap();
+    assert_eq!(at_limit.k, max);
+    // One byte more needs one more symbol.
+    assert!(matches!(
+        ErasureParams::compute(max as u64 * t + 1, 1.0),
+        Err(ErasureParamsError::TooLarge(_))
+    ));
+    // The 3 GiB ceiling is coded as one block.
+    let ceiling = ErasureParams::compute(crate::constants::MAX_FILE_SIZE_CEILING_BYTES, 1.0);
+    assert!(ceiling.is_ok(), "{ceiling:?}");
+}
+
 #[test]
 fn timestamp_weeks_elapsed() {
     let t0 = Timestamp(1_000_000);

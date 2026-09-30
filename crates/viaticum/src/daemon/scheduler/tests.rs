@@ -37,6 +37,8 @@ mod issue_stall;
 mod issue_prepare;
 // The shared owner / postman set-up of the issue-tick tests.
 mod issue_support;
+// backup-i7: the load-failure WARN of a PoS block once per day.
+mod pos_load_warn;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 

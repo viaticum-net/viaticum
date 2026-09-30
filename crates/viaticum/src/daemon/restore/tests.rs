@@ -62,6 +62,7 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         peer_backoff: None,
         work_event_tx: None,
         resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -2384,5 +2385,56 @@ async fn block_fetch_has_no_deadline_slow_holders_past_60s_still_decode() {
         t0.elapsed() >= std::time::Duration::from_secs(85),
         "30 s + 30 s + 25 s at least: {:?}",
         t0.elapsed()
+    );
+}
+
+/// backup-i5 (J1): the local tier reads no source file above this machine's size limit. The
+/// source is there and within reach, but over the limit: the block comes from the network,
+/// and no request is made in the control run, where the limit admits the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_tier_does_not_read_source_over_the_size_limit_and_goes_to_the_network() {
+    let db = Db::open_in_memory().unwrap();
+    let (symbols_dir, files_dir, staging_dir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let content = b"the file that outgrew the limit".repeat(100);
+    let path = backup_one(&db, &symbols_dir, files_dir.path(), "big.bin", &content);
+    let holders = Arc::new(FakeHolders::default());
+    place_on_fake_holders(&db, &path, &holders).await;
+    let block = db.get_file(&path).unwrap().unwrap().versions[0].source_block_id;
+    let rec = db.get_source_block(&block).unwrap().unwrap();
+    let size = std::fs::metadata(&path).unwrap().len();
+    let decode = |limit: u64| {
+        let mut coord = coord_with_source(db.clone(), &staging_dir, Some(holders.clone()));
+        coord.config.max_source_bytes = limit;
+        let rec = rec.clone();
+        async move {
+            coord
+                .decode_block_local(
+                    &block,
+                    &rec.erasure_params(),
+                    rec.encrypted_size.unwrap(),
+                    &mut NoAnswerPauses::new(JobId::new(), 1),
+                )
+                .await
+        }
+    };
+
+    // Control: the limit admits the file, the local tier serves it, the network is not asked.
+    let plaintext = decode(size).await.unwrap();
+    assert!(plaintext.ends_with(&content));
+    assert!(
+        holders.requests.lock().unwrap().is_empty(),
+        "within the limit the source serves the block"
+    );
+
+    // One byte under the file's size: not read, the holders are asked, the bytes are right.
+    let plaintext = decode(size - 1).await.unwrap();
+    assert!(plaintext.ends_with(&content));
+    assert!(
+        !holders.requests.lock().unwrap().is_empty(),
+        "over the limit the block comes from the network"
     );
 }

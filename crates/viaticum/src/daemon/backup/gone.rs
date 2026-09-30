@@ -47,6 +47,8 @@ impl BackupCoordinator {
     pub(super) fn handle_deleted(&mut self, event: &DirtyEvent) -> anyhow::Result<()> {
         let now = Timestamp::now();
         let device = event.device_id;
+        // backup-i4: a deleted path (or directory) is not a too-large file any more.
+        self.clear_too_large_of_deleted(&event.path);
         let mut known = false;
         if let Some(mut record) = self.db.get_file(&event.path)? {
             known = true;
@@ -92,6 +94,9 @@ impl BackupCoordinator {
     /// record, only if this device saw its file on disk (INV-CONF): after DR or a root
     /// change a record is unconfirmed and stays (a leak, not a loss).
     pub(super) fn handle_gone_on_recheck(&mut self, event: &DirtyEvent) -> anyhow::Result<()> {
+        // backup-i4: a path found gone is not a too-large file any more, as with a live
+        // deletion.
+        self.clear_too_large(&event.path);
         let Some(record) = self.db.get_file(&event.path)? else {
             tracing::debug!(path = %event.path, "recheck: path not in the catalog");
             return Ok(());

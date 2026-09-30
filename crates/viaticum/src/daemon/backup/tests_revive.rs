@@ -17,7 +17,7 @@ use super::events::{DedupLookup, select_dedup_source};
 use super::generation::{Committed, choose_generation, commit_block_record};
 use super::packing::build_plaintext;
 use super::pipeline::{
-    BlockTypeTag, compress_and_encrypt, compress_block, decrypt_and_decompress,
+    BlockTypeTag, compress_and_encrypt, compress_block, compress_framed, decrypt_and_decompress,
     rebuild_blob_blocking, run_pipeline, seal_compressed,
 };
 use super::rebuild::RebuildScope;
@@ -404,8 +404,8 @@ fn pipeline_keeps_serviceable_record_and_its_cached_fields() {
 #[test]
 fn pipeline_rechecks_choice_inside_write_txn() {
     let db = Db::open_in_memory().unwrap();
-    let compressed = compress_block(&content(8, 4096)).unwrap();
-    let sealed = choose_generation(&db, &compressed, &KEY).unwrap();
+    let framed = compress_framed(&content(8, 4096)).unwrap();
+    let sealed = choose_generation(&db, framed.clone(), &KEY).unwrap();
     assert_eq!(sealed.generation, 0);
     assert!(sealed.skipped.is_empty());
 
@@ -425,7 +425,7 @@ fn pipeline_rechecks_choice_inside_write_txn() {
         "nothing written over the released id"
     );
 
-    let again = choose_generation(&db, &compressed, &KEY).unwrap();
+    let again = choose_generation(&db, framed, &KEY).unwrap();
     assert_eq!(again.generation, 1);
     assert_eq!(
         again.skipped,

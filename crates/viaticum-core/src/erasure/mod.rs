@@ -7,6 +7,7 @@ use raptorq::{
 };
 use sha2::Sha256;
 
+use crate::constants::RAPTORQ_MAX_SOURCE_SYMBOLS;
 use crate::types::{DeviceId, ErasureParams, SourceBlockId};
 
 /// One encoding symbol: ESI (which symbol) + T bytes of data.
@@ -61,6 +62,10 @@ pub enum ErasureError {
     /// Source block is empty.
     #[error("source block is empty")]
     EmptyBlock,
+
+    /// `k` exceeds what the raptorq crate accepts for one source block (it panics above it).
+    #[error("too many source symbols: k = {k}, RaptorQ single-block maximum is {max}")]
+    TooManySourceSymbols { k: u32, max: u32 },
 
     /// Not enough symbols to decode (need at least K_eff).
     #[error("insufficient symbols: have {have}, need {need}")]
@@ -187,6 +192,17 @@ impl RaptorQEncoder {
     }
 }
 
+/// Refuse a `k` the raptorq crate would panic on, before anything is allocated (backup-i5).
+fn check_source_symbol_limit(params: &ErasureParams) -> Result<(), ErasureError> {
+    if params.k > RAPTORQ_MAX_SOURCE_SYMBOLS {
+        return Err(ErasureError::TooManySourceSymbols {
+            k: params.k,
+            max: RAPTORQ_MAX_SOURCE_SYMBOLS,
+        });
+    }
+    Ok(())
+}
+
 impl Default for RaptorQEncoder {
     fn default() -> Self {
         Self::new()
@@ -211,6 +227,7 @@ impl ErasureEncoder for RaptorQEncoder {
     }
 
     fn decode(&self, symbols: &[Symbol], params: &ErasureParams) -> Result<Vec<u8>, ErasureError> {
+        check_source_symbol_limit(params)?;
         let k_eff = params.k_eff as usize;
 
         if symbols.len() < k_eff {
@@ -258,6 +275,7 @@ impl ErasureEncoder for RaptorQEncoder {
         start_esi: u32,
         count: u32,
     ) -> Result<Vec<Symbol>, ErasureError> {
+        check_source_symbol_limit(params)?;
         self.encode_raw_ranges(source_block, params, &[(start_esi, count)])
     }
 
@@ -267,6 +285,7 @@ impl ErasureEncoder for RaptorQEncoder {
         params: &ErasureParams,
         ranges: &[(u32, u32)],
     ) -> Result<Vec<Symbol>, ErasureError> {
+        check_source_symbol_limit(params)?;
         if source_block.is_empty() {
             return Err(ErasureError::EmptyBlock);
         }

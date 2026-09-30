@@ -453,6 +453,8 @@ impl Db {
             tx.open_table(MAILBOX_SP_BYTES_BY_TARGET)?;
             tx.open_table(PAIR_LEDGER)?;
             tx.open_table(PAIR_LEDGER_PENDING_DROPS)?;
+            // backup-i4: too-large source marks (node-local; outside snapshot_db).
+            tx.open_table(too_large::TOO_LARGE_SOURCES)?;
             // DN-1: applied signed letters + their expiry index (outside snapshot_db, 4r-i51).
             tx.open_table(seen_signed_letters::SEEN_SIGNED_LETTERS)?;
             tx.open_table(seen_signed_letters::SEEN_SIGNED_LETTERS_BY_EXPIRY)?;
@@ -3382,6 +3384,9 @@ pub use serviceability::{Serviceability, serviceability_of};
 
 /// В-0: 4R holder state (`four_r_state`: the relay latch row).
 mod four_r_state;
+
+/// backup-i4: too-large source marks (`too_large_sources`), node-local.
+mod too_large;
 
 #[cfg(test)]
 mod tests;

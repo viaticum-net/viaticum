@@ -93,6 +93,22 @@ pub const DEFAULT_SOURCE_BLOCK_SIZE: u64 = 128 * 1024 * 1024;
 /// Symbol size T in bytes. Fixed at ~64 KB (max for raptorq crate, u16 limit).
 pub const SYMBOL_SIZE: u16 = 65_535;
 
+/// Largest K (source symbols) the raptorq crate accepts for one source block
+/// (`raptorq` asserts `K <= 56403`; a larger K panics inside the encoder). Guarded in
+/// `ErasureParams::compute` and at the erasure entry points (backup-i5).
+pub const RAPTORQ_MAX_SOURCE_SYMBOLS: u32 = 56_403;
+
+/// Largest file this build can back up as one block: 3 GiB. Ceiling for the
+/// `backup.max_file_size_mb` override (files above it are not supported yet; splitting
+/// large files is a later feature). Leaves room for compression expansion (1/256) and
+/// the AEAD framing under the RaptorQ single-block limit.
+pub const MAX_FILE_SIZE_CEILING_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+
+const _: () = assert!(
+    MAX_FILE_SIZE_CEILING_BYTES + MAX_FILE_SIZE_CEILING_BYTES / 256 + 1024
+        < RAPTORQ_MAX_SOURCE_SYMBOLS as u64 * SYMBOL_SIZE as u64
+);
+
 /// Decode overhead: K_eff = K + DECODE_OVERHEAD.
 pub const DECODE_OVERHEAD: u32 = 3;
 

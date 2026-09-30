@@ -425,6 +425,8 @@ batch plaintext = [PackIndex CBOR] + [file1 bytes] + [file2 bytes] + ...
 
 **Async run():** receives `DirtyEvent` from an mpsc channel. Three timers: idle, fallback, channel close.
 
+**Size limit:** a file is one erasure-coded block (RaptorQ has a fixed maximum block size), so a file above the limit `N` of the machine is not backed up. `N` is `backup.max_file_size_mb` if set (at most 3072 MiB, the RaptorQ ceiling), otherwise `RAM/32` clamped to [32 MiB, 1 GiB]; `RAM` is the smaller of `MemTotal` and the cgroup memory limit (v2 `memory.max`, v1 `memory.limit_in_bytes`). The size is `metadata().len()`: `size > N` is refused before the file is opened, `size == N` is backed up. Every read of a source file (event, flush, rebuild for PoS, repair and the local restore tier) is bounded by `N`. The refusal is a node-local "too large" mark (path, size, limit; not in the catalog, not sent to peers, not restored by DR), shown by `files`, `status` and the web UI, with one WARN per file. A protected file that grows above `N` keeps its earlier version in the network; the mark says that version is no longer checked. The pack size is `B_eff = min(source_block_size, N/2)`, so a pack never costs more memory than the largest accepted file. The memory budget for heavy block work is not part of this yet.
+
 ---
 
 ### restore
@@ -806,6 +808,7 @@ process_sync_response():
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `source_block_size` | 128 MB | Source block size. Reduce for low-memory hardware (32 MB → ~65 MB peak RAM) |
+| `max_file_size_mb` | 0 (automatic) | Largest file backed up, in MiB; `0` = `RAM/32` clamped to [32 MiB, 1 GiB]; at most 3072. Larger files are marked "too large" and not backed up |
 | `symbols_dir` | `"symbols"` | Directory for symbol files |
 | `epoch_key` | — | 32-byte encryption key (derived from master key) |
 | `device_id` | — | Device identifier |

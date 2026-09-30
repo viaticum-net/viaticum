@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
 
@@ -67,6 +67,7 @@ async fn make_test_state_with(
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: None,
         missing_sources: Default::default(),
+        max_file_size_bytes: 0,
     })
 }
 
@@ -299,6 +300,7 @@ async fn dispatch_device_revoke_returns_device_revoked_with_no_router() {
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: None, // no router → revocation goes nowhere (best-effort)
         missing_sources: Default::default(),
+        max_file_size_bytes: 0,
     });
 
     // Revoke device B.
@@ -929,6 +931,7 @@ async fn revocation_published_only_to_storage_relationship_peers() {
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: Some(router),
         missing_sources: Default::default(),
+        max_file_size_bytes: 0,
     });
 
     // Revoke device.
@@ -1087,6 +1090,7 @@ async fn revocation_dedup_peer_is_holder_and_owner() {
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: Some(router),
         missing_sources: Default::default(),
+        max_file_size_bytes: 0,
     });
 
     let revoked_hex: String = revoked_device_id
@@ -1325,6 +1329,7 @@ fn staging_test_state(
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: None,
         missing_sources: Default::default(),
+        max_file_size_bytes: 0,
     })
 }
 
@@ -2240,4 +2245,155 @@ async fn restore_blocker_is_being_released_when_block_is_deleting() {
         after[0].restore_blocker,
         Some(RestoreBlocker::BeingReleased)
     );
+}
+
+// ── R1-d-a (backup-i4, backup-i7): a file above the size limit is shown, never "safe" ──
+
+fn too_large_mark(size_bytes: u64) -> viaticum_core::types::TooLargeMark {
+    viaticum_core::types::TooLargeMark {
+        size_bytes,
+        limit_bytes: 268_435_456,
+        first_seen: viaticum_core::types::Timestamp(86_400 * 365),
+        last_seen: viaticum_core::types::Timestamp(86_400 * 366),
+    }
+}
+
+async fn files_of(state: &DaemonState) -> Vec<crate::cli::types::FileEntry> {
+    let CliResponse::Files(entries) =
+        dispatch(CliRequest::Files { path_prefix: None }, state).await
+    else {
+        panic!("expected Files");
+    };
+    entries
+}
+
+#[tokio::test]
+async fn files_lists_marked_file_without_record_as_never_backed_up() {
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "doc.pdf", 0.99, 0.95, true);
+    state
+        .db
+        .put_too_large("huge.mkv", &too_large_mark(4_294_967_296))
+        .unwrap();
+
+    let entries = files_of(&state).await;
+    assert_eq!(entries.len(), 2, "the catalog file and the marked one");
+
+    let huge = entries.iter().find(|e| e.path == "huge.mkv").unwrap();
+    assert_eq!(huge.last_backed_up, "never");
+    assert!(!huge.is_safe_to_delete);
+    assert_eq!(huge.versions, 0);
+    assert_eq!(huge.effective_status, None);
+    let info = huge.too_large.as_ref().expect("too_large is set");
+    assert_eq!(info.size_bytes, 4_294_967_296);
+    assert_eq!(info.limit_bytes, 268_435_456);
+    assert_eq!(info.since, "1971-01-01");
+
+    let doc = entries.iter().find(|e| e.path == "doc.pdf").unwrap();
+    assert_eq!(doc.too_large, None, "an unmarked file has no too_large");
+
+    // The JSON path the E2E reads: `.too_large.size_bytes` on the file entry itself.
+    let json = serde_json::to_value(huge).unwrap();
+    assert_eq!(json["too_large"]["size_bytes"], 4_294_967_296u64);
+    assert_eq!(json["last_backed_up"], "never");
+}
+
+#[tokio::test]
+async fn files_prefix_filters_marked_files_without_record() {
+    let state = make_test_state().await;
+    state
+        .db
+        .put_too_large("/a/huge.mkv", &too_large_mark(1 << 32))
+        .unwrap();
+    state
+        .db
+        .put_too_large("/b/huge.mkv", &too_large_mark(1 << 32))
+        .unwrap();
+    let CliResponse::Files(entries) = dispatch(
+        CliRequest::Files {
+            path_prefix: Some("/a/".to_string()),
+        },
+        &state,
+    )
+    .await
+    else {
+        panic!("expected Files");
+    };
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "/a/huge.mkv");
+}
+
+#[tokio::test]
+async fn is_safe_to_delete_false_when_mark_present() {
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "grow.bin", 0.99, 0.95, true);
+    assert!(
+        safe_to_delete_flag(&state, "grow.bin").await,
+        "control: no mark, at target"
+    );
+
+    state
+        .db
+        .put_too_large("grow.bin", &too_large_mark(300 << 20))
+        .unwrap();
+
+    let entry = file_entry(&state, "grow.bin").await;
+    assert!(!entry.is_safe_to_delete, "a mark makes it unsafe");
+    assert!(entry.too_large.is_some());
+    assert_ne!(
+        entry.last_backed_up, "never",
+        "the earlier version's date stays"
+    );
+    assert_eq!(entry.versions, 1);
+}
+
+#[tokio::test]
+async fn status_counts_too_large_files_under_watch_dirs() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let watch = dir.path().join("watched");
+    let mut state = make_test_state().await;
+    let live = Arc::new(RwLock::new(vec![viaticum_core::config::WatchConfig {
+        path: watch.to_string_lossy().into_owned(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+        bursts: None,
+    }]));
+    let (tx, _rx) = mpsc::channel(4);
+    let admin = crate::daemon::watch_admin::WatchAdmin::new(
+        dir.path().join("config.toml"),
+        live,
+        tx,
+        state.db.clone(),
+    );
+    let inner = Arc::get_mut(&mut state).expect("state is not shared yet");
+    inner.watch_admin = Some(Arc::new(admin));
+    inner.max_file_size_bytes = 268_435_456;
+
+    let inside = watch.join("huge.mkv").to_string_lossy().into_owned();
+    let nested = watch.join("sub/big.bin").to_string_lossy().into_owned();
+    let outside = dir.path().join("elsewhere/x.bin");
+    state
+        .db
+        .put_too_large(&inside, &too_large_mark(1 << 32))
+        .unwrap();
+    state
+        .db
+        .put_too_large(&nested, &too_large_mark(1 << 30))
+        .unwrap();
+    state
+        .db
+        .put_too_large(&outside.to_string_lossy(), &too_large_mark(1 << 30))
+        .unwrap();
+
+    let data = status_of(&state).await;
+    assert_eq!(
+        data.files_too_large, 2,
+        "the mark outside the watched folder is not counted"
+    );
+    assert_eq!(data.max_file_size_bytes, 268_435_456);
+    assert_eq!(data.block_work_budget_bytes, 0, "R1-d-b sets it");
+
+    let json = serde_json::to_value(&*data).unwrap();
+    assert_eq!(json["files_too_large"], 2, "the name the E2E reads");
 }

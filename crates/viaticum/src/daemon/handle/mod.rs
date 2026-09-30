@@ -121,6 +121,8 @@ pub struct DaemonState {
     /// dr-i11: background-counted "files without a local source" for `status`.
     pub missing_sources:
         std::sync::Arc<crate::daemon::dispatch::missing_sources::MissingSourceCache>,
+    /// backup-i4: this machine's file size limit in bytes (`status`, `files`).
+    pub max_file_size_bytes: u64,
 }
 
 /// Web API pieces prepared before the swarm starts (see step 9.4 of `start`).
@@ -534,7 +536,15 @@ impl DaemonHandle {
         };
 
         // ── 10. Build subsystems ──────────────────────────────────────────────
-        let source_block_size = viaticum_core::config::source_block_size_bytes(&app_config);
+        // backup-i4, backup-i5: the size limit of this machine and the pack size that
+        // follows from it (B_eff). Logged once: the limit, its source, the RAM it came from.
+        let size_limits = crate::daemon::backup::size_limit::SizeLimits::resolve(
+            app_config.backup.max_file_size_mb,
+            viaticum_core::config::source_block_size_bytes(&app_config),
+        );
+        size_limits.log_start();
+        let source_block_size = size_limits.pack_size;
+        let max_file_size_bytes = size_limits.max_file_size;
 
         // ── Step A: Build live_configs Arc ────────────────────────────────────
         // Merge CLI watch_dirs with [[watch]] entries from config. Every folder is
@@ -626,6 +636,7 @@ impl DaemonHandle {
             db.clone(),
             BackupConfig {
                 source_block_size,
+                max_file_size_bytes,
                 symbols_dir: symbols_dir.clone(),
                 epoch_key: epoch_key_bytes,
                 device_id,
@@ -671,6 +682,7 @@ impl DaemonHandle {
                     disk_reserve_bytes: viaticum_core::config::disk_reserve_bytes(&app_config),
                 }),
                 time_scale: cfg.time_scale.max(1),
+                max_source_bytes: max_file_size_bytes,
             },
             encoder.clone(),
         );
@@ -744,6 +756,7 @@ impl DaemonHandle {
             // T-13b-2: router shared with dispatch_device_revoke for directed revocation publish.
             mailbox_router: Some(std::sync::Arc::clone(&early_mailbox_router)),
             missing_sources: Default::default(),
+            max_file_size_bytes,
         });
 
         // Clone state for web API and metrics pusher.
@@ -1010,6 +1023,7 @@ impl DaemonHandle {
                     data_dir: cfg.data_dir.clone(),
                     min_pool_size: 2,
                     recheck_tx: Some(recheck_tx.clone()),
+                    max_source_bytes: max_file_size_bytes,
                 };
                 let worker = crate::daemon::work_pipeline::WorkPipeline::new(
                     db.clone(),
@@ -1140,10 +1154,10 @@ impl DaemonHandle {
             cfg.data_dir.clone(),
         );
         // К2b: the PoS rebuild reads this device's records and reports gone paths.
-        scheduler.set_rebuild_scope(crate::daemon::backup::rebuild::RebuildScope::new(
-            device_id,
-            Some(recheck_tx.clone()),
-        ));
+        scheduler.set_rebuild_scope(
+            crate::daemon::backup::rebuild::RebuildScope::new(device_id, Some(recheck_tx.clone()))
+                .with_max_source_bytes(max_file_size_bytes),
+        );
         let cancel_scheduler = cancel.clone();
         tasks.push((
             "scheduler",

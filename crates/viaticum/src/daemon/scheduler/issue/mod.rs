@@ -34,6 +34,8 @@ mod preparing;
 
 use in_flight::publish_challenge;
 pub(crate) use in_flight::{Ended, InFlight};
+#[cfg(test)]
+pub(crate) use prepare::{POS_LOAD_WARN_INTERVAL, log_load_failure, should_warn};
 
 /// An issue tick may spend 1 / `ISSUE_BUDGET_DIVISOR` of the PoS tick period (pos-i7-a:
 /// ≈ 20 %, the bar of the tick's `elapsed_ms`).

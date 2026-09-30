@@ -6,7 +6,7 @@ use crate::constants::{
     DEFAULT_SOURCE_BLOCK_SIZE, FOUR_R_C_RECIP_DAYS_DEFAULT, FOUR_R_S_HARD_DEFAULT,
     FOUR_R_S_SOFT_DEFAULT, FOUR_R_S_TARGET_DEFAULT, FOUR_R_TAU_REF_DAYS_DEFAULT,
     FOUR_R_THETA_P_DEFAULT, FOUR_R_V_FREE_GB_DEFAULT, FOUR_R_V_MIN_GB_DEFAULT, FOUR_R_W_D_DEFAULT,
-    MAX_COMPLETION_BONUS_COEFFICIENT,
+    MAX_COMPLETION_BONUS_COEFFICIENT, MAX_FILE_SIZE_CEILING_BYTES,
 };
 
 #[cfg(test)]
@@ -37,9 +37,15 @@ pub enum ConfigError {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct BackupCfg {
-    /// Source block size in megabytes. Must be a power of two, >= 1.
+    /// Source block size in megabytes. Must be a power of two, 1..=1024.
     /// Default: 128 (128 MB). Use 32 on Raspberry Pi (~65 MB peak RAM).
     pub source_block_size_mb: u64,
+
+    /// Largest file backed up on this machine, in MiB. 0 = automatic (derived from RAM).
+    /// At most 3072 (the RaptorQ single-block ceiling). Larger files are not backed up
+    /// and are shown as "too large".
+    #[serde(default)]
+    pub max_file_size_mb: u64,
 
     /// Maximum number of versions kept per file path.
     /// Default: 5.
@@ -54,6 +60,7 @@ impl Default for BackupCfg {
     fn default() -> Self {
         Self {
             source_block_size_mb: DEFAULT_SOURCE_BLOCK_SIZE / 1_048_576,
+            max_file_size_mb: 0,
             max_versions: DEFAULT_MAX_VERSIONS,
             max_version_age_days: DEFAULT_MAX_VERSION_AGE_SECS / 86400,
         }
@@ -743,6 +750,18 @@ impl AppConfig {
             return Err(ConfigError::Validation {
                 field: "backup.source_block_size_mb".to_string(),
                 reason: "must be a power of two".to_string(),
+            });
+        }
+        if b.source_block_size_mb > 1024 {
+            return Err(ConfigError::Validation {
+                field: "backup.source_block_size_mb".to_string(),
+                reason: "must be <= 1024".to_string(),
+            });
+        }
+        if b.max_file_size_mb > MAX_FILE_SIZE_CEILING_BYTES / 1_048_576 {
+            return Err(ConfigError::Validation {
+                field: "backup.max_file_size_mb".to_string(),
+                reason: "must be <= 3072 (files above 3 GiB are not supported yet)".to_string(),
             });
         }
         if b.max_versions < 1 {

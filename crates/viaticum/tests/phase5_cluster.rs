@@ -98,6 +98,7 @@ fn backup_cfg_for(symbols_dir: &TempDir, device_id: DeviceId) -> BackupConfig {
         peer_backoff: None,
         work_event_tx: None,
         resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     }
 }
 

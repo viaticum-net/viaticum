@@ -13,6 +13,9 @@
 //   generation.rs -- L1b N1: the seal generation a packed plaintext takes (delete-i9)
 //   packing.rs  -- PackIndex format: build_plaintext, parse_pack_index
 //   rebuild.rs  -- rebuild a block's plaintext from this device's files, by content (L0)
+//   source_read.rs -- bounded reads of a source file, NotFound through the error chain (R1-d)
+//   size_limit.rs  -- the size limit of this machine and the pack size (R1-d)
+//   too_large.rs -- the marks of files above the limit (backup-i4, R1-d)
 //   reconcile.rs -- L1b: current version → serviceable block, pending → queued, by level
 //   tests.rs    -- test scenarios
 //   tests_current.rs -- L1: a path points at its current content; packing does
@@ -22,6 +25,7 @@
 //   tests_seal.rs    -- L1b: a generation-0 seal keeps the pre-L1b block id (INV-G0)
 //   tests_revive.rs  -- L1b: the serviceable-block dedup gate, the seal generation (N1)
 //   tests_reconcile.rs -- L1b: the reconcile hands paths to the watcher (backup-i8, i25)
+//   tests_size_limit.rs -- R1-d: too-large marks, bounded reads, packs (backup-i4, i5, i7)
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -33,9 +37,7 @@ use viaticum_core::erasure::ErasureEncoder;
 use viaticum_core::placement::HolderCandidate;
 use viaticum_core::types::{DeviceId, FileCategory, FileId, SourceBlockId};
 
-use pipeline::{
-    BlockTypeTag, ReadAtFlush, flush_queue_inner, read_at_flush, run_pipeline, update_backed_up_at,
-};
+use pipeline::{BlockTypeTag, flush_queue_inner, run_pipeline, update_backed_up_at};
 
 pub mod events;
 mod generation;
@@ -44,6 +46,9 @@ pub mod packing;
 pub mod pipeline;
 pub mod rebuild;
 pub mod reconcile;
+pub mod size_limit;
+pub mod source_read;
+mod too_large;
 
 pub(crate) use gone::path_gone;
 
@@ -61,6 +66,8 @@ mod tests_reconcile;
 mod tests_revive;
 #[cfg(test)]
 mod tests_seal;
+#[cfg(test)]
+mod tests_size_limit;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -121,8 +128,14 @@ pub struct QueuedFile {
 /// Configuration for BackupCoordinator.
 #[derive(Clone)]
 pub struct BackupConfig {
-    /// Source block size in bytes. Default: DEFAULT_SOURCE_BLOCK_SIZE.
+    /// Pack size in bytes (`B_eff`: the configured source block size, at most half the file
+    /// limit, `size_limit::effective_pack_size`). A file of this size or more is a block of
+    /// its own. Default: DEFAULT_SOURCE_BLOCK_SIZE.
     pub source_block_size: u64,
+    /// The largest file backed up on this machine, bytes (`N`, `size_limit`): a file above
+    /// it is marked "too large" and never read past it (backup-i4, backup-i5). Default: the
+    /// RaptorQ ceiling; the daemon sets the limit in force.
+    pub max_file_size_bytes: u64,
     /// Directory where bound symbol files are written.
     pub symbols_dir: std::path::PathBuf,
     /// Epoch key for file encryption. 32 bytes.
@@ -169,6 +182,7 @@ impl Default for BackupConfig {
     fn default() -> Self {
         BackupConfig {
             source_block_size: DEFAULT_SOURCE_BLOCK_SIZE,
+            max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
             symbols_dir: std::path::PathBuf::from("symbols"),
             epoch_key: [0u8; 32],
             device_id: DeviceId([0u8; 32]),
@@ -583,6 +597,7 @@ impl BackupCoordinator {
 
         let db = self.db.clone();
         let in_network = |h: &[u8; 32]| content_in_network(&db, h);
+        let mut too_large: Vec<(String, u64)> = Vec::new();
         let results = flush_queue_inner(
             &self.db,
             &self.config,
@@ -592,7 +607,12 @@ impl BackupCoordinator {
             force,
             &candidates,
             &in_network,
+            &mut too_large,
         );
+        // Files that grew above the limit since they were queued (backup-i4).
+        for (path, size) in too_large {
+            self.mark_too_large(&path, size);
+        }
         // backup-i23: whatever the flush did not pack (a pipeline error, or the
         // MIN_BATCH_BYTES skip) stays queued.
         self.queues
@@ -646,10 +666,10 @@ impl BackupCoordinator {
 
     /// Process one large file (>= source_block_size) into its own source block.
     ///
-    /// Uses SourceBlockType::Single. Called directly for large files during process_event.
-    /// The second read follows the flush rule (backup-i23, [`read_at_flush`]): a file
-    /// that vanished, or now holds content already in the network, is skipped
-    /// (`Ok(None)`); a changed one is packed with the hash of the bytes read.
+    /// Uses SourceBlockType::Single. Called directly for large files during process_event,
+    /// with the bytes the event has just read and hashed (F1, backup-i5): the file is not
+    /// read a second time, so there is no second copy of it in memory and no second
+    /// window for it to change; `content_hash` is the hash of `file_bytes`.
     pub fn process_large_file(
         &mut self,
         path: &str,
@@ -657,17 +677,8 @@ impl BackupCoordinator {
         content_hash: [u8; 32],
         importance: f64,
         candidates: &[HolderCandidate],
-    ) -> anyhow::Result<Option<PipelineResult>> {
-        let db = self.db.clone();
-        let in_network = |h: &[u8; 32]| content_in_network(&db, h);
-        let (file_bytes, content_hash) = match read_at_flush(path, &content_hash, &in_network) {
-            ReadAtFlush::Pack {
-                bytes,
-                content_hash,
-            } => (bytes, content_hash),
-            ReadAtFlush::Skip => return Ok(None),
-        };
-
+        file_bytes: Vec<u8>,
+    ) -> anyhow::Result<PipelineResult> {
         let qf = QueuedFile {
             path: path.to_string(),
             file_id,
@@ -689,7 +700,7 @@ impl BackupCoordinator {
             importance,
         )?;
         update_backed_up_at(&self.db, &batch, result.source_block_id, result.k, result.t);
-        Ok(Some(result))
+        Ok(result)
     }
 
     /// Snapshot the set of currently-authenticated peer IDs from the swarm.
@@ -742,6 +753,8 @@ impl BackupCoordinator {
         ));
         reconcile_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         reconcile_timer.tick().await; // the first tick is immediate: this pass
+        // backup-i4: the marks of the last run are judged again, against this run's limit.
+        tokio::task::block_in_place(|| self.reconcile_too_large_marks());
         tokio::task::block_in_place(|| self.reconcile_pass());
 
         loop {
@@ -754,7 +767,7 @@ impl BackupCoordinator {
                             // while we do synchronous I/O (review A1).
                             let res = tokio::task::block_in_place(|| self.process_event(event));
                             if let Err(e) = res {
-                                tracing::error!("process_event error: {e}");
+                                tracing::error!("process_event error: {e:#}");
                             }
                             idle_timer.reset();
                         }

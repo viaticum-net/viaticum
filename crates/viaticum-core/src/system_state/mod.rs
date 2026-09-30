@@ -231,6 +231,11 @@ fn derive_system_state_key(identity_key: &[u8; 32], salt: &[u8]) -> [u8; 32] {
 /// pair_ledger.
 /// Does NOT include: holdings (holder-specific), budget, event_log (secondary/ephemeral),
 /// device_to_master (rebuilt from live certificate exchange after DR).
+/// Also not included: `too_large_sources` (backup-i4). A mark says "this machine refuses this
+/// file at this limit"; it depends on the machine's RAM and config, so it must not travel to
+/// a node with another limit. A file that was never protected has no catalog record, and a
+/// protected one that grew shows its older version with that version's date; the new node
+/// re-evaluates every path itself.
 ///
 /// Fails if any table fails to decode — including a `pair_ledger` row (strict decode, see
 /// [`crate::types::PairLedger`]). The daemon's periodic push treats a failure here as

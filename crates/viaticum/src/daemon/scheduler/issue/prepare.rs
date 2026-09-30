@@ -10,10 +10,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use viaticum_core::db::Db;
 use viaticum_core::erasure::ErasureEncoder;
 use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
@@ -21,6 +22,55 @@ use viaticum_core::messages::to_cbor;
 use viaticum_core::types::{DeviceId, IdentityPub, SourceBlockId, SymbolPlacement, Timestamp};
 
 use super::super::{PendingHashChallenge, Scheduler, random_challenge_id};
+
+/// The WARN "cannot load source block for PoS" is written at most once per this long per
+/// block (backup-i7): 86 400 s of the monotonic clock, not scaled by `time_scale`.
+pub(crate) const POS_LOAD_WARN_INTERVAL: Duration = Duration::from_secs(86_400);
+
+/// Whether the load failure of `block` at `now` is written as a WARN: the first one, and
+/// then one per [`POS_LOAD_WARN_INTERVAL`]; the rest are DEBUG. Records the time of a
+/// WARN in `map` and drops the entries that have run out. Pure: the clock is injected.
+pub(crate) fn should_warn(
+    map: &mut HashMap<SourceBlockId, Instant>,
+    block: SourceBlockId,
+    now: Instant,
+) -> bool {
+    if let Some(last) = map.get(&block)
+        && now.saturating_duration_since(*last) < POS_LOAD_WARN_INTERVAL
+    {
+        return false;
+    }
+    map.retain(|_, at| now.saturating_duration_since(*at) < POS_LOAD_WARN_INTERVAL);
+    map.insert(block, now);
+    true
+}
+
+/// backup-i7: a block whose source outgrew the size limit fails to load every tick; one
+/// WARN per block per day, the rest DEBUG. The clock is injected.
+pub(crate) fn log_load_failure(
+    warned: &Mutex<HashMap<SourceBlockId, Instant>>,
+    block_id: SourceBlockId,
+    now: Instant,
+    err: &anyhow::Error,
+) {
+    let loud = {
+        let mut map = warned.lock().unwrap_or_else(|p| p.into_inner());
+        should_warn(&mut map, block_id, now)
+    };
+    if loud {
+        warn!(
+            block_id = %block_id,
+            err = %format!("{err:#}"),
+            "scheduler: cannot load source block for PoS hash, skipping"
+        );
+    } else {
+        debug!(
+            block_id = %block_id,
+            err = %format!("{err:#}"),
+            "scheduler: cannot load source block for PoS hash, skipping"
+        );
+    }
+}
 
 /// One challenge of a block, its expected answer computed.
 pub(crate) struct PreparedChallenge {
@@ -41,6 +91,8 @@ struct BlockPrep {
     data_dir: PathBuf,
     epoch_key: [u8; 32],
     rebuild_scope: crate::daemon::backup::rebuild::RebuildScope,
+    /// Shared with the scheduler: the last WARN of a load failure per block.
+    load_warned: Arc<Mutex<HashMap<SourceBlockId, Instant>>>,
     encoder: Arc<dyn ErasureEncoder>,
     block_id: SourceBlockId,
     holders: Vec<HolderPrep>,
@@ -78,6 +130,7 @@ impl Scheduler {
             data_dir: self.data_dir.clone(),
             epoch_key: self.epoch_key,
             rebuild_scope: self.rebuild_scope.clone(),
+            load_warned: Arc::clone(&self.pos_load_warned),
             encoder: Arc::clone(&self.encoder),
             block_id,
             holders,
@@ -166,11 +219,7 @@ impl BlockPrep {
         ) {
             Ok(d) => d,
             Err(e) => {
-                warn!(
-                    block_id = %block_id,
-                    err = %format!("{e:#}"),
-                    "scheduler: cannot load source block for PoS hash, skipping"
-                );
+                log_load_failure(&self.load_warned, block_id, Instant::now(), &e);
                 return Vec::new();
             }
         };
