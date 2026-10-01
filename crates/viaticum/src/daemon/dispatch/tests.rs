@@ -2397,3 +2397,60 @@ async fn status_counts_too_large_files_under_watch_dirs() {
     let json = serde_json::to_value(&*data).unwrap();
     assert_eq!(json["files_too_large"], 2, "the name the E2E reads");
 }
+
+/// network-i14 (C-DK Р-7): status counts as known only the PeerRecords of another
+/// master with a dialable address; without a swarm there is no authenticated list.
+#[tokio::test]
+async fn dispatch_status_reports_known_devices_from_peer_records() {
+    use viaticum_core::constants::{AVAIL_EWMA_INITIAL, INITIAL_TRUST_P};
+    use viaticum_core::types::{PeerRecord, Timestamp};
+
+    let state = make_test_state().await;
+    let rec = |device_id: DeviceId, master: IdentityPub, addrs: Vec<String>| PeerRecord {
+        device_id,
+        master_identity: master,
+        trust_p: INITIAL_TRUST_P,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp::now(),
+        last_seen: Timestamp::now(),
+        revoked_device_pub_keys: vec![],
+        addrs,
+        x25519_pub: None,
+        avail_ewma: AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
+    };
+    let key = |seed: u8| {
+        DeviceId(
+            ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+    };
+    let addr = vec!["/ip4/127.0.0.1/tcp/4001".to_string()];
+    let stranger = IdentityPub([0x42; 32]);
+    let known = key(50);
+    for r in [
+        rec(known, stranger, addr.clone()),
+        rec(key(51), state.identity_pub, addr.clone()),
+        rec(key(52), stranger, vec![]),
+    ] {
+        state.db.upsert_peer(&r).unwrap();
+    }
+
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert_eq!(data.peer_count, 3, "every PeerRecord row");
+    assert_eq!(data.peer_count_known, 1);
+    assert_eq!(
+        data.known_devices,
+        Some(vec![viaticum_core::types::hex_encode(&known.0[..8])])
+    );
+    assert_eq!(
+        data.authenticated_devices, None,
+        "no swarm: no list, not an empty one"
+    );
+}

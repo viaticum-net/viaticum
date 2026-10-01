@@ -56,6 +56,10 @@ pub const VIATICUM_PROTOCOL: StreamProtocol = StreamProtocol::new("/viaticum/1")
 /// Protocol for DeviceCertExchange (transport-level cert handshake).
 pub const CERT_PROTOCOL: StreamProtocol = StreamProtocol::new("/viaticum/cert/1");
 
+/// Kademlia protocol name. Still the shared IPFS DHT name (ε.3); identify
+/// reports whether a peer announces it (C-DK Р-7 diagnostics).
+const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/ipfs/kad/1.0.0");
+
 /// Max message size — matches viaticum_core::constants::MAX_MESSAGE_SIZE.
 const MAX_MSG_SIZE: usize = viaticum_core::constants::MAX_MESSAGE_SIZE as usize;
 
@@ -385,6 +389,13 @@ enum SwarmCommand {
         device: DeviceId,
         reply: oneshot::Sender<Vec<Multiaddr>>,
     },
+    /// Test-only (`net-probe disconnect`, C-DK Р-16): close every connection to
+    /// `peer_id`. Replies whether there was one.
+    #[cfg(feature = "e2e-tools")]
+    Disconnect {
+        peer_id: PeerId,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 // ─── Error type ───────────────────────────────────────────────────────────────
@@ -548,9 +559,7 @@ impl SwarmHandle {
         );
 
         // ── 2. Build Kademlia behaviour ───────────────────────────────────────
-        let kad_protocol = libp2p::StreamProtocol::try_from_owned("/ipfs/kad/1.0.0".to_string())
-            .expect("valid kad protocol string");
-        let kad_cfg = libp2p::kad::Config::new(kad_protocol);
+        let kad_cfg = libp2p::kad::Config::new(KAD_PROTOCOL);
         let kad_store = libp2p::kad::store::MemoryStore::with_config(
             peer_id,
             libp2p::kad::store::MemoryStoreConfig {
@@ -735,6 +744,17 @@ impl SwarmHandle {
             t
         };
 
+        // Test-only record-size amplifier (C-DK Р-10): read once, applied on the
+        // first IPv4 TCP listen address.
+        #[cfg(feature = "e2e-tools")]
+        let e2e_loopback_aliases = match super::e2e_amp::alias_count_from_env() {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(err = %e, "e2e: loopback alias amplifier disabled");
+                0
+            }
+        };
+
         // ── 8. Spawn event loop ───────────────────────────────────────────────
         let loop_state = EventLoopState {
             swarm,
@@ -758,6 +778,9 @@ impl SwarmHandle {
             dialing: HashSet::new(),
             bootstrap_called: false,
             relay_reservations: HashSet::new(),
+            last_empty_lookup_warn: None,
+            #[cfg(feature = "e2e-tools")]
+            e2e_loopback_aliases,
         };
         tokio::spawn(loop_state.run());
 
@@ -967,6 +990,24 @@ impl SwarmHandle {
         reply_rx.await.map_err(|_| SwarmError::ChannelClosed)?
     }
 
+    /// Test-only (`net-probe disconnect`, C-DK Р-16): close every connection to
+    /// `device` (the PeerId is derived from the device key, so a peer that never
+    /// authenticated can be named too). `Ok(false)` when there was none. The
+    /// usual `ConnectionClosed` handling drops the peer from `authenticated`.
+    #[cfg(feature = "e2e-tools")]
+    pub async fn disconnect_device(&self, device: DeviceId) -> Result<bool, SwarmError> {
+        let peer_id = device_id_to_peer_id(&device)?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::Disconnect {
+                peer_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| SwarmError::ChannelClosed)?;
+        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)
+    }
+
     /// Query the Kademlia DHT for the peers closest to `key`.
     ///
     /// Issues a FIND_NODE query and returns the K closest peers found, each
@@ -1109,6 +1150,15 @@ struct EventLoopState {
     /// PeerIds of relay servers for which we have an active reservation.
     /// Used for logging and diagnostics only; not required for correctness.
     relay_reservations: HashSet<PeerId>,
+
+    /// When the last WARN "kademlia lookup found no peers" was logged
+    /// (rate limit, see `kad_stats`).
+    last_empty_lookup_warn: Option<Instant>,
+
+    /// Loopback aliases still to advertise on the first IPv4 TCP listen address
+    /// (test-only amplifier, C-DK Р-10); 0 once done or when off.
+    #[cfg(feature = "e2e-tools")]
+    e2e_loopback_aliases: usize,
 }
 
 impl EventLoopState {
@@ -1160,6 +1210,8 @@ impl EventLoopState {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!(addr = %address, "swarm listening on new address");
+                #[cfg(feature = "e2e-tools")]
+                self.e2e_advertise_loopback_aliases(&address);
             }
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
@@ -1188,8 +1240,15 @@ impl EventLoopState {
                     debug!(peer_id = %peer_id, "sent DeviceCertExchange as dialer (attempt 1)");
                 }
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                debug!(peer_id = %peer_id, "connection closed");
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established,
+                cause,
+                ..
+            } => {
+                // `cause` = KeepAliveTimeout would mean libp2p's idle timeout closed a
+                // link between live nodes (C-DK v3-C expects none).
+                debug!(peer_id = %peer_id, num_established, cause = ?cause, "connection closed");
                 let device_id = self.authenticated.remove(&peer_id).map(|(did, _, _)| did);
                 if let Some(did) = device_id {
                     self.device_to_peer.remove(&did);
@@ -1246,8 +1305,14 @@ impl EventLoopState {
 
     fn handle_identify_event(&mut self, event: libp2p::identify::Event) {
         if let libp2p::identify::Event::Received { peer_id, info, .. } = event {
+            // Р-7: how many addresses the peer announced and how many went into
+            // the Kademlia table (all of them, for now), and whether the peer
+            // speaks our Kademlia protocol.
             debug!(
                 peer_id = %peer_id,
+                addrs = info.listen_addrs.len(),
+                fed_to_kad = info.listen_addrs.len(),
+                kad_protocol = info.protocols.contains(&KAD_PROTOCOL),
                 protocols = ?info.protocols,
                 "identify received"
             );
@@ -1695,7 +1760,10 @@ impl EventLoopState {
 
         match event {
             Event::OutboundQueryProgressed {
-                id, result, step, ..
+                id,
+                result,
+                step,
+                stats,
             } => match result {
                 QueryResult::Bootstrap(Ok(bootstrap_ok)) if bootstrap_ok.num_remaining == 0 => {
                     info!("kademlia bootstrap complete");
@@ -1771,17 +1839,11 @@ impl EventLoopState {
                     // Err(Timeout) carry a peer list; on Timeout we keep whatever the
                     // query collected (best-effort).
                     let peer_list: Vec<(PeerId, Vec<Multiaddr>)> = match result {
-                        Ok(ok) => {
-                            debug!(
-                                query_id = ?id,
-                                count = ok.peers.len(),
-                                "dht: get_closest_peers complete"
-                            );
-                            ok.peers
-                                .into_iter()
-                                .map(|pi| (pi.peer_id, pi.addrs))
-                                .collect()
-                        }
+                        Ok(ok) => ok
+                            .peers
+                            .into_iter()
+                            .map(|pi| (pi.peer_id, pi.addrs))
+                            .collect(),
                         Err(e) => {
                             debug!(
                                 query_id = ?id,
@@ -1795,6 +1857,7 @@ impl EventLoopState {
                             }
                         }
                     };
+                    self.log_lookup_stats(id, &stats, peer_list.len());
 
                     // Route by query origin: SwarmHandle API vs DISCOVERY.
                     if let Some(reply) = self.pending_closest_peers.remove(&id) {
@@ -1821,14 +1884,81 @@ impl EventLoopState {
                 }
                 _ => {} // GetRecord, PutRecord, RepublishProvider — ignore
             },
-            Event::RoutingUpdated { peer, .. } => {
-                debug!(peer_id = %peer, "kademlia routing table updated");
+            Event::RoutingUpdated {
+                peer,
+                is_new_peer,
+                addresses,
+                ..
+            } => {
+                debug!(
+                    peer_id = %peer,
+                    is_new_peer,
+                    addrs = addresses.len(),
+                    "kademlia routing table updated"
+                );
             }
             Event::UnroutablePeer { peer } => {
                 debug!(peer_id = %peer, "kademlia: peer is unroutable");
             }
             _ => {}
         }
+    }
+
+    /// Р-7 (spec §2.4): the counters of every finished get_closest_peers
+    /// (DEBUG), and a rate-limited WARN when a non-empty table gave nothing —
+    /// the signature that tells an oversized answer (H1) from an overloaded seed
+    /// (H2) or an empty table (H4).
+    fn log_lookup_stats(&mut self, id: QueryId, stats: &libp2p::kad::QueryStats, found: usize) {
+        use super::kad_stats::{LookupStats, empty_lookup_warn_due};
+        let s = LookupStats::from_query(stats);
+        let table_entries: usize = self
+            .swarm
+            .behaviour_mut()
+            .kad
+            .kbuckets()
+            .map(|b| b.num_entries())
+            .sum();
+        debug!(
+            query_id = ?id,
+            count = found,
+            requests = s.requests,
+            successes = s.successes,
+            failures = s.failures,
+            duration_ms = s.duration_ms,
+            table_entries,
+            "dht: get_closest_peers complete"
+        );
+        let now = Instant::now();
+        if empty_lookup_warn_due(self.last_empty_lookup_warn, now, table_entries, found) {
+            self.last_empty_lookup_warn = Some(now);
+            warn!(
+                requests = s.requests,
+                successes = s.successes,
+                failures = s.failures,
+                duration_ms = s.duration_ms,
+                table_entries,
+                "kademlia lookup found no peers"
+            );
+        }
+    }
+
+    /// Test-only amplifier (C-DK Р-10): on the first IPv4 TCP listen address,
+    /// advertise the loopback aliases of its port as external addresses.
+    #[cfg(feature = "e2e-tools")]
+    fn e2e_advertise_loopback_aliases(&mut self, listen: &Multiaddr) {
+        if self.e2e_loopback_aliases == 0 {
+            return;
+        }
+        let aliases = super::e2e_amp::loopback_alias_addrs(listen, self.e2e_loopback_aliases);
+        if aliases.is_empty() {
+            return;
+        }
+        let n = aliases.len();
+        for alias in aliases {
+            self.swarm.add_external_address(alias);
+        }
+        self.e2e_loopback_aliases = 0;
+        info!(listen = %listen, "e2e: advertising {n} loopback aliases");
     }
 
     fn handle_command(&mut self, cmd: SwarmCommand) {
@@ -1967,6 +2097,12 @@ impl EventLoopState {
                     .map(|peer_id| self.peer_known_addrs(peer_id))
                     .unwrap_or_default();
                 let _ = reply.send(addrs);
+            }
+            #[cfg(feature = "e2e-tools")]
+            SwarmCommand::Disconnect { peer_id, reply } => {
+                let was_connected = self.swarm.disconnect_peer_id(peer_id).is_ok();
+                info!(peer_id = %peer_id, was_connected, "e2e: disconnect peer");
+                let _ = reply.send(was_connected);
             }
         }
     }

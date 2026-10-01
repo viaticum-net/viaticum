@@ -40,6 +40,18 @@ pub enum CliRequest {
         /// Node address of the peer (format: <device_id_hex>@<ip>:<port>).
         addr: String,
     },
+    /// Test-only (`net-probe disconnect`, C-DK Р-16): close every connection to
+    /// the known peer whose DeviceId starts with `device_hex` (16+ hex chars).
+    #[cfg(feature = "e2e-tools")]
+    E2eDisconnect {
+        device_hex: String,
+    },
+    /// Test-only (`net-probe reach`, C-DK Р-16): send a PeerAnnounce to that
+    /// peer through `send_to_device`, the path production requests take.
+    #[cfg(feature = "e2e-tools")]
+    E2eReach {
+        device_hex: String,
+    },
 }
 
 /// Response from daemon to CLI process.
@@ -64,6 +76,16 @@ pub enum CliResponse {
     Connected {
         /// Hex-encoded IdentityPub of the connected peer.
         peer_id: String,
+    },
+    /// Test-only: an E2eDisconnect / E2eReach succeeded.
+    #[cfg(feature = "e2e-tools")]
+    E2eProbe {
+        /// Full hex DeviceId of the peer.
+        device_hex: String,
+        /// What happened, in words.
+        detail: String,
+        /// Wall time of the operation in the daemon.
+        elapsed_ms: u64,
     },
     Error(String),
 }
@@ -93,6 +115,21 @@ pub struct StatusData {
     /// resets on daemon restart until cert exchange runs again.
     #[serde(default)]
     pub peer_count_authenticated: u32,
+    /// network-i14: peers this node KNOWS — PeerRecords of another master with at
+    /// least one dialable address. Knowledge, not a connection: a known peer may
+    /// be offline. PeerRecords are never deleted in production, so this does not
+    /// decrease.
+    #[serde(default)]
+    pub peer_count_known: u32,
+    /// The known peers (see `peer_count_known`): DeviceId, first 8 bytes hex,
+    /// sorted, uncapped. Shown only in --json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_devices: Option<Vec<String>>,
+    /// The devices this node is authenticated with right now: DeviceId, first 8
+    /// bytes hex, sorted, uncapped; `None` when the swarm is down. Shown only in
+    /// --json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_devices: Option<Vec<String>>,
     /// Average trust score across all peers (combined score).
     pub avg_trust: f64,
     /// Total bytes we are storing for others.

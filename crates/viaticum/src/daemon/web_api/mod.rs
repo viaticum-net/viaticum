@@ -127,7 +127,7 @@ pub(crate) fn authed_router(state: Arc<DaemonState>, auth: AuthState) -> Router 
 
 /// Every `/api/*` route, without state and auth (see `authed_router`).
 fn api_routes() -> Router<Arc<DaemonState>> {
-    Router::new()
+    let router = Router::new()
         .route("/api/status", axum::routing::get(handle_status))
         .route("/api/files", axum::routing::get(handle_files))
         .route("/api/versions", axum::routing::get(handle_versions))
@@ -171,7 +171,25 @@ fn api_routes() -> Router<Arc<DaemonState>> {
             "/api/config",
             axum::routing::get(handle_config_get).put(handle_config_put),
         )
-        .route("/api/restart", axum::routing::post(handle_restart))
+        .route("/api/restart", axum::routing::post(handle_restart));
+    with_e2e_routes(router)
+}
+
+/// Test-only network probes (`net-probe`, C-DK Р-16).
+#[cfg(feature = "e2e-tools")]
+fn with_e2e_routes(router: Router<Arc<DaemonState>>) -> Router<Arc<DaemonState>> {
+    router
+        .route(
+            "/api/e2e/disconnect",
+            axum::routing::post(handle_e2e_disconnect),
+        )
+        .route("/api/e2e/reach", axum::routing::post(handle_e2e_reach))
+}
+
+/// A user build has no test probes.
+#[cfg(not(feature = "e2e-tools"))]
+fn with_e2e_routes(router: Router<Arc<DaemonState>>) -> Router<Arc<DaemonState>> {
+    router
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -354,6 +372,59 @@ async fn handle_connect(
             "unexpected response".into(),
         )),
     }
+}
+
+// ── Test-only network probes (C-DK Р-16) ──────────────────────────────────────
+
+/// Body of `/api/e2e/disconnect` and `/api/e2e/reach`.
+#[cfg(feature = "e2e-tools")]
+#[derive(serde::Deserialize)]
+struct E2eProbeBody {
+    /// DeviceId prefix, at least 16 hex chars.
+    device: String,
+}
+
+/// 200 `{device, detail, elapsed_ms}` on success; 500 with the reason otherwise.
+#[cfg(feature = "e2e-tools")]
+fn e2e_probe_response(resp: CliResponse) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    match resp {
+        CliResponse::E2eProbe {
+            device_hex,
+            detail,
+            elapsed_ms,
+        } => Ok(Json(serde_json::json!({
+            "device": device_hex,
+            "detail": detail,
+            "elapsed_ms": elapsed_ms,
+        }))),
+        CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected response".into(),
+        )),
+    }
+}
+
+#[cfg(feature = "e2e-tools")]
+async fn handle_e2e_disconnect(
+    State(state): State<Arc<DaemonState>>,
+    Json(body): Json<E2eProbeBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let req = CliRequest::E2eDisconnect {
+        device_hex: body.device,
+    };
+    e2e_probe_response(dispatch(req, &state).await)
+}
+
+#[cfg(feature = "e2e-tools")]
+async fn handle_e2e_reach(
+    State(state): State<Arc<DaemonState>>,
+    Json(body): Json<E2eProbeBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let req = CliRequest::E2eReach {
+        device_hex: body.device,
+    };
+    e2e_probe_response(dispatch(req, &state).await)
 }
 
 // ── Watch management handlers ─────────────────────────────────────────────────

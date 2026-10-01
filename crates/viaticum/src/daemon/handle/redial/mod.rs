@@ -14,17 +14,14 @@
 mod tests;
 
 use std::collections::HashSet;
-use std::str::FromStr;
 use std::time::Duration;
 
-use libp2p::Multiaddr;
 use tokio_util::sync::CancellationToken;
 use viaticum_core::db::{Db, DbError};
 use viaticum_core::types::{DeviceId, PeerRecord};
 
-use crate::daemon::network::swarm::{
-    SwarmError, SwarmHandle, device_id_to_peer_id, strip_peer_suffix,
-};
+use crate::daemon::network::address_book::dialable_addrs;
+use crate::daemon::network::swarm::{SwarmError, SwarmHandle};
 
 /// Counters of one redial pass. Logged as INFO `auto-dial pass` whenever
 /// `known_peers > 0`, so a pass that dials nobody is visible in the log.
@@ -122,59 +119,15 @@ async fn redial_one(
         stats.already_connected += 1;
         return Ok(());
     }
-    let Some((peer_id, addrs)) = dialable_addrs(&record.device_id, &record.addrs, stats) else {
+    let Some((peer_id, addrs)) =
+        dialable_addrs(&record.device_id, &record.addrs, &mut stats.skipped_addrs)
+    else {
         stats.no_addrs += 1;
         return Ok(());
     };
     swarm.dial_addrs(peer_id, addrs).await?;
     stats.dialed += 1;
     Ok(())
-}
-
-/// PeerId of `device` and the transport addresses to dial it on (terminal
-/// `/p2p/` stripped, deduplicated). `None` when there is nothing to dial.
-fn dialable_addrs(
-    device: &DeviceId,
-    stored: &[String],
-    stats: &mut RedialStats,
-) -> Option<(libp2p::PeerId, Vec<Multiaddr>)> {
-    let peer_id = match device_id_to_peer_id(device) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(%device, err = %e, "auto-dial: device id is not a valid key, skipping peer");
-            return None;
-        }
-    };
-    let mut seen: HashSet<Multiaddr> = HashSet::new();
-    let mut addrs: Vec<Multiaddr> = Vec::new();
-    for addr_str in stored {
-        let addr = match Multiaddr::from_str(addr_str) {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!(%device, addr = %addr_str, err = %e,
-                    "auto-dial: unparseable stored address, skipping");
-                stats.skipped_addrs += 1;
-                continue;
-            }
-        };
-        match strip_peer_suffix(&addr, peer_id) {
-            Ok(transport) => {
-                if seen.insert(transport.clone()) {
-                    addrs.push(transport);
-                }
-            }
-            Err(found) => {
-                tracing::warn!(%device, expected = %peer_id, found = %found, addr = %addr_str,
-                    "auto-dial: stored address names another peer, skipping");
-                stats.skipped_addrs += 1;
-            }
-        }
-    }
-    if addrs.is_empty() {
-        None
-    } else {
-        Some((peer_id, addrs))
-    }
 }
 
 /// The daemon task: one pass at start, then one every `interval` until

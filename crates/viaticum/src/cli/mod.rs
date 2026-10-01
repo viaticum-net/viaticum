@@ -514,6 +514,10 @@ fn handle_response(response: CliResponse, json_output: bool) {
         | CliResponse::RestoreRejected(_) => {
             unreachable!("restore responses are handled by restore::run_restore")
         }
+        #[cfg(feature = "e2e-tools")]
+        CliResponse::E2eProbe { .. } => {
+            unreachable!("e2e probe responses are read by net-probe, not this CLI")
+        }
         CliResponse::Error(msg) => output::format_error(&msg),
     }
 }

@@ -513,3 +513,124 @@ pos_answers_since() {
     done
     echo "$total"
 }
+
+# ── Discovery at scale (C-DK, local_discovery_test) ─────────────────────────
+#
+# Knowledge (`known_devices`) and links (`authenticated_devices`) are 8-byte hex
+# DeviceIds in `status --json`. A field missing from the status (a build without
+# it) is NOT an empty list: the helpers say so with return code 2, and the
+# scenario turns that into FAIL(setup) or a NOTE, never a silent pass.
+
+# devices_field_of IDX FIELD : the hex ids in array FIELD of node IDX's status, one per
+# line. Returns 1 when the node does not answer, 2 when its status has no FIELD.
+devices_field_of() {
+    local js; js=$(api_get "$1" /api/status)
+    [ -n "$js" ] || return 1
+    echo "$js" | jq -e --arg f "$2" 'has($f)' >/dev/null 2>&1 || return 2
+    echo "$js" | jq -r --arg f "$2" '.[$f][]' 2>/dev/null || true
+}
+
+# authenticated_devices_of IDX / known_devices_of IDX : see devices_field_of.
+authenticated_devices_of() { devices_field_of "$1" authenticated_devices; }
+known_devices_of() { devices_field_of "$1" known_devices; }
+
+# auth_sample_all IDX... : "min median max" of peer_count_authenticated over the nodes
+# ("- - -" for no nodes).
+auth_sample_all() {
+    local i
+    for i in "$@"; do status_num "$i" peer_count_authenticated; done | sort -n \
+        | awk '{ v[NR] = $1 } END { if (!NR) { print "- - -"; exit }
+                print v[1], v[int((NR + 1) / 2)], v[NR] }'
+}
+
+# host_ips : this host's own addresses (v4 and v6, prefix and %scope stripped), one per line.
+host_ips() { ip -o addr show 2>/dev/null | awk '{ print $4 }' | sed 's|/.*||; s|%.*||' || true; }
+
+# ss_snapshot : every TCP socket of this host in every state, with the owning process
+# (`ss -tanp`). Take it once per sample and pass it to the two helpers below.
+ss_snapshot() { ss -tanp 2>/dev/null || true; }
+
+# nonlocal_sockets_of_pid PID [SNAPSHOT] : the TCP sockets of PID in ANY state (SYN-SENT
+# included) whose peer is not a local address — not 127/8, not ::1, not one of this
+# host's own IPs. One line per socket: "<state> <local> <peer>". Here-strings, not
+# pipes from ss, so pipefail never kills the caller on an early grep exit (R1-x).
+nonlocal_sockets_of_pid() {
+    local pid="$1" snap="${2:-}" hosts
+    [ -n "$snap" ] || snap=$(ss_snapshot)
+    hosts=" $(host_ips | tr '\n' ' ') "
+    grep -F "pid=$pid," <<< "$snap" | awk -v hosts="$hosts" '
+        function strip(a) { sub(/:[0-9*]+$/, "", a); gsub(/\[|\]/, "", a); sub(/%.*/, "", a); return a }
+        function is_local(a,   b) {
+            if (a == "*" || a == "0.0.0.0" || a == "::" || a == "::1") return 1
+            if (a ~ /^127\./ || a ~ /^::ffff:127\./) return 1
+            if (index(hosts, " " a " ") > 0) return 1
+            if (a ~ /^::ffff:/) { b = substr(a, 8); if (index(hosts, " " b " ") > 0) return 1 }
+            return 0
+        }
+        { if (!is_local(strip($5))) print $1, $4, $5 }' || true
+}
+
+# established_sockets_of_pid PID [SNAPSHOT] : number of ESTABLISHED TCP sockets of PID.
+established_sockets_of_pid() {
+    local pid="$1" snap="${2:-}"
+    [ -n "$snap" ] || snap=$(ss_snapshot)
+    grep -F "pid=$pid," <<< "$snap" | awk '$1 == "ESTAB" { n++ } END { print n + 0 }' || true
+}
+
+# carousel_count LOGFILE ORIGIN [FROM_LINE] : "lru: re-dial of evicted peer" lines with
+# origin=ORIGIN (after line FROM_LINE, default 0).
+carousel_count() {
+    tail -n +$(( ${3:-0} + 1 )) "$1" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
+        | grep -a "lru: re-dial of evicted peer" | grep -acE "origin=$2( |$)" || true
+}
+
+# xor_rank_table PEER_ID... : "i j rank" for every ordered pair i != j (0-based positions
+# in the argument list): the rank of j among all the others by Kademlia XOR distance from
+# i, key = SHA-256 of the PeerId bytes (libp2p-kad `Key::from(PeerId)`); 1 = closest.
+xor_rank_table() {
+    python3 - "$@" <<'PY'
+import hashlib, sys
+ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+def b58decode(s):
+    n = 0
+    for ch in s:
+        n = n * 58 + ALPHABET.index(ch)
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    return b"\0" * (len(s) - len(s.lstrip("1"))) + raw
+keys = [int.from_bytes(hashlib.sha256(b58decode(p)).digest(), "big") for p in sys.argv[1:]]
+for i, ki in enumerate(keys):
+    order = sorted((ki ^ kj, j) for j, kj in enumerate(keys) if j != i)
+    for rank, (_, j) in enumerate(order, 1):
+        print(i, j, rank)
+PY
+}
+
+# black_hole_listen PORT : a listener on PORT (0.0.0.0 and [::]) that accepts TCP and
+# never says a word — a machine whose daemon is gone but whose port still takes SYNs
+# (network-i42, spec step 8c). Sets BH_PID. The caller checks it is up and kills it.
+black_hole_listen() {
+    python3 - "$1" <<'PY' &
+import socket, sys, threading, time
+port = int(sys.argv[1])
+held = []
+def serve(family, host):
+    try:
+        s = socket.socket(family, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6:
+            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        s.bind((host, port))
+        s.listen(256)
+    except OSError as e:
+        print(f"black hole: cannot listen on {host}:{port}: {e}", file=sys.stderr)
+        return
+    while True:
+        conn, _ = s.accept()
+        held.append(conn)  # accepted, never read, never answered
+for family, host in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
+    threading.Thread(target=serve, args=(family, host), daemon=True).start()
+while True:
+    time.sleep(3600)
+PY
+    BH_PID=$!
+}
