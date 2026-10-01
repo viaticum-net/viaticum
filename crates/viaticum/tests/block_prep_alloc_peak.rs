@@ -181,8 +181,9 @@ fn check_within_estimate(params: &ErasureParams, holder_counts: &[usize]) {
 
 /// K = 4096 (a block of 256 MiB at T = 65535): L/K is 1.04 there and the walk peaks at ≈ 3.076
 /// E_pad against a permit of `k·t + encoder_bytes + 4·T` ≈ 3.09 E_pad. M26 (a copy of the padded
-/// blob: +1 E_pad) and M27 (the symbols collected: +0.19 E_pad ≈ 50 MiB) both exceed the permit. One holder count: the core test `encode_raw_ranges_each_alloc_peak_within_model`
-/// shows the walk does not grow with the holders, and this block is heavy in a debug build.
+/// blob: +1 E_pad) and M27 (the symbols collected: +0.19 E_pad ≈ 50 MiB) both exceed the permit.
+/// One holder count: that the walk does not grow with the holders is checked by the core test
+/// `encode_raw_ranges_each_peak_does_not_depend_on_holders`; this block is heavy in debug.
 #[test]
 fn block_prep_alloc_peak_within_estimate() {
     check_within_estimate(&params_of(4096, 65_535), &[3]);

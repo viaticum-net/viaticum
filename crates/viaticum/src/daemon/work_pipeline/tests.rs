@@ -1894,7 +1894,7 @@ async fn worker_iteration_does_not_overwrite_uncertain_placement() {
         &rec,
         &pool,
         0,
-        &mut std::collections::HashMap::new(),
+        &mut super::worker::TurnMemory::default(),
     )
     .await
     .unwrap();
@@ -1946,7 +1946,7 @@ async fn worker_does_not_read_source_when_no_candidates() {
         &rec,
         &pool,
         0,
-        &mut std::collections::HashMap::new(),
+        &mut super::worker::TurnMemory::default(),
     )
     .await
     .expect("no candidates must not touch the source");
@@ -1999,6 +1999,37 @@ async fn worker_parks_block_when_source_is_unreadable() {
         db.list_placements_for_block(&bid).unwrap().is_empty(),
         "no Offered record without symbols to send"
     );
+}
+
+/// v3.5a NOTE 3: a block parked by an iteration error loses the memory of its turns (the yield
+/// count and the marks of its holders), like one parked for any other reason.
+#[tokio::test]
+async fn parking_by_an_iteration_error_clears_the_turn_memory() {
+    let db = make_db();
+    let peers = [device_id(0xA1), device_id(0xA2)];
+    add_pool_peers(&db, &peers);
+    let bid = block_id(0xA3);
+    let mut rec = make_block_record(bid, 1.0, 0.99999);
+    rec.current_reliability = 0.0;
+    db.upsert_source_block(&rec).unwrap();
+
+    let mut pipeline = pipeline_with(&db, make_config(), Some(lonely_swarm(0x3b).await));
+    pipeline.yields.insert(bid, 2);
+    pipeline.last_attempt.insert(
+        bid,
+        super::worker::TurnMemory {
+            turns: 3,
+            marks: std::collections::HashMap::from([(peers[0], 2u32)]),
+        },
+    );
+    assert!(pipeline.run_iteration().await.unwrap());
+
+    assert!(
+        db.block_cooldown(&bid).parked,
+        "the unreadable source parks it"
+    );
+    assert!(!pipeline.yields.contains_key(&bid), "the yield count goes");
+    assert!(!pipeline.last_attempt.contains_key(&bid), "the marks go");
 }
 
 #[tokio::test]
@@ -2223,7 +2254,7 @@ async fn worker_iteration_delivers_only_recorded_offers() {
                 &rec,
                 pool,
                 0,
-                &mut std::collections::HashMap::new(),
+                &mut super::worker::TurnMemory::default(),
             )
             .await
             .unwrap()

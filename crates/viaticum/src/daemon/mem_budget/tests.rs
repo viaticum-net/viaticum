@@ -851,6 +851,25 @@ async fn pos_behind_a_fitting_restore_head_waits_without_a_yield() {
     drop(w);
 }
 
+/// The edge of (Б′): `max need == total − W` fits beside the worker (the waiter is served once the
+/// others release) and is no reason to yield; one MiB more is. Total 10, W 6, X 4 (0 free): the
+/// need 4 is no yield, 5 is. `>` read as `>=` would yield at 4.
+#[tokio::test]
+async fn a_need_equal_to_what_fits_beside_the_worker_does_not_yield() {
+    for (need, yields) in [(4u64, false), (5, true)] {
+        let budget = MemBudget::new(10 * MIB);
+        let w = worker_permit(&budget, 6);
+        let x = third_holder(&budget, 4);
+        let waiters = queue_up(&budget, &[(Some(OD), need)]).await;
+        assert_eq!(
+            budget.worker_must_yield(OD, &w),
+            yields,
+            "need {need} beside W 6 of 10"
+        );
+        drop((w, x, waiters));
+    }
+}
+
 /// M40: the rule (А), the free budget instead of `total − W`. Knob 3b: total 1792, the worker
 /// 1000, a pack preparation holds 100 (692 free), the big block needs 745 ≤ 792 beside the
 /// worker: the short holder releases, no yield and no re-encode of 200 MiB. (А) would yield
