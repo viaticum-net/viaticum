@@ -17,6 +17,20 @@
 # leak into a test run.
 unset VIATICUM_SERVER VIATICUM_TOKEN
 
+# Machine-lock isolation (R1-d-b K-b6, v3.11a NOTE): the lock of the daemon's memory budget is
+# per uid on a machine, so a scenario's nodes must not meet the lock of a live node of the
+# same user (a dogfood node on the build server). The test-only variable is read by builds
+# with the `e2e-tools` feature; a binary without it ignores it. The scenario's own directory
+# ($T, or $TEST_DIR in the scenarios that call it so) when it is already set, else a fresh
+# private temp directory (the daemon creates the leaf, 0700).
+if [ -z "${VIATICUM_TEST_MACHINE_LOCK_DIR:-}" ]; then
+    case "${T:-${TEST_DIR:-}}" in
+        /*) VIATICUM_TEST_MACHINE_LOCK_DIR="${T:-$TEST_DIR}/lock" ;;
+        *) VIATICUM_TEST_MACHINE_LOCK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/viaticum-e2e-lock-XXXXXX")" ;;
+    esac
+fi
+export VIATICUM_TEST_MACHINE_LOCK_DIR
+
 info() { echo "  INFO: $1"; }
 
 content_hash() { sha256sum "$1" | awk '{print $1}'; }
