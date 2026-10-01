@@ -67,7 +67,6 @@ mod symbol;
 use symbol::TransferResult;
 
 // Re-export for handle/mod.rs wiring (T-6: mailbox poll → PosResponder bridge).
-pub(crate) use pos::new_pos_slots;
 pub use pos::{PosResponder, ProcessorPosHandler};
 // Re-export for handle/mod.rs wiring (T-7: mailbox poll → SymbolDropHandler bridge).
 pub use symbol::{ProcessorDropHandler, SymbolDropHandler};
@@ -215,7 +214,7 @@ pub struct Processor {
     /// Offers whose shadow was skipped since the last logged offer shadow.
     pub(crate) shadow_offers_skipped: Arc<std::sync::atomic::AtomicU64>,
     /// K-b4 (pos-i14): the holder's PoS answers that read a share at once; shared with the
-    /// mailbox path's responder (`set_pos_slots`).
+    /// mailbox path's responder (`pos_responder`).
     pos_slots: Arc<tokio::sync::Semaphore>,
 }
 
@@ -260,10 +259,10 @@ impl Processor {
         }
     }
 
-    /// K-b4: the node's one answer semaphore (`pos::new_pos_slots`), the same the mailbox
-    /// path's `PosResponder` waits on. Called from `handle/mod.rs::start()`.
-    pub fn set_pos_slots(&mut self, slots: Arc<tokio::sync::Semaphore>) {
-        self.pos_slots = slots;
+    /// K-b4: a mailbox-path responder that waits on THIS processor's answer semaphore: the
+    /// direct and the mailbox path share one limit of `HOLDER_POS_CONCURRENCY` readers.
+    pub fn pos_responder(&self, responder: PosResponder) -> PosResponder {
+        responder.with_pos_slots(Arc::clone(&self.pos_slots))
     }
 
     /// Set the work event sender for the unified pipeline worker.

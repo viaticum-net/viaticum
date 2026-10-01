@@ -324,6 +324,20 @@ impl PosResponder {
     }
 }
 
+/// Read a symbol file into `buf`, at most T bytes: a longer file is a corrupted local file
+/// (an error with a plain text, not a Nack: the holder does not claim to have lost it).
+fn read_symbol(file: std::fs::File, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+    let cap = u64::from(viaticum_core::constants::SYMBOL_SIZE);
+    let n = file.take(cap + 1).read_to_end(buf)?;
+    if n as u64 > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("symbol file is longer than the symbol size ({cap} bytes)"),
+        ));
+    }
+    Ok(n)
+}
+
 /// The chain hash over `esis` (ascending, duplicates kept): each symbol file is read into
 /// `buf` (cleared between symbols, so its capacity is T) and pushed into the hasher before the
 /// next one is read. A missing file anywhere ends it `Missing`; any other IO error is `Err`.
@@ -341,7 +355,7 @@ fn hash_share(
         }
         buf.clear();
         let read = std::fs::File::open(block_dir.join(format!("{esi}.bin")))
-            .and_then(|mut file| file.read_to_end(&mut buf));
+            .and_then(|file| read_symbol(file, &mut buf));
         match read {
             Ok(_) => hasher.push(esi, &buf),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

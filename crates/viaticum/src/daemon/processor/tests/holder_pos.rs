@@ -19,8 +19,9 @@ use viaticum_core::types::{
     hex_encode,
 };
 
-use super::super::pos::{HOLDER_POS_CONCURRENCY, PosResponder, ProcessorPosHandler};
-use super::super::{ProcessorError, new_pos_slots};
+use super::super::ProcessorError;
+use super::super::pos::{HOLDER_POS_CONCURRENCY, PosResponder, ProcessorPosHandler, new_pos_slots};
+use super::make_processor;
 use crate::daemon::mailbox::poll::PosMailboxChallengeHandler;
 use crate::daemon::mem_budget::{HolderKind, MemBudget};
 use crate::daemon::scheduler::{FoldHolder, hash_holders};
@@ -410,6 +411,80 @@ async fn responders_given_one_semaphore_share_it() {
     }
 }
 
+/// The wiring: the Processor's direct path and a mailbox responder made by
+/// `Processor::pos_responder` wait on ONE semaphore, the processor's. With every permit taken,
+/// neither answers; released, both do.
+#[tokio::test]
+async fn processor_direct_and_mailbox_paths_share_one_answer_semaphore() {
+    let held = Held::new(&[(0, 2)], 50);
+    let processor = make_processor(held.db.clone(), &held.dir).await;
+    let mailbox = processor.pos_responder(held.responder());
+    let taken = Arc::clone(&processor.pos_slots)
+        .acquire_many_owned(HOLDER_POS_CONCURRENCY as u32)
+        .await
+        .unwrap();
+
+    let direct = tokio::time::timeout(
+        Duration::from_millis(300),
+        processor.handle_pos_hash_challenge_inner(held.owner, held.challenge(50, vec![(0, 2)])),
+    )
+    .await;
+    assert!(direct.is_err(), "the direct path answered without a permit");
+    let via_mailbox = tokio::time::timeout(
+        Duration::from_millis(300),
+        mailbox.compute_response(held.owner, held.challenge(51, vec![(0, 2)])),
+    )
+    .await;
+    assert!(
+        via_mailbox.is_err(),
+        "the mailbox path has its own semaphore"
+    );
+
+    drop(taken);
+    let reply = processor
+        .handle_pos_hash_challenge_inner(held.owner, held.challenge(52, vec![(0, 2)]))
+        .await
+        .expect("answers once a permit is free");
+    assert!(matches!(reply, Message::PosHashResponse(_)));
+    let reply = mailbox
+        .compute_response(held.owner, held.challenge(53, vec![(0, 2)]))
+        .await
+        .expect("answers once a permit is free");
+    assert!(matches!(reply, Message::PosHashResponse(_)));
+}
+
+/// A symbol file longer than T is a corrupted local file: `Err(Io)` with a plain text — not a
+/// hash over it, not a Nack, and not a read of the whole file.
+#[tokio::test]
+async fn symbol_file_longer_than_the_symbol_size_is_err() {
+    let held = Held::new(&[(0, 2)], 100);
+    let too_long = usize::from(viaticum_core::constants::SYMBOL_SIZE) + 1;
+    std::fs::write(held.file(1), symbol_of(1, too_long)).unwrap();
+    let result = held
+        .responder()
+        .compute_response(held.owner, held.challenge(60, vec![(0, 2)]))
+        .await;
+    match result {
+        Err(ProcessorError::Io(e)) => assert!(e.to_string().contains("longer"), "{e}"),
+        other => panic!(
+            "expected Err(Io), got {:?}",
+            other.map(|m| std::mem::discriminant(&m))
+        ),
+    }
+    // Exactly T is fine.
+    std::fs::write(
+        held.file(1),
+        symbol_of(1, usize::from(viaticum_core::constants::SYMBOL_SIZE)),
+    )
+    .unwrap();
+    let ok = held
+        .responder()
+        .compute_response(held.owner, held.challenge(61, vec![(0, 2)]))
+        .await
+        .expect("a symbol of T bytes");
+    assert!(matches!(ok, Message::PosHashResponse(_)));
+}
+
 // ─── A panic of the blocking task (M84) ───────────────────────────────────────────────────────
 
 /// The blocking task panics (the stand-in read does): the answer is an error, the processor
@@ -458,10 +533,11 @@ async fn holder_pos_answer_panic_is_an_error_not_a_crash() {
 
 // ─── The memory budget is not the holder's business (M82) ─────────────────────────────────────
 
-/// The holder answers while the budget of its node is closed (a DR runs) and while it is full (a
-/// worker holds it all): the answer arrives, the budget grants nothing for it. The responder
-/// has no budget to ask (v3.10 §2: the answer is O(T) and must not wait for the owner's heavy
-/// work); this unit stands guard when one is threaded in.
+/// STRUCTURAL guard, not a mutation one (M82 is structural): the responder has no budget to ask
+/// (v3.10 §2: the answer is O(T) and must not wait for the owner's heavy work), so this unit
+/// passes whatever it is given. It documents the rule and goes red only for whoever threads a
+/// budget in AND wires it here: the holder answers while the budget of its node is closed (a
+/// DR runs) and while it is full (a worker holds it all), and the budget grants nothing for it.
 #[tokio::test]
 async fn holder_answers_while_the_budget_is_closed_or_full() {
     let closed = MemBudget::new_closed(64 << 20);
