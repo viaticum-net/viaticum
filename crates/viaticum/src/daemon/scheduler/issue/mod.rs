@@ -309,6 +309,7 @@ impl Scheduler {
     /// holder's trust is read once per tick. A tick with due challenges ends with one
     /// INFO line `scheduler: PoS issue tick`: due, issued, blocks, skipped_pending,
     /// deferred, deferred_mem (placements of the blocks the memory budget deferred, pos-i13),
+    /// budget_closed (1 while a DR keeps the budget closed, pos-i13),
     /// cut_blocks, preparing (preparations running past their ticks, and overdue ones running),
     /// waiting_mem (overdue blocks waiting for memory), oldest_prep_s (age of the oldest running
     /// one, pos-i7-d-b), oldest_wait_s (the longest wait for memory), in_flight, elapsed_ms, scan_ms,
@@ -612,6 +613,9 @@ impl Scheduler {
             skipped_pending = tick.skipped_pending,
             deferred = tick.deferred,
             deferred_mem = tick.deferred_mem,
+            // pos-i13: 1 while the budget is closed because a DR runs on this machine (v3.9a
+            // item 4) — the deferrals of such a tick are not a shortage of memory.
+            budget_closed = u8::from(self.mem_budget.is_closed()),
             cut_blocks = tick.cut_blocks,
             preparing = in_flight.preparing.running(),
             waiting_mem = in_flight.preparing.waiting(),

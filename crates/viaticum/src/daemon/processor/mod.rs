@@ -67,6 +67,7 @@ mod symbol;
 use symbol::TransferResult;
 
 // Re-export for handle/mod.rs wiring (T-6: mailbox poll → PosResponder bridge).
+pub(crate) use pos::new_pos_slots;
 pub use pos::{PosResponder, ProcessorPosHandler};
 // Re-export for handle/mod.rs wiring (T-7: mailbox poll → SymbolDropHandler bridge).
 pub use symbol::{ProcessorDropHandler, SymbolDropHandler};
@@ -213,6 +214,9 @@ pub struct Processor {
     pub(crate) shadow_offer_slot: Arc<tokio::sync::Semaphore>,
     /// Offers whose shadow was skipped since the last logged offer shadow.
     pub(crate) shadow_offers_skipped: Arc<std::sync::atomic::AtomicU64>,
+    /// K-b4 (pos-i14): the holder's PoS answers that read a share at once; shared with the
+    /// mailbox path's responder (`set_pos_slots`).
+    pos_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl Processor {
@@ -252,7 +256,14 @@ impl Processor {
             four_r: viaticum_core::four_r_holder::FourRParams::default(),
             shadow_offer_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             shadow_offers_skipped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pos_slots: pos::new_pos_slots(),
         }
+    }
+
+    /// K-b4: the node's one answer semaphore (`pos::new_pos_slots`), the same the mailbox
+    /// path's `PosResponder` waits on. Called from `handle/mod.rs::start()`.
+    pub fn set_pos_slots(&mut self, slots: Arc<tokio::sync::Semaphore>) {
+        self.pos_slots = slots;
     }
 
     /// Set the work event sender for the unified pipeline worker.
