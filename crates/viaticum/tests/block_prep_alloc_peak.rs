@@ -211,7 +211,8 @@ fn block_prep_alloc_peak_within_estimate_small_k() {
 //
 // The very stages the restore runs on the blocking pool (`decode_decrypt_stage`, `plaintext_stage`),
 // each under a permit of the size the coordinator holds for it, on a block whose plaintext is four
-// times its encrypted size (compressible: S ≈ 4E). The base of the counting allocator is taken
+// times its encrypted size (compressible: S ≈ 4E; S = 80 MiB is not a power of two, so that the
+// doubling of `decode_all` overshoots S, M60). The base of the counting allocator is taken
 // BEFORE the symbols exist — the fixture makes them inside the measurement, as the fetch does — and
 // every stage is judged by the ABSOLUTE live bytes above it against the permit of that stage:
 //   decode stage     ≤ estimate_restore_network  + δ   (includes the k_eff·T of symbols in hand)
@@ -257,7 +258,7 @@ fn restore_network_peak_follows_the_permit() {
     // worst case of the decode) — made inside the measurement; everything else of it is gone
     // before the stages run.
     let (symbols, params, encrypted_size, want_hash, plain_len) = {
-        let plaintext = compressible_plaintext(64 << 20);
+        let plaintext = compressible_plaintext(80 << 20);
         let want_hash = blake3::hash(&plaintext);
         let plain_len = plaintext.len() as u64;
         let mut stored = compress_and_encrypt(&plaintext, &key).unwrap();
@@ -265,8 +266,8 @@ fn restore_network_peak_follows_the_permit() {
         let encrypted_size = stored.len() as u64;
         let params = ErasureParams::compute(encrypted_size, 1.0).unwrap();
         assert!(
-            (256..=260).contains(&params.k),
-            "fixture: a block of about 16 MiB (K = {})",
+            (300..=340).contains(&params.k),
+            "fixture: a block of about 20 MiB (K = {})",
             params.k
         );
         pad_for_encoding(&mut stored, &params);
