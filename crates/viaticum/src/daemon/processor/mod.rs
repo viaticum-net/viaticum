@@ -64,6 +64,7 @@ mod peer;
 mod pos;
 mod restore;
 mod symbol;
+mod work_wake;
 use symbol::TransferResult;
 
 // Re-export for handle/mod.rs wiring (T-6: mailbox poll → PosResponder bridge).
@@ -213,6 +214,8 @@ pub struct Processor {
     pub(crate) shadow_offer_slot: Arc<tokio::sync::Semaphore>,
     /// Offers whose shadow was skipped since the last logged offer shadow.
     pub(crate) shadow_offers_skipped: Arc<std::sync::atomic::AtomicU64>,
+    /// C-DK Р-18: the last work-pipeline wake per device.
+    work_wake: std::sync::Mutex<work_wake::WorkWakeLimiter>,
 }
 
 impl Processor {
@@ -252,6 +255,7 @@ impl Processor {
             four_r: viaticum_core::four_r_holder::FourRParams::default(),
             shadow_offer_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             shadow_offers_skipped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            work_wake: std::sync::Mutex::new(work_wake::WorkWakeLimiter::default()),
         }
     }
 

@@ -12,6 +12,7 @@ fn make_status(peers: Vec<PeerSummary>) -> StatusData {
         peer_count_known: 0,
         known_devices: None,
         authenticated_devices: None,
+        conn_cache: Default::default(),
         avg_trust: 0.75,
         holding_bytes: 1024,
         backed_up_files: 3,

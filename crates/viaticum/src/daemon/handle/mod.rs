@@ -502,6 +502,19 @@ impl DaemonHandle {
                 // gets cancelled by the duplicate send, surfacing as
                 // "Connection was closed before a response was received".
                 cert_timeout_secs: 35,
+                // Before `kademlia_bootstrap_peers` (which moves the vector): a
+                // seed (relay_role = punch) or a friend whose first ≤ 2 bootstrap
+                // peers are infrastructure (C-DK Р-15).
+                conn_policy: crate::daemon::network::swarm::ConnPolicy::for_role(
+                    app_config.network.relay_role,
+                    crate::daemon::network::address_book::AddressBook::new(
+                        db.clone(),
+                        cluster_master_pub,
+                        device_id,
+                    ),
+                    &kademlia_bootstrap_peers,
+                    cfg.time_scale,
+                ),
                 kademlia_bootstrap_peers,
                 // Under an accelerated test clock (time_scale>1) the 5-min real-time
                 // discovery interval fires only ~once in a minutes-long run, so non-seed
@@ -518,13 +531,6 @@ impl DaemonHandle {
                     None
                 },
                 enable_relay_server: app_config.network.enable_relay_server,
-                conn_policy: crate::daemon::network::swarm::ConnPolicy::daemon(
-                    crate::daemon::network::address_book::AddressBook::new(
-                        db.clone(),
-                        cluster_master_pub,
-                        device_id,
-                    ),
-                ),
             };
             let (handle, events) = crate::daemon::network::swarm::SwarmHandle::start(swarm_cfg)
                 .await

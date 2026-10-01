@@ -272,9 +272,25 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         None => hex_encode(&state.identity_pub.0),
     };
 
-    let (peer_count_connected, peer_count_authenticated) = match state.swarm_handle.as_ref() {
-        Some(s) => s.peer_counts().await.unwrap_or((0, 0)),
-        None => (0, 0),
+    // network-i41: the cache fields and the connected / authenticated counts
+    // come from ONE ConnStats snapshot (taken after an eviction pass).
+    let (conn, work_wakes_suppressed) = match state.swarm_handle.as_ref() {
+        Some(s) => (s.conn_stats().await.ok(), s.work_wakes_suppressed()),
+        None => (None, 0),
+    };
+    let conn = conn.unwrap_or_default();
+    let (peer_count_connected, peer_count_authenticated) = (conn.connected, conn.authenticated);
+    let conn_cache = crate::cli::types::ConnCacheStatus {
+        busy_peers: conn.busy,
+        protected_peers: conn.protected,
+        infra_peers: conn.infra,
+        closing_peers: conn.closing,
+        connection_cap: conn.cap,
+        lru_evictions_total: conn.evictions_total,
+        on_demand_dials_ok: conn.on_demand_ok,
+        on_demand_dials_failed: conn.on_demand_failed,
+        on_demand_neg_cached: conn.on_demand_neg_cached,
+        work_wakes_suppressed,
     };
 
     let by_importance = compute_importance_buckets(&source_blocks);
@@ -335,6 +351,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         peer_count_known: known_devices.len() as u32,
         known_devices: Some(known_devices),
         authenticated_devices,
+        conn_cache,
         avg_trust,
         holding_bytes: holdings_bytes,
         backed_up_files: files.len() as u32,

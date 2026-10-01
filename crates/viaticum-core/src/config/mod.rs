@@ -145,6 +145,26 @@ pub struct NetworkCfg {
     /// libp2p TCP listen port. 0 = ephemeral (default). Set to a fixed value
     /// when running behind a firewall that only opens specific ports.
     pub listen_port: u16,
+
+    /// Relay role of this node: `"off"` (default) or `"punch"`. Only for a
+    /// public seed: on an ordinary friend `punch` effectively turns the
+    /// connection cache off — every connection becomes infrastructure.
+    /// Today `punch` means only that role for the connection cache and redial:
+    /// the seed keeps a connection with every friend (up to 1024) outside the
+    /// cache and redials every known peer (network-i15, i41). R2 adds the relay
+    /// itself and requires `external_addrs` with it.
+    pub relay_role: RelayRole,
+}
+
+/// `[network] relay_role` (network-i15, i41): who is infrastructure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RelayRole {
+    /// An ordinary friend.
+    #[default]
+    Off,
+    /// A public seed: its connections with friends are infrastructure.
+    Punch,
 }
 
 // ============================================================
@@ -419,6 +439,7 @@ impl Default for NetworkCfg {
             bootstrap_peers: vec![],
             kademlia_bootstrap_peers: vec![],
             listen_port: 0,
+            relay_role: RelayRole::Off,
         }
     }
 }

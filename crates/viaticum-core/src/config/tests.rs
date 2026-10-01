@@ -6,8 +6,8 @@ use std::io::Write;
 #[cfg(test)]
 use crate::config::{
     AppConfig, BackupCfg, ClusterCfg, ConfigError, DEFAULT_IMPORTANCE,
-    DEFAULT_IMPORTANCE_MULTIPLIER, FourRCfg, MetricsCfg, NetworkCfg, ReliabilityConfig, RestoreCfg,
-    StorageCfg, WatchConfig, WebApiCfg, derive_file_importance, disk_reserve_bytes,
+    DEFAULT_IMPORTANCE_MULTIPLIER, FourRCfg, MetricsCfg, NetworkCfg, RelayRole, ReliabilityConfig,
+    RestoreCfg, StorageCfg, WatchConfig, WebApiCfg, derive_file_importance, disk_reserve_bytes,
     expand_data_dir, hard_quota_bytes, soft_quota_bytes, source_block_size_bytes,
 };
 #[cfg(test)]
@@ -94,6 +94,7 @@ fn config_roundtrips_all_fields() {
             bootstrap_peers: vec![],
             kademlia_bootstrap_peers: vec![],
             listen_port: 0,
+            relay_role: RelayRole::Off,
         },
         cluster: ClusterCfg {
             sync_batch_size: 200,
@@ -1424,6 +1425,33 @@ fn config_network_legacy_ipfs_key_is_ignored() {
     assert!(
         !saved.contains("ipfs"),
         "the key is not carried over when the config is written back: {saved}"
+    );
+}
+
+/// network-i15, i41 (C-DK C4): a config written before `relay_role` existed
+/// loads as an ordinary friend (`off`); `"punch"` is the seed role.
+#[test]
+fn config_network_relay_role_defaults_to_off_and_parses_punch() {
+    let old = write_toml("[network]\nlisten_port = 4001\n");
+    let cfg = AppConfig::load(old.path()).expect("an old config without relay_role loads");
+    assert_eq!(cfg.network.relay_role, RelayRole::Off);
+
+    let seed = write_toml(
+        "[network]\nrelay_role = \"punch\"\nexternal_addrs = [\"/ip4/127.0.0.1/tcp/4001\"]\n",
+    );
+    let cfg = AppConfig::load(seed.path())
+        .expect("a seed config loads (external_addrs is ignored until R2)");
+    assert_eq!(cfg.network.relay_role, RelayRole::Punch);
+    let saved = toml::to_string(&cfg).expect("serialize");
+    assert!(
+        saved.contains("relay_role = \"punch\""),
+        "written back: {saved}"
+    );
+
+    let bad = write_toml("[network]\nrelay_role = \"relay\"\n");
+    assert!(
+        AppConfig::load(bad.path()).is_err(),
+        "an unknown role is refused"
     );
 }
 

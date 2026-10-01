@@ -9,7 +9,7 @@ use viaticum_core::constants::{
 use viaticum_core::messages::{PeerAnnounceMsg, verify_peer_announce};
 use viaticum_core::types::{DeviceId, IdentityPub, PeerRecord, Timestamp, ewma_contact_observed};
 
-use super::{Processor, ProcessorError};
+use super::{Processor, ProcessorError, work_wake};
 
 impl Processor {
     /// Called when DeviceCertExchange succeeds for a peer (AC-1, AC-2).
@@ -69,6 +69,7 @@ impl Processor {
         let now_secs = now.0;
         // Swarm already normalized these (one `/p2p/<peer_id>` suffix each).
         let addr_strings: Vec<String> = listen_addrs.iter().map(|a| a.to_string()).collect();
+        let mut is_new_peer = false;
         let mut record = match self.db.get_peer(&device_id) {
             Ok(Some(mut existing)) => {
                 existing.master_identity = identity_pub;
@@ -83,22 +84,25 @@ impl Processor {
                 existing.last_avail_sample = now_secs;
                 existing
             }
-            Ok(None) => PeerRecord {
-                device_id,
-                master_identity: identity_pub,
-                trust_p: INITIAL_TRUST_P,
-                trust_i: 0.0,
-                trust_s: 1.0,
-                bytes_we_store_for_peer: 0,
-                bytes_peer_stores_for_us: 0,
-                first_seen: now,
-                last_seen: now,
-                revoked_device_pub_keys: vec![],
-                addrs: vec![],
-                x25519_pub,
-                avail_ewma: AVAIL_EWMA_INITIAL,
-                last_avail_sample: now_secs,
-            },
+            Ok(None) => {
+                is_new_peer = true;
+                PeerRecord {
+                    device_id,
+                    master_identity: identity_pub,
+                    trust_p: INITIAL_TRUST_P,
+                    trust_i: 0.0,
+                    trust_s: 1.0,
+                    bytes_we_store_for_peer: 0,
+                    bytes_peer_stores_for_us: 0,
+                    first_seen: now,
+                    last_seen: now,
+                    revoked_device_pub_keys: vec![],
+                    addrs: vec![],
+                    x25519_pub,
+                    avail_ewma: AVAIL_EWMA_INITIAL,
+                    last_avail_sample: now_secs,
+                }
+            }
             Err(e) => {
                 error!(
                     device = %device_id,
@@ -133,9 +137,11 @@ impl Processor {
             .await;
 
         // 4. Send PeerAnnounce so the peer learns our identity ↔ DeviceId binding.
+        //    Only over the connection that just authenticated: never a dial
+        //    (C-DK v3.2 N-3 — a peer the cache closed meanwhile stays closed).
         let pa = self.swarm.build_peer_announce(Timestamp::now());
         let pa_msg = viaticum_core::messages::Message::PeerAnnounce(pa);
-        if let Err(e) = self.swarm.send_to_device(device_id, pa_msg).await {
+        if let Err(e) = self.swarm.send_if_connected(device_id, pa_msg).await {
             warn!(
                 device = %device_id,
                 err = %e,
@@ -145,8 +151,23 @@ impl Processor {
             debug!(device = %device_id, "processor: sent PeerAnnounce after authentication");
         }
 
-        // 5. Notify WorkPipeline worker (if wired) to reset cooldowns and wake.
-        if let Some(tx) = &self.work_event_tx {
+        // 5. Notify WorkPipeline worker (if wired) to reset cooldowns and wake —
+        //    a new peer always, a returning one at most once per 10 min /
+        //    time_scale per device (C-DK Р-18).
+        let wake = self
+            .work_wake
+            .lock()
+            .expect("work wake lock poisoned")
+            .allow(
+                device_id,
+                is_new_peer,
+                work_wake::work_wake_min(self.swarm.time_scale()),
+                std::time::Instant::now(),
+            );
+        if !wake {
+            self.swarm.note_work_wake_suppressed();
+            debug!(device = %device_id, "processor: work wake suppressed");
+        } else if let Some(tx) = &self.work_event_tx {
             let event = crate::daemon::work_pipeline::WorkEvent::PeerAuthenticated { device_id };
             if let Err(e) = tx.try_send(event) {
                 debug!(device = %device_id, err = %e, "processor: work_event_tx send failed (pipeline busy or uninitialized)");

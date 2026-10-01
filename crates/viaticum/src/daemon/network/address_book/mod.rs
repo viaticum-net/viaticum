@@ -133,6 +133,24 @@ impl AddressBook {
         }
     }
 
+    /// The transport addresses (terminal `/p2p/` stripped, deduplicated) of
+    /// `device` from its PeerRecord, for an on-demand dial (network-i42). Empty
+    /// when there is no record or no usable address. Quiet: a send must not log
+    /// every bad stored address again (redial does).
+    pub fn addrs_of(&self, device: &DeviceId) -> Vec<Multiaddr> {
+        let record = match self.db.get_peer(device) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(%device, err = %e, "address book: cannot read the peer record");
+                return Vec::new();
+            }
+        };
+        collect_dialable(device, &record.addrs)
+            .map(|(_, addrs, _)| addrs)
+            .unwrap_or_default()
+    }
+
     /// PeerIds of every known peer ([`is_known`]). A DB error is logged and
     /// yields none: discovery then dials them once more, nothing worse.
     pub fn known_peer_ids(&self) -> Vec<PeerId> {

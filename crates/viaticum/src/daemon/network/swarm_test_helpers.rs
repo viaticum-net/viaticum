@@ -107,3 +107,127 @@ pub(crate) async fn wait_for_authenticated(
     .await
     .expect("timed out waiting for PeerAuthenticated")
 }
+
+// ── C-DK C4 helpers: the connection cache and the on-demand dial ─────────────
+
+/// A test config with the connection cache (`cap`), on-demand dial on, and a
+/// short handshake grace (`grace_ms`) so the protection ends inside a test.
+pub(crate) fn cached_config(seed_byte: u8, cap: usize, grace_ms: u64) -> SwarmConfig {
+    let mut cfg = make_swarm_config(seed_byte);
+    cfg.conn_policy.cap = Some(cap);
+    cfg.conn_policy.dial_on_demand = true;
+    cfg.conn_policy.handshake_grace = Duration::from_millis(grace_ms);
+    cfg
+}
+
+/// A device id of the test cluster for `seed_byte`.
+pub(crate) fn device_of(seed_byte: u8) -> DeviceId {
+    DeviceId(make_signing_key(seed_byte).verifying_key().to_bytes())
+}
+
+/// An application message (activity for the cache).
+pub(crate) fn app_message() -> viaticum_core::messages::Message {
+    use viaticum_core::messages::{Message, PosHashChallengeMsg};
+    Message::PosHashChallenge(PosHashChallengeMsg {
+        v: 1,
+        challenge_id: [1u8; 16],
+        source_block_id: viaticum_core::types::SourceBlockId([2u8; 32]),
+        esi_ranges: vec![(42, 1)],
+        timestamp: Timestamp(1000),
+        device_id: None,
+        sig: [0u8; 64],
+    })
+}
+
+/// Answer every inbound request on `events` with an Ack after `delay`; drop
+/// every other event. Owns the event receiver: wait for authentication with
+/// [`wait_auth`] instead.
+pub(crate) fn serve_acks(
+    handle: std::sync::Arc<SwarmHandle>,
+    mut events: tokio::sync::mpsc::Receiver<ProtocolEvent>,
+    delay: Duration,
+) {
+    tokio::spawn(async move {
+        while let Some(ev) = events.recv().await {
+            if let ProtocolEvent::InboundRequest {
+                response_channel, ..
+            } = ev
+            {
+                let h = handle.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let ack =
+                        viaticum_core::messages::Message::Ack(viaticum_core::messages::AckMsg {
+                            v: 1,
+                        });
+                    let _ = h.respond(response_channel, ack);
+                });
+            }
+        }
+    });
+}
+
+/// Poll `handle` until `device` is (or is not, `want`) authenticated (≤ 5 s).
+pub(crate) async fn wait_auth(handle: &SwarmHandle, device: DeviceId, want: bool) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let (auth, _) = handle.peer_sets().await.expect("peer_sets");
+            if auth.contains(&device) == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("authenticated({device:?}) never became {want}"));
+}
+
+/// A TCP port that accepts and never answers (a "black hole"): a dial to it
+/// hangs in the Noise handshake until the transport timeout.
+pub(crate) async fn black_hole_addr() -> Multiaddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind black hole");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    format!("/ip4/127.0.0.1/tcp/{port}").parse().expect("ma")
+}
+
+/// A TCP port nobody listens on: a dial to it is refused at once.
+pub(crate) fn closed_port_addr() -> Multiaddr {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = l.local_addr().expect("addr").port();
+    drop(l);
+    format!("/ip4/127.0.0.1/tcp/{port}").parse().expect("ma")
+}
+
+/// A PeerRecord of `device` (another master) with `addrs`.
+pub(crate) fn peer_record_with(
+    device: DeviceId,
+    master: IdentityPub,
+    addrs: &[Multiaddr],
+) -> viaticum_core::types::PeerRecord {
+    use viaticum_core::constants::{AVAIL_EWMA_INITIAL, INITIAL_TRUST_P};
+    let now = Timestamp::now();
+    viaticum_core::types::PeerRecord {
+        device_id: device,
+        master_identity: master,
+        trust_p: INITIAL_TRUST_P,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: now,
+        last_seen: now,
+        revoked_device_pub_keys: vec![],
+        addrs: addrs.iter().map(|a| a.to_string()).collect(),
+        x25519_pub: None,
+        avail_ewma: AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
+    }
+}

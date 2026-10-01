@@ -133,3 +133,26 @@ fn address_book_known_peer_ids_are_the_known_records() {
         vec![device_id_to_peer_id(&device(31)).unwrap()]
     );
 }
+
+/// network-i42: the on-demand dial reads a peer's transport addresses from its
+/// PeerRecord (suffix stripped, bad ones dropped); nothing for an unknown device.
+#[test]
+fn address_book_addrs_of_reads_the_peer_record() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let db = viaticum_core::db::Db::open(&dir.path().join("db.redb")).expect("db");
+    let d = device(41);
+    let peer = device_id_to_peer_id(&d).unwrap();
+    let bare: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
+    let stored = vec![
+        bare.clone().with(Protocol::P2p(peer)).to_string(),
+        "garbage".to_string(),
+    ];
+    db.upsert_peer(&record(d, IdentityPub([0xBB; 32]), stored))
+        .expect("upsert");
+    let book = AddressBook::new(db, IdentityPub([0xAA; 32]), device(40));
+    assert_eq!(book.addrs_of(&d), vec![bare]);
+    assert!(
+        book.addrs_of(&device(42)).is_empty(),
+        "no record, no address"
+    );
+}

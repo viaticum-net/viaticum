@@ -107,7 +107,10 @@ async fn discovery_does_not_dial_peer_from_address_book() {
 
     let mut cfg = make_swarm_config(50);
     let book = AddressBook::new(db, test_cluster_master_pub(), device(50));
-    cfg.conn_policy = ConnPolicy::daemon(book);
+    cfg.conn_policy = ConnPolicy {
+        address_book: Some(book),
+        ..ConnPolicy::off()
+    };
     let (a, _events) = SwarmHandle::start(cfg).await.expect("swarm A");
 
     let stranger = PeerId::random();

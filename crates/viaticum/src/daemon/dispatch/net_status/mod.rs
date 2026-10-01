@@ -122,9 +122,9 @@ mod e2e {
     }
 
     /// `net-probe reach`: send a PeerAnnounce (harmless, idempotent; answered
-    /// with an Ack) through `send_to_device` exactly as production requests go.
-    /// Whatever `send_to_device` does with a peer that is not connected is what
-    /// this reports (C1: `peer not authenticated`).
+    /// with an Ack) through `send_to_device` exactly as production requests go:
+    /// a peer that is not connected is dialed on demand (network-i42; the log
+    /// says `swarm: on-demand dial … msg=PeerAnnounce`).
     pub(crate) async fn dispatch_e2e_reach(state: &DaemonState, hex: &str) -> CliResponse {
         let device = match resolve(state, hex) {
             Ok(d) => d,

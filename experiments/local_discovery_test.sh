@@ -2,7 +2,9 @@
 # Viaticum discovery at scale (C-DK): 40 friends find each other through one seed.
 #
 # Scenario:     40 independent owners on one host: seed node-00 (fixed listen port P,
-#               relay_role = "punch") + 39 friends whose config names only the seed
+#               relay_role = "punch" with external_addrs = ["/ip4/127.0.0.1/tcp/P"], the
+#               pair R2 requires; C-DK ignores external_addrs) + 39 friends whose config
+#               names only the seed
 #               (kademlia_bootstrap_peers), no `connect` anywhere. Every node advertises AMP
 #               loopback aliases (e2e-tools amplifier, default 20) so peer records are large.
 #               Converge, place one file each, hold, SIGKILL + restart the seed, a 41st friend
@@ -12,16 +14,17 @@
 #               MODE=lru24: CAP=24 (model: k=20 < cap), TIME_SCALE=60 — the proof of i42.
 #               MODE=lru: CAP=12 (stress: k > cap), TIME_SCALE=60.
 #               MODE=hold: CAP=12, TIME_SCALE=1: converge, then 30 min at production cadence.
-# Intent:       network-i14, i15, i16 (final v3.2 editions), i17, i18, i19 (probabilistic),
+# Intent:       network-i14, i15, i16 (final editions, v3.3), i17, i18, i19 (probabilistic),
 #               i20 (via the i18 path), i41, i42, i43
 # Proves:       every node KNOWS >= 20 other owners within 300 s (a PeerRecord with a
 #               dialable address), symmetric on the OTHER node, never decreasing; every
 #               friend stays under the connection cap (connected - busy - infra - closing,
 #               one snapshot); maintenance never re-dials a peer it evicted (origin redial /
 #               discovery = 0) and lookups slow down after convergence; a known peer with no
-#               connection is reached on demand (seen on THAT peer) and a restore from cold
-#               holders succeeds without the no-answer redial (bars in lru24/lru; NOTE in the
-#               main run); every friend's file lands on >= 2 holders other than the seed
+#               authentication on either side (cold() reads authenticated_devices on both
+#               nodes; a connection without a cert may exist) is reached on demand (seen on
+#               THAT peer) and a restore from such cold holders succeeds without the
+#               no-answer redial (bars in lru24/lru; NOTE in the main run); every friend's file lands on >= 2 holders other than the seed
 #               (symbols on THEIR disks); the seed's crash goes unnoticed and the seed rejoins
 #               every live friend without `connect`; the late node is known by >= 10 old
 #               nodes (on THEIR status); no daemon ever opens a TCP socket (any state) to a
@@ -44,14 +47,19 @@
 #               1. 40 nodes, no connect -> <= 300 s (hold 600, ROUGH > 120 / 300): every
 #                  node known >= 20, seed known = 39; symmetry on the other side (100 % PASS,
 #                  >= 95 % ROUGH, else FAIL); every sample: friends connected - busy - infra
-#                  - closing <= CAP_eff; seed connected = its authenticated (CAP modes: 39);
+#                  - closing <= CAP_eff and protected_peers <= 16; seed connected = its
+#                  authenticated (CAP modes: 39);
 #                  H1..H4 signature printed (spec §2.4) (i14, i18, i41) — status, logs
 #               2. each friend adds a 64 KB .jpg -> <= 180 s (lru*: 300, ROUGH > 180)
 #                  restorable and on >= 2 holders other than the seed (i14) — holder disks
 #               3. hold W (13 min; FAST=1: 3; lru*: 10; hold: 30), sample every 30 s (hold
-#                  60): known >= 20 and never down; cap invariant; evictable_for_ms <= 11000;
-#                  lookup/bootstrap starts after convergence <= ceil(W/T_s)+1 (bar in CAP
-#                  modes); re-dial of evicted with origin redial|discovery = 0; main: after
+#                  60): known >= 20 and never down; cap invariant + protected <= 16;
+#                  evictable_for_ms <= 11000 (a line > 11000 within 15 s after a WARN `lru:
+#                  tick late` of that node = NOTE "host overloaded" + re-run, else RED);
+#                  lookup/bootstrap starts (any origin: start|timer|auto) after convergence
+#                  <= ceil(W/T_s)+1 (bar in CAP modes); NOTE: time over the cap (estimate
+#                  lru ~95-100 %, lru24 ~90-100 %, hold ~30-40 %; ROUGH only hold > 70 %),
+#                  max(busy - protected), origin=auto bootstraps (expected 0); re-dial of evicted with origin redial|discovery = 0; main: after
 #                  minute 5 every `auto-dial pass` with already_connected >= 16 has dialed=0
 #                  (i14, i19, i41, i43)
 #               4a. SIGKILL seed 90 s -> friends' known not below the value before, at +30 s
@@ -65,24 +73,29 @@
 #                  0 `outgoing connection error` with an IPFS bootstrap PeerId, node-39 keeps
 #                  its legacy key = false — the key must change nothing (i17)
 #               8a. 5 pairs (X, Y): cold pair (checked on both sides <= 1 s before), net-probe
-#                  reach -> exit 0 <= 15 s, X in authenticated_devices(Y) on Y <= 5 s, X logs
-#                  `swarm: on-demand dial peer_id=<Y>`; 0 pairs = FAIL (i42; bar in lru24/lru/
-#                  hold, NOTE in main)
+#                  reach -> exit 0 <= 15 s, X in authenticated_devices(Y) on Y (polled at once,
+#                  then every 0.5 s up to 5 s: the reach connection is handshake-only and goes
+#                  first), X logs `swarm: on-demand dial peer_id=<Y> … msg=PeerAnnounce`;
+#                  0 pairs = FAIL (i42; bar in lru24/lru/hold, NOTE in main)
 #               8b. node-07's holders cold, source deleted at a live daemon, restore -> <= 120
 #                  s hash match, 0 `fetch: redialed holders`, >= 1 cold holder sends
-#                  RestoreResponse and was dialed on demand (i42; bar in lru24/lru, NOTE main)
+#                  RestoreResponse and was dialed on demand with msg=RestoreRequest (i42; bar in
+#                  lru24/lru, NOTE main)
 #               8c. black-hole holder H (>= 2 of 6 blocks), restore 6 files -> <= 180 s hashes
-#                  match; in the restore window on-demand failures to H <= 1 + ceil(T/60),
-#                  cached-unreachable lines >= blocks(H) - failures (i42; lru24/lru only)
+#                  match; in the restore window on-demand failures to H with msg=RestoreRequest
+#                  <= 1 + ceil(T/60), cached-unreachable lines (msg=RestoreRequest) >= blocks(H)
+#                  - failures; `on-demand: gave up` lines are not failures (i42; lru24/lru only)
 #               7. NOTE for line B (dr-i63): SIGKILL node-05, DR of its phrase onto a clean
 #                  node-42 — postmen asked/answered/pointers, Kademlia candidates, dr_ready
 #                  (runs last: it kills node-05, an X of step 8a)
 #
-# Modes (spec C-DK v3.2 "Варианты"):
+# Modes (spec C-DK v3.2/v3.3 "Варианты"):
 #   MODE=main  (default) TIME_SCALE=1200, AMP=20, no CAP (48): steps 0-7, 8a/8b as NOTE.
 #   MODE=lru24 CAP=24, TIME_SCALE=60: 0, 1, 2, 3 (10 min), 5, 8a-8c.
 #   MODE=lru   CAP=12, TIME_SCALE=60: 0, 1, 2, 3 (10 min), 5, 8a-8c.
-#   MODE=hold  CAP=12, TIME_SCALE=1:  0, 1, 3 (30 min), 8a.
+#   MODE=hold  CAP=12, TIME_SCALE=1:  0, 1, 3 (30 min), 8a. NOTE: nodes whose cadence
+#              settled while their status showed known < 20 (the swarm's known set counts
+#              peers without an address too, spec Р-17 v3.3).
 #   AMP=0 = the realistic control run. FAST=1 = step 3 of 3 min (debugging only).
 #   SEED_NEW_PORT=1 = the seed restarts on P+1 (mutation M7). STEPS="..." overrides the set.
 #   BASELINE=1 = a C1 baseline run (M0 / M0+amp on a build BEFORE the C2 fix): only then
@@ -317,11 +330,20 @@ log_has_since() {
     n=$(plain_log_since "$1" "$2" | grep -aF -- "$3" | grep -acF -- "$4" || true)
     [ "${n:-0}" -gt 0 ]
 }
+# on_demand_dial_since IDX LINE0 PEER_ID KIND : node IDX logged `swarm: on-demand dial
+# peer_id=<PEER_ID> … msg=<kinds>` after LINE0 with KIND among the message kinds (v3.3
+# WARN-3: the line proves the dial was made FOR that request, not by a mailbox poll).
+on_demand_dial_since() {
+    local n
+    n=$(plain_log_since "$1" "$2" | grep -aF -- "swarm: on-demand dial peer_id=$3" \
+        | grep -acE -- "msg=([A-Za-z]+,)*$4(,| |$)" || true)
+    [ "${n:-0}" -gt 0 ]
+}
 
 # ── One status sample of every live node ────────────────────────────────────
-# Fills K (known), A (authenticated), C (connected), BUSY/INFRA/CLOSING ("NA" when the
-# build has no such field), KD/AD (",hex8,hex8," lists), HAS_KNOWN (Y/N).
-declare -A K A C BUSY INFRA CLOSING KD AD HAS_KNOWN WAKES
+# Fills K (known), A (authenticated), C (connected), BUSY/INFRA/CLOSING/PROT ("NA" when
+# the build has no such field), KD/AD (",hex8,hex8," lists), HAS_KNOWN (Y/N).
+declare -A K A C BUSY INFRA CLOSING PROT KD AD HAS_KNOWN WAKES
 FIELDS_NOTED=0
 sample_one() { # NODE
     local i="$1" js row
@@ -336,10 +358,11 @@ sample_one() { # NODE
         ("," + ((.known_devices // []) | join(",")) + ","),
         ("," + ((.authenticated_devices // []) | join(",")) + ","),
         (if has("known_devices") then "Y" else "N" end),
-        (if has("work_wakes_suppressed") then .work_wakes_suppressed else "NA" end)
+        (if has("work_wakes_suppressed") then .work_wakes_suppressed else "NA" end),
+        (if has("protected_peers") then .protected_peers else "NA" end)
       ] | @tsv' 2>/dev/null || true)
     IFS=$'\t' read -r "K[$i]" "A[$i]" "C[$i]" "BUSY[$i]" "INFRA[$i]" "CLOSING[$i]" "KD[$i]" "AD[$i]" \
-        "HAS_KNOWN[$i]" "WAKES[$i]" <<< "$row"
+        "HAS_KNOWN[$i]" "WAKES[$i]" "PROT[$i]" <<< "$row"
 }
 sample_all() {
     local i
@@ -370,23 +393,51 @@ resample_missing() { # NODES...
 }
 
 # Friends' cap invariant on the current sample: connected - busy - infra - closing <= CAP_eff
-# (spec v3.2 WR-1). A build without those fields counts them as 0 — stricter, never greener.
-CAP_VIOLATIONS=""
+# (spec v3.2 WR-1) and protected_peers <= 16 (v3.3 BLOCK-1). A build without those fields
+# counts them as 0 — stricter, never greener. MAX_BUSY_NOT_PROT = max(busy - protected)
+# over the samples (NOTE: what keeps a node over the cap besides the protected).
+CAP_VIOLATIONS=""; MAX_BUSY_NOT_PROT=0
 check_cap_sample() {
-    local i inv b f c
+    local i inv b f c pr
     for i in $(alive_friends); do
         [ -n "${K[$i]:-}" ] || continue
-        b="${BUSY[$i]:-NA}"; f="${INFRA[$i]:-NA}"; c="${CLOSING[$i]:-NA}"
-        if [ "$FIELDS_NOTED" = 0 ] && { [ "$b" = NA ] || [ "$f" = NA ] || [ "$c" = NA ]; }; then
-            note "status has no busy_peers/infra_peers/closing_peers (build before C4): the cap invariant uses peer_count_connected alone (stricter)"
+        b="${BUSY[$i]:-NA}"; f="${INFRA[$i]:-NA}"; c="${CLOSING[$i]:-NA}"; pr="${PROT[$i]:-NA}"
+        if [ "$FIELDS_NOTED" = 0 ] && { [ "$b" = NA ] || [ "$f" = NA ] || [ "$c" = NA ] || [ "$pr" = NA ]; }; then
+            note "status has no busy_peers/infra_peers/closing_peers/protected_peers (build before C4): the cap invariant uses peer_count_connected alone (stricter)"
             FIELDS_NOTED=1
         fi
-        [ "$b" = NA ] && b=0; [ "$f" = NA ] && f=0; [ "$c" = NA ] && c=0
+        [ "$b" = NA ] && b=0; [ "$f" = NA ] && f=0; [ "$c" = NA ] && c=0; [ "$pr" = NA ] && pr=0
         inv=$(( ${C[$i]:-0} - b - f - c ))
         if [ "$inv" -gt "$CAP_EFF" ]; then
             CAP_VIOLATIONS="$CAP_VIOLATIONS node-$i:$inv@$(( $(date -u +%s) - T_BASE ))s"
         fi
+        if [ "$pr" -gt 16 ]; then
+            CAP_VIOLATIONS="$CAP_VIOLATIONS node-$i:protected=$pr>16@$(( $(date -u +%s) - T_BASE ))s"
+        fi
+        [ $(( b - pr )) -gt "$MAX_BUSY_NOT_PROT" ] && MAX_BUSY_NOT_PROT=$(( b - pr ))
     done
+    return 0
+}
+
+# Р-17 v3.3 NOTE: the swarm settles its lookup cadence on ITS known set (peers without an
+# address count there), so a node may settle while its status shows known < 20. On every
+# sample, a node whose log has `kademlia lookup cadence settled` for the first time is
+# checked against the status just read (an approximation: the sample comes <= 5-60 s after
+# the line, and known never decreases, so this undercounts).
+declare -A SETTLED_SEEN
+SETTLED_LOW=""; SETTLED_N=0
+scan_cadence_settled() {
+    local i n
+    for i in $(alive_nodes); do
+        [ -n "${SETTLED_SEEN[$i]:-}" ] && continue
+        n=$(grep -ac "kademlia lookup cadence settled" "$(node_log "$i")" 2>/dev/null || true)
+        [ "${n:-0}" -gt 0 ] || continue
+        SETTLED_SEEN[$i]=1; SETTLED_N=$((SETTLED_N + 1))
+        if [ -n "${K[$i]:-}" ] && [ "${K[$i]}" != NA ] && [ "${K[$i]}" -lt 20 ]; then
+            SETTLED_LOW="$SETTLED_LOW node-$i:${K[$i]}"
+        fi
+    done
+    return 0
 }
 
 # Step 6 on every sample: non-local sockets of every live daemon (any TCP state).
@@ -607,8 +658,10 @@ reach_pair() {
         PAIR_MSG="node-$x -> node-$y: net-probe reach exit $rc after ${el}ms: ${out:0:200}"
         return 1
     fi
+    # Polled at once (<= 0.5 s after reach), then every 0.5 s up to 5 s; one hit is
+    # enough: the reach connection is handshake-only and the cache closes it first (v3.3).
     got=0
-    for t in $(seq 1 10); do
+    for t in $(seq 1 11); do
         in_list "${DEV8[$x]}" ",$(authenticated_devices_of "$y" | tr '\n' ',')" && { got=1; break; }
         sleep 0.5
     done
@@ -616,8 +669,8 @@ reach_pair() {
         PAIR_MSG="node-$x -> node-$y reached in ${el}ms, but node-$y does not list node-$x as authenticated within 5 s"
         return 1
     fi
-    if ! log_has_since "$x" "$line0" "swarm: on-demand dial" "peer_id=${PEER_ID[$y]}"; then
-        PAIR_MSG="node-$x -> node-$y reached in ${el}ms without a 'swarm: on-demand dial peer_id=${PEER_ID[$y]}' line (kad reconnected it?)"
+    if ! on_demand_dial_since "$x" "$line0" "${PEER_ID[$y]}" PeerAnnounce; then
+        PAIR_MSG="node-$x -> node-$y reached in ${el}ms without a 'swarm: on-demand dial peer_id=${PEER_ID[$y]} … msg=PeerAnnounce' line (kad reconnected it?)"
         return 1
     fi
     PAIR_MSG="node-$x -> node-$y reached on demand in ${el}ms, seen on node-$y"
@@ -704,8 +757,10 @@ for i in $(seq 0 $NUM_FRIENDS); do
 done
 M_DR_SOURCE=$(grep -A1 "^Mnemonic" "$TEST_DIR/logs/init-$DR_SOURCE.out" | tail -1 | sed 's/^ *//' || true)
 [ "$(echo "$M_DR_SOURCE" | wc -w)" -eq 24 ] || setup_fail "node-$DR_SOURCE init printed no 24-word phrase"
-# Seed: fixed port, the infrastructure role of spec v3.2 (ignored by builds before C4).
-write_config "$SEED" "$SEED_PORT" "" 'relay_role = "punch"'
+# Seed: fixed port, the infrastructure role (C-DK v3.2/v3.3; ignored by builds before C4)
+# with the external address R2 will require next to it (unknown key, ignored in C-DK).
+seed_network_lines() { printf 'relay_role = "punch"\nexternal_addrs = ["/ip4/127.0.0.1/tcp/%s"]' "$1"; }
+write_config "$SEED" "$SEED_PORT" "" "$(seed_network_lines "$SEED_PORT")"
 start_daemon "$SEED"
 wait_api "$SEED" 60 || setup_fail "seed daemon does not answer"
 learn_identity "$SEED" || setup_fail "seed has no listen address"
@@ -772,7 +827,7 @@ done
 if [ "$MODE" = hold ]; then BAR1=600; ROUGH1=300; else BAR1=300; ROUGH1=120; fi
 CONVERGED_AT=""
 while :; do
-    sample_all; check_cap_sample; check_sockets_sample
+    sample_all; check_cap_sample; check_sockets_sample; scan_cadence_settled
     LAG=""
     for i in $(alive_nodes); do
         if [ "$i" = "$SEED" ]; then
@@ -830,7 +885,7 @@ else
     fail "symmetry: $ASYM of $PAIRS pairs one-sided:$(echo "$ASYM_LIST" | cut -c1-300)"
 fi
 if [ -z "$CAP_VIOLATIONS" ]; then
-    pass "every sample: friends' connected - busy - infra - closing <= $CAP_EFF"
+    pass "every sample: friends' connected - busy - infra - closing <= $CAP_EFF, protected <= 16"
 else
     fail "cap invariant broken:$(echo "$CAP_VIOLATIONS" | cut -c1-300)"
 fi
@@ -916,7 +971,7 @@ if runs_step 3; then
     declare -A LINE3 PREV_K
     for i in $(alive_nodes); do LINE3[$i]=$(log_line_count "$i"); done
     T3=$(date -u +%s)
-    KNOW_BAD=""; CAP_VIOLATIONS=""; SAMPLES=0; RESAMPLED=""; RESAMPLE_N=0
+    KNOW_BAD=""; CAP_VIOLATIONS=""; MAX_BUSY_NOT_PROT=0; SAMPLES=0; RESAMPLED=""; RESAMPLE_N=0
     sample_all; resample_missing $(alive_nodes)
     for i in $(alive_nodes); do
         if [ -z "${K[$i]:-}" ]; then KNOW_BAD="$KNOW_BAD $i:no-status"; fi
@@ -925,6 +980,7 @@ if runs_step 3; then
     while [ $(( $(date -u +%s) - T3 )) -lt "$HOLD_SECS" ]; do
         sleep "$SAMPLE_SECS"
         sample_all; resample_missing $(alive_nodes); check_cap_sample; check_sockets_sample
+        scan_cadence_settled
         SAMPLES=$((SAMPLES + 1))
         for i in $(alive_nodes); do
             k="${K[$i]:-}"
@@ -945,19 +1001,29 @@ if runs_step 3; then
         fail "knowledge fell:$(echo "$KNOW_BAD" | cut -c1-300)"
     fi
     if [ -z "$CAP_VIOLATIONS" ]; then
-        pass "$SAMPLES samples: friends' connected - busy - infra - closing <= $CAP_EFF"
+        pass "$SAMPLES samples: friends' connected - busy - infra - closing <= $CAP_EFF, protected <= 16"
     else
         fail "cap invariant broken:$(echo "$CAP_VIOLATIONS" | cut -c1-300)"
     fi
     # Log bars (spec v3.2 BL-2). Lines of a build without the cache are simply absent.
-    EVICT=0; SLOW_EVICT=""; REDIAL_CAR=0; DISC_CAR=0; KAD_CAR=0; OND_CAR=0; LOOKUPS_MAX=0; BOOTS_MAX=0
-    OVER_MS=0; KEEPALIVE=0
+    EVICT=0; SLOW_EVICT=""; SLOW_EVICT_LATE=""; REDIAL_CAR=0; DISC_CAR=0; KAD_CAR=0; OND_CAR=0
+    LOOKUPS_MAX=0; BOOTS_MAX=0; AUTO_BOOTS=0; OVER_MS=0; KEEPALIVE=0; TICK_LATE=0
     for i in $(alive_nodes); do
         L="$(plain_log_since "$i" "${LINE3[$i]}")"
         n=$(grep -ac "lru: evicted peer" <<< "$L" || true); EVICT=$((EVICT + n))
-        while read -r ms; do
-            [ -n "$ms" ] && [ "$ms" -gt 11000 ] && SLOW_EVICT="$SLOW_EVICT $i:${ms}ms"
-        done < <(grep -a "lru: evicted peer" <<< "$L" | grep -oE 'evictable_for_ms=[0-9]+' | cut -d= -f2 || true)
+        # evictable_for_ms > 11000 (v3.3): within 15 s after a WARN `lru: tick late` of the
+        # same node = the host stalled the event loop (NOTE + re-run), otherwise RED.
+        LATE_TS=$(events "$(node_log "$i")" "lru: tick late" lag_ms | awk -v l0="${LINE3[$i]}" '$2 > l0 { print $1 }')
+        TICK_LATE=$((TICK_LATE + $(grep -c . <<< "$LATE_TS" || true)))
+        while read -r t _l ms; do
+            [ -n "$ms" ] && [ "$ms" != "-" ] && [ "$ms" -gt 11000 ] || continue
+            if awk -v t="$t" '{ d = t - $1; if (d >= 0 && d <= 15) f = 1 } END { exit !f }' <<< "$LATE_TS"; then
+                SLOW_EVICT_LATE="$SLOW_EVICT_LATE $i:${ms}ms"
+            else
+                SLOW_EVICT="$SLOW_EVICT $i:${ms}ms"
+            fi
+        done < <(events "$(node_log "$i")" "lru: evicted peer" evictable_for_ms | awk -v l0="${LINE3[$i]}" '$2 > l0')
+        n=$(grep -a "kademlia bootstrap started" <<< "$L" | grep -acE "origin=auto( |$)" || true); AUTO_BOOTS=$((AUTO_BOOTS + n))
         LF=$(node_log "$i"); L0I="${LINE3[$i]}"
         REDIAL_CAR=$((REDIAL_CAR + $(carousel_count "$LF" redial "$L0I")))
         DISC_CAR=$((DISC_CAR + $(carousel_count "$LF" discovery "$L0I")))
@@ -972,10 +1038,12 @@ if runs_step 3; then
     W=$(( T3_END - T3 ))
     T_S=$(( 1800 / TIME_SCALE )); [ "$T_S" -lt 60 ] && T_S=60
     START_BAR=$(( (W + T_S - 1) / T_S + 1 ))
+    [ -n "$SLOW_EVICT_LATE" ] && note "host overloaded: victims closed > 11 s after they became evictable right after a 'lru: tick late' (re-run the mode on a quiet host):$(echo "$SLOW_EVICT_LATE" | cut -c1-200)"
+    [ "$TICK_LATE" -gt 0 ] && note "'lru: tick late' warnings in the window: $TICK_LATE (the event loop stood > 12 s)"
     if [ -n "$SLOW_EVICT" ]; then
-        fail "victims closed later than 11 s after they became evictable:$(echo "$SLOW_EVICT" | cut -c1-200)"
+        fail "victims closed later than 11 s after they became evictable (no 'lru: tick late' before them):$(echo "$SLOW_EVICT" | cut -c1-200)"
     elif [ "$EVICT" -gt 0 ]; then
-        pass "$EVICT evictions, each within 11 s of becoming evictable"
+        pass "$EVICT evictions, each within 11 s of becoming evictable (or right after a stalled loop)"
     fi
     if [ $((REDIAL_CAR + DISC_CAR)) -gt 0 ]; then
         fail "carousel: re-dials of evicted peers origin=redial $REDIAL_CAR, origin=discovery $DISC_CAR"
@@ -995,8 +1063,16 @@ if runs_step 3; then
         else
             fail "lookups do not slow down after convergence: max $LOOKUPS_MAX lookups / $BOOTS_MAX bootstraps per node > $START_BAR (M15)"
         fi
+        # Time over the cap (connected - infra - closing > CAP) from the closed episodes —
+        # a NOTE with the v3.3 estimates; ROUGH only in hold above 70 %.
         FRAC=$(( OVER_MS / 10 / (W * $(alive_friends | wc -l)) ))
-        if [ "$FRAC" -gt 60 ]; then rough "time over the cap ${FRAC}% of friend-time (> 60 %)"; else note "time over the cap ${FRAC}% of friend-time (estimate ~35 %)"; fi
+        case "$MODE" in
+            hold)  if [ "$FRAC" -gt 70 ]; then rough "time over the cap ${FRAC}% of friend-time (> 70 %, estimate ~30-40 %)"
+                   else note "time over the cap ${FRAC}% of friend-time (estimate ~30-40 %)"; fi ;;
+            lru)   note "time over the cap ${FRAC}% of friend-time from closed episodes (estimate ~95-100 %)" ;;
+            *)     note "time over the cap ${FRAC}% of friend-time from closed episodes (estimate ~90-100 %)" ;;
+        esac
+        note "max(busy - protected) over the samples: $MAX_BUSY_NOT_PROT; 'kademlia bootstrap started origin=auto' in the window: $AUTO_BOOTS (expected 0: the table holds >= 20 entries)"
     else
         note "lookup starts per node after convergence: max $LOOKUPS_MAX, bootstraps max $BOOTS_MAX (ceil(W/T_s)+1 = $START_BAR; no lines = build before C4); evictions at cap 48 > 39 peers: $EVICT (expected 0)"
         # Main run: after minute 5 of the run, a node with >= 16 authenticated peers dials
@@ -1022,6 +1098,7 @@ if runs_step 3; then
     read -r AMIN AMED AMAX <<< "$(auth_sample_all $(alive_nodes))"
     note "peer_count_authenticated min/median/max at the end: $AMIN/$AMED/$AMAX; established sockets - connected peers (W6 duplicates) max $MAX_DUP_SOCKETS"
     [ "$MODE" = hold ] && note "closes with cause KeepAliveTimeout: $KEEPALIVE (expected 0: identify keeps links alive, v3-C)"
+    [ "$MODE" = hold ] && note "lookup cadence settled on $SETTLED_N nodes; status known < 20 at the first sample after it:${SETTLED_LOW:- none} (Р-17 v3.3: the swarm's known set counts peers without an address)"
     if [ "${WAKES[$SEED]:-NA}" = NA ]; then
         note "work_wakes_suppressed absent from status (build before C4, Р-18)"
     else
@@ -1076,7 +1153,7 @@ if runs_step 4b; then
     step 4b "the seed restarts with the same data dir"
     NEW_P="$SEED_PORT"
     if [ "$SEED_NEW_PORT" = 1 ]; then NEW_P=$(( SEED_PORT + 1 )); note "M7: seed restarts on port $NEW_P"; fi
-    write_config "$SEED" "$NEW_P" "" 'relay_role = "punch"'
+    write_config "$SEED" "$NEW_P" "" "$(seed_network_lines "$NEW_P")"
     SEED_ADDR="/ip4/127.0.0.1/tcp/$NEW_P/p2p/${PEER_ID[$SEED]}"
     L0=$(log_line_count "$SEED")
     start_daemon "$SEED"
@@ -1228,12 +1305,12 @@ if runs_step 8b && [ "$SKIP_8BC" = 0 ]; then
         SERVED=""
         for j in $COLD; do
             if log_has_since "$j" "${HL0[$j]}" "sending RestoreResponse" "${BLK:0:16}" \
-                && log_has_since "$OWNER" "$L7" "swarm: on-demand dial" "peer_id=${PEER_ID[$j]}"; then
+                && on_demand_dial_since "$OWNER" "$L7" "${PEER_ID[$j]}" RestoreRequest; then
                 SERVED="$SERVED $j"
             fi
         done
         [ -n "$SERVED" ] && bar8_pass "cold holders dialed on demand that sent RestoreResponse:$SERVED" \
-            || bar8_fail "no cold holder was dialed on demand and sent RestoreResponse (cold:$COLD)"
+            || bar8_fail "no cold holder was dialed on demand (msg=RestoreRequest) and sent RestoreResponse (cold:$COLD)"
     fi
 fi
 
@@ -1284,10 +1361,15 @@ run_8c() {
     fi
     [ "$OK_FILES" -eq 6 ] && pass "all 6 files restored, hashes match, in ${T_RESTORE}s" \
         || fail "restore: $OK_FILES/6 files match (exit $RESTORE_RC, ${T_RESTORE}s): ${RESTORE_LAST:0:300}"
-    # Only the lines of the restore window (spec v3.2 WR-2): earlier failures do not count.
+    # Only the lines of the restore window (spec v3.2 WR-2), and only those of a
+    # RestoreRequest (v3.3 WARN-3): a mailbox poll's failures do not count, nor do
+    # `on-demand: gave up` lines (WARN-4: the peer was never tried).
     WIN=$(sed -n "$(( L7 + 1 )),${L7_END}p" "$(node_log "$OWNER")" | sed 's/\x1b\[[0-9;]*m//g')
-    FAILS=$(grep -a "swarm: on-demand dial failed" <<< "$WIN" | grep -acF "peer_id=${PEER_ID[$H]}" || true)
-    CACHED=$(grep -a "on-demand: unreachable (cached)" <<< "$WIN" | grep -acF "peer_id=${PEER_ID[$H]}" || true)
+    RR_RE='msg=([A-Za-z]+,)*RestoreRequest(,| |$)'
+    FAILS=$(grep -a "swarm: on-demand dial failed" <<< "$WIN" | grep -aF "peer_id=${PEER_ID[$H]}" | grep -acE "$RR_RE" || true)
+    CACHED=$(grep -a "on-demand: unreachable (cached)" <<< "$WIN" | grep -aF "peer_id=${PEER_ID[$H]}" | grep -acE "$RR_RE" || true)
+    GAVEUP=$(grep -a "on-demand: gave up" <<< "$WIN" | grep -acF "peer_id=${PEER_ID[$H]}" || true)
+    [ "$GAVEUP" -gt 0 ] && note "on-demand: gave up for node-$H in the window: $GAVEUP (queued / foreign dial: not failures)"
     FAIL_BAR=$(( 1 + (T_RESTORE + 59) / 60 ))
     [ "$FAILS" -le "$FAIL_BAR" ] && pass "on-demand dial failures to node-$H in the restore window: $FAILS <= $FAIL_BAR" \
         || fail "on-demand dial failures to node-$H: $FAILS > $FAIL_BAR (M16: no negative cache)"
