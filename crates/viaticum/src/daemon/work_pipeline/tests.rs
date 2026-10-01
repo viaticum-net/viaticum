@@ -92,13 +92,13 @@ fn make_db() -> Db {
     Db::open(&path).unwrap()
 }
 
-fn device_id(byte: u8) -> DeviceId {
+pub(super) fn device_id(byte: u8) -> DeviceId {
     let mut b = [0u8; 32];
     b[0] = byte;
     DeviceId(b)
 }
 
-fn block_id(byte: u8) -> SourceBlockId {
+pub(super) fn block_id(byte: u8) -> SourceBlockId {
     let mut b = [0u8; 32];
     b[0] = byte;
     SourceBlockId(b)
@@ -143,6 +143,7 @@ pub(super) fn make_config() -> WorkPipelineConfig {
         // A budget no test of the old behaviour can exhaust; budget tests set their own.
         mem_budget: crate::daemon::mem_budget::MemBudget::new(64 << 30),
         chunk_budget_bytes: viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,
+        restore_pauses_backup: super::RESTORE_PAUSES_BACKUP,
     }
 }
 
@@ -1811,7 +1812,7 @@ pub(super) fn placement(
 
 /// A started swarm with no peers: `send_to_device` fails at once (peer not
 /// authenticated), `peer_sets` is empty so `snapshot_pool` falls back to the DB peers.
-async fn lonely_swarm(seed: u8) -> Arc<crate::daemon::network::swarm::SwarmHandle> {
+pub(super) async fn lonely_swarm(seed: u8) -> Arc<crate::daemon::network::swarm::SwarmHandle> {
     let cfg = crate::daemon::network::swarm_test_helpers::make_swarm_config(seed);
     let (handle, events) = crate::daemon::network::swarm::SwarmHandle::start(cfg)
         .await
@@ -1822,14 +1823,14 @@ async fn lonely_swarm(seed: u8) -> Arc<crate::daemon::network::swarm::SwarmHandl
     Arc::new(handle)
 }
 
-fn add_pool_peers(db: &Db, peers: &[DeviceId]) {
+pub(super) fn add_pool_peers(db: &Db, peers: &[DeviceId]) {
     for (i, &p) in peers.iter().enumerate() {
         db.upsert_peer(&make_peer_with_master(p, master_pub(0x40 + i as u8)))
             .unwrap();
     }
 }
 
-fn pipeline_with(
+pub(super) fn pipeline_with(
     db: &Db,
     config: WorkPipelineConfig,
     swarm: Option<Arc<crate::daemon::network::swarm::SwarmHandle>>,
@@ -1842,7 +1843,11 @@ fn pipeline_with(
 
 /// A below-target block whose blob is retained under `data_dir/system_state` (the
 /// SystemState path), so the worker can encode it without source files.
-fn retained_block(data_dir: &std::path::Path, seed: u8, importance: f64) -> SourceBlockRecord {
+pub(super) fn retained_block(
+    data_dir: &std::path::Path,
+    seed: u8,
+    importance: f64,
+) -> SourceBlockRecord {
     let blob: Vec<u8> = (0..3000u32).map(|i| (i as u8) ^ seed).collect();
     let bid = SourceBlockId(*blake3::hash(&blob).as_bytes());
     crate::daemon::system_state::block::store_retained_block(data_dir, &bid, &blob).unwrap();
@@ -2019,7 +2024,13 @@ async fn parking_by_an_iteration_error_clears_the_turn_memory() {
         bid,
         super::worker::TurnMemory {
             turns: 3,
-            marks: std::collections::HashMap::from([(peers[0], 2u32)]),
+            holders: std::collections::HashMap::from([(
+                peers[0],
+                super::worker::HolderDelivery {
+                    acked: vec![(0, 2)],
+                    state: super::worker::HolderState::Failed(2),
+                },
+            )]),
         },
     );
     assert!(pipeline.run_iteration().await.unwrap());
@@ -2175,7 +2186,7 @@ fn bind_placement_symbols_with_non_contiguous_ranges_binds_each_esi_to_its_own_s
     // BIND_NS+4..BIND_NS+10 is not encoded.
     let raw = raw_for_ranges(&[(BIND_NS, 4), (BIND_NS + 10, 2), (BIND_NS + 20, 3)]);
 
-    let bound = bind_placement_symbols(&encoder, &placement.source_block_id, &placement, &raw)
+    let bound = bind_placement_symbols(&encoder, &placement.source_block_id, &placement, &[], &raw)
         .expect("every placement ESI is in the raw symbols");
 
     let want_esis: Vec<u32> = (BIND_NS..BIND_NS + 4)
@@ -2205,7 +2216,8 @@ fn bind_placement_symbols_when_a_placement_esi_is_missing_returns_error() {
     // BIND_NS+11 was not encoded.
     let raw = raw_for_ranges(&[(BIND_NS, 4), (BIND_NS + 10, 1)]);
 
-    let result = bind_placement_symbols(&encoder, &placement.source_block_id, &placement, &raw);
+    let result =
+        bind_placement_symbols(&encoder, &placement.source_block_id, &placement, &[], &raw);
 
     assert!(
         result.is_err(),

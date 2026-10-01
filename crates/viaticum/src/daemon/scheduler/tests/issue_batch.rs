@@ -570,6 +570,54 @@ async fn batch_ends_between_members_for_a_restore_that_does_not_fit_beside_it() 
     assert_eq!(pending_len(&owner), 3);
 }
 
+/// M93 (v3.12a; lesson of v3.12: completion within N). A restore that does not fit beside the
+/// batch ends EVERY batch after its first member. Five marks of an earlier tick (the ones due
+/// longest) and six blocks that arrive marked a tick later: the members the batch returns keep
+/// their marks and go first, so a mark of rank r is published within r + 1 ticks, however many
+/// newer ones keep coming — all five within six ticks. Returned members at the END of the order
+/// (the newest marks first) would let the newer ones overtake them every tick, for ever.
+#[tokio::test]
+async fn every_mark_is_published_within_rank_plus_one_ticks_when_restore_cuts_each_batch() {
+    let (owner, budget) = budgeted_at(1, 11, 1, make_test_encoder());
+    let holder = make_identity(0x80);
+    // Blocks 0..5 were marked on tick 0; 5..11 are marked by tick 1 and stay newer.
+    for b in 0..5u8 {
+        owner.scheduler.note_mem_deferred(block_at(b), 0);
+    }
+    let published = |owner: &super::issue_support::Owner| -> usize {
+        let pending = owner.pending.try_lock().expect("the pending index");
+        (0..5u8)
+            .filter(|&b| pending.contains_key(&(block_at(b), holder)))
+            .count()
+    };
+    let mut in_flight = InFlight::default();
+
+    for tick_no in 1..=6usize {
+        let hold = hold_all(&budget);
+        tick(&owner, &mut in_flight).await; // the batch of every ripe mark, behind the hold
+        until("the batch queues", || {
+            budget.priority_waiters(PriorityKind::OverduePos) == 1
+        })
+        .await;
+        // A restore of the whole budget queues behind it: it never fits beside the batch.
+        let restore = spawn_restore(&budget, TOTAL_MIB);
+        until("the restore queues", || budget.queued_waiters() == 2).await;
+        drop(hold);
+        let granted = tokio::time::timeout(Duration::from_secs(10), restore)
+            .await
+            .expect("the restore gets its memory once the batch's first member is done")
+            .unwrap();
+        drop(granted);
+        settle_until_idle(&owner, &mut in_flight, Duration::from_secs(10)).await;
+        assert!(
+            published(&owner) >= tick_no.min(5),
+            "tick {tick_no}: {} of the five old marks are published",
+            published(&owner)
+        );
+    }
+    assert_eq!(published(&owner), 5, "all five within six ticks");
+}
+
 /// MR-R3 (WARN-3b). The batch yields only to a RESTORE (Q-V8, (a)): a worker waiting in the queue
 /// behind it, however big, does not end it between members — the worker takes the budget when the
 /// batch is done, as before. All three members are served.

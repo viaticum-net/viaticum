@@ -71,6 +71,10 @@ pub fn render_status(data: &StatusData) -> String {
             lease.age_s
         ));
     }
+    // Q-V9 (a): the node's memory goes to the restore first.
+    if data.backup_paused_while_restoring {
+        out.push_str("  backup:         paused while restoring\n");
+    }
     out.push_str(&render_dr_readiness(data));
     // holder-i1/i2: 0 is "no room", never "unlimited"; an unread disk says so.
     let quota_str = match data.quota_state.as_str() {

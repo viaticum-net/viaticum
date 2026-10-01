@@ -1081,6 +1081,7 @@ impl DaemonHandle {
                     mem_budget: Arc::clone(&mem_budget),
                     chunk_budget_bytes:
                         viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,
+                    restore_pauses_backup: crate::daemon::work_pipeline::RESTORE_PAUSES_BACKUP,
                 };
                 let worker = crate::daemon::work_pipeline::WorkPipeline::new(
                     db.clone(),
@@ -1091,7 +1092,8 @@ impl DaemonHandle {
                     Some(Arc::clone(&peer_backoff)),
                     Some(cluster_state.clone()),
                     work_event_rx,
-                );
+                )
+                .with_restore_gate(restore_jobs.running_job_gate());
                 tasks.push((
                     "work_pipeline",
                     tokio::spawn(async move { worker.run().await }),

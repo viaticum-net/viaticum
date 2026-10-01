@@ -227,6 +227,10 @@ pub struct StatusData {
     /// absent when no DR does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dr_lease: Option<DrLeaseStatus>,
+    /// A restore job runs and the backup worker starts no new iteration (Q-V9 (a), spec v3.12a):
+    /// «backup paused while restoring». Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backup_paused_while_restoring: bool,
 }
 
 /// The lease a `viaticum dr` holds on this node's block work budget (`status`).

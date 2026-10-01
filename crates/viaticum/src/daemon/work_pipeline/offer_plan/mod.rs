@@ -224,7 +224,8 @@ fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     merged
 }
 
-/// Every ESI the plan needs, ascending and merged — what to encode (once) for this plan.
+/// Every ESI the plan offers, ascending and merged (the whole ranges, not the undelivered rest).
+#[cfg(test)]
 pub(crate) fn union_ranges(offers: &[PlannedOffer]) -> Vec<(u32, u32)> {
     merge_ranges(
         offers
@@ -232,6 +233,41 @@ pub(crate) fn union_ranges(offers: &[PlannedOffer]) -> Vec<(u32, u32)> {
             .flat_map(|o| o.esi_ranges.iter().copied())
             .collect(),
     )
+}
+
+/// `a` without what `b` covers, ascending and merged (both may be unsorted; empty ranges are
+/// ignored). The undelivered rest of a placement is `esi_ranges − acked` (К-b2a‴, spec v3.12).
+pub(crate) fn subtract_ranges(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let b = merge_ranges(b.to_vec());
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for (start, count) in merge_ranges(a.to_vec()) {
+        let (mut cur, end) = (u64::from(start), u64::from(start) + u64::from(count));
+        for &(b_start, b_count) in &b {
+            let (b_start, b_end) = (u64::from(b_start), u64::from(b_start) + u64::from(b_count));
+            if b_end <= cur || b_start >= end {
+                continue;
+            }
+            if b_start > cur {
+                out.push((cur as u32, (b_start - cur) as u32));
+            }
+            cur = cur.max(b_end);
+        }
+        if cur < end {
+            out.push((cur as u32, (end - cur) as u32));
+        }
+    }
+    out
+}
+
+/// `into` plus `more`, ascending and merged.
+pub(crate) fn add_ranges(into: &mut Vec<(u32, u32)>, more: &[(u32, u32)]) {
+    into.extend_from_slice(more);
+    *into = merge_ranges(std::mem::take(into));
+}
+
+/// Every ESI of several range lists, ascending and merged: what the turn encodes (once).
+pub(crate) fn union_of(lists: &[Vec<(u32, u32)>]) -> Vec<(u32, u32)> {
+    merge_ranges(lists.iter().flatten().copied().collect())
 }
 
 /// Write the plan's rows as `Offered` (one txn) plus a `SymbolsPlaced` event per range.

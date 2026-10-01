@@ -38,7 +38,7 @@ use viaticum_core::types::{
     Timestamp,
 };
 
-use super::offer_plan::{self, OfferPlan};
+use super::offer_plan::{self, OfferPlan, add_ranges, subtract_ranges, union_of};
 use super::{WorkPipelineConfig, pool::PoolSnapshot};
 use crate::daemon::mem_budget::{
     self, HolderKind, MemBudget, MemPermit, PriorityKind, estimate_worker, estimate_worker_delivery,
@@ -74,12 +74,13 @@ pub(crate) struct WorkOutcome {
 /// How one holder's delivery ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeliveryOutcome {
-    /// Every chunk acked; the placement is `Alive`.
+    /// The holder's `acked` covers its whole range; the placement is `Alive`.
     Stored,
-    /// Attempted, not every chunk acked; the placement stays `Offered`.
+    /// Attempted, the range is not covered; the placement stays `Offered`.
     NotStored,
-    /// The worker stopped before the next chunk to give the budget away (overdue PoS).
-    Yielded,
+    /// The worker stopped before the next chunk to give the budget away (overdue PoS, or a
+    /// restore when `RESTORE_PAUSES_BACKUP` is off).
+    Yielded(YieldTo),
 }
 
 /// Who the worker gives the budget to.
@@ -92,13 +93,81 @@ pub(super) enum YieldTo {
 /// How long the worker waits for the budget before the INFO line says so (N4).
 const WAIT_LOG_AFTER: Duration = Duration::from_secs(5);
 
+/// Where the delivery to one holder stands between two turns (spec v3.12, К-b2a‴).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HolderState {
+    /// The turn gave the budget away in the middle of the share: this holder goes first.
+    InProgress,
+    /// The last attempt (turn number) ended without the share delivered: an offer without
+    /// consent, an error, a chunk not stored. The longest ago goes first among these.
+    Failed(u32),
+}
+
+/// What the holder has acknowledged of the block, and how its last attempt ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HolderDelivery {
+    /// ESIs the holder answered `SymbolStored` for: never sent again (it keeps them; a repeat is
+    /// `already_held` at its side). Ascending, merged.
+    pub(crate) acked: Vec<(u32, u32)>,
+    pub(crate) state: HolderState,
+}
+
 /// What the worker keeps between the turns of one block (RAM only, cleared with the yield count,
-/// backup-i24-a): how many turns the block has had (any turn, yielded or not) and, per holder,
-/// the number of the turn in which it was last attempted.
+/// backup-i24-a, spec v3.12): how many turns the block has had (any turn, yielded or not) and,
+/// per holder, the delivery memory. A restart empties it: the share is then sent from its first
+/// chunk once (the holder writes nothing twice).
 #[derive(Debug, Default)]
 pub(crate) struct TurnMemory {
     pub(crate) turns: u32,
-    pub(crate) marks: HashMap<DeviceId, u32>,
+    pub(crate) holders: HashMap<DeviceId, HolderDelivery>,
+}
+
+impl TurnMemory {
+    /// The place of a holder in the order of a turn: in progress first, then never attempted
+    /// (plan order, the sort is stable), then failed, the longest ago first.
+    fn order_key(&self, holder: &DeviceId) -> (u8, u32) {
+        match self.holders.get(holder).map(|h| h.state) {
+            Some(HolderState::InProgress) => (0, 0),
+            None => (1, 0),
+            Some(HolderState::Failed(turn)) => (2, turn),
+        }
+    }
+
+    fn acked_of(&self, holder: &DeviceId) -> &[(u32, u32)] {
+        self.holders
+            .get(holder)
+            .map_or(&[][..], |h| h.acked.as_slice())
+    }
+
+    /// The holder's attempt of turn `turn` ended without the share delivered.
+    fn mark_failed(&mut self, holder: DeviceId, turn: u32) {
+        self.holders
+            .entry(holder)
+            .and_modify(|h| h.state = HolderState::Failed(turn))
+            .or_insert(HolderDelivery {
+                acked: Vec::new(),
+                state: HolderState::Failed(turn),
+            });
+    }
+
+    fn mark_in_progress(&mut self, holder: DeviceId) {
+        self.holders
+            .entry(holder)
+            .and_modify(|h| h.state = HolderState::InProgress)
+            .or_insert(HolderDelivery {
+                acked: Vec::new(),
+                state: HolderState::InProgress,
+            });
+    }
+
+    /// `esis` were acknowledged by the holder.
+    fn record_acked(&mut self, holder: DeviceId, esis: &[(u32, u32)]) {
+        let entry = self.holders.entry(holder).or_insert(HolderDelivery {
+            acked: Vec::new(),
+            state: HolderState::InProgress,
+        });
+        add_ranges(&mut entry.acked, esis);
+    }
 }
 
 /// Progress of one turn (one `run_block_iteration`) — the yield rules need it: a turn always
@@ -116,6 +185,9 @@ pub(super) struct Turn<'a> {
     /// accepted offer counts for nothing by itself: it and the holder's first chunk are one
     /// attempt — so a holder who accepts always gets one chunk per turn.
     pub(super) attempts: u32,
+    /// `!RESTORE_PAUSES_BACKUP` (Q-V9 (b), spec v3.12): a waiting restore gets the budget after
+    /// the turn's first attempt, before every next send — not only between holders.
+    pub(super) restore_at_chunk: bool,
 }
 
 impl Turn<'_> {
@@ -127,11 +199,25 @@ impl Turn<'_> {
                 .worker_must_yield(PriorityKind::OverduePos, self.permit)
     }
 
+    /// Before a next chunk, only when restore yields at the chunk boundary (Q-V9 (b)).
+    pub(super) fn restore_wants_the_budget_at_a_chunk(&self) -> bool {
+        self.restore_at_chunk
+            && self.attempts >= 1
+            && self
+                .budget
+                .worker_must_yield(PriorityKind::Restore, self.permit)
+    }
+
     /// Before a next holder.
     pub(super) fn yield_before_next_holder(&self) -> Option<YieldTo> {
+        let started = if self.restore_at_chunk {
+            self.attempts >= 1
+        } else {
+            self.holders_started >= 1
+        };
         if self.overdue_pos_wants_the_budget() {
             Some(YieldTo::OverduePos)
-        } else if self.holders_started >= 1
+        } else if started
             && self
                 .budget
                 .worker_must_yield(PriorityKind::Restore, self.permit)
@@ -162,19 +248,33 @@ fn log_yield(to: YieldTo, block: &SourceBlockId, holders_done: usize, of: usize,
     }
 }
 
+/// `a..b` per range of `ranges` (inclusive ends), joined by `,`: the ESIs of a chunk in the log.
+fn esis_text(ranges: &[(u32, u32)]) -> String {
+    ranges
+        .iter()
+        .map(|&(start, count)| {
+            format!("{start}..{}", start.saturating_add(count.saturating_sub(1)))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// One DEBUG line per chunk sent: the observable of backup-i24-a (an `Ack` without
-/// `SymbolStored` leaves no other line).
+/// `SymbolStored` leaves no other line). `esis` are the chunk's ESIs (v3.12): no (holder, ESI)
+/// pair repeats in `reply=stored` lines within one process.
 fn log_chunk_sent(
     placement: &SymbolPlacement,
     block_id: &SourceBlockId,
     idx: usize,
     total_chunks: usize,
+    esis: &[(u32, u32)],
     reply: &str,
 ) {
     tracing::debug!(
         holder = %placement.holder_id,
         block_id = %block_id,
         chunk = %format!("{}/{}", idx + 1, total_chunks),
+        esis = %esis_text(esis),
         reply = %reply,
         "work_pipeline: chunk sent"
     );
@@ -214,10 +314,11 @@ pub(crate) struct ExcludedHolders {
 ///
 /// `yields_before` is the number of turns on this block that ended in a yield since it was last
 /// delivered in full (for the yield line); `memory` (RAM, per block, cleared with the yield
-/// count) counts every turn of the block and holds, per holder, the number of the turn in which
-/// it was last ATTEMPTED (`turn.attempts` grew while it was served): the turn goes through the
-/// holders in that order, never-attempted first, then the longest ago (LRU, spec v3.5a 16',
-/// backup-i24-a), and marks the holders it attempts.
+/// count) counts every turn of the block and holds, per holder, the delivery memory (spec v3.12,
+/// К-b2a‴): the ESIs it acknowledged and whether it is in progress or failed. The turn goes
+/// through the holders in progress first, then those never attempted, then the failed ones, the
+/// longest ago first; to each it sends only the ESIs it has not acknowledged, and the encoder is
+/// asked for those only. A placement becomes `Alive` when the acknowledged ESIs cover its range.
 ///
 /// The caller records the attempt after this returns (`last_attempted_at`,
 /// `last_pool_signature`): an ordinary cooldown when `offered > 0`, otherwise (or on
@@ -308,24 +409,28 @@ pub(crate) async fn run_block_iteration(
         }
     };
 
-    // The order of the turn: holders never tried first (plan order), then those tried longest ago
-    // (stable sort). Every yielded turn tries at least its first holder, so within h yielded
-    // turns every live holder is first once, however the list shrinks or grows.
+    // The delivery memory (v3.12): a holder that dropped out of the plan loses its entry. The
+    // order of the turn: in progress, then never attempted (plan order, the sort is stable), then
+    // failed, the longest ago first. Every yielded turn sends a NEW chunk to its first holder
+    // that accepts, so a block is done within Σ ⌈rest / chunk⌉ turns that made progress.
     memory.turns += 1;
     let this_turn = memory.turns;
+    memory
+        .holders
+        .retain(|d, _| offers.iter().any(|o| o.device_id == *d));
     let mut offers = offers;
-    offers.sort_by_key(|o| {
-        memory
-            .marks
-            .get(&o.device_id)
-            .map_or((0u8, 0u32), |&turn| (1u8, turn))
-    });
+    offers.sort_by_key(|o| memory.order_key(&o.device_id));
+    // What each holder still lacks: only that is encoded and sent.
+    let rests: Vec<Vec<(u32, u32)>> = offers
+        .iter()
+        .map(|o| subtract_ranges(&o.esi_ranges, memory.acked_of(&o.device_id)))
+        .collect();
 
     // 3b. The memory permit (J8): one for the whole iteration, taken now — after the plan, so
     //     the early exits above never touch the budget, and before the source is read. It
     //     waits its turn behind whoever is queued; nothing is held meanwhile. Sized by the
     //     symbols this plan asks the encoder for (J10: at most 10·k_eff of them).
-    let encode_ranges = offer_plan::union_ranges(&offers);
+    let encode_ranges = union_of(&rests);
     let out_symbols: u64 = encode_ranges.iter().map(|&(_, count)| count as u64).sum();
     debug_assert!(
         out_symbols <= 10 * params.k_eff as u64,
@@ -420,6 +525,7 @@ pub(crate) async fn run_block_iteration(
         chunk_budget_bytes: config.chunk_budget_bytes,
         holders_started: 0,
         attempts: 0,
+        restore_at_chunk: !config.restore_pauses_backup,
     };
 
     for (idx, offer) in offers.iter().enumerate() {
@@ -466,31 +572,31 @@ pub(crate) async fn run_block_iteration(
             &raw_symbols,
             block.importance,
             &mut turn,
+            memory,
         )
         .await;
-        // Marked by what the holder was put through, not by being reached: a turn that gave
-        // the budget away before its first attempt leaves it unmarked (16').
-        if turn.attempts > attempts_before {
-            memory.marks.insert(offer.device_id, this_turn);
-        }
         match delivery {
             Ok(DeliveryOutcome::Stored) => {
+                // Alive: the holder is done, its entry goes (v3.12 item 4).
+                memory.holders.remove(&offer.device_id);
                 acked += 1;
             }
             Ok(DeliveryOutcome::NotStored) => {
-                // Delivery attempted but no full ack (placement left Offered).
+                // Delivery attempted but the range is not covered (placement left Offered); what
+                // the holder acknowledged is kept.
+                memory.mark_failed(offer.device_id, this_turn);
                 failed += 1;
             }
-            Ok(DeliveryOutcome::Yielded) => {
-                // Between two chunks: the placement stays Offered (the holder keeps what it
-                // got; a later turn sends again, A20), and this is not a failure.
-                log_yield(
-                    YieldTo::OverduePos,
-                    &block.block_id,
-                    idx,
-                    offers.len(),
-                    yields_before + 1,
-                );
+            Ok(DeliveryOutcome::Yielded(to)) => {
+                // Between two chunks: the placement stays Offered, the holder keeps what it got
+                // and what it acknowledged stays in the memory (a later turn sends the rest, not
+                // the whole), and this is not a failure. In progress only when this turn put the
+                // holder through an attempt: a turn that gave the budget away before its first
+                // one leaves it as it was (16', M37).
+                if turn.attempts > attempts_before {
+                    memory.mark_in_progress(offer.device_id);
+                }
+                log_yield(to, &block.block_id, idx, offers.len(), yields_before + 1);
                 yielded = true;
                 break;
             }
@@ -500,6 +606,7 @@ pub(crate) async fn run_block_iteration(
                     holder = %offer.device_id,
                     "work_pipeline: deliver_to_holder_worker failed: {e}"
                 );
+                memory.mark_failed(offer.device_id, this_turn);
                 failed += 1;
             }
         }
@@ -521,9 +628,11 @@ pub(crate) async fn run_block_iteration(
 
 /// Deliver symbols for one (block, holder) pair using SymbolOffer/Accept/Transfer flow.
 ///
-/// Returns `Stored` if the holder acked all chunks (Offered→Alive transitioned), `NotStored`
-/// if delivery was attempted but not all chunks acked, `Yielded` if the worker stopped
-/// between two chunks to give the budget away. Returns Err on network or DB error.
+/// Sends the ESIs of the placement the holder has not acknowledged (`memory`), the offer
+/// itself carries the whole range. Returns `Stored` if the acknowledged ESIs now cover the range
+/// (Offered→Alive transitioned), `NotStored` if delivery was attempted and they do not,
+/// `Yielded` if the worker stopped between two chunks to give the budget away. Returns Err on
+/// network or DB error. A holder that has acknowledged everything is not offered again.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_to_holder_worker(
     db: &Db,
@@ -536,8 +645,14 @@ async fn deliver_to_holder_worker(
     raw_symbols: &[viaticum_core::erasure::Symbol],
     importance: f64,
     turn: &mut Turn<'_>,
+    memory: &mut TurnMemory,
 ) -> anyhow::Result<DeliveryOutcome> {
     use viaticum_core::messages::Message;
+
+    // Nothing left to send: the memory says the holder has the whole range already.
+    if subtract_ranges(&placement.esi_ranges, memory.acked_of(&placement.holder_id)).is_empty() {
+        return Ok(confirm_alive(db, &block.block_id, placement));
+    }
 
     // If signing key is present, use SymbolOffer/Accept/Transfer handshake.
     if let Some(signing_key) = master_signing_key {
@@ -570,16 +685,8 @@ async fn deliver_to_holder_worker(
                     backoff.record_accept(&placement.holder_id);
                 }
                 // Holder accepted — send the actual symbols.
-                deliver_transfer_worker(
-                    db,
-                    encoder,
-                    swarm,
-                    &block.block_id,
-                    placement,
-                    raw_symbols,
-                    turn,
-                )
-                .await
+                deliver_transfer_worker(db, encoder, swarm, placement, raw_symbols, turn, memory)
+                    .await
             }
             Message::SymbolReject(reject) => {
                 turn.attempts += 1;
@@ -604,32 +711,25 @@ async fn deliver_to_holder_worker(
         }
     } else {
         // No signing key: fall back to direct SymbolTransfer.
-        deliver_transfer_worker(
-            db,
-            encoder,
-            swarm,
-            &block.block_id,
-            placement,
-            raw_symbols,
-            turn,
-        )
-        .await
+        deliver_transfer_worker(db, encoder, swarm, placement, raw_symbols, turn, memory).await
     }
 }
 
-/// Every symbol of `placement`, bound to its holder: each ESI of `placement.esi_ranges` is
-/// looked up BY ESI in `raw_symbols` (ascending by ESI — encoded from
-/// `offer_plan::union_ranges`; ranges need not be contiguous, repair-i9) and bound with
-/// (block, holder). An ESI missing from `raw_symbols` is an error, never silently skipped:
-/// the holder must get exactly the placement's symbols.
+/// The symbols of `placement` the holder has not acknowledged (`acked` is what it has), bound to
+/// it: each ESI of `placement.esi_ranges − acked` is looked up BY ESI in `raw_symbols` (ascending
+/// by ESI — encoded from the union of the turn's undelivered rests; ranges need not be
+/// contiguous, repair-i9) and bound with (block, holder). An ESI of that rest missing from
+/// `raw_symbols` is an error, never silently skipped: the holder must get exactly what it lacks.
+/// The acknowledged ESIs are not bound: the turn did not encode them (spec v3.12a NOTE 2).
 pub(crate) fn bind_placement_symbols(
     encoder: &dyn ErasureEncoder,
     block_id: &SourceBlockId,
     placement: &SymbolPlacement,
+    acked: &[(u32, u32)],
     raw_symbols: &[viaticum_core::erasure::Symbol],
 ) -> anyhow::Result<Vec<viaticum_core::erasure::Symbol>> {
-    let bound: Vec<viaticum_core::erasure::Symbol> = placement
-        .esi_ranges
+    let rest = subtract_ranges(&placement.esi_ranges, acked);
+    let bound: Vec<viaticum_core::erasure::Symbol> = rest
         .iter()
         .flat_map(|&(start_esi, count)| start_esi..start_esi.saturating_add(count))
         .filter_map(|esi| {
@@ -638,43 +738,88 @@ pub(crate) fn bind_placement_symbols(
         })
         .collect();
 
-    let expected = placement.symbol_count() as usize;
+    let expected: usize = rest.iter().map(|&(_, count)| count as usize).sum();
     if bound.len() != expected {
         anyhow::bail!(
-            "raw symbols missing for block {} holder {}: {} of {} (ranges={:?}, raw_len={})",
+            "raw symbols missing for block {} holder {}: {} of {} (rest={:?}, raw_len={})",
             block_id,
             placement.holder_id,
             bound.len(),
             expected,
-            placement.esi_ranges,
+            rest,
             raw_symbols.len(),
         );
     }
     Ok(bound)
 }
 
+/// Offered→Alive for a placement whose range the holder has acknowledged in full, plus the
+/// W11a hook (cached fields).
+fn confirm_alive(
+    db: &Db,
+    block_id: &SourceBlockId,
+    placement: &SymbolPlacement,
+) -> DeliveryOutcome {
+    let now = Timestamp::now();
+    match db.transition_placement_offered_to_alive(block_id, &placement.holder_id, now) {
+        Ok(true) => {
+            tracing::info!(
+                holder = %placement.holder_id,
+                block_id = %block_id,
+                symbols = placement.symbol_count(),
+                "work_pipeline: symbols confirmed stored, placement Offered→Alive"
+            );
+            crate::daemon::processor::recompute_and_persist_block_cached_fields(db, block_id);
+            return DeliveryOutcome::Stored;
+        }
+        Ok(false) => {
+            tracing::debug!(
+                holder = %placement.holder_id,
+                "work_pipeline: placement transition skipped (not in Offered state)"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                holder = %placement.holder_id,
+                err = %e,
+                "work_pipeline: DB error transitioning Offered→Alive"
+            );
+        }
+    }
+    DeliveryOutcome::NotStored
+}
+
 /// Send SymbolTransfer chunks to a holder, wait for SymbolStored acks.
 ///
-/// On full ack: transitions placement Offered→Alive + runs W11a hook.
+/// Only the ESIs the holder has not acknowledged go out (numbered by that rest); each
+/// `SymbolStored` adds its ESIs to the memory at once, so a yield or a failure later keeps them.
+/// When the acknowledged ESIs cover the placement's range: Offered→Alive + runs W11a hook.
 /// Before each chunk once the turn has made an attempt, an overdue PoS that cannot run beside this
-/// permit makes the worker stop (`Yielded`, backup-i24-a); the placement stays `Offered`. Every
-/// chunk sent counts as an attempt, whatever the holder answers.
+/// permit makes the worker stop (`Yielded`, backup-i24-a) — a restore too when it yields at the
+/// chunk boundary (`Turn::restore_at_chunk`); the placement stays `Offered`. Every chunk sent
+/// counts as an attempt, whatever the holder answers.
 async fn deliver_transfer_worker(
     db: &Db,
     encoder: &Arc<dyn ErasureEncoder>,
     swarm: &SwarmHandle,
-    block_id: &SourceBlockId,
     placement: &SymbolPlacement,
     raw_symbols: &[viaticum_core::erasure::Symbol],
     turn: &mut Turn<'_>,
+    memory: &mut TurnMemory,
 ) -> anyhow::Result<DeliveryOutcome> {
     use viaticum_core::erasure::chunk_symbols_by_size;
     use viaticum_core::messages::{Message, SymbolTransferMsg};
 
-    // Bind raw symbols inline at send time — no disk read.
-    let bound = bind_placement_symbols(encoder.as_ref(), block_id, placement, raw_symbols)?;
+    let block_id = &placement.source_block_id;
+    // Bind raw symbols inline at send time — no disk read. Only the unacknowledged rest.
+    let bound = bind_placement_symbols(
+        encoder.as_ref(),
+        block_id,
+        placement,
+        memory.acked_of(&placement.holder_id),
+        raw_symbols,
+    )?;
 
-    let symbol_count = bound.len();
     let chunks = chunk_symbols_by_size(bound, turn.chunk_budget_bytes);
     let total_chunks = chunks.len();
     let mut stored_ok = 0usize;
@@ -682,9 +827,13 @@ async fn deliver_transfer_worker(
 
     for (idx, chunk) in chunks.into_iter().enumerate() {
         if turn.overdue_pos_wants_the_budget() {
-            return Ok(DeliveryOutcome::Yielded);
+            return Ok(DeliveryOutcome::Yielded(YieldTo::OverduePos));
+        }
+        if turn.restore_wants_the_budget_at_a_chunk() {
+            return Ok(DeliveryOutcome::Yielded(YieldTo::Restore));
         }
         let chunk_len = chunk.len();
+        let chunk_esis = union_of(&[chunk.iter().map(|s| (s.esi, 1)).collect()]);
         let msg = SymbolTransferMsg {
             v: 1,
             source_block_id: *block_id,
@@ -699,7 +848,7 @@ async fn deliver_transfer_worker(
         let reply = match sent {
             Ok(reply) => reply,
             Err(e) => {
-                log_chunk_sent(placement, block_id, idx, total_chunks, "err");
+                log_chunk_sent(placement, block_id, idx, total_chunks, &chunk_esis, "err");
                 return Err(anyhow::anyhow!(
                     "send SymbolTransfer chunk {}/{}: {}",
                     idx + 1,
@@ -710,9 +859,22 @@ async fn deliver_transfer_worker(
         };
 
         match reply {
-            Message::SymbolStored(_) => {
+            Message::SymbolStored(stored) => {
                 stored_ok += 1;
-                log_chunk_sent(placement, block_id, idx, total_chunks, "stored");
+                log_chunk_sent(
+                    placement,
+                    block_id,
+                    idx,
+                    total_chunks,
+                    &chunk_esis,
+                    "stored",
+                );
+                // What the holder acknowledged, as far as it is what this chunk carried.
+                let confirmed = subtract_ranges(
+                    &chunk_esis,
+                    &subtract_ranges(&chunk_esis, &stored.esi_ranges),
+                );
+                memory.record_acked(placement.holder_id, &confirmed);
                 tracing::debug!(
                     holder = %placement.holder_id,
                     block_id = %block_id,
@@ -739,10 +901,10 @@ async fn deliver_transfer_worker(
                 // Holder did not confirm storage with SymbolStored (transfer handler
                 // failed, or an older/unhandled path replied with a generic Ack).
                 saw_old_protocol = true;
-                log_chunk_sent(placement, block_id, idx, total_chunks, "ack");
+                log_chunk_sent(placement, block_id, idx, total_chunks, &chunk_esis, "ack");
             }
             other => {
-                log_chunk_sent(placement, block_id, idx, total_chunks, "other");
+                log_chunk_sent(placement, block_id, idx, total_chunks, &chunk_esis, "other");
                 tracing::warn!(
                     holder = %placement.holder_id,
                     "work_pipeline: unexpected reply to SymbolTransfer: {:?}",
@@ -752,34 +914,14 @@ async fn deliver_transfer_worker(
         }
     }
 
-    if stored_ok == total_chunks {
-        let now = Timestamp::now();
-        match db.transition_placement_offered_to_alive(block_id, &placement.holder_id, now) {
-            Ok(true) => {
-                tracing::info!(
-                    holder = %placement.holder_id,
-                    block_id = %block_id,
-                    symbols = symbol_count,
-                    "work_pipeline: symbols confirmed stored, placement Offered→Alive"
-                );
-                crate::daemon::processor::recompute_and_persist_block_cached_fields(db, block_id);
-                return Ok(DeliveryOutcome::Stored);
-            }
-            Ok(false) => {
-                tracing::debug!(
-                    holder = %placement.holder_id,
-                    "work_pipeline: placement transition skipped (not in Offered state)"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    holder = %placement.holder_id,
-                    err = %e,
-                    "work_pipeline: DB error transitioning Offered→Alive"
-                );
-            }
-        }
-    } else if saw_old_protocol {
+    // Alive when the acknowledged ESIs cover the placement's range (not "every chunk of this turn
+    // was stored": a delivery spread over several turns is covered by the memory).
+    let covered =
+        subtract_ranges(&placement.esi_ranges, memory.acked_of(&placement.holder_id)).is_empty();
+    if covered {
+        return Ok(confirm_alive(db, block_id, placement));
+    }
+    if saw_old_protocol {
         tracing::debug!(
             holder = %placement.holder_id,
             chunks_ok = stored_ok,

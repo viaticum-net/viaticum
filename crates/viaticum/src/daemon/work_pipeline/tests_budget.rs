@@ -239,6 +239,8 @@ struct HolderLog {
     offers: usize,
     /// Symbols of each SymbolTransfer received, in order.
     transfers: Vec<usize>,
+    /// Every ESI received, in order (a repeat is a re-sent symbol, К-b2a‴).
+    esis: Vec<u32>,
     /// What the budget held when the first transfer arrived.
     outstanding_at_first_transfer: Option<u64>,
     grants_at_first_transfer: Option<u64>,
@@ -255,6 +257,9 @@ impl Holder {
     }
     fn offers(&self) -> usize {
         self.log.lock().unwrap().offers
+    }
+    fn esis(&self) -> Vec<u32> {
+        self.log.lock().unwrap().esis.clone()
     }
 }
 
@@ -342,6 +347,7 @@ impl Net {
                         let first = {
                             let mut l = task_log.lock().unwrap();
                             l.transfers.push(transfer.symbols.len());
+                            l.esis.extend(transfer.symbols.iter().map(|s| s.esi));
                             if l.transfers.len() == 1 {
                                 l.outstanding_at_first_transfer = Some(budget.outstanding_bytes());
                                 l.grants_at_first_transfer = Some(budget.grants());
@@ -1092,6 +1098,7 @@ async fn worker_turn_yields_only_after_its_first_attempt_or_holder() {
             chunk_budget_bytes: 1024,
             holders_started,
             attempts,
+            restore_at_chunk: false,
         }
     }
     let budget = MemBudget::new(100 * MIB);
@@ -1206,7 +1213,13 @@ fn yield_counter_counts_per_block_and_resets_on_full_delivery() {
     let holder = DeviceId([9; 32]);
     let marked = |holder, turn| worker::TurnMemory {
         turns: turn + 1,
-        marks: HashMap::from([(holder, turn)]),
+        holders: HashMap::from([(
+            holder,
+            worker::HolderDelivery {
+                acked: vec![(0, 1)],
+                state: worker::HolderState::Failed(turn),
+            },
+        )]),
     };
     let mut yields = HashMap::new();
     let mut last = HashMap::new();
@@ -1475,7 +1488,7 @@ async fn worker_yields_to_restore_after_a_failed_first_holder() {
     drain_waiter(&slot).await;
 }
 
-// ─── Rotation: least recently tried first (spec v3.5 WARN-4, M35) ─────────────
+// ─── Rotation: in progress, never tried, failed longest ago (spec v3.5 WARN-4, v3.12) ──────
 
 /// One turn under a constant overdue PoS: the waiter is put in at the first offer of the turn.
 async fn constant_pos_turn(
@@ -1864,4 +1877,663 @@ async fn worker_wait_logs_once_after_slow_after() {
         .unwrap_or_else(|| panic!("no waited_ms: {granted}"));
     assert!(waited >= 36_000, "waited_ms = {waited}: {granted}");
     assert_eq!(wait_lines().len(), 1);
+}
+
+// ─── Delivery memory: progress through the yields (К-b2a‴, spec v3.12, v3.12a) ───────────────
+//
+// The liveness of the worker is pre-registered as COMPLETION within N turns, not as activity of a
+// turn (the lesson of v3.12): a chunk sent twice looked like progress to the old tests.
+
+/// The chunk budget (bytes) that cuts the largest share of the plan for `pool` into three chunks
+/// (a symbol is `BIG_T` bytes, so `n` symbols per chunk is `n · BIG_T`).
+fn three_chunk_budget(rig: &Rig, rec: &SourceBlockRecord, pool: &PoolSnapshot) -> usize {
+    let plan = super::offer_plan::plan_offers(&rig.db, rec, &pool.candidates, 0).unwrap();
+    let super::offer_plan::OfferPlan::Planned { offers, .. } = plan else {
+        panic!("stand: the plan has offers");
+    };
+    let share = offers
+        .iter()
+        .map(|o| o.esi_ranges.iter().map(|r| r.1).sum::<u32>())
+        .max()
+        .unwrap();
+    assert!(share >= 3, "stand: a share of {share} symbols");
+    share.div_ceil(3) as usize * BIG_T as usize
+}
+
+fn alive_count(db: &Db, bid: &SourceBlockId) -> usize {
+    placement_statuses(db, bid)
+        .iter()
+        .filter(|s| **s == PlacementStatus::Alive)
+        .count()
+}
+
+/// One turn under a constant overdue PoS: the waiter is put in on the first offer of the turn
+/// and served (and let go) after it, if the turn put one in.
+async fn pos_turn(
+    rig: &Rig,
+    swarm: &Arc<SwarmHandle>,
+    rec: &SourceBlockRecord,
+    pool: &PoolSnapshot,
+    turn_no: u32,
+    armed: &Arc<AtomicBool>,
+    slot: &Arc<Mutex<Option<JoinHandle<MemPermit>>>>,
+) -> WorkOutcome {
+    armed.store(true, Ordering::SeqCst);
+    let outcome = rig
+        .turn(&plain_encoder(), swarm, rec, pool, turn_no)
+        .await
+        .unwrap();
+    if slot.lock().unwrap().is_some() {
+        drain_waiter(slot).await;
+    }
+    outcome
+}
+
+/// ESIs of a `chunk sent` line: `esis=a..b,c..d` (inclusive ends).
+fn esis_of_line(line: &str) -> Vec<u32> {
+    let text = line
+        .split("esis=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no esis field: {line}"));
+    text.split(',')
+        .flat_map(|range| {
+            let (a, b) = range.split_once("..").unwrap();
+            a.parse::<u32>().unwrap()..=b.parse::<u32>().unwrap()
+        })
+        .collect()
+}
+
+fn field_of<'a>(line: &'a str, name: &str) -> &'a str {
+    line.split(&format!("{name}="))
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no {name} field: {line}"))
+}
+
+/// The `symbols` of every `encoded raw symbols` line, in order.
+fn encoded_symbols(text: &str) -> Vec<usize> {
+    text.lines()
+        .filter(|l| l.contains("work_pipeline: encoded raw symbols"))
+        .map(|l| field_of(l, "symbols").parse().unwrap())
+        .collect()
+}
+
+/// The stand of the delivery tests: a block, a constant overdue PoS, `n` live holders.
+struct PosStand {
+    rig: Rig,
+    rec: SourceBlockRecord,
+    armed: Arc<AtomicBool>,
+    slot: Arc<Mutex<Option<JoinHandle<MemPermit>>>>,
+    flags: Vec<Arc<AtomicBool>>,
+    holders: Vec<Holder>,
+    swarm: Arc<SwarmHandle>,
+    pool: PoolSnapshot,
+}
+
+impl PosStand {
+    async fn new(seed: u8, net_seed: u8, holders: u8, dead: bool) -> PosStand {
+        let mut rig = Rig::new(YIELD_BUDGET_MIB, BIG_CHUNK);
+        let rec = retained(rig.data_dir.path(), seed, BIG_K, BIG_T);
+        rig.db.upsert_source_block(&rec).unwrap();
+        let (armed, slot) = (Arc::new(AtomicBool::new(true)), Arc::new(Mutex::new(None)));
+        let waiter = register_waiter_once(
+            &rig.budget,
+            PriorityKind::OverduePos,
+            YIELD_WAITER_MIB,
+            &armed,
+            &slot,
+        );
+        let mut net = Net::new(net_seed).await;
+        let mut flags = Vec::new();
+        let mut list = Vec::new();
+        for i in 0..holders {
+            let flag = Arc::new(AtomicBool::new(dead));
+            list.push(
+                net.holder(
+                    net_seed + 0x10 + i,
+                    &rig.budget,
+                    dead_holder_hooks(&flag, waiter.clone()),
+                )
+                .await,
+            );
+            flags.push(flag);
+        }
+        let swarm = net.ready();
+        let devices: Vec<DeviceId> = list.iter().map(|h| h.device_id).collect();
+        let pool = pool_of(&devices);
+        rig.config.chunk_budget_bytes = three_chunk_budget(&rig, &rec, &pool);
+        PosStand {
+            rig,
+            rec,
+            armed,
+            slot,
+            flags,
+            holders: list,
+            swarm,
+            pool,
+        }
+    }
+
+    async fn turn(&self, turn_no: u32) -> WorkOutcome {
+        pos_turn(
+            &self.rig,
+            &self.swarm,
+            &self.rec,
+            &self.pool,
+            turn_no,
+            &self.armed,
+            &self.slot,
+        )
+        .await
+    }
+}
+
+/// M85 (v3.12). Two live holders with three chunks each, an overdue PoS that stands in the queue
+/// again on every send: both placements are `Alive` within seven turns, and no ESI is accepted
+/// twice by a holder — the delivery goes on from where it stopped. Without the memory every turn
+/// sends the first chunk again, and nothing is ever finished (the finding of the К-b6 run).
+#[tokio::test]
+async fn delivery_completes_under_constant_overdue_pos() {
+    let (logs, _guard) = capture_logs();
+    let st = PosStand::new(0x30, 0x60, 2, false).await;
+
+    let mut turns = 0u32;
+    while alive_count(&st.rig.db, &st.rec.block_id) < 2 && turns < 7 {
+        let outcome = st.turn(turns).await;
+        turns += 1;
+        assert!(
+            outcome.yielded || alive_count(&st.rig.db, &st.rec.block_id) == 2,
+            "turn {turns}: {outcome:?}"
+        );
+    }
+
+    assert_eq!(
+        alive_count(&st.rig.db, &st.rec.block_id),
+        2,
+        "both placements are Alive within 7 turns (turns used: {turns}, chunks: {:?})",
+        st.holders.iter().map(Holder::transfers).collect::<Vec<_>>()
+    );
+    for (i, h) in st.holders.iter().enumerate() {
+        let esis = h.esis();
+        let unique: std::collections::HashSet<u32> = esis.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            esis.len(),
+            "holder {i} got an ESI twice: {esis:?}"
+        );
+        assert_eq!(h.transfers(), 3, "stand: three chunks per holder");
+    }
+    // The log says the same, with the field `esis` (the E2E guard reads it): no (holder, ESI)
+    // pair twice among the stored chunks, and the lines add up to what the holders received.
+    let text = logs.text();
+    let mut seen = std::collections::HashSet::new();
+    for line in text
+        .lines()
+        .filter(|l| l.contains("work_pipeline: chunk sent") && l.contains("reply=stored"))
+    {
+        let holder = field_of(line, "holder").to_string();
+        for esi in esis_of_line(line) {
+            assert!(
+                seen.insert((holder.clone(), esi)),
+                "({holder}, {esi}) twice"
+            );
+        }
+    }
+    let received: usize = st.holders.iter().map(|h| h.esis().len()).sum();
+    assert_eq!(seen.len(), received, "every received ESI is in a line");
+}
+
+/// M86 (v3.12, v3.12a NOTE 6). The holder that was put through a chunk and was cut goes FIRST
+/// next turn, ahead of the ones never tried; a dead holder goes last once a live one is waiting.
+/// Holders [D, X, Y]: D rejects (turn 0). Turn 1: a never-tried X gets its first chunk. Turn 2: X
+/// again (in progress), not Y. Turn 3: X completes. Turn 4: Y (never tried) before D (failed).
+#[tokio::test]
+async fn in_progress_holder_goes_first_dead_holder_goes_last() {
+    let st = PosStand::new(0x31, 0x62, 3, true).await;
+
+    // Turn 0: all reject; the one the plan puts first is D.
+    st.turn(0).await;
+    assert_eq!(offers_total(&st.holders), 1);
+    let dead = st.holders.iter().position(|h| h.offers() == 1).unwrap();
+    for (i, flag) in st.flags.iter().enumerate() {
+        flag.store(i == dead, Ordering::SeqCst);
+    }
+
+    // Turn 1: a never-tried holder first, one chunk, cut.
+    let outcome = st.turn(1).await;
+    assert!(outcome.yielded, "{outcome:?}");
+    let x = st
+        .holders
+        .iter()
+        .position(|h| h.transfers() == 1)
+        .expect("a live holder got its first chunk");
+    assert_ne!(x, dead);
+    let y = (0..3).find(|&i| i != dead && i != x).unwrap();
+
+    // Turn 2: X is in progress and goes first: its second chunk. Y was not even offered.
+    st.turn(2).await;
+    assert_eq!(
+        st.holders[x].transfers(),
+        2,
+        "the holder in progress goes first"
+    );
+    assert_eq!(st.holders[y].offers(), 0, "the never-tried one waited");
+    assert_eq!(st.holders[dead].offers(), 1);
+
+    // Turn 3: its third chunk covers the range: Alive.
+    st.turn(3).await;
+    assert_eq!(st.holders[x].transfers(), 3);
+    assert_eq!(alive_count(&st.rig.db, &st.rec.block_id), 1);
+
+    // Turn 4: Y, never tried, goes before the dead one.
+    st.turn(4).await;
+    assert_eq!(st.holders[y].transfers(), 1, "Y got its first chunk");
+    assert_eq!(st.holders[dead].offers(), 1, "the dead holder went last");
+}
+
+/// v3.12a (lesson of v3.12: completion within N). A dead holder that the plan puts first, and two
+/// live ones with three chunks each, under a constant overdue PoS: both live placements are
+/// `Alive` within eight turns — the dead one costs one turn, then goes behind the live ones.
+#[tokio::test]
+async fn delivery_completes_with_a_dead_first_holder_under_constant_overdue_pos() {
+    let st = PosStand::new(0x32, 0x64, 3, true).await;
+
+    st.turn(0).await;
+    let dead = st.holders.iter().position(|h| h.offers() == 1).unwrap();
+    for (i, flag) in st.flags.iter().enumerate() {
+        flag.store(i == dead, Ordering::SeqCst);
+    }
+    let mut turns = 1u32;
+    while alive_count(&st.rig.db, &st.rec.block_id) < 2 && turns < 8 {
+        st.turn(turns).await;
+        turns += 1;
+    }
+
+    assert_eq!(
+        alive_count(&st.rig.db, &st.rec.block_id),
+        2,
+        "both live holders are Alive within 8 turns (used {turns}; chunks {:?})",
+        st.holders.iter().map(Holder::transfers).collect::<Vec<_>>()
+    );
+    let statuses = placement_statuses(&st.rig.db, &st.rec.block_id);
+    assert!(
+        statuses.iter().any(|s| *s != PlacementStatus::Alive),
+        "the dead holder is not Alive: {statuses:?}"
+    );
+    for (i, h) in st.holders.iter().enumerate().filter(|(i, _)| *i != dead) {
+        let esis = h.esis();
+        let unique: std::collections::HashSet<u32> = esis.iter().copied().collect();
+        assert_eq!(unique.len(), esis.len(), "holder {i} got an ESI twice");
+    }
+}
+
+/// M89 (v3.12 item 3). The encoder is asked for the ESIs that are not acknowledged yet: after a
+/// turn that put one chunk on the wire, the next turn encodes that many symbols fewer.
+#[tokio::test]
+async fn turn_encodes_only_the_unacked_esis() {
+    let (logs, _guard) = capture_logs();
+    let st = PosStand::new(0x33, 0x66, 2, false).await;
+
+    st.turn(0).await;
+    let sent: usize = st
+        .holders
+        .iter()
+        .map(|h| h.log.lock().unwrap().transfers.iter().sum::<usize>())
+        .sum();
+    assert!(sent >= 1, "stand: the first turn sent a chunk");
+    st.turn(1).await;
+
+    let encoded = encoded_symbols(&logs.text());
+    assert_eq!(encoded.len(), 2, "{encoded:?}");
+    assert_eq!(
+        encoded[1],
+        encoded[0] - sent,
+        "the second turn encodes the rest only: {encoded:?} after {sent} acknowledged"
+    );
+}
+
+/// M91 (v3.12a NOTE 2). Binding takes the rest of the range, `esi_ranges − acked`: a turn that
+/// encoded only the rest binds without error, and what it binds is exactly the rest.
+#[test]
+fn bind_covers_only_the_unacked_rest() {
+    let encoder = RaptorQEncoder::new();
+    let mut placement = super::tests::placement(
+        SourceBlockId([0xD1; 32]),
+        DeviceId([0xD2; 32]),
+        PlacementStatus::Offered,
+        0,
+    );
+    placement.esi_ranges = vec![(100, 6), (200, 2)];
+    let acked = [(100, 2), (104, 1)];
+    // What the turn encoded: the rest only — 102..104, 105, 200..202.
+    let raw: Vec<Symbol> = [102u32, 103, 105, 200, 201]
+        .iter()
+        .map(|&esi| Symbol {
+            esi,
+            data: esi.to_le_bytes().repeat(4),
+        })
+        .collect();
+
+    let bound = worker::bind_placement_symbols(
+        &encoder,
+        &placement.source_block_id,
+        &placement,
+        &acked,
+        &raw,
+    )
+    .expect("the rest is all the binding looks for");
+
+    assert_eq!(
+        bound.iter().map(|s| s.esi).collect::<Vec<_>>(),
+        vec![102, 103, 105, 200, 201]
+    );
+    for s in &bound {
+        let want = encoder.apply_binding(
+            Symbol {
+                esi: s.esi,
+                data: s.esi.to_le_bytes().repeat(4),
+            },
+            &placement.source_block_id,
+            &placement.holder_id,
+        );
+        assert_eq!(s.data, want.data, "ESI {} bound to its holder", s.esi);
+    }
+}
+
+/// M90 (v3.12, Q-V9 (b): `restore_pauses_backup = false`). A restore waiting for the budget stops
+/// the worker at a CHUNK boundary: after the turn's first attempt, before the next send — not only
+/// between holders. One chunk goes out, the restore gets the budget, the placements stay `Offered`.
+#[tokio::test]
+async fn worker_yields_to_restore_at_a_chunk_boundary_after_one_attempt() {
+    let (logs, _guard) = capture_logs();
+    let mut rig = Rig::new(YIELD_BUDGET_MIB, BIG_CHUNK);
+    rig.config.restore_pauses_backup = false;
+    let rec = retained(rig.data_dir.path(), 0x34, BIG_K, BIG_T);
+    rig.db.upsert_source_block(&rec).unwrap();
+    let armed = Arc::new(AtomicBool::new(true));
+    let slot = Arc::new(Mutex::new(None));
+    let h = register_waiter_once(
+        &rig.budget,
+        PriorityKind::Restore,
+        YIELD_WAITER_MIB,
+        &armed,
+        &slot,
+    );
+    let hooks = Hooks {
+        on_first_transfer: Some(h),
+        ..Hooks::default()
+    };
+    let mut net = Net::new(0x68).await;
+    let holders = [
+        net.holder(0x78, &rig.budget, hooks.clone()).await,
+        net.holder(0x79, &rig.budget, hooks).await,
+    ];
+    let swarm = net.ready();
+    let devices: Vec<DeviceId> = holders.iter().map(|h| h.device_id).collect();
+
+    let outcome = rig
+        .turn(&plain_encoder(), &swarm, &rec, &pool_of(&devices), 0)
+        .await
+        .unwrap();
+
+    assert!(outcome.yielded, "{outcome:?}");
+    assert_eq!(
+        transfers_total(&holders),
+        1,
+        "one chunk, then the restore: not the whole holder"
+    );
+    assert_eq!(
+        (outcome.acked, outcome.failed),
+        (0, 0),
+        "a yield is not a failure, nothing was delivered in full"
+    );
+    let statuses = placement_statuses(&rig.db, &rec.block_id);
+    assert!(
+        statuses.iter().all(|s| *s == PlacementStatus::Offered),
+        "{statuses:?}"
+    );
+    drain_waiter(&slot).await;
+    let text = logs.text();
+    let line = text
+        .lines()
+        .find(|l| l.contains("work_pipeline: yielding memory to restore"))
+        .unwrap_or_else(|| panic!("no yield line:\n{text}"));
+    assert!(line.contains("holders_done=0"), "{line}");
+}
+
+/// The chunk-boundary rule of the turn without a network (Q-V9 (b)): never before the first
+/// attempt; afterwards only while the restore does not fit beside the permit; and only when the
+/// turn is built for it — with `restore_at_chunk = false` the rule is not there.
+#[tokio::test]
+async fn turn_yields_to_restore_at_a_chunk_only_when_built_for_it() {
+    fn turn<'a>(
+        budget: &'a MemBudget,
+        permit: &'a MemPermit,
+        attempts: u32,
+        restore_at_chunk: bool,
+    ) -> Turn<'a> {
+        Turn {
+            budget,
+            permit,
+            chunk_budget_bytes: 1024,
+            holders_started: 1,
+            attempts,
+            restore_at_chunk,
+        }
+    }
+    let budget = MemBudget::new(100 * MIB);
+    let held = budget
+        .try_acquire(HolderKind::Worker, &SourceBlockId([1; 32]), 80 * MIB)
+        .unwrap();
+    let _restore = spawn_waiter(&budget, PriorityKind::Restore, 60);
+    until("the restore waits", || {
+        budget.priority_waiters(PriorityKind::Restore) == 1
+    })
+    .await;
+
+    assert!(!turn(&budget, &held, 0, true).restore_wants_the_budget_at_a_chunk());
+    assert!(turn(&budget, &held, 1, true).restore_wants_the_budget_at_a_chunk());
+    assert!(!turn(&budget, &held, 1, false).restore_wants_the_budget_at_a_chunk());
+}
+
+// ─── The memory is cleared (M88) ──────────────────────────────────────────────
+
+fn memory_of(holder: DeviceId) -> worker::TurnMemory {
+    worker::TurnMemory {
+        turns: 4,
+        holders: HashMap::from([(
+            holder,
+            worker::HolderDelivery {
+                acked: vec![(0, 2)],
+                state: worker::HolderState::InProgress,
+            },
+        )]),
+    }
+}
+
+/// M88 (v3.12 item 5). The delivery memory of a block goes when the block is parked, when it
+/// leaves service, and — per holder — when the holder drops out of the plan; the memory of the
+/// holders that stay is kept.
+#[tokio::test]
+async fn delivery_memory_is_dropped_on_park_and_when_the_holder_leaves_the_plan() {
+    use super::tests::{add_pool_peers, block_id, device_id, lonely_swarm, pipeline_with};
+
+    // The holder leaves the plan: Z is not in the pool of this turn, P is.
+    let data_dir = tempfile::tempdir().unwrap();
+    let rig_db = db();
+    let (p, z) = (device_id(0xB1), device_id(0xB2));
+    let other = device_id(0xB3);
+    add_pool_peers(&rig_db, &[p, other]);
+    let rec = super::tests::retained_block(data_dir.path(), 0xB4, 1.0);
+    rig_db.upsert_source_block(&rec).unwrap();
+    let mut config = super::tests::make_config();
+    config.data_dir = data_dir.path().to_path_buf();
+    let swarm = lonely_swarm(0x3c).await;
+    let mut memory = memory_of(z);
+    memory.holders.insert(
+        p,
+        worker::HolderDelivery {
+            acked: vec![(0, 1)],
+            state: worker::HolderState::InProgress,
+        },
+    );
+    let _ = worker::run_block_iteration(
+        &rig_db,
+        &config,
+        &plain_encoder(),
+        &swarm,
+        None,
+        None,
+        None,
+        &rec,
+        &pool_of(&[p, other]),
+        0,
+        &mut memory,
+    )
+    .await;
+    assert!(
+        !memory.holders.contains_key(&z),
+        "Z is not in the plan: its entry is gone"
+    );
+    assert!(
+        memory.holders.contains_key(&p),
+        "P is in the plan: its entry stays (failed, with what it acknowledged)"
+    );
+
+    // Parked: the pool is too small for the block.
+    let db2 = db();
+    let bid = block_id(0xB5);
+    let mut rec2 = super::tests::make_block_record(bid, 1.0, 0.99999);
+    rec2.current_reliability = 0.0;
+    db2.upsert_source_block(&rec2).unwrap();
+    add_pool_peers(&db2, &[p]);
+    let swarm2 = lonely_swarm(0x3d).await;
+    let mut pipeline = pipeline_with(&db2, super::tests::make_config(), Some(swarm2));
+    pipeline.yields.insert(bid, 1);
+    pipeline.last_attempt.insert(bid, memory_of(p));
+    assert!(pipeline.run_iteration().await.unwrap());
+    assert!(
+        db2.block_cooldown(&bid).parked,
+        "the pool is too small: parked"
+    );
+    assert!(
+        !pipeline.last_attempt.contains_key(&bid),
+        "the memory went with it"
+    );
+    assert!(!pipeline.yields.contains_key(&bid));
+}
+
+/// M88 (v3.12 item 5): a block that left service while nobody worked it loses its memory at the
+/// start of the next iteration (`forget_blocks_out_of_service`); the memory of a block still in
+/// service is kept.
+#[tokio::test]
+async fn delivery_memory_of_a_block_that_left_service_is_dropped() {
+    use super::tests::{block_id, device_id, lonely_swarm, pipeline_with};
+
+    let db = db();
+    let (gone, kept) = (block_id(0xB6), block_id(0xB7));
+    let holder = device_id(0xB8);
+    let mut leaving = super::tests::make_block_record(gone, 1.0, 0.99999);
+    leaving.status = SourceBlockStatus::Deleting;
+    db.upsert_source_block(&leaving).unwrap();
+    let mut staying = super::tests::make_block_record(kept, 1.0, 0.99999);
+    staying.status = SourceBlockStatus::Active;
+    db.upsert_source_block(&staying).unwrap();
+
+    let swarm = lonely_swarm(0x3e).await;
+    let mut pipeline = pipeline_with(&db, super::tests::make_config(), Some(swarm));
+    for b in [gone, kept] {
+        pipeline.yields.insert(b, 2);
+        pipeline.last_attempt.insert(b, memory_of(holder));
+    }
+    pipeline.forget_blocks_out_of_service();
+
+    assert!(!pipeline.last_attempt.contains_key(&gone) && !pipeline.yields.contains_key(&gone));
+    assert!(pipeline.last_attempt.contains_key(&kept) && pipeline.yields.contains_key(&kept));
+}
+
+// ─── Q-V9 (a): the worker does not start while a restore job runs (M92) ───────────────────────
+
+/// M92 (v3.12a). With a restore job running the worker starts no iteration — nothing is picked,
+/// the block keeps no cooldown — and says so ONCE per job; a second job gets its own line; when
+/// the job ends the next iteration works. With `restore_pauses_backup = false` it does not wait.
+#[tokio::test]
+async fn worker_does_not_start_while_a_restore_job_runs() {
+    use super::tests::{add_pool_peers, device_id, lonely_swarm, pipeline_with, retained_block};
+    use crate::daemon::restore::staging::JobId;
+
+    let (logs, _guard) = capture_logs();
+    let data_dir = tempfile::tempdir().unwrap();
+    let db_a = db();
+    let peers = [device_id(0xC1), device_id(0xC2)];
+    add_pool_peers(&db_a, &peers);
+    let rec = retained_block(data_dir.path(), 0xC3, 1.0);
+    db_a.upsert_source_block(&rec).unwrap();
+    let mut config = super::tests::make_config();
+    config.data_dir = data_dir.path().to_path_buf();
+    let (tx, rx) = tokio::sync::watch::channel(None::<JobId>);
+    let mut pipeline =
+        pipeline_with(&db_a, config.clone(), Some(lonely_swarm(0x3f).await)).with_restore_gate(rx);
+
+    let job = JobId::new();
+    tx.send_replace(Some(job));
+    for _ in 0..3 {
+        assert!(
+            !pipeline.run_iteration().await.unwrap(),
+            "paused: nothing picked"
+        );
+    }
+    assert!(
+        db_a.block_cooldown(&rec.block_id)
+            .last_attempted_at
+            .is_none(),
+        "the block was not worked"
+    );
+    let text = logs.text();
+    assert!(!text.contains("picked block for work"), "{text}");
+    let paused = |t: &str| {
+        t.lines()
+            .filter(|l| l.contains("work_pipeline: paused while a restore job runs"))
+            .count()
+    };
+    assert_eq!(paused(&text), 1, "once per job:\n{text}");
+    let line = text
+        .lines()
+        .find(|l| l.contains("work_pipeline: paused while a restore job runs"))
+        .unwrap();
+    assert!(
+        line.contains("INFO") && line.contains(&job.to_string()),
+        "{line}"
+    );
+
+    // The next job gets its own line.
+    tx.send_replace(None);
+    tx.send_replace(Some(JobId::new()));
+    assert!(!pipeline.run_iteration().await.unwrap());
+    assert_eq!(paused(&logs.text()), 2, "{}", logs.text());
+
+    // The job ends: the worker works.
+    tx.send_replace(None);
+    assert!(pipeline.run_iteration().await.unwrap());
+    assert!(
+        db_a.block_cooldown(&rec.block_id)
+            .last_attempted_at
+            .is_some()
+    );
+
+    // (b): not paused at all.
+    let db_b = db();
+    add_pool_peers(&db_b, &peers);
+    db_b.upsert_source_block(&rec).unwrap();
+    let mut config_b = config;
+    config_b.restore_pauses_backup = false;
+    let (tx_b, rx_b) = tokio::sync::watch::channel(Some(JobId::new()));
+    let mut pipeline_b =
+        pipeline_with(&db_b, config_b, Some(lonely_swarm(0x40).await)).with_restore_gate(rx_b);
+    assert!(
+        pipeline_b.run_iteration().await.unwrap(),
+        "(b) works beside a restore"
+    );
+    drop(tx_b);
 }

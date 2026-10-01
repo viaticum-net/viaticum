@@ -32,6 +32,9 @@ pub const MAX_FINISHED_JOBS_IN_MEMORY: usize = 32;
 pub struct RestoreJobs {
     inner: Arc<Mutex<JobsInner>>,
     staging_root: PathBuf,
+    /// The job that runs now (the first one `Running`), for the worker's pause (Q-V9, spec
+    /// v3.12a): it wakes when a job starts or ends.
+    running_tx: Arc<tokio::sync::watch::Sender<Option<JobId>>>,
 }
 
 #[derive(Debug, Default)]
@@ -111,7 +114,34 @@ impl RestoreJobs {
         RestoreJobs {
             inner: Arc::new(Mutex::new(JobsInner::default())),
             staging_root,
+            running_tx: Arc::new(tokio::sync::watch::channel(None).0),
         }
+    }
+
+    /// A receiver of the job that runs now (`None`: no job runs). The backup worker waits on it
+    /// while `RESTORE_PAUSES_BACKUP` (Q-V9).
+    pub fn running_job_gate(&self) -> tokio::sync::watch::Receiver<Option<JobId>> {
+        self.running_tx.subscribe()
+    }
+
+    /// Whether the backup worker is paused by a running restore job (Q-V9 (a)): `status` says so.
+    pub fn backup_paused(&self) -> bool {
+        crate::daemon::work_pipeline::RESTORE_PAUSES_BACKUP && self.running_tx.borrow().is_some()
+    }
+
+    /// Tell the gate which job runs now (the oldest `Running` one, jobs run one at a time).
+    fn publish_running(&self, inner: &JobsInner) {
+        let running = inner
+            .jobs
+            .values()
+            .filter(|e| e.record.state == RestoreJobState::Running)
+            .min_by_key(|e| e.seq)
+            .map(|e| e.record.job_id);
+        self.running_tx.send_if_modified(|cur| {
+            let changed = *cur != running;
+            *cur = running;
+            changed
+        });
     }
 
     pub fn staging_root(&self) -> &Path {
@@ -168,7 +198,9 @@ impl RestoreJobs {
 
     /// Roll back a submit whose request never reached the coordinator.
     pub fn remove(&self, job_id: JobId) {
-        self.lock().jobs.remove(&job_id);
+        let mut inner = self.lock();
+        inner.jobs.remove(&job_id);
+        self.publish_running(&inner);
     }
 
     /// The coordinator took the job. `files_total` is the count it actually
@@ -183,6 +215,7 @@ impl RestoreJobs {
             r.state = RestoreJobState::Running;
             r.files_total = files_total;
         }
+        self.publish_running(&inner);
     }
 
     /// A file is visible under its own name in the job dir. Call only after that
@@ -253,6 +286,7 @@ impl RestoreJobs {
         }
         let done = r.clone();
         inner.evict_finished();
+        self.publish_running(&inner);
         Some(done)
     }
 

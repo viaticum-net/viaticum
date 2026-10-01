@@ -431,6 +431,112 @@ async fn restore_regrant_releases_before_waiting() {
     assert_eq!(budget.outstanding_bytes(), 0);
 }
 
+/// Competitors that stand in the budget's queue again after every grant: a worker and a batch of
+/// overdue PoS checks, each taking the whole budget for a moment. Counts their grants, and those
+/// that came while a restore stood in the queue (they were ahead of it).
+struct Competition {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    grants: Arc<AtomicUsize>,
+    ahead_of_restore: Arc<AtomicUsize>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Competition {
+    fn start(budget: &Arc<MemBudget>, need: u64) -> Competition {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let grants = Arc::new(AtomicUsize::new(0));
+        let ahead_of_restore = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for pos in [false, true] {
+            let (budget, stop) = (Arc::clone(budget), Arc::clone(&stop));
+            let (grants, ahead) = (Arc::clone(&grants), Arc::clone(&ahead_of_restore));
+            tasks.push(tokio::spawn(async move {
+                let block = SourceBlockId([if pos { 0xA1 } else { 0xA2 }; 32]);
+                while !stop.load(Ordering::SeqCst) {
+                    let slow = Duration::from_secs(3600);
+                    let permit = if pos {
+                        budget
+                            .acquire_priority(PriorityKind::OverduePos, &block, need, slow, || {})
+                            .await
+                    } else {
+                        budget
+                            .acquire(HolderKind::Worker, &block, need, slow, |_| {})
+                            .await
+                    };
+                    grants.fetch_add(1, Ordering::SeqCst);
+                    if budget.priority_waiters(PriorityKind::Restore) > 0 {
+                        ahead.fetch_add(1, Ordering::SeqCst);
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    drop(permit);
+                }
+            }));
+        }
+        Competition {
+            stop,
+            grants,
+            ahead_of_restore,
+            tasks,
+        }
+    }
+
+    /// (all grants, grants that came while a restore waited).
+    async fn end(self) -> (usize, usize) {
+        self.stop.store(true, Ordering::SeqCst);
+        for task in self.tasks {
+            let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+        }
+        (
+            self.grants.load(Ordering::SeqCst),
+            self.ahead_of_restore.load(Ordering::SeqCst),
+        )
+    }
+}
+
+/// v3.12a (lesson of v3.12: completion within N). A block of the network tier needs two permits
+/// (the decode, then the plaintext). A worker and a batch of overdue PoS checks stand in the queue
+/// again after every grant, for good: the block is restored within three waits, each of them
+/// behind the two competitors at most — the restore is not pushed back by whoever comes later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_block_completes_within_three_waits_under_constant_competition() {
+    let w = World::new();
+    let content = vec![0u8; 6 << 20];
+    let holders = Arc::new(FakeHolders::default());
+    let path = w.backup_placed("c.bin", &content, &holders).await;
+    let (_, rec) = w.block_of(&path);
+    std::fs::remove_file(&path).unwrap();
+    // A budget that holds one permit at a time: the competitors take all of it.
+    let need2 = estimate_restore_plaintext(rec.encrypted_size.unwrap(), content.len() as u64);
+    let budget = MemBudget::new(need2);
+    let coord = w.coord(&budget, Some(&holders), raptorq());
+    let competition = Competition::start(&budget, need2);
+    until("the competitors are in", || {
+        budget.queued_waiters() >= 1 || budget.grants() >= 1
+    })
+    .await;
+
+    let result = tokio::time::timeout(Duration::from_secs(60), coord.restore(request(&path)))
+        .await
+        .expect("the restore completes under constant competition");
+    let (competitor_grants, ahead) = competition.end().await;
+
+    let result = result.unwrap();
+    assert_eq!(result.files_restored, 1, "{:?}", result.failures);
+    // The grants are counted by the budget (a grant to a queued waiter is logged by whoever
+    // releases, not by the waiter): the restore's are what the competitors' do not account for.
+    let waits = budget.grants() as usize - competitor_grants;
+    assert!(
+        (1..=3).contains(&waits),
+        "at most three waits per block (local, decode, plaintext): {waits}"
+    );
+    // Each wait stands behind the two competitors (one holds, one queues) and no more: whoever
+    // stands in the queue again after a grant is behind the restore.
+    assert!(
+        ahead <= 2 * waits,
+        "{ahead} grants went to the competitors ahead of the restore in {waits} waits"
+    );
+}
+
 /// M62: the restore waits as a restore-priority waiter (the worker yields to it by the rule of
 /// the spec v3.5 (Б′)), in the task of the job.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

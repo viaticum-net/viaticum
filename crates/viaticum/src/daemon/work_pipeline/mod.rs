@@ -23,6 +23,7 @@ use viaticum_core::types::{DeviceId, SourceBlockId, SourceBlockRecord, Timestamp
 use crate::daemon::mem_budget::MemBudget;
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
+use crate::daemon::restore::staging::JobId;
 
 mod offer_plan;
 mod pool;
@@ -34,6 +35,20 @@ mod tests;
 mod tests_budget;
 
 pub use pool::{PoolSnapshot, pool_signature, snapshot_pool};
+
+// ─── Q-V9: restore or backup first ────────────────────────────────────────────
+
+/// Q-V9 (spec v3.12a), awaiting Ilya's answer; the recommendation (a) is in force.
+///
+/// `true` (a): while a restore job runs the worker starts no new iteration (`status`: «backup
+/// paused while restoring», one INFO line per job); an iteration already running still yields
+/// the budget to a waiting restore between two holders (J13). PoS is not affected.
+/// `false` (b): the worker works on and gives the budget to a waiting restore at a chunk
+/// boundary (after the turn's first attempt, before every next send), then takes it again and
+/// re-encodes the rest — restore-i39's bound per block is then the encode of the backup block
+/// plus 60 s. Switching is this constant alone; the daemon passes it to
+/// `WorkPipelineConfig::restore_pauses_backup`.
+pub const RESTORE_PAUSES_BACKUP: bool = true;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -86,6 +101,9 @@ pub struct WorkPipelineConfig {
     /// `SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES`; tests shrink it to get several chunks out of a
     /// small block (the worker yields between chunks).
     pub chunk_budget_bytes: usize,
+    /// `RESTORE_PAUSES_BACKUP` (Q-V9): no new iteration while a restore job runs. A field, so the
+    /// tests can run both variants; the daemon passes the constant.
+    pub restore_pauses_backup: bool,
 }
 
 // Only tests build a config this way (`..Default::default()`): the daemon sets every field, and
@@ -106,6 +124,7 @@ impl Default for WorkPipelineConfig {
             max_source_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
             mem_budget: MemBudget::new(u64::MAX),
             chunk_budget_bytes: viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,
+            restore_pauses_backup: RESTORE_PAUSES_BACKUP,
         }
     }
 }
@@ -159,7 +178,8 @@ enum BlockAttempt {
     LeftService,
 }
 
-/// Forget a block's turn memory: the yield count and the holders' marks (v3.5a NOTE 3).
+/// Forget a block's turn memory: the yield count and the delivery memory of its holders (v3.5a
+/// NOTE 3, v3.12 item 5).
 fn clear_turn_memory(
     yields: &mut std::collections::HashMap<SourceBlockId, u32>,
     last_attempt: &mut std::collections::HashMap<SourceBlockId, TurnMemory>,
@@ -173,7 +193,7 @@ fn clear_turn_memory(
 /// (`last_attempt`; both RAM only, backup-i24-a): a yield counts; a delivery in full starts the
 /// count afresh; a block that left service (or was parked: nobody to offer to) without a full
 /// delivery loses both — the memory of a block that is no longer served must not live on
-/// (spec v3.5a NOTE 3); anything else leaves them.
+/// (spec v3.5a NOTE 3, v3.12 item 5); anything else leaves them.
 fn count_yields(
     yields: &mut std::collections::HashMap<SourceBlockId, u32>,
     last_attempt: &mut std::collections::HashMap<SourceBlockId, TurnMemory>,
@@ -187,10 +207,10 @@ fn count_yields(
     } else if delivered_in_full || outcome.left_service || outcome.offered == 0 {
         clear_turn_memory(yields, last_attempt, block_id);
     }
-    // The turn marked nobody: nothing to keep.
+    // The turn left no holder in the memory: nothing to keep.
     if last_attempt
         .get(&block_id)
-        .is_some_and(|m| m.marks.is_empty())
+        .is_some_and(|m| m.holders.is_empty())
     {
         last_attempt.remove(&block_id);
     }
@@ -220,6 +240,28 @@ pub struct WorkPipeline {
     /// attempted (RAM only; cleared together with `yields`). The next turn goes through the
     /// holders by it, the longest ago first (LRU, backup-i24-a).
     last_attempt: std::collections::HashMap<SourceBlockId, TurnMemory>,
+    /// The restore job that runs now, if any (the registry's gate; Q-V9). With
+    /// `config.restore_pauses_backup` the worker starts no iteration while it is `Some`.
+    restore_gate: Option<tokio::sync::watch::Receiver<Option<JobId>>>,
+    /// The job the INFO line «paused while a restore job runs» was written for (once per job).
+    pause_announced_for: Option<JobId>,
+}
+
+/// Resolves when the restore gate changes; never while there is no gate (or its sender is gone,
+/// in which case the gate is dropped: a closed channel must not spin the loop).
+async fn restore_gate_changed(
+    gate: &mut Option<tokio::sync::watch::Receiver<Option<JobId>>>,
+) -> bool {
+    match gate {
+        Some(rx) => match rx.changed().await {
+            Ok(()) => true,
+            Err(_) => {
+                *gate = None;
+                false
+            }
+        },
+        None => std::future::pending().await,
+    }
 }
 
 impl WorkPipeline {
@@ -246,6 +288,46 @@ impl WorkPipeline {
             event_rx,
             yields: std::collections::HashMap::new(),
             last_attempt: std::collections::HashMap::new(),
+            restore_gate: None,
+            pause_announced_for: None,
+        }
+    }
+
+    /// Give the worker the restore gate (`RestoreJobs::running_job_gate`): the job that runs now.
+    /// A change wakes the worker, so it starts again when the job ends (Q-V9 (a)).
+    pub fn with_restore_gate(mut self, gate: tokio::sync::watch::Receiver<Option<JobId>>) -> Self {
+        self.restore_gate = Some(gate);
+        self
+    }
+
+    /// Q-V9 (a): a restore job runs and the constant says it comes first — no new iteration.
+    /// One INFO line per job.
+    fn paused_for_restore(&mut self) -> bool {
+        if !self.config.restore_pauses_backup {
+            return false;
+        }
+        let Some(job) = self.restore_gate.as_ref().and_then(|g| *g.borrow()) else {
+            return false;
+        };
+        if self.pause_announced_for != Some(job) {
+            self.pause_announced_for = Some(job);
+            tracing::info!(job = %job, "work_pipeline: paused while a restore job runs");
+        }
+        true
+    }
+
+    /// Forget the turn memory of blocks that left service while nobody looked (v3.12 item 5):
+    /// the memory of a block that is no longer served must not live on.
+    fn forget_blocks_out_of_service(&mut self) {
+        let gone: Vec<SourceBlockId> = self
+            .yields
+            .keys()
+            .chain(self.last_attempt.keys())
+            .copied()
+            .filter(|b| matches!(self.db.block_serviceability(b), Ok(s) if !s.is_serviceable()))
+            .collect();
+        for block_id in gone {
+            clear_turn_memory(&mut self.yields, &mut self.last_attempt, block_id);
         }
     }
 
@@ -259,9 +341,18 @@ impl WorkPipeline {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         tracing::info!("work_pipeline: started (tick={}s)", tick_secs);
+        // Its own receiver for the wake-up (the one in `self` is read by `run_iteration`).
+        let mut gate = self.restore_gate.clone();
 
         loop {
             tokio::select! {
+                open = restore_gate_changed(&mut gate) => {
+                    // A restore job started or ended. Ended: the worker starts again at once
+                    // (a started one only makes `run_iteration` say it is paused).
+                    if open && let Err(e) = self.run_iteration().await {
+                        tracing::error!(error = %e, "work_pipeline: post-restore iteration failed");
+                    }
+                }
                 _ = tick.tick() => {
                     tracing::debug!("work_pipeline: periodic tick");
                     // CS-SCH-10: surface DbErrors from run_iteration (via next_work_item)
@@ -319,6 +410,11 @@ impl WorkPipeline {
     ///
     /// `pub` for testability — called from `run()` and from tests directly.
     pub async fn run_iteration(&mut self) -> anyhow::Result<bool> {
+        // Q-V9 (a): a restore job runs — the memory is its, the worker starts nothing.
+        if self.paused_for_restore() {
+            return Ok(false);
+        }
+        self.forget_blocks_out_of_service();
         let now = Timestamp::now();
         // cooldown is already pre-scaled by handle/mod.rs. See note in `run()`.
         let cooldown = self.config.cooldown;
@@ -355,6 +451,10 @@ impl WorkPipeline {
                     break;
                 }
             };
+            // A restore job may have started while the previous block was worked.
+            if picked_any && self.paused_for_restore() {
+                break;
+            }
             // With pool signature 0 `next_work_item` ignores cooldowns and would hand the
             // same block back; never work one block twice in an iteration.
             if !tried.insert(block.block_id) {
