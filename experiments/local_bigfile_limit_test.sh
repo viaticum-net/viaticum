@@ -499,8 +499,8 @@ s3_attempt() {
     S3_K=$(( ${sz:-0} / SYMBOL_BYTES ))
     # t_encode: granted kind=worker block=NB -> encoded raw symbols block_id=NB.
     local tg te
-    tg=$(ev 0 $((Lreset + 1)) "mem_budget: granted" kind block | awk -v nb="$S3_NB" '$3 == "worker" && $4 == nb { print $1; exit }')
-    te=$(ev 0 $((Lreset + 1)) "work_pipeline: encoded raw symbols" block_id | awk -v nb="$S3_NB" '$3 == nb { print $1; exit }')
+    tg=$(ev 0 $((Lreset + 1)) "mem_budget: granted" kind block | awk -v nb="$S3_NB" '$3 == "worker" && $4 == nb { if (!_d++) print $1 }')
+    te=$(ev 0 $((Lreset + 1)) "work_pipeline: encoded raw symbols" block_id | awk -v nb="$S3_NB" '$3 == nb { if (!_d++) print $1 }')
     S3_TENC=""
     [ -n "$tg" ] && [ -n "$te" ] && S3_TENC=$(awk -v a="$tg" -v b="$te" 'BEGIN { printf "%.1f", b - a }')
     # Cleanliness (a): every grant paired with a release at the reset; (b): foreign grants <= 16 MiB.
@@ -562,7 +562,7 @@ nb_alive_on() {
     for i in "$@"; do
         d=$(dev_id "$i"); [ -n "$d" ] || return 1
         [ -n "$(ev 0 "${NB_L0:-1}" "work_pipeline: symbols confirmed stored" block_id holder \
-            | awk -v nb="$NB" -v d="$d" '$3 == nb && $4 == d { print; exit }')" ] || return 1
+            | awk -v nb="$NB" -v d="$d" '$3 == nb && $4 == d { if (!_d++) print }')" ] || return 1
     done
 }
 
@@ -615,7 +615,7 @@ step3b() {
     while :; do
         now=$(date +%s)
         if [ -z "$B2" ]; then
-            B2=$(ev 0 "$L3B" "mem_budget: granted" kind block | awk -v nb="$NB" -v rb="$RB16" '$3 == "worker" && $4 != nb && $4 != rb { print $4; exit }')
+            B2=$(ev 0 "$L3B" "mem_budget: granted" kind block bytes | awk -v nb="$NB" -v rb="$RB16" '$3 == "worker" && $4 != nb && $4 != rb && $5 + 0 >= 1000 * 1048576 { if (!_d++) print $4 }')
         fi
         if [ -n "$B2" ] && [ -z "$RST_PID" ]; then
             line=$(clog 0 "$L3B" | grep -aF "work_pipeline: chunk sent" | grep -aF "block_id=$B2" | head -1 || true)
@@ -660,8 +660,8 @@ b2_settle() {
     t0=$T_CONT; [ "$(date +%s)" -gt "$t0" ] && t0=$(date +%s)
     end_t=$(( t0 + 180 ))
     while :; do
-        ok1=$(ev 0 "$((L3B + 1))" "work_pipeline: symbols confirmed stored" block_id holder | awk -v b="$B2" -v d="$d1" '$3 == b && $4 == d { print; exit }')
-        ok2=$(ev 0 "$((L3B + 1))" "work_pipeline: symbols confirmed stored" block_id holder | awk -v b="$B2" -v d="$d2" '$3 == b && $4 == d { print; exit }')
+        ok1=$(ev 0 "$((L3B + 1))" "work_pipeline: symbols confirmed stored" block_id holder | awk -v b="$B2" -v d="$d1" '$3 == b && $4 == d { if (!_d++) print }')
+        ok2=$(ev 0 "$((L3B + 1))" "work_pipeline: symbols confirmed stored" block_id holder | awk -v b="$B2" -v d="$d2" '$3 == b && $4 == d { if (!_d++) print }')
         [ -n "$ok1" ] && [ -n "$ok2" ] && break
         [ "$(date +%s)" -ge "$end_t" ] && break
         sleep 3
@@ -696,7 +696,7 @@ step3b_judge() {
     fi
     # ---- (b) bytes, not a mutex
     local tg tend2 g w
-    g=$(ev 0 "$F" "mem_budget: granted" kind block | awk -v b="$B2" '$3 == "worker" && $4 == b { print $1; exit }')
+    g=$(ev 0 "$F" "mem_budget: granted" kind block | awk -v b="$B2" '$3 == "worker" && $4 == b { if (!_d++) print $1 }')
     tend2=$( { ev 0 "$F" "mem_budget: released kind=" kind block | awk -v b="$B2" -v g="${g:-0}" '$3 == "worker" && $4 == b && $1 >= g { print $1 }'
                ev 0 "$F" "work_pipeline: yielding memory to" block | awk -v b="$B2" -v g="${g:-0}" '$3 == b && $1 >= g { print $1 }'; } | sort -n | head -1)
     if [ -z "$g" ]; then
@@ -713,17 +713,17 @@ step3b_judge() {
     fi
     # ---- (c) the overdue NB is served after the worker yields
     local A B C D E tA tB tC tD tEB2 lim
-    A=$(ev 0 "$F" "pos: overdue batch waiting for memory" blocks need_mib | awk -v nb="$NB" 'index($3, nb) { print; exit }')
+    A=$(ev 0 "$F" "pos: overdue batch waiting for memory" blocks need_mib | awk -v nb="$NB" 'index($3, nb) { if (!_d++) print }')
     tA=$(awk '{ print $1 }' <<< "$A")
     if [ -n "$tA" ]; then
-        tB=$(ev 0 "$F" "work_pipeline: yielding memory to overdue PoS" block | awk -v b="$B2" -v a="$tA" '$3 == b && $1 >= a { print $1; exit }')
-        [ -n "$tB" ] && tC=$(ev 0 "$F" "mem_budget: granted" kind waited_ms | awk -v a="$tB" '$3 == "pos" && $1 >= a { print $1; exit }')
-        [ -n "${tC:-}" ] && tD=$(ev 0 "$F" "scheduler: PoS late preparation published" block_id | awk -v nb="$NB" -v a="$tC" '$3 == nb && $1 >= a { print $1; exit }')
+        tB=$(ev 0 "$F" "work_pipeline: yielding memory to overdue PoS" block | awk -v b="$B2" -v a="$tA" '$3 == b && $1 >= a { if (!_d++) print $1 }')
+        [ -n "$tB" ] && tC=$(ev 0 "$F" "mem_budget: granted" kind waited_ms | awk -v a="$tB" '$3 == "pos" && $1 >= a { if (!_d++) print $1 }')
+        [ -n "${tC:-}" ] && tD=$(ev 0 "$F" "scheduler: PoS late preparation published" block_id | awk -v nb="$NB" -v a="$tC" '$3 == nb && $1 >= a { if (!_d++) print $1 }')
     fi
     if [ -n "${tD:-}" ]; then
         E=$(holder_answers "$NB" "$tD" 9999999999)
         info "3b (c): batch waits at +$(awk -v a="$T3B" -v b="$tA" 'BEGIN { printf "%.1f", b - a }') s ($(awk '{ print "need_mib=" $4 }' <<< "$A")), yield at +$(awk -v a="$T3B" -v b="$tB" 'BEGIN { printf "%.1f", b - a }') s, pos grant +$(awk -v a="$T3B" -v b="$tC" 'BEGIN { printf "%.1f", b - a }') s, published +$(awk -v a="$T3B" -v b="$tD" 'BEGIN { printf "%.1f", b - a }') s; NB answers after: $E"
-        tEB2=$(ev 0 "$F" "work_pipeline: encoded raw symbols" block_id | awk -v b="$B2" '$3 == b { print $1; exit }')
+        tEB2=$(ev 0 "$F" "work_pipeline: encoded raw symbols" block_id | awk -v b="$B2" '$3 == b { if (!_d++) print $1 }')
         if [ -n "$tEB2" ] && fle "$tEB2" "$tA"; then lim=65
         elif [ -n "$tEB2" ]; then lim=$(awk -v e="$tEB2" -v a="$tA" 'BEGIN { printf "%.1f", e - a + 65 }')
         else lim=65; fi
@@ -736,13 +736,13 @@ step3b_judge() {
     fi
     # ---- (d) the restore waits for memory and gets through
     local W G1 tW tG shr reg rel tres sha_ok="" outcome sp f got
-    tW=$(ev 0 "$F" "restore: waiting for memory budget" block tier need_mib queued_ahead | awk -v b="$RB16" '$3 == b { print $1 " " $5 " " $6 " " $4; exit }')
+    tW=$(ev 0 "$F" "restore: waiting for memory budget" block tier need_mib queued_ahead | awk -v b="$RB16" '$3 == b { if (!_d++) print $1 " " $5 " " $6 " " $4 }')
     G1=$(ev 0 "$F" "mem_budget: granted" kind block | awk -v b="$RB16" '$3 == "restore" && $4 == b { print $1 }')
     tG=$(awk 'NR == 1 { print }' <<< "$G1")
-    shr=$(ev 0 "$F" "mem_budget: released (shrunk)" kind block | awk -v b="$RB16" '$3 == "restore" && $4 == b { print $1; exit }')
-    reg=$(ev 0 "$F" "restore: regrant for plaintext" block | awk -v b="$RB16" '$3 == b { print $1; exit }')
+    shr=$(ev 0 "$F" "mem_budget: released (shrunk)" kind block | awk -v b="$RB16" '$3 == "restore" && $4 == b { if (!_d++) print $1 }')
+    reg=$(ev 0 "$F" "restore: regrant for plaintext" block | awk -v b="$RB16" '$3 == b { if (!_d++) print $1 }')
     rel=$(ev 0 "$F" "mem_budget: released kind=" kind block | awk -v b="$RB16" '$3 == "restore" && $4 == b { t = $1 } END { print t }')
-    tres=$(ev 0 "$F" "restored path=" path | awk '$3 ~ /r\.bin$/ { print $1; exit }')
+    tres=$(ev 0 "$F" "restored path=" path | awk '$3 ~ /r\.bin$/ { if (!_d++) print $1 }')
     info "3b (d): waiting line: ${tW:-none} (t need_mib queued_ahead tier); granted restore RB: $(count_lines "$G1")x; shrunk: ${shr:-none}; regrant: ${reg:-none}; last release: ${rel:-none}; restored line: ${tres:-none}"
     if [ -z "$tW" ]; then
         fail "3b (d): no INFO 'restore: waiting for memory budget ... block=RB' (the restore did not wait for the budget)"
@@ -758,8 +758,8 @@ step3b_judge() {
                 || { [ "$ok" -eq 1 ] && fail "3b (d): released kind=restore (${rel:-none}) not earlier than 'restored' (${tres:-none})"; }
             # yield of the worker to the restore: before the grant
             local y1 y2
-            y1=$(ev 0 "$F" "work_pipeline: yielding memory to restore" block | awk -v b="$B2" -v g="$tG" '$3 == b && $1 <= g { print $1; exit }')
-            y2=$(ev 0 "$F" "mem_budget: released kind=" kind block | awk -v b="$B2" -v g="$tG" '$3 == "worker" && $4 == b && $1 <= g { print $1; exit }')
+            y1=$(ev 0 "$F" "work_pipeline: yielding memory to restore" block | awk -v b="$B2" -v g="$tG" '$3 == b && $1 <= g { if (!_d++) print $1 }')
+            y2=$(ev 0 "$F" "mem_budget: released kind=" kind block | awk -v b="$B2" -v g="$tG" '$3 == "worker" && $4 == b && $1 <= g { if (!_d++) print $1 }')
             if [ -n "$y1" ] || [ -n "$y2" ]; then pass "3b (d): the worker gave way to the restore (${y1:+yielding memory to restore at $y1}${y1:+ }${y2:+released kind=worker block=B2 at $y2}) before the restore's grant"
             else fail "3b (d): no 'yielding memory to restore' / 'released kind=worker block=B2' before 'granted kind=restore block=RB'"; fi
             local wt; wt=$(awk -v a="$tw_t" -v b="$tG" 'BEGIN { printf "%.1f", b - a }')
@@ -817,8 +817,8 @@ step3c() {
         [ -n "$D" ] || { rough "3c: no device id for node-0$h"; continue; }
         if [ "$attempt" -eq 1 ]; then
             while :; do
-                if [ -n "$(ev 0 "$((L3B + 1))" "work_pipeline: symbols confirmed stored" block_id holder | awk -v b="$B2" -v d="$D" '$3 == b && $4 == d { print; exit }')" ] \
-                    || [ -n "$(ev 0 "$((L3B + 1))" "work_pipeline: iteration complete" block_id yielded | awk -v b="$B2" '$3 == b && $4 == "false" { print; exit }')" ]; then
+                if [ -n "$(ev 0 "$((L3B + 1))" "work_pipeline: symbols confirmed stored" block_id holder | awk -v b="$B2" -v d="$D" '$3 == b && $4 == d { if (!_d++) print }')" ] \
+                    || [ -n "$(ev 0 "$((L3B + 1))" "work_pipeline: iteration complete" block_id yielded | awk -v b="$B2" '$3 == b && $4 == "false" { if (!_d++) print }')" ]; then
                     settled=1; break; fi
                 [ "$(date +%s)" -ge "$end_t" ] && break
                 sleep 2
@@ -838,14 +838,14 @@ step3c() {
         hwm_end=$(hwm_kb "${DPID[$h]}")
         if [ -z "$found" ]; then fail "3c: node-0$h did not answer a PoS challenge for NB within 120 s"; continue; fi
         dh=$(( hwm_end - rss0 ))
-        tR=$(ev "$h" "$((Lh + 1))" "responding with chain hash" block_id | awk -v nb="$NB" '$3 == nb { print $1; exit }')
+        tR=$(ev "$h" "$((Lh + 1))" "responding with chain hash" block_id | awk -v nb="$NB" '$3 == nb { if (!_d++) print $1 }')
         # clean: the owner sent no chunk to h in [t0, the answer] (T8)
         local ch
         ch=$(ev 0 "$((L0 + 1))" "work_pipeline: chunk sent" holder block_id | awk -v d="$D" -v a="$t0" -v b="${tR:-$t0}" '$3 == d && $1 >= a && $1 <= b' | wc -l)
         # the owner's verdict
         vt=""
         for _ in $(seq 1 60); do
-            vt=$(ev 0 "$((L0 + 1))" "scheduler: PoS verdict" block_id holder outcome | awk -v nb="$NB" -v d="$D" '$3 == nb && $4 == d && $5 == "pass" { print $1; exit }')
+            vt=$(ev 0 "$((L0 + 1))" "scheduler: PoS verdict" block_id holder outcome | awk -v nb="$NB" -v d="$D" '$3 == nb && $4 == d && $5 == "pass" { if (!_d++) print $1 }')
             [ -n "$vt" ] && break
             sleep 1
         done
