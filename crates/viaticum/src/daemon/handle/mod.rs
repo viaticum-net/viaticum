@@ -520,6 +520,13 @@ impl DaemonHandle {
                     None
                 },
                 enable_relay_server: app_config.network.enable_relay_server,
+                conn_policy: crate::daemon::network::swarm::ConnPolicy::daemon(
+                    crate::daemon::network::address_book::AddressBook::new(
+                        db.clone(),
+                        identity_pub,
+                        device_id,
+                    ),
+                ),
             };
             let (handle, events) = crate::daemon::network::swarm::SwarmHandle::start(swarm_cfg)
                 .await

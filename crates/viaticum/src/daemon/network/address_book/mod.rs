@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 use libp2p::{Multiaddr, PeerId};
+use viaticum_core::db::Db;
 use viaticum_core::types::{DeviceId, IdentityPub, PeerRecord};
 
 use crate::daemon::network::swarm::{device_id_to_peer_id, strip_peer_suffix};
@@ -100,6 +101,47 @@ pub(crate) fn dialable_addrs(
         None
     } else {
         Some((peer_id, addrs))
+    }
+}
+
+/// Read-only view of the PeerRecord table for the swarm (C-DK Р-14,
+/// network-i14). C2 reads it once at swarm start to seed the set of known peers
+/// that discovery does not dial (Р-5′, network-i43); C4 adds the on-demand dial
+/// addresses (network-i42).
+///
+/// A plain struct over the real DB, not a trait: there is one implementation,
+/// and tests use real redb on a tmpfile.
+#[derive(Clone)]
+pub struct AddressBook {
+    db: Db,
+    own_master: IdentityPub,
+    own_device: DeviceId,
+}
+
+impl AddressBook {
+    pub fn new(db: Db, own_master: IdentityPub, own_device: DeviceId) -> Self {
+        Self {
+            db,
+            own_master,
+            own_device,
+        }
+    }
+
+    /// PeerIds of every known peer ([`is_known`]). A DB error is logged and
+    /// yields none: discovery then dials them once more, nothing worse.
+    pub fn known_peer_ids(&self) -> Vec<PeerId> {
+        let peers = match self.db.list_all_peers() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(err = %e, "address book: cannot list peers");
+                return Vec::new();
+            }
+        };
+        peers
+            .iter()
+            .filter(|p| is_known(p, &self.own_master, &self.own_device))
+            .filter_map(|p| device_id_to_peer_id(&p.device_id).ok())
+            .collect()
     }
 }
 

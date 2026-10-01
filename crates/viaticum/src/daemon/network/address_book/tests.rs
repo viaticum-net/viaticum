@@ -6,7 +6,7 @@ use libp2p::multiaddr::Protocol;
 use viaticum_core::constants::{AVAIL_EWMA_INITIAL, INITIAL_TRUST_P};
 use viaticum_core::types::{DeviceId, IdentityPub, PeerRecord, Timestamp};
 
-use super::{dialable_addrs, is_known};
+use super::{AddressBook, dialable_addrs, is_known};
 use crate::daemon::network::swarm::device_id_to_peer_id;
 use crate::daemon::network::swarm_test_helpers::make_signing_key;
 
@@ -107,5 +107,29 @@ fn known_excludes_own_master_own_device_and_addrless_records() {
     assert!(
         !is_known(&only_foreign, &own_master, &own_device),
         "an address naming another peer is not a route"
+    );
+}
+
+/// The swarm seeds its known set from here (Р-5′): exactly the PeerIds of the
+/// records that count as known in status, read from a real redb.
+#[test]
+fn address_book_known_peer_ids_are_the_known_records() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let db = viaticum_core::db::Db::open(&dir.path().join("db.redb")).expect("db");
+    let own_device = device(30);
+    let own_master = IdentityPub([0xAA; 32]);
+    let other_master = IdentityPub([0xBB; 32]);
+    let addr = vec!["/ip4/127.0.0.1/tcp/4001".to_string()];
+    db.upsert_peer(&record(device(31), other_master, addr.clone()))
+        .expect("stranger");
+    db.upsert_peer(&record(device(32), own_master, addr.clone()))
+        .expect("sibling");
+    db.upsert_peer(&record(device(33), other_master, vec![]))
+        .expect("addrless");
+
+    let book = AddressBook::new(db, own_master, own_device);
+    assert_eq!(
+        book.known_peer_ids(),
+        vec![device_id_to_peer_id(&device(31)).unwrap()]
     );
 }

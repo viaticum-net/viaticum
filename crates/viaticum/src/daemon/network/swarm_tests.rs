@@ -18,7 +18,7 @@ use super::swarm_test_helpers::{
     get_listen_addr, make_cert, make_signing_key, make_swarm_config, wait_for_authenticated,
 };
 use crate::daemon::network::swarm::{
-    CertCodec, ProtocolEvent, SwarmConfig, SwarmError, SwarmHandle, ViaticumCodec,
+    CertCodec, ConnPolicy, ProtocolEvent, SwarmConfig, SwarmError, SwarmHandle, ViaticumCodec,
 };
 
 /// Build a PosHashChallenge message for testing.
@@ -367,6 +367,7 @@ async fn cert_mismatch_rejected() {
         kad_republish_interval_override: None,
         kad_discovery_interval_override: None,
         enable_relay_server: false,
+        conn_policy: ConnPolicy::off(),
     };
 
     let config_a = make_swarm_config(80);

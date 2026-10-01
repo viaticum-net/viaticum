@@ -12,8 +12,8 @@ use viaticum_core::types::DeviceId;
 
 use super::swarm_test_helpers::{get_listen_addr, make_cert, make_signing_key};
 use crate::daemon::network::swarm::{
-    ProtocolEvent, SwarmConfig, SwarmHandle, discovery_dial_candidates, ipfs_bootstrap_peers,
-    peer_id_from_multiaddr, scaled_kad_cadence,
+    ConnPolicy, ProtocolEvent, SwarmConfig, SwarmHandle, discovery_dial_candidates,
+    ipfs_bootstrap_peers, peer_id_from_multiaddr, scaled_kad_cadence,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -42,10 +42,11 @@ fn make_kad_config(seed_byte: u8, bootstrap_peers: Vec<Multiaddr>) -> SwarmConfi
         cert_timeout_secs: 10,
         kademlia_bootstrap_peers: bootstrap_peers,
         kademlia_disable_ipfs_bootstrap: true,
-        // Speed up republish and discovery for tests.
-        kad_republish_interval_override: Some(Duration::from_millis(300)),
+        kad_republish_interval_override: None,
+        // Speed up discovery for tests.
         kad_discovery_interval_override: Some(Duration::from_millis(200)),
         enable_relay_server: false,
+        conn_policy: ConnPolicy::off(),
     }
 }
 
@@ -77,66 +78,10 @@ async fn wait_for_peer_authenticated(
     .unwrap_or(false)
 }
 
-// ─── T1: namespace_key_is_sha256_of_canonical_string ─────────────────────────
-
-/// The Kademlia namespace key is sha256(b"/viaticum/peers/v1") computed at runtime.
-/// This test asserts determinism and documents the expected digest.
-#[test]
-fn namespace_key_is_sha256_of_canonical_string() {
-    use sha2::{Digest, Sha256};
-
-    let computed = Sha256::digest(b"/viaticum/peers/v1");
-
-    // Recompute to verify determinism.
-    let recomputed = Sha256::digest(b"/viaticum/peers/v1");
-    assert_eq!(
-        computed.as_slice(),
-        recomputed.as_slice(),
-        "sha256 must be deterministic"
-    );
-
-    // The key must be exactly 32 bytes.
-    assert_eq!(computed.len(), 32, "sha256 output must be 32 bytes");
-
-    // Regression guard: pin the canonical first 4 bytes.
-    // This is sha256(b"/viaticum/peers/v1")[0..4].
-    // If this assertion fails, the namespace key changed and all existing
-    // provider records in the DHT would become unreachable.
-    // Value computed once and fixed here; the test enforces stability.
-    //
-    // To recompute: echo -n "/viaticum/peers/v1" | sha256sum
-    // and take the first 8 hex chars (= 4 bytes).
-    // The actual bytes depend on the sha256 implementation (stable across crates).
-    let key_as_record = libp2p::kad::RecordKey::new(&computed);
-    let key_bytes: Vec<u8> = key_as_record.to_vec();
-    assert_eq!(
-        key_bytes.len(),
-        32,
-        "RecordKey must preserve 32-byte length"
-    );
-
-    // Regression: different input must produce a different key.
-    let other = Sha256::digest(b"/viaticum/peers/v2");
-    assert_ne!(
-        computed.as_slice(),
-        other.as_slice(),
-        "different inputs must produce different digests"
-    );
-
-    // The key must be the same as what EventLoopState::new() would compute.
-    // We verify by constructing the key the same way.
-    let event_loop_key = libp2p::kad::RecordKey::new(&Sha256::digest(b"/viaticum/peers/v1"));
-    assert_eq!(
-        key_bytes,
-        event_loop_key.to_vec(),
-        "namespace key construction must be identical to EventLoopState"
-    );
-}
-
 // ─── T2: two_kad_nodes_discover_each_other ────────────────────────────────────
 
 /// Two SwarmHandles with DHT enabled discover each other via Kademlia.
-/// A acts as bootstrap for B. Both publish provider records and run get_providers.
+/// A acts as bootstrap for B: B's Kademlia bootstrap dials A.
 /// Expected: both sides authenticate within 10 seconds.
 #[tokio::test]
 async fn two_kad_nodes_discover_each_other() {
@@ -155,8 +100,8 @@ async fn two_kad_nodes_discover_each_other() {
     let (_handle_b, mut events_b) = SwarmHandle::start(config_b).await.expect("swarm B start");
 
     // Wait for both sides to emit PeerAuthenticated.
-    // The discovery flow: B bootstraps via A → both publish provider records
-    // → both run get_providers → dial each other → cert exchange → authenticated.
+    // The discovery flow: B's Kademlia bootstrap dials A → cert exchange →
+    // authenticated on both sides.
     let ok_b_sees_a =
         wait_for_peer_authenticated(&mut events_b, device_id_a, Duration::from_secs(10)).await;
     let ok_a_sees_b =
@@ -305,39 +250,6 @@ fn config_validation_accepts_valid_multiaddr_prefix() {
             "valid multiaddr should not cause a kademlia validation error, got: {e}"
         );
     }
-}
-
-// ─── T9: kademlia_mode_is_server ─────────────────────────────────────────────
-
-/// After SwarmHandle::start, the Kademlia behaviour must be in Server mode.
-///
-/// Server mode: the node responds to DHT queries and stores records.
-/// All Viaticum nodes run as servers (stable addresses on NAS/desktops).
-#[tokio::test]
-async fn kademlia_mode_is_server() {
-    // We verify server mode indirectly: start_providing succeeds only in Server
-    // mode. In Client mode, start_providing returns NotServerMode error.
-    //
-    // Direct mode inspection would require exposing EventLoopState internals.
-    // Instead, we verify that the swarm bootstraps and issues provider records
-    // without error — which only works in Server mode.
-    //
-    // The test: start a single node with no bootstrap peers, wait for the
-    // republish timer to fire. If the kad behaviour is in Server mode, the
-    // start_providing call in do_kad_republish will not log "kademlia start_providing failed".
-    //
-    // We use a short republish override (300ms) so the timer fires quickly.
-    let config = make_kad_config(70, vec![]);
-    let (_handle, _events) = SwarmHandle::start(config).await.expect("swarm start");
-
-    // Give the event loop time for republish timer to fire and do_kad_republish to run.
-    // If kademlia mode is not Server, start_providing would error with NotServerMode.
-    // We can't directly observe the kad mode from outside the event loop, but we can
-    // verify the swarm starts without panicking (Server mode is set at construction).
-    tokio::time::sleep(Duration::from_millis(600)).await;
-
-    // If we reach here, the swarm started and the republish timer fired without panic.
-    // Server mode is set in SwarmHandle::start via kademlia.set_mode(Some(Mode::Server)).
 }
 
 // ─── Unit test: peer_id_from_multiaddr helper ────────────────────────────────
@@ -545,51 +457,41 @@ fn fake_peer_list(n: usize) -> Vec<(libp2p::PeerId, Vec<Multiaddr>)> {
         .collect()
 }
 
+/// Р-5′: known (and otherwise skipped) peers are dropped BEFORE the per-round
+/// cap, so a result led by peers we already know still yields new ones.
 #[test]
-fn discovery_dial_candidates_returns_empty_when_target_reached() {
-    use viaticum_core::constants::{MAX_CONCURRENT_DISCOVERY_DIALS, TARGET_PEERS};
-    // We already have TARGET_PEERS authenticated → no further dials.
-    let peers = fake_peer_list(MAX_CONCURRENT_DISCOVERY_DIALS + 2);
-    let out = discovery_dial_candidates(peers, TARGET_PEERS);
-    assert!(
-        out.is_empty(),
-        "must skip discovery once auth_count >= TARGET_PEERS"
-    );
-
-    // Also empty when above the target.
-    let peers = fake_peer_list(3);
-    let out = discovery_dial_candidates(peers, TARGET_PEERS + 5);
-    assert!(
-        out.is_empty(),
-        "must skip discovery when above TARGET_PEERS"
+fn discovery_dial_candidates_skips_known_before_cap() {
+    use viaticum_core::constants::MAX_CONCURRENT_DISCOVERY_DIALS;
+    let peers = fake_peer_list(MAX_CONCURRENT_DISCOVERY_DIALS + 6);
+    let known: Vec<libp2p::PeerId> = peers.iter().take(4).map(|(p, _)| *p).collect();
+    let fresh: Vec<libp2p::PeerId> = peers
+        .iter()
+        .skip(4)
+        .take(MAX_CONCURRENT_DISCOVERY_DIALS)
+        .map(|(p, _)| *p)
+        .collect();
+    let out = discovery_dial_candidates(peers, |p| known.contains(p));
+    let got: Vec<libp2p::PeerId> = out.iter().map(|(p, _)| *p).collect();
+    assert_eq!(
+        got, fresh,
+        "the first unknown peers, up to the cap, in result order"
     );
 }
 
+/// Р-5′: no gate on how many peers we already have (TARGET_PEERS is gone):
+/// whatever is not skipped is dialed, up to the per-round cap.
 #[test]
-fn discovery_dial_candidates_caps_to_max_concurrent_dials() {
+fn discovery_dial_candidates_has_no_count_gate() {
     use viaticum_core::constants::MAX_CONCURRENT_DISCOVERY_DIALS;
-    // Far below TARGET_PEERS, but given more peers than the dial cap.
     let peers = fake_peer_list(MAX_CONCURRENT_DISCOVERY_DIALS + 10);
-    let out = discovery_dial_candidates(peers, 0);
-    assert_eq!(
-        out.len(),
-        MAX_CONCURRENT_DISCOVERY_DIALS,
-        "must cap concurrent dials to MAX_CONCURRENT_DISCOVERY_DIALS"
-    );
-}
+    let out = discovery_dial_candidates(peers, |_| false);
+    assert_eq!(out.len(), MAX_CONCURRENT_DISCOVERY_DIALS);
 
-#[test]
-fn discovery_dial_candidates_returns_all_when_under_both_limits() {
-    use viaticum_core::constants::MAX_CONCURRENT_DISCOVERY_DIALS;
-    // Fewer peers than the dial cap, auth_count under the target.
-    let n = MAX_CONCURRENT_DISCOVERY_DIALS.saturating_sub(2).max(1);
-    let peers = fake_peer_list(n);
-    let out = discovery_dial_candidates(peers, 1);
-    assert_eq!(
-        out.len(),
-        n,
-        "must return all peers when under both the dial cap and the peer target"
-    );
+    let few = fake_peer_list(2);
+    assert_eq!(discovery_dial_candidates(few, |_| false).len(), 2);
+
+    let all_known = fake_peer_list(8);
+    assert!(discovery_dial_candidates(all_known, |_| true).is_empty());
 }
 
 #[test]
@@ -597,7 +499,7 @@ fn discovery_dial_candidates_preserves_addresses() {
     // The addrs vec must pass through unchanged for each surviving entry.
     let peers = fake_peer_list(2);
     let expected: Vec<(libp2p::PeerId, Vec<Multiaddr>)> = peers.clone();
-    let out = discovery_dial_candidates(peers, 0);
+    let out = discovery_dial_candidates(peers, |_| false);
     assert_eq!(out.len(), expected.len());
     for (got, want) in out.iter().zip(expected.iter()) {
         assert_eq!(got.0, want.0, "peer_id must be preserved");

@@ -13,6 +13,10 @@ pub mod addr;
 // PeerRecord address book: known peers and their dialable addresses (network-i14).
 pub mod address_book;
 
+// What identify feeds into a peer's Kademlia record: filtered, ranked, capped
+// (C-DK Р-3, network-i18).
+mod kad_feed;
+
 // Kademlia lookup statistics and the "lookup found no peers" warning (C-DK Р-7).
 mod kad_stats;
 
@@ -27,8 +31,12 @@ mod no_port_reuse;
 
 #[cfg(test)]
 mod swarm_addr_tests;
+#[cfg(test)]
+mod swarm_conn_tests;
 #[cfg(all(test, feature = "e2e-tools"))]
 mod swarm_e2e_tests;
+#[cfg(test)]
+mod swarm_kad_frame_tests;
 #[cfg(test)]
 mod swarm_kad_tests;
 #[cfg(test)]

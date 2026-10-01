@@ -208,19 +208,14 @@ pub const HANDSHAKE_FRESHNESS_SECS: u64 = 300;
 /// since msg_id dedup + signature verify already prevent replay attacks.
 pub const MESSAGE_FRESHNESS_SECS: u64 = 3600;
 
-/// Target authenticated peer count.
+/// Max discovery dials per Kademlia discovery round (one `get_closest_peers`
+/// of our own id, C-DK).
 ///
-/// When `authenticated.len() >= TARGET_PEERS`, Kademlia discovery skips new
-/// dial attempts to avoid unbounded connection growth. Cold backup needs
-/// only a small stable set of holders; more peers don't improve reliability
-/// beyond redundancy targets.
-pub const TARGET_PEERS: usize = 20;
-
-/// Max concurrent discovery dials per Kademlia `GetProviders` result.
-///
-/// libp2p Kademlia can return up to K=20 providers per query, and DHT walks
-/// aggregate across multiple hops. Without a cap we burst-dial every result,
-/// blowing `pending_cert` HashMap and saturating `check_cert_timeouts` ticker.
+/// The lookup returns up to K=20 peers. Discovery dials only the ones we do not
+/// know yet (no PeerRecord, not met since start; C-DK Р-5′) and at most this
+/// many per round, so a burst does not flood `pending_cert` and the
+/// `check_cert_timeouts` ticker. There is no gate on how many peers we already
+/// have: knowing many friends is cheap, connections are bounded separately.
 pub const MAX_CONCURRENT_DISCOVERY_DIALS: usize = 5;
 
 /// Max relay hop count — drop entries with hop >= this.

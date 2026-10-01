@@ -10,7 +10,7 @@ use tokio::time::timeout;
 use viaticum_core::cluster::{DeviceCertificate, issue_device_certificate};
 use viaticum_core::types::{DeviceId, IdentityPub, Timestamp};
 
-use crate::daemon::network::swarm::{ProtocolEvent, SwarmConfig, SwarmHandle};
+use crate::daemon::network::swarm::{ConnPolicy, ProtocolEvent, SwarmConfig, SwarmHandle};
 
 /// Build a deterministic SigningKey from a seed byte.
 pub(crate) fn make_signing_key(seed: u8) -> SigningKey {
@@ -72,6 +72,7 @@ pub(crate) fn make_swarm_config(seed_byte: u8) -> SwarmConfig {
         kad_republish_interval_override: None,
         kad_discovery_interval_override: None,
         enable_relay_server: false,
+        conn_policy: ConnPolicy::off(),
     }
 }
 

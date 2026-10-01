@@ -42,7 +42,7 @@ use viaticum_core::types::{
 
 use super::{AcceptedOffer, Processor, esi_list_to_ranges, ranges_to_esi_list};
 use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
-use crate::daemon::network::swarm::{SwarmConfig, SwarmHandle};
+use crate::daemon::network::swarm::{ConnPolicy, SwarmConfig, SwarmHandle};
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -124,6 +124,7 @@ async fn make_swarm() -> Arc<SwarmHandle> {
         kad_republish_interval_override: None,
         kad_discovery_interval_override: None,
         enable_relay_server: false,
+        conn_policy: ConnPolicy::off(),
     };
     let (handle, _events) = SwarmHandle::start(cfg).await.expect("swarm start");
     Arc::new(handle)
