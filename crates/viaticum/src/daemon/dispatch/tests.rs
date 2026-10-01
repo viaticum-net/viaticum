@@ -2454,3 +2454,69 @@ async fn dispatch_status_reports_known_devices_from_peer_records() {
         "no swarm: no list, not an empty one"
     );
 }
+
+/// network-i14 (C-DK N-5): on a device that joined a cluster, its own
+/// `identity_pub` is not the cluster's master. Status counts known peers by the
+/// cluster master — the anchor the swarm checks certificates against and seeds
+/// its known set by — so a sibling (a device of the founder) is not a known
+/// peer, and a stranger is. By `identity_pub` the sibling would be counted.
+#[tokio::test]
+async fn dispatch_status_known_devices_exclude_siblings_by_cluster_master() {
+    use std::sync::Mutex;
+
+    use viaticum_core::cluster::{ClusterState, issue_device_certificate, master_identity};
+    use viaticum_core::constants::{AVAIL_EWMA_INITIAL, INITIAL_TRUST_P};
+    use viaticum_core::types::{PeerRecord, Timestamp};
+
+    let Ok(mut state) = Arc::try_unwrap(make_test_state().await) else {
+        panic!("the test state has one reference");
+    };
+    let founder_key = viaticum_core::cluster::derive_master_key(&[20u8; 32]).unwrap();
+    let founder = master_identity(&founder_key);
+    assert_ne!(
+        founder, state.identity_pub,
+        "a joiner: own identity != cluster master"
+    );
+    let now = Timestamp(1_000_000);
+    let cert = issue_device_certificate(&founder_key, state.device_id, now);
+    let cluster = ClusterState::init(state.db.clone(), founder, cert, now, now).unwrap();
+    state.cluster_state = Some(Arc::new(Mutex::new(cluster)));
+
+    let key = |seed: u8| {
+        DeviceId(
+            ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+    };
+    let rec = |device_id: DeviceId, master: IdentityPub| PeerRecord {
+        device_id,
+        master_identity: master,
+        trust_p: INITIAL_TRUST_P,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp::now(),
+        last_seen: Timestamp::now(),
+        revoked_device_pub_keys: vec![],
+        addrs: vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
+        x25519_pub: None,
+        avail_ewma: AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
+    };
+    let stranger = key(60);
+    state.db.upsert_peer(&rec(key(61), founder)).unwrap();
+    state
+        .db
+        .upsert_peer(&rec(stranger, IdentityPub([0x42; 32])))
+        .unwrap();
+
+    let data = status_of(&Arc::new(state)).await;
+    assert_eq!(
+        data.known_devices,
+        Some(vec![viaticum_core::types::hex_encode(&stranger.0[..8])]),
+        "the founder's device is a sibling, not a known peer"
+    );
+    assert_eq!(data.peer_count_known, 1);
+}

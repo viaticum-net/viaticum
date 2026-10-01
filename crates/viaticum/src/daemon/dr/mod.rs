@@ -317,8 +317,6 @@ async fn recover_into_staging(
         listen_port: 0,
         cert_timeout_secs: net::AUTH_TIMEOUT_SECS,
         kademlia_bootstrap_peers: seed_multiaddrs.clone(),
-        kademlia_disable_ipfs_bootstrap: true,
-        kad_republish_interval_override: None,
         kad_discovery_interval_override: None,
         enable_relay_server: false,
         conn_policy: crate::daemon::network::swarm::ConnPolicy::off(),

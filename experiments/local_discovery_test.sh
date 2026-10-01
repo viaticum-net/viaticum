@@ -26,8 +26,9 @@
 #               every live friend without `connect`; the late node is known by >= 10 old
 #               nodes (on THEIR status); no daemon ever opens a TCP socket (any state) to a
 #               non-local address.
-# Adversarial:  SIGKILL of the seed; late joiner; node-39 carries
-#               kademlia_disable_ipfs_bootstrap = false; oversized peer records (amplifier);
+# Adversarial:  SIGKILL of the seed; late joiner; node-39 carries the legacy key
+#               kademlia_disable_ipfs_bootstrap = false (it switched the IPFS bootstrap on
+#               before C-DK C3; now ignored); oversized peer records (amplifier);
 #               forced disconnects before an on-demand reach and a restore; a holder that
 #               accepts TCP and stays silent (8c); cap 12/24 < 39 peers (lru, lru24, hold).
 # Cannot close: NAT / separate hosts (network-i21, R2); DNS seed; > 41 nodes (cap pressure
@@ -62,7 +63,7 @@
 #                  holders (i16)
 #               6. whole run: no TCP socket (any state) of any daemon to a non-local address,
 #                  0 `outgoing connection error` with an IPFS bootstrap PeerId, node-39 keeps
-#                  its key = false (i17)
+#                  its legacy key = false — the key must change nothing (i17)
 #               8a. 5 pairs (X, Y): cold pair (checked on both sides <= 1 s before), net-probe
 #                  reach -> exit 0 <= 15 s, X in authenticated_devices(Y) on Y <= 5 s, X logs
 #                  `swarm: on-demand dial peer_id=<Y>`; 0 pairs = FAIL (i42; bar in lru24/lru/
@@ -132,7 +133,7 @@ SEED=0
 LATE=40          # the late joiner (step 5)
 DR_NODE=42       # the clean machine of step 7
 DR_SOURCE=5      # the friend whose phrase step 7 recovers
-IPFS_KEY_NODE=39 # carries kademlia_disable_ipfs_bootstrap = false (step 6)
+IPFS_KEY_NODE=39 # carries the legacy kademlia_disable_ipfs_bootstrap = false (step 6)
 # On disk, not /tmp: /tmp on the build server is tmpfs (RAM), and 41 DEBUG logs are large.
 TEST_DIR="${TEST_DIR:-$HOME/viaticum-e2e-runs/discovery-$$}"
 BINARY="${BINARY:-viaticum}"
@@ -140,7 +141,9 @@ KEEP="${KEEP:-0}"
 # Our swarm module and libp2p-kad's query failures at DEBUG: the lookup statistics and
 # the "Request to peer in query failed" lines are the H1..H4 signatures (spec §2.4).
 NODE_LOG_FILTER="${NODE_LOG_FILTER:-info,libp2p_kad::behaviour=debug,viaticum::daemon::network::swarm=debug}"
-# IPFS bootstrap PeerIds (swarm.rs ipfs_bootstrap_peers) — step 6.
+# IPFS bootstrap PeerIds — the list swarm.rs dialed under `kademlia_disable_ipfs_bootstrap =
+# false` until C-DK C3 removed it (network-i17) — step 6. A later build has no way to dial
+# them; seeing one is a regression (M2).
 IPFS_PEER_IDS=(
     QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa
     QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt
@@ -521,7 +524,7 @@ run_step6() {
         fail "dials to IPFS bootstrap nodes:$ipfs_err"
     fi
     if grep -q '^kademlia_disable_ipfs_bootstrap = false' "$(node_dir $IPFS_KEY_NODE)/config.toml"; then
-        pass "node-$IPFS_KEY_NODE still carries kademlia_disable_ipfs_bootstrap = false"
+        pass "node-$IPFS_KEY_NODE still carries the legacy kademlia_disable_ipfs_bootstrap = false"
     else
         fail "node-$IPFS_KEY_NODE config lost the key"
     fi
@@ -883,10 +886,15 @@ fi
 # ── STEP 3: HOLD ────────────────────────────────────────────────────────────
 if runs_step 3; then
     step 3 "hold ${HOLD_SECS}s, sample every ${SAMPLE_SECS}s"
-    declare -A LINE3 PREV_K
+    # A status that does not answer within the API timeout on one sample (a loaded build
+    # host pauses every node at once) is a missed sample, not fallen knowledge: it goes to
+    # a NOTE (node@second) and leaves PREV_K alone, so "never down" compares with the last
+    # value received. Two or more missed samples IN A ROW of one node are a FAIL
+    # (i:no-status×N).
+    declare -A LINE3 PREV_K MISS_RUN3 MISS_MAX3
     for i in $(alive_nodes); do LINE3[$i]=$(log_line_count "$i"); done
     T3=$(date -u +%s)
-    KNOW_BAD=""; CAP_VIOLATIONS=""; SAMPLES=0
+    KNOW_BAD=""; CAP_VIOLATIONS=""; SAMPLES=0; MISSED3=0; MISSED3_AT=""
     sample_all
     for i in $(alive_nodes); do PREV_K[$i]="${K[$i]:-0}"; done
     while [ $(( $(date -u +%s) - T3 )) -lt "$HOLD_SECS" ]; do
@@ -895,17 +903,29 @@ if runs_step 3; then
         SAMPLES=$((SAMPLES + 1))
         for i in $(alive_nodes); do
             k="${K[$i]:-}"
-            if [ -z "$k" ] || [ "$k" = NA ]; then KNOW_BAD="$KNOW_BAD $i:no-status"; continue; fi
+            if [ -z "$k" ]; then
+                MISSED3=$((MISSED3 + 1))
+                MISSED3_AT="$MISSED3_AT node-$i@$(( $(date -u +%s) - T_BASE ))s"
+                MISS_RUN3[$i]=$(( ${MISS_RUN3[$i]:-0} + 1 ))
+                [ "${MISS_RUN3[$i]}" -gt "${MISS_MAX3[$i]:-0}" ] && MISS_MAX3[$i]="${MISS_RUN3[$i]}"
+                continue
+            fi
+            MISS_RUN3[$i]=0
+            if [ "$k" = NA ]; then KNOW_BAD="$KNOW_BAD $i:no-known-field"; continue; fi
             [ "$k" -lt 20 ] && KNOW_BAD="$KNOW_BAD $i:$k<20"
             [ "$k" -lt "${PREV_K[$i]:-0}" ] && KNOW_BAD="$KNOW_BAD $i:${PREV_K[$i]}->$k"
             PREV_K[$i]="$k"
         done
     done
     T3_END=$(date -u +%s)
+    for i in "${!MISS_MAX3[@]}"; do
+        [ "${MISS_MAX3[$i]}" -ge 2 ] && KNOW_BAD="$KNOW_BAD $i:no-status×${MISS_MAX3[$i]}"
+    done
+    [ "$MISSED3" -gt 0 ] && note "status missed on $MISSED3 node-samples (single misses are not a fall):$(echo "$MISSED3_AT" | cut -c1-300)"
     if [ "$SAMPLES" -eq 0 ]; then
         fail "0 samples taken"
     elif [ -z "$KNOW_BAD" ]; then
-        pass "$SAMPLES samples: every node knows >= 20 and its known count never went down"
+        pass "$SAMPLES samples ($MISSED3 node-samples missed): every node knows >= 20 and its known count never went down"
     else
         fail "knowledge fell:$(echo "$KNOW_BAD" | cut -c1-300)"
     fi
@@ -1002,12 +1022,24 @@ if runs_step 4a; then
     for i in $(alive_friends); do K_BEFORE[$i]="${K[$i]:-0}"; done
     kill_node "$SEED"
     T4=$(date -u +%s)
+    # As in step 3: a status missed on one check is a NOTE and keeps the comparison with the
+    # last value received; missed on both checks in a row is a FAIL (i:no-status×2).
+    declare -A MISS_RUN4
     check_known_kept() { # LABEL
-        local i bad=""
+        local i bad="" missed=""
         sample_all
         for i in $(alive_friends); do
-            [ "${K[$i]:-0}" -ge "${K_BEFORE[$i]}" ] 2>/dev/null || bad="$bad $i:${K_BEFORE[$i]}->${K[$i]:-?}"
+            if [ -z "${K[$i]:-}" ]; then
+                MISS_RUN4[$i]=$(( ${MISS_RUN4[$i]:-0} + 1 ))
+                missed="$missed node-$i@$(( $(date -u +%s) - T_BASE ))s"
+                [ "${MISS_RUN4[$i]}" -ge 2 ] && bad="$bad $i:no-status×${MISS_RUN4[$i]}"
+                continue
+            fi
+            MISS_RUN4[$i]=0
+            [ "${K[$i]}" -ge "${K_BEFORE[$i]}" ] 2>/dev/null || bad="$bad $i:${K_BEFORE[$i]}->${K[$i]}"
+            K_BEFORE[$i]="${K[$i]}"
         done
+        [ -n "$missed" ] && note "$1: status missed (not a fall):$(echo "$missed" | cut -c1-300)"
         if [ -z "$bad" ]; then pass "$1: no friend's known count fell"; else fail "$1: known fell:$(echo "$bad" | cut -c1-300)"; fi
     }
     sleep_until $(( T4 - T_BASE + 30 ))

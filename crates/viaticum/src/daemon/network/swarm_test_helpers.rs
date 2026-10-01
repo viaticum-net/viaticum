@@ -47,8 +47,6 @@ pub(crate) fn test_cluster_master_pub() -> IdentityPub {
 /// successfully authenticate each other via DeviceCertExchange. To test
 /// rejection (peer from different cluster), build SwarmConfig manually with
 /// a fresh master and ignore this helper.
-///
-/// IPFS bootstrap is disabled to avoid real network traffic in tests.
 pub(crate) fn make_swarm_config(seed_byte: u8) -> SwarmConfig {
     debug_assert!(
         seed_byte != TEST_CLUSTER_MASTER_SEED,
@@ -68,8 +66,6 @@ pub(crate) fn make_swarm_config(seed_byte: u8) -> SwarmConfig {
         listen_port: 0,
         cert_timeout_secs: 10,
         kademlia_bootstrap_peers: vec![],
-        kademlia_disable_ipfs_bootstrap: true,
-        kad_republish_interval_override: None,
         kad_discovery_interval_override: None,
         enable_relay_server: false,
         conn_policy: ConnPolicy::off(),

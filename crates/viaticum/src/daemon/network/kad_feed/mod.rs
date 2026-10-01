@@ -45,9 +45,10 @@ pub(crate) const MAX_KAD_ADDR_BYTES: usize = 128;
 /// Bytes of addresses per peer in our Kademlia table, the dialed address
 /// included (network-i20). This, not the count, is what bounds our largest
 /// answer, FIND_NODE with k = 20 closer peers, each a protobuf `Peer` of
-/// ≈ 45 B (id 38 B + tags, connection type) plus its addresses with ≤ 2 B of
-/// tag and length each (≤ 7 of them):
-///   20 × (≈45 + 640 + 7 × 2) ≈ 14 KB < 16384 (`KAD_MAX_PACKET_SIZE`).
+/// ≈ 45 B (id 38 B + tags, connection type) plus its addresses with ≤ 3 B of
+/// tag and length each (≤ 7 of them; a length of 128 B — `MAX_KAD_ADDR_BYTES`
+/// exactly — takes a 2-byte varint, shorter ones 1 byte):
+///   20 × (≈45 + 640 + 7 × 3) = 20 × 706 ≈ 14 100 B < 16384 (`KAD_MAX_PACKET_SIZE`).
 /// Without it, nine peers announcing six 300 B DNS names each (it fits a
 /// 4 KiB identify) are enough to push an answer over the frame.
 pub(crate) const MAX_KAD_ADDR_BYTES_PER_PEER: usize = 640;

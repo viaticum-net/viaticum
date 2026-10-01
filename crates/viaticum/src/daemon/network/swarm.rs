@@ -7,6 +7,7 @@
 //   - SwarmHandle: public API to the event loop
 //   - EventLoopState: private state machine running in a tokio task
 //   - Kademlia DHT: automatic Viaticum peer discovery over FIND_NODE (ε.3, C-DK)
+//     on our own DHT, `/viaticum/kad/1.0.0` — no IPFS (network-i17, ADR-003)
 //
 // Identity model:
 //   device_signing_key → Ed25519 keypair → PeerId (libp2p transport identity)
@@ -14,7 +15,11 @@
 //   Noise IX authenticates both ends at transport level.
 //   DeviceCertExchange adds protocol-level proof of cluster membership.
 //
-// Kademlia discovery (C-DK C2):
+// Kademlia discovery (C-DK C2, C3):
+//   Our own DHT: the protocol is KAD_PROTOCOL, the only way in is the circle's
+//   `kademlia_bootstrap_peers`, and identify feeds Kademlia only peers that
+//   announce KAD_PROTOCOL — so an IPFS (or any other) Kademlia node never
+//   enters our table and is never handed out by our lookups (network-i17).
 //   FIND_NODE only — the Kademlia bootstrap plus a periodic get_closest_peers
 //   of our own id; found peers we do not know yet are dialed, and
 //   DeviceCertExchange runs automatically after TCP+Noise connects. There is no
@@ -61,9 +66,11 @@ pub const VIATICUM_PROTOCOL: StreamProtocol = StreamProtocol::new("/viaticum/1")
 /// Protocol for DeviceCertExchange (transport-level cert handshake).
 pub const CERT_PROTOCOL: StreamProtocol = StreamProtocol::new("/viaticum/cert/1");
 
-/// Kademlia protocol name. Still the shared IPFS DHT name (ε.3); identify
-/// reports whether a peer announces it (C-DK Р-7 diagnostics).
-pub(crate) const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/ipfs/kad/1.0.0");
+/// Kademlia protocol name: our own DHT, separate from IPFS by construction
+/// (network-i17, ADR-003). A node speaking another Kademlia (IPFS's
+/// `/ipfs/kad/1.0.0`) cannot query us, is not answered by us, and is not fed
+/// into our table by identify (`handle_identify_event`).
+pub(crate) const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/viaticum/kad/1.0.0");
 
 /// Max message size — matches viaticum_core::constants::MAX_MESSAGE_SIZE.
 const MAX_MSG_SIZE: usize = viaticum_core::constants::MAX_MESSAGE_SIZE as usize;
@@ -413,6 +420,13 @@ enum SwarmCommand {
         addrs: Vec<Multiaddr>,
         reply: oneshot::Sender<Vec<Multiaddr>>,
     },
+    /// Unit tests only: the addresses our Kademlia table holds for `peer_id`
+    /// (empty when the peer is not in the table).
+    #[cfg(test)]
+    TestKadAddrs {
+        peer_id: PeerId,
+        reply: oneshot::Sender<Vec<Multiaddr>>,
+    },
     /// Unit tests only: how many times Kademlia reported `peer_id` as a NEW
     /// entry of its table (`RoutingUpdated { is_new_peer: true }`) so far.
     #[cfg(test)]
@@ -522,16 +536,6 @@ pub struct SwarmConfig {
     /// Additional Kademlia bootstrap multiaddrs from config.
     /// Already parsed and validated by AppConfig::validate().
     pub kademlia_bootstrap_peers: Vec<Multiaddr>,
-
-    /// When true (the default, see `NetworkCfg`), skip built-in IPFS bootstrap
-    /// nodes: the friends' network is closed (network-i11).
-    pub kademlia_disable_ipfs_bootstrap: bool,
-
-    /// Ignored since C-DK C2: there is no provider record to republish. Kept
-    /// only so this slice touches `handle/mod.rs` and `dr/mod.rs` by one field
-    /// (`conn_policy`); it goes in C-DK C3 together with
-    /// `kademlia_disable_ipfs_bootstrap`.
-    pub kad_republish_interval_override: Option<Duration>,
 
     /// Override for KAD_DISCOVERY_INTERVAL and initial discovery delay.
     /// None = use the constants. Used in tests to speed up discovery.
@@ -660,13 +664,8 @@ impl SwarmHandle {
         let mut kademlia = libp2p::kad::Behaviour::with_config(peer_id, kad_store, kad_cfg);
         kademlia.set_mode(Some(libp2p::kad::Mode::Server));
 
-        // Add IPFS bootstrap peers unless disabled (e.g. in tests).
-        if !config.kademlia_disable_ipfs_bootstrap {
-            for (bs_peer_id, addr) in ipfs_bootstrap_peers() {
-                kademlia.add_address(&bs_peer_id, addr);
-            }
-        }
-        // Add config-provided bootstrap peers.
+        // The circle's bootstrap peers are the only way into our DHT: there are
+        // no built-in bootstrap nodes (network-i17).
         for addr in &config.kademlia_bootstrap_peers {
             if let Some(bs_peer_id) = peer_id_from_multiaddr(addr) {
                 kademlia.add_address(&bs_peer_id, addr.clone());
@@ -1115,6 +1114,21 @@ impl SwarmHandle {
         rx.await.expect("swarm loop replied")
     }
 
+    /// Unit tests only: the addresses our Kademlia table holds for `peer`
+    /// (empty when it is not in the table).
+    #[cfg(test)]
+    pub(crate) async fn test_kad_addrs(&self, peer: PeerId) -> Vec<Multiaddr> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestKadAddrs {
+                peer_id: peer,
+                reply,
+            })
+            .await
+            .expect("swarm loop alive");
+        rx.await.expect("swarm loop replied")
+    }
+
     /// Unit tests only: how many times Kademlia reported `peer` as a new entry
     /// of its table so far (`RoutingUpdated { is_new_peer: true }`). Events
     /// reach the loop after the command that caused them: wait on another
@@ -1486,14 +1500,24 @@ impl EventLoopState {
 
     fn handle_identify_event(&mut self, event: libp2p::identify::Event) {
         if let libp2p::identify::Event::Received { peer_id, info, .. } = event {
-            let kad_addrs = self.feed_kad(peer_id, &info.listen_addrs);
+            // network-i17: only a peer that announces OUR Kademlia goes into the
+            // table. `add_address` would put any peer there, and a protocol the
+            // peer then fails to confirm only marks it, never removes it — an
+            // IPFS node connecting to us would stay in the table and be handed
+            // out by our FIND_NODE answers.
+            let kad_protocol = info.protocols.contains(&KAD_PROTOCOL);
+            let kad_addrs = if kad_protocol {
+                self.feed_kad(peer_id, &info.listen_addrs)
+            } else {
+                self.kad_addrs_of(&peer_id).len()
+            };
             // Р-7 / network-i18: how many addresses the peer announced, how many
             // its Kademlia record holds now, and whether it speaks our Kademlia.
             debug!(
                 peer_id = %peer_id,
                 addrs = info.listen_addrs.len(),
                 fed_to_kad = kad_addrs,
-                kad_protocol = info.protocols.contains(&KAD_PROTOCOL),
+                kad_protocol,
                 protocols = ?info.protocols,
                 "identify received"
             );
@@ -2291,6 +2315,10 @@ impl EventLoopState {
                 let _ = reply.send(self.kad_addrs_of(&peer_id));
             }
             #[cfg(test)]
+            SwarmCommand::TestKadAddrs { peer_id, reply } => {
+                let _ = reply.send(self.kad_addrs_of(&peer_id));
+            }
+            #[cfg(test)]
             SwarmCommand::TestKadNewPeerCount { peer_id, reply } => {
                 let n = self.test_kad_new_peer.get(&peer_id).copied().unwrap_or(0);
                 let _ = reply.send(n);
@@ -2556,32 +2584,6 @@ pub fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
             None
         }
     })
-}
-
-/// Return the hardcoded IPFS DHT bootstrap nodes (PeerId + Multiaddr pairs).
-///
-/// Source: https://github.com/ipfs/go-ipfs-config/blob/master/bootstrap_peers.go
-/// These are the canonical IPFS bootstrap nodes for the /ipfs/kad/1.0.0 DHT.
-pub fn ipfs_bootstrap_peers() -> Vec<(PeerId, Multiaddr)> {
-    const BOOTSTRAP_ADDRS: &[&str] = &[
-        "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-        "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-        "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
-        "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
-        "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
-        "/ip4/104.236.179.241/tcp/4001/p2p/QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM",
-        "/ip4/128.199.219.111/tcp/4001/p2p/QmSoLSafTMBsPKadTEgaXctDQVcqN88CNLHXMkTNwMKPnu",
-        "/ip4/104.236.76.40/tcp/4001/p2p/QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64",
-    ];
-
-    BOOTSTRAP_ADDRS
-        .iter()
-        .filter_map(|addr_str| {
-            let addr: Multiaddr = addr_str.parse().ok()?;
-            let peer_id = peer_id_from_multiaddr(&addr)?;
-            Some((peer_id, addr))
-        })
-        .collect()
 }
 
 /// Convert a Viaticum DeviceId (Ed25519 pubkey bytes) to a libp2p PeerId.

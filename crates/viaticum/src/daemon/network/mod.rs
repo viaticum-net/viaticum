@@ -38,6 +38,8 @@ mod swarm_discovery_tests;
 #[cfg(all(test, feature = "e2e-tools"))]
 mod swarm_e2e_tests;
 #[cfg(test)]
+mod swarm_kad_foreign_tests;
+#[cfg(test)]
 mod swarm_kad_frame_tests;
 #[cfg(test)]
 mod swarm_kad_tests;

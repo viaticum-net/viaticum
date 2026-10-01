@@ -124,9 +124,13 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         .as_ref()
         .map(|set| net_status::devices_hex8_sorted(set.iter()));
     let auth_devices = auth_snapshot.unwrap_or_default();
-    // network-i14: knowledge, from the PeerRecords (another master + a dialable address).
-    let known_devices =
-        net_status::known_devices_hex8(&peers, &state.identity_pub, &state.device_id);
+    // network-i14: knowledge, from the PeerRecords (another master + a dialable
+    // address). "Another" = not the cluster's master, as in the swarm's known set.
+    let known_devices = net_status::known_devices_hex8(
+        &peers,
+        &net_status::status_cluster_master(state),
+        &state.device_id,
+    );
 
     // Compute peer summaries, sorted by combined trust descending (top 20).
     let mut peer_summaries: Vec<PeerSummary> = peers

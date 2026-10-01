@@ -1,7 +1,7 @@
 // Kademlia DHT tests for swarm.rs (ε.3).
 //
-// All tests use kademlia_disable_ipfs_bootstrap = true to avoid real network
-// traffic. Tests bootstrap against each other using localhost addresses.
+// There are no built-in bootstrap nodes (network-i17), so no test touches a real
+// network: nodes bootstrap against each other on localhost addresses.
 
 use std::time::Duration;
 
@@ -13,14 +13,13 @@ use viaticum_core::types::DeviceId;
 use super::swarm_test_helpers::{get_listen_addr, make_cert, make_signing_key};
 use crate::daemon::network::swarm::{
     ConnPolicy, ProtocolEvent, SwarmConfig, SwarmHandle, discovery_dial_candidates,
-    ipfs_bootstrap_peers, peer_id_from_multiaddr, scaled_kad_cadence,
+    peer_id_from_multiaddr, scaled_kad_cadence,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Build a SwarmConfig for Kademlia tests.
 ///
-/// All tests disable IPFS bootstrap (kademlia_disable_ipfs_bootstrap = true).
 /// Bootstrap peers can be added via kademlia_bootstrap_peers.
 /// kad_discovery_interval_override speeds up the discovery cycle.
 fn make_kad_config(seed_byte: u8, bootstrap_peers: Vec<Multiaddr>) -> SwarmConfig {
@@ -41,8 +40,6 @@ fn make_kad_config(seed_byte: u8, bootstrap_peers: Vec<Multiaddr>) -> SwarmConfi
         listen_port: 0,
         cert_timeout_secs: 10,
         kademlia_bootstrap_peers: bootstrap_peers,
-        kademlia_disable_ipfs_bootstrap: true,
-        kad_republish_interval_override: None,
         // Speed up discovery for tests.
         kad_discovery_interval_override: Some(Duration::from_millis(200)),
         enable_relay_server: false,
@@ -209,7 +206,6 @@ fn config_validation_rejects_invalid_multiaddr() {
     let mut cfg = AppConfig::default();
     cfg.network = NetworkCfg {
         kademlia_bootstrap_peers: vec!["not_a_multiaddr".to_string()],
-        kademlia_disable_ipfs_bootstrap: false,
         ..Default::default()
     };
 
@@ -237,7 +233,6 @@ fn config_validation_accepts_valid_multiaddr_prefix() {
             "/ip4/127.0.0.1/tcp/4001/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
                 .to_string(),
         ],
-        kademlia_disable_ipfs_bootstrap: true,
         ..Default::default()
     };
 
@@ -275,30 +270,6 @@ fn peer_id_from_multiaddr_returns_none_without_p2p() {
         result.is_none(),
         "should return None when no /p2p component"
     );
-}
-
-// ─── Unit test: ipfs_bootstrap_peers ─────────────────────────────────────────
-
-#[test]
-fn ipfs_bootstrap_peers_nonempty() {
-    let peers = ipfs_bootstrap_peers();
-    assert!(
-        !peers.is_empty(),
-        "ipfs_bootstrap_peers must return at least one entry"
-    );
-    // Every returned entry must have a valid PeerId.
-    for (peer_id, addr) in &peers {
-        let extracted = peer_id_from_multiaddr(addr);
-        assert!(
-            extracted.is_some(),
-            "each bootstrap addr must have a /p2p component"
-        );
-        assert_eq!(
-            extracted.unwrap(),
-            *peer_id,
-            "extracted PeerId must match the returned PeerId"
-        );
-    }
 }
 
 // ─── T-9a: get_closest_peers_returns_known_peers ──────────────────────────────

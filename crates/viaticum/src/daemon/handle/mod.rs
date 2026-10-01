@@ -503,8 +503,6 @@ impl DaemonHandle {
                 // "Connection was closed before a response was received".
                 cert_timeout_secs: 35,
                 kademlia_bootstrap_peers,
-                kademlia_disable_ipfs_bootstrap: app_config.network.kademlia_disable_ipfs_bootstrap,
-                kad_republish_interval_override: None,
                 // Under an accelerated test clock (time_scale>1) the 5-min real-time
                 // discovery interval fires only ~once in a minutes-long run, so non-seed
                 // nodes never discover holders and place nothing. Scale it with time_scale
@@ -523,7 +521,7 @@ impl DaemonHandle {
                 conn_policy: crate::daemon::network::swarm::ConnPolicy::daemon(
                     crate::daemon::network::address_book::AddressBook::new(
                         db.clone(),
-                        identity_pub,
+                        cluster_master_pub,
                         device_id,
                     ),
                 ),

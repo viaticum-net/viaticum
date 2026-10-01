@@ -119,6 +119,12 @@ pub struct AddressBook {
 }
 
 impl AddressBook {
+    /// `own_master` is the CLUSTER master (`SwarmConfig::cluster_master_pub`),
+    /// the anchor the swarm checks certificates against: a peer of that master
+    /// is a sibling (`CertTrustPath::Intra`), every other one is known once it
+    /// has an address — the same split the swarm applies to peers it meets
+    /// (`record_authenticated`). On a device that joined a cluster this is the
+    /// founder's identity, not the device's own `identity_pub`.
     pub fn new(db: Db, own_master: IdentityPub, own_device: DeviceId) -> Self {
         Self {
             db,
@@ -146,8 +152,9 @@ impl AddressBook {
 }
 
 /// network-i14: `record` is a known peer — another master (not our own device,
-/// not a sibling of our master) with at least one dialable address. Quiet: a
-/// status read must not log every bad stored address again.
+/// not a sibling: `own_master` is the cluster master, see [`AddressBook::new`])
+/// with at least one dialable address. Quiet: a status read must not log every
+/// bad stored address again.
 pub(crate) fn is_known(
     record: &PeerRecord,
     own_master: &IdentityPub,

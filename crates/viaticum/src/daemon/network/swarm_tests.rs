@@ -363,8 +363,6 @@ async fn cert_mismatch_rejected() {
         listen_port: 0,
         cert_timeout_secs: 5,
         kademlia_bootstrap_peers: vec![],
-        kademlia_disable_ipfs_bootstrap: true,
-        kad_republish_interval_override: None,
         kad_discovery_interval_override: None,
         enable_relay_server: false,
         conn_policy: ConnPolicy::off(),

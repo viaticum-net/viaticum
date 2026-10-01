@@ -93,7 +93,6 @@ fn config_roundtrips_all_fields() {
             relay_url: None,
             bootstrap_peers: vec![],
             kademlia_bootstrap_peers: vec![],
-            kademlia_disable_ipfs_bootstrap: false,
             listen_port: 0,
         },
         cluster: ClusterCfg {
@@ -1406,18 +1405,26 @@ fn every_section_when_present_but_empty_then_equals_section_default() {
     }
 }
 
+/// network-i17: the IPFS bootstrap switch is gone. A config written before it
+/// was removed still loads, the old key changes nothing, and the keys around it
+/// are read as usual.
 #[test]
-fn network_section_without_key_keeps_ipfs_bootstrap_disabled() {
-    let f = write_toml("[network]\nlisten_port = 4001\n");
-    let cfg = AppConfig::load(f.path()).unwrap();
-    assert!(cfg.network.kademlia_disable_ipfs_bootstrap);
-}
-
-#[test]
-fn network_explicit_false_when_set_then_ipfs_bootstrap_enabled() {
-    let f = write_toml("[network]\nkademlia_disable_ipfs_bootstrap = false\n");
-    let cfg = AppConfig::load(f.path()).unwrap();
-    assert!(!cfg.network.kademlia_disable_ipfs_bootstrap);
+fn config_network_legacy_ipfs_key_is_ignored() {
+    let f = write_toml(
+        "[network]\nkademlia_disable_ipfs_bootstrap = false\nlisten_port = 4001\n\
+         kademlia_bootstrap_peers = [\"/ip4/127.0.0.1/tcp/4002\"]\n",
+    );
+    let cfg = AppConfig::load(f.path()).expect("a legacy [network] key must not refuse the config");
+    assert_eq!(cfg.network.listen_port, 4001);
+    assert_eq!(
+        cfg.network.kademlia_bootstrap_peers,
+        vec!["/ip4/127.0.0.1/tcp/4002".to_string()]
+    );
+    let saved = toml::to_string(&cfg).expect("serialize");
+    assert!(
+        !saved.contains("ipfs"),
+        "the key is not carried over when the config is written back: {saved}"
+    );
 }
 
 #[test]

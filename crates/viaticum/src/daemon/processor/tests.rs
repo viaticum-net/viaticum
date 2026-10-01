@@ -120,8 +120,6 @@ async fn make_swarm() -> Arc<SwarmHandle> {
         listen_port: 0, // OS assigns port
         cert_timeout_secs: 10,
         kademlia_bootstrap_peers: vec![],
-        kademlia_disable_ipfs_bootstrap: true,
-        kad_republish_interval_override: None,
         kad_discovery_interval_override: None,
         enable_relay_server: false,
         conn_policy: ConnPolicy::off(),

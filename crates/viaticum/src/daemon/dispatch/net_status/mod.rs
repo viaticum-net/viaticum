@@ -12,6 +12,7 @@ mod tests;
 use viaticum_core::types::{DeviceId, IdentityPub, PeerRecord};
 
 use super::bytes_to_hex_8;
+use crate::daemon::handle::DaemonState;
 use crate::daemon::network::address_book::is_known;
 
 /// DeviceIds as their first 8 bytes in hex, sorted (the `identity_hex` form of
@@ -22,6 +23,21 @@ pub(crate) fn devices_hex8_sorted<'a>(
     let mut out: Vec<String> = devices.into_iter().map(|d| bytes_to_hex_8(&d.0)).collect();
     out.sort();
     out
+}
+
+/// The master whose devices are siblings, not known peers (network-i14): the
+/// cluster's master, the anchor the swarm checks certificates against and seeds
+/// its known set by (`AddressBook::new`). On a device that joined a cluster it
+/// is the founder's identity, not this device's own `identity_pub`; that one is
+/// used only when there is no cluster state (dispatch tests).
+pub(crate) fn status_cluster_master(state: &DaemonState) -> IdentityPub {
+    match state.cluster_state.as_ref() {
+        Some(cluster) => cluster
+            .lock()
+            .expect("cluster_state lock poisoned")
+            .master_pub(),
+        None => state.identity_pub,
+    }
 }
 
 /// network-i14: the known peers among `peers` (another master, a dialable

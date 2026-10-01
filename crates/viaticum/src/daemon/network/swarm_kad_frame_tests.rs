@@ -280,11 +280,16 @@ async fn wait_new_peer_events(s: &SwarmHandle, peer: PeerId, n: usize) {
 /// replaces the stale addresses in our record instead of piling up next to them
 /// — and the peer stays in the table the whole time: no second
 /// `RoutingUpdated { is_new_peer: true }`. Removing first (M: remove before
-/// add) empties the record, libp2p drops the peer (`remove_address` on its
-/// last address) and re-inserts it as new: the final set is the same, but on a
-/// seed (friends dial in, so no dialed address protects the record) the peer
-/// loses its place in the bucket, and next to a full bucket it may not get one
-/// back.
+/// add) empties the record: libp2p drops the peer (`remove_address` on its
+/// last address) and the add that follows inserts it again. The final address
+/// set is the same, and in a bucket with room the peer loses nothing — it lands
+/// at the most-recent end. The harm is elsewhere: Kademlia reports a false new
+/// peer (`is_new_peer: true`) and may start an automatic bootstrap
+/// (`bootstrap_on_low_peers`); and in a full bucket the re-insert is not
+/// immediate — the peer becomes the bucket's pending entry, or, when another
+/// peer is already pending, gets `Full` and drops out of the table. On a seed
+/// (friends dial in, so no dialed address protects the record) that is a
+/// friend gone from the routing table until its next identify.
 #[tokio::test]
 async fn identify_with_new_port_replaces_stale_kad_addrs() {
     let (s, _events) = SwarmHandle::start(make_swarm_config(114))
