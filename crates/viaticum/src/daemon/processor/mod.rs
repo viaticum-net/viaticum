@@ -213,6 +213,9 @@ pub struct Processor {
     pub(crate) shadow_offer_slot: Arc<tokio::sync::Semaphore>,
     /// Offers whose shadow was skipped since the last logged offer shadow.
     pub(crate) shadow_offers_skipped: Arc<std::sync::atomic::AtomicU64>,
+    /// K-b4 (pos-i14): the holder's PoS answers that read a share at once; shared with the
+    /// mailbox path's responder (`pos_responder`).
+    pos_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl Processor {
@@ -252,7 +255,14 @@ impl Processor {
             four_r: viaticum_core::four_r_holder::FourRParams::default(),
             shadow_offer_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             shadow_offers_skipped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pos_slots: pos::new_pos_slots(),
         }
+    }
+
+    /// K-b4: a mailbox-path responder that waits on THIS processor's answer semaphore: the
+    /// direct and the mailbox path share one limit of `HOLDER_POS_CONCURRENCY` readers.
+    pub fn pos_responder(&self, responder: PosResponder) -> PosResponder {
+        responder.with_pos_slots(Arc::clone(&self.pos_slots))
     }
 
     /// Set the work event sender for the unified pipeline worker.

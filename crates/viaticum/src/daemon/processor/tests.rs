@@ -4671,6 +4671,8 @@ mod four_r_shadow_wedge;
 mod symbol_transfer_reply;
 // F-Q: the offer rule over the quota states (holder-i1..i3).
 mod quota_states;
+// К-b4 (pos-i14): the holder's PoS answer streams the share, at most two at once.
+mod holder_pos;
 
 // ─── pos-i5-a: a holder answers only a fresh challenge (replay guard) ───────────
 

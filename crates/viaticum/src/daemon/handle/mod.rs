@@ -1008,6 +1008,9 @@ impl DaemonHandle {
         // resolves mailbox PoS responses against them), read by the mailbox poll loop
         // (it forwards only responses to pending challenges, pos-i6). Wired below.
         let pending_challenges: PendingChallenges = new_pending_challenges();
+        // K-b4 (pos-i14): the mailbox path's responder, built from the Processor so that both
+        // paths wait on ONE semaphore of PoS answers (`Processor::pos_responder`).
+        let pos_responder;
 
         // Raw quota values from config. 0 = "not configured" (use disk-based limit).
         // Processor and holder_cleanup compute effective_quota from disk_free at runtime.
@@ -1047,6 +1050,14 @@ impl DaemonHandle {
             // Wire WorkPipeline event channel to Processor so on_peer_authenticated
             // sends WorkEvent::PeerAuthenticated to wake the worker.
             processor.set_work_event_tx(work_event_tx.clone());
+            pos_responder = processor.pos_responder(
+                crate::daemon::processor::PosResponder::new(
+                    db.clone(),
+                    holdings_dir.clone(),
+                    master_key.clone(),
+                )
+                .with_time_scale(time_scale),
+            );
             // В-0b: the [four_r] dials drive the 4R offer shadow (logs only, off the reply path).
             processor.set_four_r(viaticum_core::four_r_holder::FourRParams::from_cfg(
                 &app_config.four_r,
@@ -1226,15 +1237,12 @@ impl DaemonHandle {
         {
             use crate::daemon::mailbox::poll::run_mailbox_poll;
             use crate::daemon::processor::{
-                PosResponder, ProcessorDeleteHandler, ProcessorDropHandler, ProcessorPosHandler,
+                ProcessorDeleteHandler, ProcessorDropHandler, ProcessorPosHandler,
                 ProcessorRevocationHandler,
             };
 
             // pos-i5-a: the freshness window of an answered challenge scales with the run.
-            let pos_handler = ProcessorPosHandler::new(
-                PosResponder::new(db.clone(), holdings_dir.clone(), master_key.clone())
-                    .with_time_scale(time_scale),
-            );
+            let pos_handler = ProcessorPosHandler::new(pos_responder);
 
             // T-13a: pass repair_tx so ProcessorDropHandler can wake the repair worker
             // for immediate-drop DropNotice entries (deadline ≈ now).

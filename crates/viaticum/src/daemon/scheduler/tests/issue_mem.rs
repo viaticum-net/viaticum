@@ -975,3 +975,35 @@ async fn stuck_load_is_only_named_when_write_off_is_off() {
     assert!(!text.contains("written off"), "{text}");
     assert_eq!(budget.outstanding_bytes(), 0);
 }
+
+// ─── The closed budget (К-b4, pos-i13 «НЕ входит», v3.10 §2) ──────────────────────────────────────
+
+/// The tick line carries `budget_closed`: 1 while a DR keeps the budget closed (the deferrals of
+/// that tick are not a shortage of memory), 0 otherwise.
+#[tokio::test]
+async fn pos_issue_tick_line_says_when_the_budget_is_closed() {
+    let (open_owner, _budget) = budgeted(1, 2, make_test_encoder());
+    let mut closed_owner = owner_with_encoder(
+        900,
+        SlowPostman::acking_after(Duration::from_millis(5)),
+        make_test_encoder(),
+        |db, dir| seed_due(db, dir, 1, 2),
+    );
+    let closed = MemBudget::new_closed(TOTAL_MIB * MIB);
+    closed_owner.scheduler.set_mem_budget(Arc::clone(&closed));
+    freeze_batch_clock(&mut closed_owner);
+
+    let mut in_flight = InFlight::default();
+    let buf = logged(tick(&closed_owner, &mut in_flight)).await;
+    let line = &tick_lines(&buf)[0];
+    assert_eq!(field(line, "budget_closed"), Some(1), "{line}");
+    assert_eq!(field(line, "issued"), Some(0), "{line}");
+    assert_eq!(field(line, "deferred_mem"), Some(2), "{line}");
+    assert_eq!(closed.grants(), 0, "a closed budget grants nothing");
+
+    let mut in_flight = InFlight::default();
+    let buf = logged(tick(&open_owner, &mut in_flight)).await;
+    let line = &tick_lines(&buf)[0];
+    assert_eq!(field(line, "budget_closed"), Some(0), "{line}");
+    settle_until_idle(&open_owner, &mut in_flight, Duration::from_secs(10)).await;
+}
