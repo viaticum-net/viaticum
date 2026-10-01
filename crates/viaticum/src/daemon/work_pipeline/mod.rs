@@ -38,16 +38,17 @@ pub use pool::{PoolSnapshot, pool_signature, snapshot_pool};
 
 // ─── Q-V9: restore or backup first ────────────────────────────────────────────
 
-/// Q-V9 (spec v3.12a), awaiting Ilya's answer; the recommendation (a) is in force.
+/// Q-V9 (spec v3.12a): the decision of Ilya, 2026-10-01 — (a), restore first. The value is final;
+/// the constant stays so that the pause is one switch and has its mutation (M92).
 ///
 /// `true` (a): while a restore job runs the worker starts no new iteration (`status`: «backup
 /// paused while restoring», one INFO line per job); an iteration already running still yields
 /// the budget to a waiting restore between two holders (J13). PoS is not affected.
-/// `false` (b): the worker works on and gives the budget to a waiting restore at a chunk
-/// boundary (after the turn's first attempt, before every next send), then takes it again and
-/// re-encodes the rest — restore-i39's bound per block is then the encode of the backup block
-/// plus 60 s. Switching is this constant alone; the daemon passes it to
-/// `WorkPipelineConfig::restore_pauses_backup`.
+/// `false` (b), kept as the minimal variant behind the switch: the worker works on and gives the
+/// budget to a waiting restore at a chunk boundary (after the turn's first attempt, before every
+/// next send), then takes it again and re-encodes the rest — restore-i39's bound per block is then
+/// the encode of the backup block plus 60 s. Switching is this constant alone; the daemon passes
+/// it to `WorkPipelineConfig::restore_pauses_backup`.
 pub const RESTORE_PAUSES_BACKUP: bool = true;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
