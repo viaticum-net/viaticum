@@ -341,13 +341,11 @@ fn each_peak(blob: &[u8], params: &ErasureParams, holders: u32) -> usize {
     peak
 }
 
-/// F8' (WARN-3, v3.5): the MODEL bar of the walk. The model explains 2.157 E_pad (build stage with
-/// the plan) but the measurement is ≈ 2.192 — about 0.035 E_pad ≈ 9 T the model does not name. No
-/// slack is allowed in a model bar (that was W2 of v3.4), so this unit stays ignored until a spec
-/// delta names the term; it is run by hand with `--ignored` and its numbers go to `runs.jsonl`.
-/// The live units below hold the estimate (M7, M37) and the independence of the holders.
+/// F8' (spec v3.7b): the MODEL bar of the walk. `each = max(build, walk) = build`, because the plan
+/// is let go before the walk: `(1 + L/K)·E_pad + P(K)`, with P(K) the plan held after generation,
+/// measured in this same test (`plan_held`: 0.0395 E_pad at K = 257 — the term v3.5 could not name).
+/// The bar is the model plus delta (0.02 E_pad), no other slack. Measured 2.1918 against the bar 2.2113.
 #[test]
-#[ignore = "STOP v3.4 each: model term unnamed, spec v3.5 WARN-3"]
 fn encode_raw_ranges_each_alloc_peak_within_model() {
     let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let (blob, params) = padded_block();
@@ -377,7 +375,7 @@ fn encode_raw_ranges_each_alloc_peak_within_model() {
 }
 
 /// What `estimate_pos_issue` takes above the input — `encoder_bytes` plus the symbol buffers —
-/// covers the measured walk (held by M7, M37; the model bar above is ignored, WARN-3).
+/// covers the measured walk (held by M7, M37; the model bar above holds the exact term, v3.7b).
 #[test]
 fn encode_raw_ranges_each_peak_is_covered_by_the_estimate() {
     let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());

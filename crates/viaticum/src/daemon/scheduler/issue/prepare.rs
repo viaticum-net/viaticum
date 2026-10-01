@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,10 @@ use viaticum_core::db::Db;
 use viaticum_core::erasure::ErasureEncoder;
 use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
 use viaticum_core::messages::to_cbor;
-use viaticum_core::types::{DeviceId, IdentityPub, SourceBlockId, SymbolPlacement, Timestamp};
+use viaticum_core::pos::PosError;
+use viaticum_core::types::{
+    DeviceId, ErasureParams, IdentityPub, SourceBlockId, SymbolPlacement, Timestamp,
+};
 
 use super::super::{PendingHashChallenge, Scheduler, random_challenge_id, scaled_timer_secs};
 use super::fold::{self, FoldHolder};
@@ -131,6 +134,10 @@ pub(crate) struct PrepShared {
     phase: AtomicU8,
     handle: Mutex<Option<WriteOffHandle>>,
     started: Mutex<Option<tokio::time::Instant>>,
+    /// Whether this preparation holds the one place of "a batch in flight" (spec v3.7, WARN-1):
+    /// set at its start, cleared by its write-off. A batch that is written off no longer stops
+    /// the next one from forming.
+    counts_in_flight: AtomicBool,
 }
 
 impl PrepShared {
@@ -139,7 +146,13 @@ impl PrepShared {
             phase: AtomicU8::new(PrepPhase::Start as u8),
             handle: Mutex::new(None),
             started: Mutex::new(started),
+            counts_in_flight: AtomicBool::new(true),
         })
+    }
+
+    /// Whether the preparation still holds its place in flight (false after a write-off).
+    pub(super) fn counts_in_flight(&self) -> bool {
+        self.counts_in_flight.load(Ordering::SeqCst)
     }
 
     pub(super) fn set_started(&self, at: tokio::time::Instant) {
@@ -164,7 +177,7 @@ impl PrepShared {
     }
 
     /// The permit is held: it can be written off from now.
-    fn hold(&self, permit: &mut MemPermit) {
+    pub(super) fn hold(&self, permit: &mut MemPermit) {
         *self.handle.lock().unwrap_or_else(|p| p.into_inner()) = Some(permit.write_off_handle());
     }
 
@@ -181,7 +194,15 @@ impl PrepShared {
     /// off or another holder is already written off.
     pub(super) fn write_off(&self, budget: &MemBudget) -> Option<u64> {
         let guard = self.handle.lock().unwrap_or_else(|p| p.into_inner());
-        budget.write_off(guard.as_ref()?)
+        let bytes = budget.write_off(guard.as_ref()?)?;
+        // A written-off preparation does not count as in flight any more (WARN-1).
+        self.counts_in_flight.store(false, Ordering::SeqCst);
+        Some(bytes)
+    }
+
+    /// Back to "no permit work": between the members of a batch.
+    pub(super) fn rest(&self) {
+        self.set_phase(PrepPhase::Start);
     }
 }
 
@@ -234,14 +255,9 @@ pub(super) struct BlockPrep {
     block_id: SourceBlockId,
     holders: Vec<FoldHolder>,
     pub(super) state: Arc<PrepShared>,
-}
-
-/// What the precheck of an overdue block decides before it waits for memory.
-pub(super) enum Precheck {
-    /// Wait for memory: this much.
-    Ready { need_bytes: u64 },
-    /// Nothing to wait for (logged).
-    Unserved,
+    /// Runs just before a holder's master is looked up (tests: the permit must be gone).
+    #[cfg(test)]
+    master_lookup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Scheduler {
@@ -279,6 +295,12 @@ impl Scheduler {
             block_id,
             holders,
             state: PrepShared::new(started),
+            #[cfg(test)]
+            master_lookup_hook: self
+                .master_lookup_hook
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
         }
     }
 
@@ -298,12 +320,12 @@ impl Scheduler {
         );
         let shared = Arc::clone(&prep.state);
         (
-            tokio::task::spawn_blocking(with_current_dispatch(move || prep.run(None))),
+            tokio::task::spawn_blocking(with_current_dispatch(move || prep.run())),
             shared,
         )
     }
 
-    /// Whether `block` failed to load and is still out of the overdue queue at `now`; the
+    /// Whether `block` failed to load and is still out of the overdue batches at `now`; the
     /// entries that ran out are dropped.
     pub(super) fn load_failed_now(&self, block: &SourceBlockId, now: Instant) -> bool {
         let mut map = self.load_failed.lock().unwrap_or_else(|p| p.into_inner());
@@ -374,6 +396,27 @@ impl Scheduler {
     }
 }
 
+/// A preparation's hashes, computed under a permit that is gone by now: what is left is the
+/// look-up of the holders' masters (database reads), done WITHOUT the permit (J12, MR5).
+pub(super) struct Hashed {
+    pub(super) prep: BlockPrep,
+    pub(super) hashes: HashList,
+}
+
+/// The expected chain hash of every holder of a block, in the order of its holders.
+pub(super) type HashList = Vec<Result<[u8; 32], PosError>>;
+
+/// One member of a batch of overdue preparations: its record is read, its need known.
+pub(super) struct Member {
+    pub(super) prep: BlockPrep,
+    pub(super) record: viaticum_core::types::SourceBlockRecord,
+    pub(super) need_bytes: u64,
+}
+
+/// A member's work under the batch's permit: the hashes, or nothing (the block cannot be served,
+/// logged).
+pub(super) type Computed = Option<HashList>;
+
 impl BlockPrep {
     pub(super) fn block_id(&self) -> SourceBlockId {
         self.block_id
@@ -390,10 +433,26 @@ impl BlockPrep {
         }
     }
 
-    /// Whether the sources of the block can be read at all (W3): by `metadata`, without a permit.
-    /// A retained blob (SystemState) needs no source files. `false` is logged like a load
-    /// failure (WARN once a day per block, backup-i7) and the block is not served.
-    fn sources_ready(&self, record: &viaticum_core::types::SourceBlockRecord) -> bool {
+    /// A batch member's first look (blocking, no permit): the record and the need. `None` when the
+    /// block has no record (logged) or no holders; it is served nothing.
+    pub(super) fn into_member(self) -> Option<Member> {
+        if self.holders.is_empty() {
+            return None;
+        }
+        let record = self.record()?;
+        let need_bytes = pos_need_bytes(&record);
+        Some(Member {
+            prep: self,
+            record,
+            need_bytes,
+        })
+    }
+
+    /// A member's sources, judged by `metadata` before the load (spec v3.7 WARN-4): a block whose
+    /// source files are gone or above the size limit fails at once — `load_failed` for a day, the
+    /// WARN of backup-i7 — and never reads a byte. A retained blob (SystemState) needs no source
+    /// files; a catalog read that fails is left to the load, which reports it.
+    fn sources_are_readable(&self, record: &viaticum_core::types::SourceBlockRecord) -> bool {
         use crate::daemon::backup::rebuild::{SourceCheck, precheck_sources};
         if crate::daemon::system_state::block::retained_block_path(&self.data_dir, &self.block_id)
             .exists()
@@ -401,81 +460,34 @@ impl BlockPrep {
             return true;
         }
         let why = match precheck_sources(&self.db, record, &self.rebuild_scope) {
-            Ok(SourceCheck::Ready) => return true,
+            Ok(SourceCheck::Ready) | Err(_) => return true,
             Ok(SourceCheck::Missing) => "its source files are missing",
             Ok(SourceCheck::OverLimit) => "its source files are over the size limit",
-            // A catalog read that fails is left to the load itself, which reports it.
-            Err(_) => return true,
         };
+        let now = Instant::now();
+        self.load_failed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(self.block_id, now + POS_LOAD_WARN_INTERVAL);
         log_load_failure(
             &self.load_warned,
             self.block_id,
-            Instant::now(),
+            now,
             &anyhow::anyhow!("cannot rebuild the block: {why}"),
         );
         false
     }
 
-    /// Before an overdue block waits for memory (W3, NOTE 7): its record and its sources by
-    /// `metadata`, no permit. Blocking.
-    pub(super) fn precheck(&self) -> Precheck {
-        let Some(record) = self.record() else {
-            return Precheck::Unserved;
-        };
-        if !self.sources_ready(&record) {
-            return Precheck::Unserved;
-        }
-        Precheck::Ready {
-            need_bytes: pos_need_bytes(&record),
-        }
-    }
-
-    /// Load, encode once, and hash per holder (F8'). Blocking; runs on the blocking pool.
-    ///
-    /// The memory permit (backup-i24): `given` by an overdue block's wrapper, which waited for
-    /// it; else taken here by `try_acquire`, right after the block's record is read — a busy
-    /// budget ends the run `Deferred` with nothing loaded. It is
-    /// held from before the load to the end of the encode and dropped BEFORE the holders'
-    /// masters are looked up and the result is returned: nothing is published under it (J12).
-    pub(super) fn run(self, given: Option<MemPermit>) -> PrepOutcome {
+    /// Load the block and encode it once, folding the hashes of every holder (F8'), under
+    /// `permit`. Blocking. `None`: the block cannot be served (logged, `load_failed` set).
+    fn compute(
+        &self,
+        record_params: &ErasureParams,
+        permit: &mut MemPermit,
+        state: &PrepShared,
+    ) -> Computed {
         let block_id = self.block_id;
-        if self.holders.is_empty() {
-            return PrepOutcome::Unserved;
-        }
-        let Some(record) = self.record() else {
-            return PrepOutcome::Unserved;
-        };
-        let params = record.erasure_params();
-        let need_bytes = pos_need_bytes(&record);
-
-        let mut permit = match given {
-            Some(p) => p,
-            // The tick's own preparation goes straight to `try_acquire`: a precheck here would
-            // read the whole catalog once more for every block of every tick. A doomed block
-            // that finds the budget busy is judged by the overdue wrapper's precheck a tick
-            // later, before it waits for anything; one that finds it free fails in its load.
-            None => {
-                match self
-                    .budget
-                    .try_acquire(HolderKind::Pos, &block_id, need_bytes)
-                {
-                    Some(p) => p,
-                    None => {
-                        debug!(
-                            block = %block_id,
-                            need_mib = need_bytes >> 20,
-                            queued = self.budget.queued_waiters(),
-                            outstanding_mib = self.budget.outstanding_bytes() >> 20,
-                            "pos: block deferred, memory budget busy"
-                        );
-                        return PrepOutcome::Deferred;
-                    }
-                }
-            }
-        };
-        self.state.hold(&mut permit);
-        self.state.set_phase(PrepPhase::Load);
-
+        state.set_phase(PrepPhase::Load);
         // Load source block data (retained SS blob, else rebuild from source files).
         let blob = match load_source_block(
             &self.db,
@@ -498,35 +510,106 @@ impl BlockPrep {
                     .unwrap_or_else(|p| p.into_inner())
                     .insert(block_id, load_failed_until(&e, now, self.retry_after));
                 log_load_failure(&self.load_warned, block_id, now, &e);
-                return PrepOutcome::Unserved;
+                return None;
             }
         };
 
-        self.state.set_phase(PrepPhase::Encode);
+        state.set_phase(PrepPhase::Encode);
         // The blob is padded in place, the encoder walks the union of the holders' ESIs once and
         // every symbol goes to the hashers of the holders that have it (F8').
-        let hashes = match fold::hash_holders(
-            &permit,
+        match fold::hash_holders(
+            permit,
             self.encoder.as_ref(),
             &block_id,
-            &params,
+            record_params,
             blob,
             &self.holders,
         ) {
-            Ok(h) => h,
+            Ok(h) => Some(h),
             Err(e) => {
                 error!(block_id = %block_id, "scheduler: encode_raw failed: {e}");
-                return PrepOutcome::Unserved;
+                None
             }
+        }
+    }
+
+    /// A batch member's turn under the batch's permit: the sources by `metadata`, then the load
+    /// and the encode. The permit stays with the batch; the masters are looked up when it is gone.
+    /// `state` is the batch's (its phase is what the stuck-load watch reads).
+    pub(super) fn compute_member(
+        member: Member,
+        permit: &mut MemPermit,
+        state: &PrepShared,
+    ) -> (BlockPrep, Computed) {
+        let Member { prep, record, .. } = member;
+        let hashes = if prep.sources_are_readable(&record) {
+            prep.compute(&record.erasure_params(), permit, state)
+        } else {
+            None
         };
+        state.rest();
+        (prep, hashes)
+    }
+
+    /// The tick's preparation (and a cut one): load, encode once, and hash per holder (F8').
+    /// Blocking; runs on the blocking pool.
+    ///
+    /// The memory permit (backup-i24): taken here by `try_acquire`, right after the block's
+    /// record is read — a busy budget ends the run `Deferred` with nothing loaded. It is held
+    /// from before the load to the end of the encode and dropped BEFORE the holders' masters are
+    /// looked up and the result is returned: nothing is published under it (J12). No check of the
+    /// sources here: a missing or grown source is found by the load (backup-i7); a database
+    /// catalog scan per block per tick is not for the tick (spec v3.7).
+    pub(super) fn run(self) -> PrepOutcome {
+        let block_id = self.block_id;
+        if self.holders.is_empty() {
+            return PrepOutcome::Unserved;
+        }
+        let Some(record) = self.record() else {
+            return PrepOutcome::Unserved;
+        };
+        let need_bytes = pos_need_bytes(&record);
+        let Some(mut permit) = self
+            .budget
+            .try_acquire(HolderKind::Pos, &block_id, need_bytes)
+        else {
+            debug!(
+                block = %block_id,
+                need_mib = need_bytes >> 20,
+                queued = self.budget.queued_waiters(),
+                outstanding_mib = self.budget.outstanding_bytes() >> 20,
+                "pos: block deferred, memory budget busy"
+            );
+            return PrepOutcome::Deferred;
+        };
+        self.state.hold(&mut permit);
+        let computed = self.compute(&record.erasure_params(), &mut permit, &self.state);
         // The encoder and the source are gone: give the budget back before anything else.
         drop(permit);
+        match computed {
+            Some(hashes) => Hashed { prep: self, hashes }.finish(),
+            None => PrepOutcome::Unserved,
+        }
+    }
+}
 
+impl Hashed {
+    /// The challenges: each holder's key resolved (CS-POS-3), its hash paired. Database reads, no
+    /// permit.
+    pub(super) fn finish(self) -> PrepOutcome {
+        let Hashed { prep, hashes } = self;
+        let block_id = prep.block_id;
         let mut results = Vec::new();
-        for (holder, hash) in self.holders.into_iter().zip(hashes) {
+        for (holder, hash) in prep.holders.into_iter().zip(hashes) {
             match hash {
                 Ok(expected_chain_hash) => {
-                    let holder_master = self
+                    #[cfg(test)]
+                    {
+                        if let Some(hook) = &prep.master_lookup_hook {
+                            hook();
+                        }
+                    }
+                    let holder_master = prep
                         .db
                         .get_master_for_device(&holder.holder_id)
                         .ok()

@@ -41,6 +41,8 @@ mod issue_support;
 mod issue_fold;
 // R1-d-b (backup-i24, pos-i13, pos-i7-d-c/d): the issue tick under the memory budget.
 mod issue_mem;
+// R1-d-b fix round К-b2b (spec v3.7, v3.7a): the batch of overdue preparations, the marking.
+mod issue_batch;
 // backup-i7: the load-failure WARN of a PoS block once per day.
 mod pos_load_warn;
 

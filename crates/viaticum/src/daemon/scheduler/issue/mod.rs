@@ -18,11 +18,15 @@
 // once. So a block whose preparation is longer than a tick budget is served, once per
 // preparation, not restarted by every tick.
 //
-// Memory (R1-d-b, backup-i24, pos-i13): a preparation takes its permit from the block work
-// budget itself, by `try_acquire`, right after it has read the block's record, and gives it back
-// before anything is published. A busy budget ends it `Deferred`: the tick goes on to the next
-// block, and from the NEXT tick the deferred block waits for memory as an overdue preparation
-// (`Preparing::adopt_waiting`), ahead of the order and the tick's time budget.
+// Memory (R1-d-b, backup-i24, pos-i13, spec v3.7 / v3.7a): a preparation takes its permit from the
+// block work budget itself, by `try_acquire`, right after it has read the block's record, and gives
+// it back before anything is published. When somebody waits in the budget's queue no `try_acquire`
+// can pass (A12-b), so the tick prepares nothing: it MARKS every due block it would have started
+// (`mem_deferred_at`, the tick's number) and ends its block loop. A block too big for the free
+// memory is marked too, and the tick goes on (a small one behind it may fit). From the next tick
+// the marked blocks are prepared by ONE batch (`Preparing::adopt_batch`): one wait for memory
+// sized by the largest member, the members one after the other, ahead of the order and the tick's
+// time budget; their publication follows the batch's release of the permit.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -47,6 +51,7 @@ pub(crate) use prepare::PrepOutcome;
 pub(crate) use prepare::load_failed_until;
 #[cfg(test)]
 pub(crate) use prepare::{POS_LOAD_WARN_INTERVAL, log_load_failure, should_warn};
+use preparing::BatchPlan;
 #[cfg(test)]
 pub(crate) use preparing::PrepDone;
 
@@ -68,10 +73,10 @@ const WAIT_DEADLINE_PCT: u32 = 95;
 /// Block preparations a tick started that may run at once (pos-i7-d-a, pos-i7-d-c): the one in
 /// the tick and up to this many cut from earlier ticks. A bound on CPU, blocking-pool threads and
 /// the blocks excluded from the ticks — NOT on memory: memory is the budget's (backup-i24), each
-/// preparation holds a permit while it holds its source and symbols. A preparation that waits for
-/// memory (an overdue one, pos-i13) is not counted here; overdue ones that run are bounded apart
-/// (`MAX_OVERDUE_RUNNING`). Two: one can finish while the next starts. A block that would be the
-/// third stays due and counts in `deferred`.
+/// preparation holds a permit while it holds its source and symbols. The batch of overdue
+/// preparations (pos-i13) is not counted here: there is at most one, and it waits for memory as a
+/// priority waiter (CPU: K + 2 at most). Two: one can finish while the next starts. A block that
+/// would be the third stays due and counts in `deferred`.
 pub(crate) const MAX_PREPARATIONS: usize = 2;
 
 /// A preparation running longer than this many issue-tick periods (scaled like the tick
@@ -80,10 +85,16 @@ pub(crate) const MAX_PREPARATIONS: usize = 2;
 pub(crate) const STUCK_PREPARATION_PERIODS: u32 = 10;
 
 /// pos-i7-d-d, variant (a) — the architect's recommendation, not Ilya's decision (Q-V7 is open):
-/// a preparation hung in its load phase for `STUCK_PREPARATION_PERIODS` periods is written off
-/// (its bytes return to the memory budget while it hangs), at most one at a time. `false` is
-/// variant (b): visibility only, the WARN of the stuck preparation.
+/// a preparation hung in its load phase for `max(STUCK_PREPARATION_PERIODS × period,
+/// WRITE_OFF_MIN_REAL)` is written off (its bytes return to the memory budget while it hangs), at
+/// most one at a time. `false` is variant (b): visibility only, the WARN of the stuck preparation.
 pub(crate) const WRITE_OFF_STUCK_LOADS: bool = true;
+
+/// The floor of the write-off age, in REAL time (spec v3.6 WARN-4): on a time-scaled rig
+/// `STUCK_PREPARATION_PERIODS` periods are seconds, and a load that is merely slow must not be
+/// written off. In production (10 h) the floor does not matter. The WARN of a stuck preparation
+/// stays at `STUCK_PREPARATION_PERIODS` periods.
+pub(crate) const WRITE_OFF_MIN_REAL: Duration = Duration::from_secs(600);
 
 /// Challenge publishes in flight at once (pos-i7-a), across ticks. About one block's
 /// holders (8 in the E2E) plus one: a block's re-encode (~110 ms at 1 MiB) is longer than
@@ -179,6 +190,13 @@ impl Scheduler {
         match ended {
             Ended::Published(done) => self.settle_publish(done, &mut in_flight.settled).await,
             Ended::Prepared(done) => self.publish_prepared(done, in_flight).await,
+            // The batch has given its permit back; its members' challenges are published one
+            // after the other (J12).
+            Ended::Batch(done) => {
+                for member in done {
+                    self.publish_prepared(member, in_flight).await;
+                }
+            }
         }
     }
 
@@ -208,11 +226,7 @@ impl Scheduler {
                 return;
             }
             Err(e) => {
-                error!(
-                    block_id = %block_id,
-                    err = %e,
-                    "scheduler: PoS hash compute task failed (panicked or cancelled) — skipping block"
-                );
+                self.prep_failed(block_id, &e);
                 return;
             }
         };
@@ -302,6 +316,9 @@ impl Scheduler {
     /// previous line — zero_ack and slowest_publish_ms.
     pub(crate) async fn issue_tick(&self, in_flight: &mut InFlight) -> anyhow::Result<()> {
         let started = Instant::now();
+        // The same moment on the batch's clock (spec v3.7a: a batch starts no member past 0.9 of
+        // a period from here).
+        let tick_start = (self.batch_clock)();
         // The number of this tick (pos-i13): a block the budget defers on tick n waits for memory
         // from tick n + 1, whatever the clock says.
         let tick_no = self.issue_seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -316,6 +333,7 @@ impl Scheduler {
             tokio::time::Instant::now(),
             period,
             STUCK_PREPARATION_PERIODS,
+            WRITE_OFF_MIN_REAL,
             &self.mem_budget,
             WRITE_OFF_STUCK_LOADS,
         );
@@ -418,14 +436,22 @@ impl Scheduler {
                     && !preparing_blocks.contains(&e.source_block_id)
             })
             .collect();
-        // pos-i13: a block the budget deferred on an EARLIER tick waits for memory now, as an
-        // overdue preparation — decided here, before the order and the tick's time budget, so
-        // neither can keep it from being queued. A deferral whose block is no longer due (or
-        // preparing) is forgotten: a later deferral starts its own count.
-        let overdue =
-            self.adopt_overdue(in_flight, tick_no, period, &mut not_pending, &placement_of);
-        if overdue > 0 {
-            debug!(overdue, "scheduler: deferred blocks now wait for memory");
+        // pos-i13: the blocks marked on an EARLIER tick are prepared now, by one batch — decided
+        // here, before the order and the tick's time budget, so neither can keep them from being
+        // queued. With no marks this is one lock and a return (the hot path of the tick).
+        let batched = self.adopt_overdue(
+            in_flight,
+            tick_no,
+            tick_start,
+            period,
+            &mut not_pending,
+            &placement_of,
+        );
+        if batched > 0 {
+            debug!(
+                batched,
+                "scheduler: marked blocks now wait for memory as a batch"
+            );
         }
         tick.skipped_pending = due.len() - not_pending.len();
         let blocks = {
@@ -449,6 +475,25 @@ impl Scheduler {
         'blocks: while let Some((block_id, block_entries)) = blocks.next() {
             while let Some(done) = in_flight.try_join_next() {
                 self.settle_publish(done, &mut in_flight.settled).await;
+            }
+            // pos-i13 (spec v3.7): somebody waits in the budget's queue, so no `try_acquire` of
+            // this tick can pass (A12-b). The tick prepares nothing: this block and every one
+            // left are marked (they wait for memory as a batch from the next tick) and keep their
+            // place in the order (`last_attempted` is not moved). Marking costs no CPU, so it
+            // comes before the time budget and K.
+            let queued = self.mem_budget.queued_waiters();
+            if queued > 0 {
+                let mut marked = 0usize;
+                let mut rest = vec![(block_id, block_entries)];
+                rest.extend(blocks.by_ref());
+                let ids: Vec<SourceBlockId> = rest.iter().map(|(b, _)| *b).collect();
+                for (_, entries) in &rest {
+                    tick.deferred_mem += entries.len();
+                    marked += 1;
+                }
+                self.note_mem_deferred_all(ids, tick_no);
+                debug!(marked, queued, "pos: blocks marked, memory queue busy");
+                break 'blocks;
             }
             // pos-i7-a: start a block only while it fits the budget, with a spare block of
             // headroom. The first block always starts: a tick issues something even if one
@@ -493,13 +538,9 @@ impl Scheduler {
             let outcome = match tokio::time::timeout_at(deadline, &mut prep).await {
                 Ok(Ok(outcome)) => outcome,
                 Ok(Err(join_err)) => {
-                    // CS-POS-8: the blocking task panicked — log it loudly, skip the block
-                    // this tick rather than re-panic the scheduler task.
-                    error!(
-                        block_id = %block_id,
-                        err = %join_err,
-                        "scheduler: PoS hash compute task failed (panicked or cancelled) — skipping block this tick"
-                    );
+                    // CS-POS-8: the blocking task panicked — name it, skip the block (its mark
+                    // goes, it waits one period) rather than re-panic the scheduler task.
+                    self.prep_failed(block_id, &anyhow::Error::from(join_err));
                     PrepOutcome::Unserved
                 }
                 Err(_) => {
@@ -521,10 +562,11 @@ impl Scheduler {
                     self.clear_mem_deferred(&block_id);
                     Vec::new()
                 }
-                // The budget is busy (logged by the preparation): not a reason to stop. A small
-                // block behind a big one may fit (backup-i24), so the tick goes on, unlike at
-                // the time budget and K. The deferral is brief (a record read); it does not
-                // count as a slow block.
+                // The block is too big for the free memory (the queue was empty, or a waiter came
+                // after the tick looked; logged by the preparation): marked, and the tick goes
+                // on — a small block behind a big one may fit (backup-i24, M22), unlike at the
+                // time budget and K. The deferral is brief (a record read); it does not count as
+                // a slow block.
                 PrepOutcome::Deferred => {
                     self.note_mem_deferred(block_id, tick_no);
                     tick.deferred_mem += block_entries.len();
@@ -573,6 +615,8 @@ impl Scheduler {
             cut_blocks = tick.cut_blocks,
             preparing = in_flight.preparing.running(),
             waiting_mem = in_flight.preparing.waiting(),
+            marked = self.marked_len(),
+            batch = in_flight.preparing.batch_members(),
             oldest_prep_s = in_flight
                 .preparing
                 .oldest_age(tokio::time::Instant::now())
@@ -596,7 +640,7 @@ impl Scheduler {
     }
 }
 
-/// The deferral book of the memory budget (pos-i13): the tick a block was first deferred on.
+/// The deferral book of the memory budget (pos-i13): the tick a block was first marked on.
 impl Scheduler {
     /// `block` was deferred by the budget on tick `tick_no`; the first deferral of an episode
     /// counts, a later one does not move it.
@@ -606,6 +650,17 @@ impl Scheduler {
             .unwrap_or_else(|p| p.into_inner())
             .entry(block)
             .or_insert(tick_no);
+    }
+
+    /// The same for many blocks under one lock (a tick that finds the queue busy marks them all).
+    fn note_mem_deferred_all(&self, blocks: impl IntoIterator<Item = SourceBlockId>, tick_no: u64) {
+        let mut map = self
+            .mem_deferred_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for block in blocks {
+            map.entry(block).or_insert(tick_no);
+        }
     }
 
     /// `block` got its memory (or cannot be served): the episode is over.
@@ -623,75 +678,130 @@ impl Scheduler {
             .retain(|b, _| keep(b));
     }
 
-    /// Start the waiting for memory of every block deferred on an earlier tick than `tick_no`
-    /// (J11: deferred on n, waiting from n + 1): their due placements leave `not_pending` and go
-    /// to `in_flight.preparing` as overdue preparations. A block whose last load failed
-    /// (`load_failed`, backup-i7) is not among them: it stays in the ordinary flow, where
-    /// `try_acquire` decides. Returns the number of blocks adopted.
+    /// Blocks marked now (the `marked` field of the tick line).
+    fn marked_len(&self) -> usize {
+        self.mem_deferred_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+
+    /// A preparation whose task panicked or was cancelled (spec v3.6 NOTE 4): named, its mark is
+    /// cleared (the batch or the tick does not wait for it), and it waits one period before a
+    /// batch takes it again — as after any other failure to read the source.
+    fn prep_failed(&self, block_id: SourceBlockId, err: &anyhow::Error) {
+        warn!(
+            block_id = %block_id,
+            err = %err,
+            "scheduler: PoS hash compute task failed (panicked or cancelled) — skipping block"
+        );
+        self.clear_mem_deferred(&block_id);
+        let period = Duration::from_secs(scaled_timer_secs(
+            self.config.pos_interval_secs,
+            self.config.time_scale,
+        ));
+        self.load_failed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(block_id, Instant::now() + period);
+    }
+
+    /// Start the batch of the blocks marked on an earlier tick than `tick_no` (J11: marked on n,
+    /// prepared from n + 1), if none is in flight; spec v3.7. Their due placements leave
+    /// `not_pending` (the ticks leave them alone while the batch holds them). A block whose last
+    /// load failed (`load_failed`, backup-i7) is not among them: it stays in the ordinary flow,
+    /// where `try_acquire` decides. Marks of blocks no longer due (and not held by a preparation)
+    /// are dropped first. Returns the number of blocks in the batch.
+    ///
+    /// The hot path of the tick: with no marks this is one lock and a return, and nothing here
+    /// reads the database or the files — the members' records and sources are looked at by the
+    /// batch itself, on the blocking pool.
     fn adopt_overdue(
         &self,
         in_flight: &mut InFlight,
         tick_no: u64,
+        tick_start: Instant,
         period: Duration,
         not_pending: &mut Vec<&ChallengeScheduleEntry>,
         placement_of: &HashMap<PendingKey, &SymbolPlacement>,
     ) -> usize {
+        if self
+            .mem_deferred_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+        {
+            return 0;
+        }
         let due_blocks: HashSet<SourceBlockId> =
             not_pending.iter().map(|e| e.source_block_id).collect();
         let preparing = in_flight.preparing.blocks();
-        let candidates: HashSet<SourceBlockId> = {
+        let ripe: Vec<(SourceBlockId, u64)> = {
             let mut map = self
                 .mem_deferred_at
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
+            // A mark whose block is no longer due, nor held by a preparation, is stale.
             map.retain(|b, _| due_blocks.contains(b) || preparing.contains(b));
+            if in_flight.preparing.batch_in_flight() {
+                return 0;
+            }
             map.iter()
                 .filter(|(b, n)| **n < tick_no && due_blocks.contains(*b))
-                .map(|(b, _)| *b)
+                .map(|(b, n)| (*b, *n))
                 .collect()
         };
         let now = Instant::now();
-        let overdue: HashSet<SourceBlockId> = candidates
+        let mark_of: HashMap<SourceBlockId, u64> = ripe
             .into_iter()
-            .filter(|b| !self.load_failed_now(b, now))
+            .filter(|(b, _)| !self.load_failed_now(b, now))
             .collect();
-        if overdue.is_empty() {
+        if mark_of.is_empty() {
             return 0;
         }
-        // Their entries, block by block in the order the tick found them.
-        let mut order: Vec<SourceBlockId> = Vec::new();
-        let mut by_block: HashMap<SourceBlockId, Vec<&ChallengeScheduleEntry>> = HashMap::new();
+        // Their entries, block by block: the oldest mark first, then the order of pos-i7-c.
+        let mut taken: Vec<&ChallengeScheduleEntry> = Vec::new();
         not_pending.retain(|e| {
-            if !overdue.contains(&e.source_block_id) {
-                return true;
+            if mark_of.contains_key(&e.source_block_id) {
+                taken.push(*e);
+                return false;
             }
-            by_block
-                .entry(e.source_block_id)
-                .or_insert_with(|| {
-                    order.push(e.source_block_id);
-                    Vec::new()
-                })
-                .push(*e);
-            false
+            true
         });
-        let slow_after = period * STUCK_PREPARATION_PERIODS;
-        for block_id in &order {
-            let entries = &by_block[block_id];
-            let cpw_of: HashMap<DeviceId, u32> =
-                entries.iter().map(|e| (e.holder_id, e.cpw)).collect();
-            let holder_placements: Vec<&SymbolPlacement> = entries
-                .iter()
-                .filter_map(|e| placement_of.get(&(e.source_block_id, e.holder_id)).copied())
-                .collect();
-            let prep = self.make_prep(*block_id, &holder_placements, None);
-            in_flight.preparing.adopt_waiting(
-                *block_id,
-                cpw_of,
-                prep,
-                Arc::clone(&self.mem_budget),
-                slow_after,
-            );
-        }
-        order.len()
+        let mut ordered = {
+            let attempted = self
+                .last_attempted
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            blocks_least_recently_tried_first(taken, |k| {
+                let verified = placement_of.get(k).and_then(|p| p.last_verified);
+                verified.max(attempted.get(k).copied())
+            })
+        };
+        ordered.sort_by_key(|(b, _)| mark_of[b]);
+        let members: Vec<_> = ordered
+            .iter()
+            .map(|(block_id, entries)| {
+                let cpw_of: HashMap<DeviceId, u32> =
+                    entries.iter().map(|e| (e.holder_id, e.cpw)).collect();
+                let holder_placements: Vec<&SymbolPlacement> = entries
+                    .iter()
+                    .filter_map(|e| placement_of.get(&(e.source_block_id, e.holder_id)).copied())
+                    .collect();
+                (self.make_prep(*block_id, &holder_placements, None), cpw_of)
+            })
+            .collect();
+        let count = members.len();
+        in_flight.preparing.adopt_batch(
+            members,
+            Arc::clone(&self.mem_budget),
+            BatchPlan {
+                period,
+                tick_start,
+                clock: Arc::clone(&self.batch_clock),
+                slow_after: period * STUCK_PREPARATION_PERIODS,
+            },
+        );
+        count
     }
 }

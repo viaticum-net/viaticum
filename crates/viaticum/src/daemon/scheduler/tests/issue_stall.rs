@@ -79,7 +79,13 @@ pub(super) struct StallingEncoder {
     stall_from: usize,
     stall_upto: usize,
     stall: Duration,
+    /// Runs at the start of every `encode_raw_ranges_each` with the call's index (tests: advance
+    /// a fake clock, read the budget, panic).
+    hook: std::sync::Mutex<Option<CallHook>>,
 }
+
+/// What a test runs at the start of each preparation's encode.
+pub(super) type CallHook = Arc<dyn Fn(usize) + Send + Sync>;
 
 impl StallingEncoder {
     pub(super) fn new(stall_from: usize, stall_upto: usize, stall: Duration) -> Arc<Self> {
@@ -91,7 +97,13 @@ impl StallingEncoder {
             stall_from,
             stall_upto,
             stall,
+            hook: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Run `hook(call_index)` at the start of every encode from now on.
+    pub(super) fn set_hook(&self, hook: impl Fn(usize) + Send + Sync + 'static) {
+        *self.hook.lock().unwrap() = Some(Arc::new(hook));
     }
 }
 
@@ -153,6 +165,10 @@ impl ErasureEncoder for StallingEncoder {
         f: &mut SymbolSink<'_>,
     ) -> Result<(), ErasureError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let hook = self.hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(call);
+        }
         let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(now, Ordering::SeqCst);
         if (self.stall_from..self.stall_upto).contains(&call) {

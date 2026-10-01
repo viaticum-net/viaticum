@@ -28,7 +28,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -438,6 +438,25 @@ impl MemBudget {
         false
     }
 
+    /// Whether the batch of overdue PoS checks, holding `permit` (after its shrink), must end
+    /// between two members for a restore (Q-V8, answer (a): restore first; spec v3.7a WARN-B):
+    /// the rule (Б′) of the worker, `max need(1..i) > total − W` for some queued restore `i`, read
+    /// for the batch's permit. Kept apart from `worker_must_yield`: a worker may wait in the queue
+    /// behind the batch, which is not the worker's A4 case.
+    pub fn batch_must_yield_to_restore(&self, permit: &MemPermit) -> bool {
+        let fits_beside_batch = self.total_mib.saturating_sub(permit.mib);
+        let w = self.lock_waiters();
+        let mut prefix_max = 0u32;
+        for x in &w.queued {
+            prefix_max = prefix_max.max(x.need_mib);
+            if x.kind == WaitKind::Priority(PriorityKind::Restore) && prefix_max > fits_beside_batch
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Write a stuck holder's permit off (pos-i7-d-d, variant (a)): its bytes go back to the budget
     /// now, while the holder still runs, and will not be returned a second time when it ends. At
     /// most one permit is written off at a time — the overspend is bounded by one estimate. `None`
@@ -448,30 +467,32 @@ impl MemBudget {
             self.written_off_live.fetch_sub(1, Ordering::SeqCst);
             return None;
         }
-        if handle
-            .shared
-            .state
-            .compare_exchange(LIVE, WRITTEN_OFF, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
+        // The shared lock also orders this against a `shrink_to` of the holder: the size read
+        // here is the size the permit holds, and no shrink runs between the read and the return.
+        let mut shared = handle.shared.lock();
+        if shared.state != LIVE {
+            drop(shared);
             self.written_off_live.fetch_sub(1, Ordering::SeqCst);
             return None;
         }
+        let mib = shared.mib;
+        shared.state = WRITTEN_OFF;
         // The state flag is ours now: the holder's drop will only forget its semaphore units.
         // `held` shrinks and the units reach the semaphore (and its first waiter) under the lock
         // that also grants waiters, so no waiter is granted between the two halves.
         {
             let _queue = self.lock_waiters();
-            self.held_mib.fetch_sub(handle.mib as u64, Ordering::SeqCst);
-            self.sem.add_permits(handle.mib as usize);
+            self.held_mib.fetch_sub(mib as u64, Ordering::SeqCst);
+            self.sem.add_permits(mib as usize);
         }
+        drop(shared);
         tracing::debug!(
             kind = %handle.kind.as_str(),
             block = %handle.block,
-            bytes = handle.mib as u64 * MIB,
+            bytes = mib as u64 * MIB,
             "mem_budget: released (written off)"
         );
-        Some(handle.mib as u64 * MIB)
+        Some(mib as u64 * MIB)
     }
 
     /// `acquire` without the slow-wait line (tests).
@@ -541,9 +562,21 @@ pub struct MemPermit {
 }
 
 /// State of a permit that can be written off: live, written off by [`MemBudget::write_off`], or
-/// dropped by its holder. The one atomic decides who returns the bytes.
+/// dropped by its holder; with the size the permit holds now (a `shrink_to` changes it). One lock
+/// decides who returns the bytes and keeps the size and the state together.
 struct PermitShared {
-    state: AtomicU8,
+    inner: Mutex<SharedInner>,
+}
+
+struct SharedInner {
+    state: u8,
+    mib: u32,
+}
+
+impl PermitShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SharedInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 const LIVE: u8 = 0;
@@ -556,7 +589,6 @@ pub struct WriteOffHandle {
     shared: Arc<PermitShared>,
     kind: HolderKind,
     block: SourceBlockId,
-    mib: u32,
 }
 
 impl WriteOffHandle {
@@ -564,8 +596,9 @@ impl WriteOffHandle {
         self.kind
     }
 
+    /// What the permit holds now.
     pub fn bytes(&self) -> u64 {
-        self.mib as u64 * MIB
+        self.shared.lock().mib as u64 * MIB
     }
 }
 
@@ -578,34 +611,39 @@ impl MemPermit {
         self.kind
     }
 
-    /// A handle to write this permit off from another thread (pos-i7-d-d). Taken on a permit that
-    /// is not shrunk afterwards: the handle keeps the size it saw.
+    /// A handle to write this permit off from another thread (pos-i7-d-d). The handle follows
+    /// the permit's size: a permit shrunk afterwards (the batch of overdue checks does) is
+    /// written off at the size it holds then.
     pub fn write_off_handle(&mut self) -> WriteOffHandle {
+        let mib = self.mib;
         let shared = Arc::clone(self.shared.get_or_insert_with(|| {
             Arc::new(PermitShared {
-                state: AtomicU8::new(LIVE),
+                inner: Mutex::new(SharedInner { state: LIVE, mib }),
             })
         }));
         WriteOffHandle {
             shared,
             kind: self.kind,
             block: self.block,
-            mib: self.mib,
         }
     }
 
     /// Release down to `keep_bytes` (whole MiB, rounded up, at least 1): the difference goes back
-    /// to the budget and to whoever is queued. A no-op when the permit is already that small.
+    /// to the budget and to whoever is queued. A no-op when the permit is already that small, or
+    /// was written off (its bytes are back already).
     pub fn shrink_to(&mut self, keep_bytes: u64) {
         let keep = to_mib(keep_bytes).min(self.mib as u64) as u32;
         let diff = self.mib - keep;
         if diff == 0 {
             return;
         }
-        debug_assert!(
-            self.shared.is_none(),
-            "a permit with a write-off handle is not shrunk"
-        );
+        // Under the lock a write-off shares: either it came first (nothing left to release) or
+        // it reads the size after this shrink.
+        let shared = self.shared.clone();
+        let mut guard = shared.as_ref().map(|s| s.lock());
+        if guard.as_ref().is_some_and(|g| g.state != LIVE) {
+            return;
+        }
         // Count the bytes free before the semaphore hands them to a waiter.
         self.budget
             .held_mib
@@ -614,6 +652,10 @@ impl MemPermit {
             drop(part);
         }
         self.mib = keep;
+        if let Some(g) = guard.as_mut() {
+            g.mib = keep;
+        }
+        drop(guard);
         tracing::debug!(
             kind = %self.kind.as_str(),
             block = %self.block,
@@ -627,7 +669,7 @@ impl MemPermit {
 impl Drop for MemPermit {
     fn drop(&mut self) {
         if let Some(shared) = &self.shared
-            && shared.state.swap(DROPPED, Ordering::SeqCst) == WRITTEN_OFF
+            && std::mem::replace(&mut shared.lock().state, DROPPED) == WRITTEN_OFF
         {
             // Written off while its holder ran: the budget already took the bytes back and
             // counted them free. Forget the semaphore units instead of returning them twice.

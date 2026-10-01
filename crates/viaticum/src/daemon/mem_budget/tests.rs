@@ -1176,3 +1176,58 @@ async fn granted_line_carries_waited_ms() {
         "{text}"
     );
 }
+
+/// A permit shrunk after its write-off handle was taken (the batch of overdue checks shrinks
+/// after every member): the write-off gives back what it holds NOW, not what it held at the
+/// handle; and a shrink after the write-off returns nothing a second time.
+#[test]
+fn write_off_follows_the_size_of_a_shrunk_permit() {
+    let budget = MemBudget::new(10 * MIB);
+    let mut p = budget
+        .try_acquire(HolderKind::Pos, &block(1), 8 * MIB)
+        .unwrap();
+    let handle = p.write_off_handle();
+    p.shrink_to(3 * MIB);
+    assert_eq!(handle.bytes(), 3 * MIB, "the handle sees the shrink");
+    assert_eq!(budget.outstanding_bytes(), 3 * MIB);
+
+    assert_eq!(budget.write_off(&handle), Some(3 * MIB));
+    assert_eq!(budget.outstanding_bytes(), 0);
+    assert_eq!(budget.semaphore_free_bytes(), 10 * MIB);
+
+    // A shrink after the write-off is a no-op: nothing is released twice.
+    p.shrink_to(MIB);
+    assert_eq!(budget.outstanding_bytes(), 0);
+    assert_eq!(budget.semaphore_free_bytes(), 10 * MIB);
+    drop(p);
+    assert_eq!(budget.semaphore_free_bytes(), 10 * MIB, "no units twice");
+    assert_eq!(budget.outstanding_bytes(), 0);
+}
+
+/// The batch's rule toward restore is the worker's (Б′): a queued restore that cannot fit beside
+/// the batch makes it end; one that fits, or a queued worker, does not. A worker waiting behind
+/// the batch is not the worker's A4 case (no assertion).
+#[tokio::test]
+async fn batch_yields_to_a_restore_that_does_not_fit_beside_it() {
+    let budget = MemBudget::new(10 * MIB);
+    let batch = budget
+        .try_acquire(HolderKind::Pos, &block(1), 6 * MIB)
+        .unwrap();
+    let other = third_holder(&budget, 4);
+    let waiters = queue_up(&budget, &[(None, 3), (Some(PriorityKind::Restore), 5)]).await;
+    // The plain waiter stands for the worker's `acquire` shape; restore needs 5 > 10 - 6.
+    assert!(budget.batch_must_yield_to_restore(&batch));
+    drop((batch, other, waiters));
+
+    let budget = MemBudget::new(10 * MIB);
+    let batch = budget
+        .try_acquire(HolderKind::Pos, &block(1), 4 * MIB)
+        .unwrap();
+    let other = third_holder(&budget, 6);
+    let waiters = queue_up(&budget, &[(Some(PriorityKind::Restore), 5)]).await;
+    assert!(
+        !budget.batch_must_yield_to_restore(&batch),
+        "5 <= 10 - 4: it is served when the others' units come back, no yield needed"
+    );
+    drop((batch, other, waiters));
+}

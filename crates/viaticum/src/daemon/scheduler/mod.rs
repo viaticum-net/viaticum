@@ -134,7 +134,16 @@ pub struct Scheduler {
     /// backup-i7): such a block is tried only through `try_acquire`. Shared with the
     /// preparation task, which sets and clears it on the blocking pool.
     load_failed: Arc<std::sync::Mutex<HashMap<SourceBlockId, std::time::Instant>>>,
+    /// The clock of the batch of overdue PoS checks (its work limit and hard stop, spec v3.7a):
+    /// the real one, replaced in tests.
+    batch_clock: BatchClock,
+    /// Runs before a holder's master is looked up in a preparation (tests: no permit is held).
+    #[cfg(test)]
+    master_lookup_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
+
+/// A source of "now" for the batch of overdue PoS checks.
+pub(crate) type BatchClock = Arc<dyn Fn() -> std::time::Instant + Send + Sync>;
 
 impl Scheduler {
     /// Create a new Scheduler.
@@ -171,7 +180,16 @@ impl Scheduler {
             issue_seq: std::sync::atomic::AtomicU64::new(0),
             mem_deferred_at: std::sync::Mutex::new(HashMap::new()),
             load_failed: Arc::default(),
+            batch_clock: Arc::new(std::time::Instant::now),
+            #[cfg(test)]
+            master_lookup_hook: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Replace the clock of the batch of overdue PoS checks (tests).
+    #[cfg(test)]
+    pub(crate) fn set_batch_clock(&mut self, clock: BatchClock) {
+        self.batch_clock = clock;
     }
 
     /// Set the block work memory budget the PoS preparations share with the worker and restore

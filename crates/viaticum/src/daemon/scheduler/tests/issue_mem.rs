@@ -1,9 +1,9 @@
 // R1-d-b (backup-i24, pos-i13, pos-i7-d-c, pos-i7-d-d): the PoS issue tick under the block work
 // memory budget. A preparation takes its permit itself by `try_acquire` and gives it back before
-// anything is published; a busy budget defers the block, and from the NEXT tick the block waits
-// for memory as an overdue preparation (by tick number, not by clock); overdue preparations run
-// one at a time and do not count in K; a block whose sources cannot be read never waits; a load
-// that hangs gives its memory back (variant (a)).
+// anything is published; a busy budget marks the block, and from the NEXT tick the marked blocks
+// are prepared by one batch (by tick number, not by clock) that does not count in K; a load that
+// hangs gives its memory back (variant (a)). The batch itself — one permit, the members one after
+// the other, its limits — is in `issue_batch`.
 //
 // Every test runs the REAL tick (`issue_tick`) on a real owner; the run loop's part — settling
 // what ends — is driven by hand, as in `issue_prepare`.
@@ -30,21 +30,21 @@ use crate::daemon::mem_budget::{
 };
 use crate::daemon::scheduler::issue::{Ended, InFlight, PrepOutcome, load_failed_until};
 
-const MIB: u64 = 1 << 20;
+pub(super) const MIB: u64 = 1 << 20;
 /// The permit of a PoS preparation of a test block (`k·t` = 640 B): one MiB, the estimate's floor.
-fn permit_of_test_block() -> u64 {
+pub(super) fn permit_of_test_block() -> u64 {
     estimate_pos_issue(TEST_K, TEST_T)
 }
 
 /// The budget of these tests: generous, so only what a test holds makes it busy.
-const TOTAL_MIB: u64 = 100;
+pub(super) const TOTAL_MIB: u64 = 100;
 
 /// The block `seed_due` makes at index `b`.
-fn block_at(b: u8) -> SourceBlockId {
+pub(super) fn block_at(b: u8) -> SourceBlockId {
     SourceBlockId(*blake3::hash(&pos_block_bytes(b)).as_bytes())
 }
 
-fn capture() -> (LogBuf, tracing::Dispatch) {
+pub(super) fn capture() -> (LogBuf, tracing::Dispatch) {
     let buf = LogBuf::default();
     let writer = buf.clone();
     let dispatch = tracing::Dispatch::new(
@@ -58,13 +58,13 @@ fn capture() -> (LogBuf, tracing::Dispatch) {
 }
 
 /// Run `body` with its log captured.
-async fn logged<F: Future<Output = ()>>(body: F) -> LogBuf {
+pub(super) async fn logged<F: Future<Output = ()>>(body: F) -> LogBuf {
     let (buf, dispatch) = capture();
     body.with_subscriber(dispatch).await;
     buf
 }
 
-fn tick_lines(buf: &LogBuf) -> Vec<String> {
+pub(super) fn tick_lines(buf: &LogBuf) -> Vec<String> {
     buf.text()
         .lines()
         .filter(|l| l.contains("scheduler: PoS issue tick"))
@@ -73,10 +73,24 @@ fn tick_lines(buf: &LogBuf) -> Vec<String> {
 }
 
 /// An owner with `blocks` × `holders` due placements, sharing the returned budget.
-fn budgeted(blocks: u8, holders: u8, encoder: Arc<dyn ErasureEncoder>) -> (Owner, Arc<MemBudget>) {
+pub(super) fn budgeted(
+    blocks: u8,
+    holders: u8,
+    encoder: Arc<dyn ErasureEncoder>,
+) -> (Owner, Arc<MemBudget>) {
+    budgeted_at(900, blocks, holders, encoder)
+}
+
+/// `budgeted` at `time_scale` (the period of the tick is 3600 / `time_scale` s).
+pub(super) fn budgeted_at(
+    time_scale: u64,
+    blocks: u8,
+    holders: u8,
+    encoder: Arc<dyn ErasureEncoder>,
+) -> (Owner, Arc<MemBudget>) {
     let budget = MemBudget::new(TOTAL_MIB * MIB);
     let mut owner = owner_with_encoder(
-        900,
+        time_scale,
         SlowPostman::acking_after(Duration::from_millis(5)),
         encoder,
         |db, dir| seed_due(db, dir, blocks, holders),
@@ -86,7 +100,7 @@ fn budgeted(blocks: u8, holders: u8, encoder: Arc<dyn ErasureEncoder>) -> (Owner
 }
 
 /// Take the whole budget: a busy worker.
-fn hold_all(budget: &Arc<MemBudget>) -> MemPermit {
+pub(super) fn hold_all(budget: &Arc<MemBudget>) -> MemPermit {
     budget
         .try_acquire(
             HolderKind::Worker,
@@ -96,12 +110,12 @@ fn hold_all(budget: &Arc<MemBudget>) -> MemPermit {
         .expect("a free budget")
 }
 
-async fn tick(owner: &Owner, in_flight: &mut InFlight) {
+pub(super) async fn tick(owner: &Owner, in_flight: &mut InFlight) {
     owner.scheduler.issue_tick(in_flight).await.expect("tick");
 }
 
 /// The run loop's settling: whatever ends within `cap`, until nothing is in flight.
-async fn settle_until_idle(owner: &Owner, in_flight: &mut InFlight, cap: Duration) {
+pub(super) async fn settle_until_idle(owner: &Owner, in_flight: &mut InFlight, cap: Duration) {
     let until = Instant::now() + cap;
     while let Ok(Some(ended)) = tokio::time::timeout_at(until, in_flight.join_next_any()).await {
         owner.scheduler.settle_ended(ended, in_flight).await;
@@ -109,7 +123,7 @@ async fn settle_until_idle(owner: &Owner, in_flight: &mut InFlight, cap: Duratio
 }
 
 /// Wait (with a deadline) until `cond` holds.
-async fn until(what: &str, mut cond: impl FnMut() -> bool) {
+pub(super) async fn until(what: &str, mut cond: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !cond() {
         assert!(std::time::Instant::now() < deadline, "timed out: {what}");
@@ -117,11 +131,11 @@ async fn until(what: &str, mut cond: impl FnMut() -> bool) {
     }
 }
 
-fn pending_len(owner: &Owner) -> usize {
+pub(super) fn pending_len(owner: &Owner) -> usize {
     owner.pending.try_lock().map(|g| g.len()).unwrap_or(0)
 }
 
-fn deferred_tick_of(owner: &Owner, block: &SourceBlockId) -> Option<u64> {
+pub(super) fn deferred_tick_of(owner: &Owner, block: &SourceBlockId) -> Option<u64> {
     owner
         .scheduler
         .mem_deferred_at
@@ -208,7 +222,7 @@ async fn pos_deferral_is_capped_at_one_issuance_tick() {
         assert_eq!(
             in_flight.preparing.waiting(),
             1,
-            "waiting from the next tick"
+            "waiting from the next tick, as a batch"
         );
         until("the overdue block queues for memory", || {
             budget.priority_waiters(PriorityKind::OverduePos) == 1
@@ -227,7 +241,10 @@ async fn pos_deferral_is_capped_at_one_issuance_tick() {
 
     assert_eq!(pending_len(&owner), 2, "both holders challenged");
     let text = buf.text();
-    assert!(text.contains("pos: overdue, waiting for memory"), "{text}");
+    assert!(
+        text.contains("pos: overdue batch waiting for memory"),
+        "{text}"
+    );
     assert!(
         text.contains("mem_budget: granted kind=pos"),
         "the overdue block holds a pos permit: {text}"
@@ -308,7 +325,12 @@ async fn waiting_for_memory_preparations_do_not_take_k_slots() {
     .await;
 
     let second = &tick_lines(&buf)[1];
-    assert_eq!(field(second, "waiting_mem"), Some(2), "{second}");
+    assert_eq!(
+        field(second, "waiting_mem"),
+        Some(1),
+        "A and B wait as one batch: {second}"
+    );
+    assert_eq!(field(second, "batch"), Some(2), "{second}");
     assert_eq!(in_flight.preparing.tick_started(), 0, "waiting is not K");
     assert_eq!(
         field(second, "blocks"),
@@ -320,20 +342,21 @@ async fn waiting_for_memory_preparations_do_not_take_k_slots() {
     drop(hold);
 }
 
-/// MAX_OVERDUE_RUNNING = 1: three overdue blocks whose preparation takes 0.5 s each, all
-/// granted memory at once (the budget is free again) — they run one after the other.
+/// Three marked blocks whose preparation takes 0.5 s each, all granted memory at once (the budget
+/// is free again): ONE batch, one after the other — never two preparations at once.
 #[tokio::test]
-async fn at_most_one_overdue_preparation_runs() {
+async fn a_batch_prepares_its_members_one_after_the_other() {
     let encoder = StallingEncoder::new(0, usize::MAX, Duration::from_millis(500));
     let (owner, budget) = budgeted(3, 1, Arc::clone(&encoder) as _);
     let hold = hold_all(&budget);
     let mut in_flight = InFlight::default();
 
-    tick(&owner, &mut in_flight).await; // deferred: the encoder was not reached
+    tick(&owner, &mut in_flight).await; // marked: the encoder was not reached
     assert_eq!(encoder.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     drop(hold);
-    tick(&owner, &mut in_flight).await; // all three adopted
-    assert_eq!(in_flight.preparing.waiting(), 3);
+    tick(&owner, &mut in_flight).await; // all three in one batch
+    assert_eq!(in_flight.preparing.waiting(), 1);
+    assert_eq!(in_flight.preparing.batch_members(), 3);
     settle_until_idle(&owner, &mut in_flight, Duration::from_secs(20)).await;
 
     assert_eq!(pending_len(&owner), 3, "all three issued");
@@ -398,18 +421,23 @@ async fn memory_deferred_block_does_not_stop_the_tick() {
     assert_eq!(deferred_tick_of(&owner, &small), None);
 }
 
-fn sized_blob(seed: u8, t: u16) -> Vec<u8> {
+pub(super) fn sized_blob(seed: u8, t: u16) -> Vec<u8> {
     (0..TEST_K as usize * t as usize)
         .map(|i| ((i + seed as usize) & 0xFF) as u8)
         .collect()
 }
 
-fn sized_block_id(seed: u8, t: u16) -> SourceBlockId {
+pub(super) fn sized_block_id(seed: u8, t: u16) -> SourceBlockId {
     SourceBlockId(*blake3::hash(&sized_blob(seed, t)).as_bytes())
 }
 
 /// A retained block of `k·t` bytes with symbol size `t`, and its record.
-fn seed_sized_block(dir: &std::path::Path, db: &viaticum_core::db::Db, seed: u8, t: u16) {
+pub(super) fn seed_sized_block(
+    dir: &std::path::Path,
+    db: &viaticum_core::db::Db,
+    seed: u8,
+    t: u16,
+) {
     let blob = sized_blob(seed, t);
     let id = SourceBlockId(*blake3::hash(&blob).as_bytes());
     crate::daemon::system_state::block::store_retained_block(dir, &id, &blob).unwrap();
@@ -477,54 +505,6 @@ async fn cut_preparation_holds_permit_until_it_ends() {
     settle_until_idle(&owner, &mut in_flight, Duration::from_secs(10)).await;
     assert_eq!(budget.outstanding_bytes(), 0, "given back at its end");
     assert_eq!(pending_len(&owner), 2);
-}
-
-// ─── Sources that cannot be read never wait ───────────────────────────────────
-
-/// A block with a record and no source (no retained blob, no file on any path), deferred by a
-/// busy budget: the overdue wrapper judges its sources by `metadata` BEFORE it waits — it ends
-/// `Unserved`, never queues for memory, the worker never yields for it, and nothing stays
-/// marked.
-#[tokio::test]
-async fn overdue_wrapper_prechecks_sources_before_waiting() {
-    let (owner, budget) = budgeted(0, 0, make_test_encoder());
-    let doomed = SourceBlockId([0x56; 32]);
-    owner
-        .db
-        .upsert_source_block(&make_source_block_record(doomed))
-        .unwrap();
-    owner
-        .db
-        .upsert_placement(&make_placement(doomed, make_identity(0x80)))
-        .unwrap();
-    let hold = hold_all(&budget);
-    let mut in_flight = InFlight::default();
-
-    let buf = logged(async {
-        tick(&owner, &mut in_flight).await; // tick 1: the budget is busy, the block is deferred
-        assert_eq!(deferred_tick_of(&owner, &doomed), Some(1));
-        tick(&owner, &mut in_flight).await; // tick 2: adopted as overdue
-        assert_eq!(in_flight.preparing.waiting(), 1, "adopted");
-        settle_until_idle(&owner, &mut in_flight, Duration::from_secs(5)).await;
-    })
-    .await;
-
-    assert_eq!(budget.priority_waiters(PriorityKind::OverduePos), 0);
-    assert_eq!(budget.queued_waiters(), 0);
-    assert_eq!(budget.grants(), 1, "no permit but the hold");
-    let text = buf.text();
-    assert!(!text.contains("pos: overdue, waiting for memory"), "{text}");
-    assert!(
-        text.contains("cannot load source block for PoS hash"),
-        "its failure is logged like a load failure (backup-i7): {text}"
-    );
-    assert_eq!(in_flight.preparing.waiting(), 0);
-    assert_eq!(
-        deferred_tick_of(&owner, &doomed),
-        None,
-        "the episode is closed"
-    );
-    drop(hold);
 }
 
 // ─── load_failed (backup-i7, NOTE 7) ──────────────────────────────────────────
@@ -646,8 +626,8 @@ async fn overdue_waiter_is_cancelled_on_shutdown_and_priority_counter_drops() {
 }
 
 /// The tick line carries `deferred_mem` for the blocks the budget deferred in this tick,
-/// `waiting_mem` for the overdue ones waiting, and `oldest_wait_s`; `preparing` counts only
-/// the running ones.
+/// `waiting_mem` for the batch waiting (at most one), `batch` for its members, `marked` for the
+/// marks, and `oldest_wait_s`; `preparing` counts only the running ones.
 #[tokio::test]
 async fn tick_line_counts_deferred_mem_and_waiting_mem() {
     let (owner, budget) = budgeted(2, 3, make_test_encoder());
@@ -668,7 +648,13 @@ async fn tick_line_counts_deferred_mem_and_waiting_mem() {
         "2 blocks x 3 holders: {first}"
     );
     assert_eq!(field(first, "waiting_mem"), Some(0), "{first}");
-    assert_eq!(field(second, "waiting_mem"), Some(2), "{second}");
+    assert_eq!(
+        field(second, "waiting_mem"),
+        Some(1),
+        "one batch for both blocks: {second}"
+    );
+    assert_eq!(field(second, "batch"), Some(2), "{second}");
+    assert_eq!(field(second, "marked"), Some(2), "{second}");
     assert_eq!(field(second, "deferred_mem"), Some(0), "{second}");
     assert_eq!(
         field(second, "preparing"),
@@ -735,6 +721,7 @@ async fn stuck_warn_counts_from_grant_not_from_wait() {
             Instant::now(),
             Duration::from_millis(50),
             10,
+            Duration::ZERO,
             &budget,
             false,
         );
@@ -765,6 +752,7 @@ async fn stuck_warn_counts_run_time_not_memory_wait() {
             Instant::now(),
             Duration::from_millis(50),
             10,
+            Duration::ZERO,
             &budget,
             true,
         );
@@ -793,20 +781,20 @@ async fn stuck_warn_counts_run_time_not_memory_wait() {
 // ─── pos-i7-d-d (variant (a)): a hung load gives its memory back ─────────────
 
 /// Unblocks a FIFO a preparation hangs on; also when the test fails before it did.
-struct Unblock {
+pub(super) struct Unblock {
     path: std::path::PathBuf,
     done: std::cell::Cell<bool>,
 }
 
 impl Unblock {
-    fn new(path: std::path::PathBuf) -> Self {
+    pub(super) fn new(path: std::path::PathBuf) -> Self {
         Unblock {
             path,
             done: std::cell::Cell::new(false),
         }
     }
 
-    fn now(&self) {
+    pub(super) fn now(&self) {
         use std::os::unix::fs::OpenOptionsExt;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
@@ -861,9 +849,14 @@ async fn stuck_load_is_written_off_after_h_and_budget_serves_others() {
 
         // Ten periods of work later.
         let later = Instant::now() + Duration::from_secs(11);
-        in_flight
-            .preparing
-            .watch_stuck(later, Duration::from_secs(1), 10, &budget, true);
+        in_flight.preparing.watch_stuck(
+            later,
+            Duration::from_secs(1),
+            10,
+            Duration::ZERO,
+            &budget,
+            true,
+        );
         assert_eq!(budget.outstanding_bytes(), 0, "written off");
         assert_eq!(budget.semaphore_free_bytes(), budget.total_bytes());
 
@@ -876,9 +869,14 @@ async fn stuck_load_is_written_off_after_h_and_budget_serves_others() {
             )
             .expect("the written-off bytes are free");
         // The same stuck holder is not written off again.
-        in_flight
-            .preparing
-            .watch_stuck(later, Duration::from_secs(1), 10, &budget, true);
+        in_flight.preparing.watch_stuck(
+            later,
+            Duration::from_secs(1),
+            10,
+            Duration::ZERO,
+            &budget,
+            true,
+        );
         assert_eq!(budget.outstanding_bytes(), TOTAL_MIB * MIB);
 
         // The read returns (an empty blob: not the block). The task ends; it returns nothing.
@@ -930,6 +928,7 @@ async fn stuck_load_is_only_named_when_write_off_is_off() {
             Instant::now() + Duration::from_secs(11),
             Duration::from_secs(1),
             10,
+            Duration::ZERO,
             &budget,
             false,
         );
