@@ -359,6 +359,10 @@ write_config() {
             echo "source_block_size_mb = $PACK_MB_0"
             echo '[[watch]]'
             echo "path = \"$FILES\""
+            # PHASE b: a *.bin file is class Unknown (importance 0.05, target reliability 0.708,
+            # R = 4/3 over 4 holders). The spec's dials assume R = 4 (a holder carries about k
+            # symbols; v3.3, v3.11 §1): the multiplier 20 lifts importance to 1.0 (target 0.99999).
+            run_b && echo 'importance_multiplier = 20.0'
             echo '[[watch]]'
             echo "path = \"$BULK\""
             echo 'importance_multiplier = 0.0'   # importance 0 -> reliability target 0.5
@@ -789,7 +793,7 @@ step3c() {
         Lh=$(log_line_count "$h"); L0=$(log_line_count 0); t0=$(now_f)
         end_t=$(( $(date +%s) + 120 ))
         while [ "$(date +%s)" -lt "$end_t" ]; do
-            found=$(tail -n +$((Lh + 1)) "$(node_log "$h")" | grep -aF "responding with chain hash" | grep -aF -m1 "block_id=$NB" || true)
+            found=$(tail -n +$((Lh + 1)) "$(node_log "$h")" | sed 's/\x1b\[[0-9;]*m//g' | grep -aF "responding with chain hash" | grep -aF -m1 "block_id=$NB" || true)
             [ -n "$found" ] && break
             sleep 0.2
         done
