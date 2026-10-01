@@ -412,7 +412,11 @@ impl DaemonHandle {
         // restore-i14: every job dir in staging is a known job before the web API
         // answers `--status <id>`; leftover temp files of jobs the previous run did
         // not finish are removed (nothing runs yet, restore-i24).
-        let restore_jobs = crate::daemon::restore::jobs::RestoreJobs::new(staging_root.clone());
+        // The notifier of the backup worker's restore gate (Q-V9 (a), spec v3.12b): the registry of
+        // jobs and the DR's session on the budget bump it, the gate reads their state.
+        let gate_wake = crate::daemon::work_pipeline::new_gate_wake();
+        let restore_jobs = crate::daemon::restore::jobs::RestoreJobs::new(staging_root.clone())
+            .with_gate_wake(Arc::clone(&gate_wake));
         let seeded = restore_jobs.seed_from_staging();
         if seeded > 0 {
             tracing::info!(jobs = seeded, "restore: job dirs registered from staging");
@@ -565,11 +569,12 @@ impl DaemonHandle {
                 &machine_lock_dir,
                 &machine_lock_record,
             );
-        let dr_leases = crate::daemon::mem_budget::DrLeases::new(
+        let dr_leases = crate::daemon::mem_budget::DrLeases::with_gate_wake(
             Arc::clone(&mem_budget),
             crate::daemon::mem_budget::lease_ceiling(std::time::Duration::from_secs(
                 crate::daemon::scheduler::scaled_timer_secs(3600, cfg.time_scale.max(1)),
             )),
+            Arc::clone(&gate_wake),
         );
         size_limits.log_start(mem_budget.total_bytes());
         let source_block_size = size_limits.pack_size;
@@ -1093,7 +1098,12 @@ impl DaemonHandle {
                     Some(cluster_state.clone()),
                     work_event_rx,
                 )
-                .with_restore_gate(restore_jobs.running_job_gate());
+                .with_restore_gate({
+                    let (jobs, leases) = (restore_jobs.clone(), Arc::clone(&dr_leases));
+                    crate::daemon::work_pipeline::RestoreGate::new(&gate_wake, move || {
+                        jobs.has_unfinished() || leases.session_active()
+                    })
+                });
                 tasks.push((
                     "work_pipeline",
                     tokio::spawn(async move { worker.run().await }),

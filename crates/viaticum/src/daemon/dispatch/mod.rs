@@ -354,7 +354,12 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         files_too_large: count_too_large_under_watches(state),
         max_file_size_bytes: state.max_file_size_bytes,
         block_work_budget_bytes: state.block_work_budget_bytes,
-        backup_paused_while_restoring: state.restore_jobs.backup_paused(),
+        backup_paused_while_restoring: state.restore_jobs.backup_paused()
+            || (crate::daemon::work_pipeline::RESTORE_PAUSES_BACKUP
+                && state
+                    .dr_leases
+                    .as_ref()
+                    .is_some_and(|leases| leases.session_active())),
         dr_lease: state
             .dr_leases
             .as_ref()

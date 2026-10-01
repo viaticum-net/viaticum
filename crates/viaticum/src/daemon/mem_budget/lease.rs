@@ -40,6 +40,12 @@ pub fn lease_ceiling(period: Duration) -> Duration {
 /// A lease that waits this long is named in the log.
 const SLOW_AFTER: Duration = Duration::from_secs(5);
 
+/// The DR session's window (spec v3.12b WARN-3): the backup worker's gate stays up this long
+/// (REAL time) after the last lease was given back or dropped, so that the pauses between two SS
+/// blocks (the DR fetches the next one) do not let the worker start. A dropped connection ends
+/// the lease and the window runs out the same way.
+pub(super) const DR_SESSION_LINGER: Duration = Duration::from_secs(30);
+
 /// A revoke the shared write-off counter refused is tried again after this.
 const REVOKE_RETRY: Duration = Duration::from_secs(5);
 
@@ -87,6 +93,10 @@ struct Entry {
 struct Inner {
     next_id: u64,
     leases: HashMap<u64, Entry>,
+    /// Lease requests that wait for the budget now (they are part of the DR session).
+    waiting: usize,
+    /// When the session last became idle (no request waiting, no lease held).
+    idle_since: Option<Instant>,
 }
 
 /// The leases a DR holds on this node's budget.
@@ -96,6 +106,25 @@ pub struct DrLeases {
     ceiling: Duration,
     keepalive: Duration,
     inner: Mutex<Inner>,
+    /// Wakes the backup worker's loop when the DR session starts or its window runs out.
+    gate_wake: Option<crate::daemon::work_pipeline::GateWake>,
+}
+
+/// A lease request that waits for the budget: counts in the session, and leaves it when it is
+/// dropped without a lease (the DR gave up).
+struct WaitingPin<'a> {
+    leases: &'a Arc<DrLeases>,
+    armed: bool,
+}
+
+impl Drop for WaitingPin<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut inner = self.leases.lock();
+            inner.waiting -= 1;
+            self.leases.note_idle(&mut inner);
+        }
+    }
 }
 
 /// A lease that is held: dropping it gives the bytes back.
@@ -132,12 +161,67 @@ impl DrLeases {
         ceiling: Duration,
         keepalive: Duration,
     ) -> Arc<Self> {
+        Self::build(budget, ceiling, keepalive, None)
+    }
+
+    /// As `new`, and the DR session wakes the backup worker through `wake` (spec v3.12b WARN-3).
+    pub fn with_gate_wake(
+        budget: Arc<MemBudget>,
+        ceiling: Duration,
+        wake: crate::daemon::work_pipeline::GateWake,
+    ) -> Arc<Self> {
+        Self::build(budget, ceiling, DEFAULT_KEEPALIVE, Some(wake))
+    }
+
+    fn build(
+        budget: Arc<MemBudget>,
+        ceiling: Duration,
+        keepalive: Duration,
+        gate_wake: Option<crate::daemon::work_pipeline::GateWake>,
+    ) -> Arc<Self> {
         Arc::new(DrLeases {
             budget,
             ceiling,
             keepalive,
             inner: Mutex::new(Inner::default()),
+            gate_wake,
         })
+    }
+
+    fn wake_gate(&self) {
+        if let Some(wake) = &self.gate_wake {
+            crate::daemon::work_pipeline::notify_gate(wake);
+        }
+    }
+
+    /// Whether a DR session is on (spec v3.12b WARN-3): from the first lease request until
+    /// `DR_SESSION_LINGER` after the last lease was given back or dropped. Computed from the
+    /// state and the clock at every call (the backup worker's gate reads it).
+    pub fn session_active(&self) -> bool {
+        let inner = self.lock();
+        inner.waiting > 0
+            || !inner.leases.is_empty()
+            || inner
+                .idle_since
+                .is_some_and(|t| t.elapsed() < DR_SESSION_LINGER)
+    }
+
+    /// The session may have just become idle: start its window and make the worker look again
+    /// when the window runs out. Called under the lock after a request or a lease went.
+    fn note_idle(&self, inner: &mut Inner) {
+        if inner.waiting > 0 || !inner.leases.is_empty() {
+            return;
+        }
+        inner.idle_since = Some(Instant::now());
+        if let (Some(wake), Ok(rt)) = (
+            self.gate_wake.clone(),
+            tokio::runtime::Handle::try_current(),
+        ) {
+            rt.spawn(async move {
+                tokio::time::sleep(DR_SESSION_LINGER + Duration::from_millis(50)).await;
+                crate::daemon::work_pipeline::notify_gate(&wake);
+            });
+        }
     }
 
     pub fn keepalive(&self) -> Duration {
@@ -165,6 +249,13 @@ impl DrLeases {
         encrypted_size: u64,
     ) -> Result<LeaseGuard, LeaseError> {
         let need = Self::need_for(encrypted_size)?;
+        // The session starts with the first request (the DR is here: restore first).
+        self.lock().waiting += 1;
+        self.wake_gate();
+        let mut pin = WaitingPin {
+            leases: self,
+            armed: true,
+        };
         let mut permit = self
             .budget
             .acquire_dr_lease(&block, need, SLOW_AFTER, || {
@@ -177,6 +268,9 @@ impl DrLeases {
             .await;
         let handle = permit.write_off_handle();
         let mut inner = self.lock();
+        // The request becomes a lease in one step under the lock: the session never blinks.
+        inner.waiting -= 1;
+        pin.armed = false;
         inner.next_id += 1;
         let id = inner.next_id;
         let me = Arc::clone(self);
@@ -200,7 +294,14 @@ impl DrLeases {
 
     /// Give a lease back. A lease the ceiling took back answers `Revoked` (once).
     pub fn release(&self, id: u64) -> ReleaseOutcome {
-        let entry = self.lock().leases.remove(&id);
+        let entry = {
+            let mut inner = self.lock();
+            let entry = inner.leases.remove(&id);
+            if entry.is_some() {
+                self.note_idle(&mut inner);
+            }
+            entry
+        };
         match entry {
             None => ReleaseOutcome::Unknown,
             Some(entry) => {

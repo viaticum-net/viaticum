@@ -1290,11 +1290,19 @@ impl Processor {
             });
         }
 
-        let offer_bytes: u64 = offer
-            .esi_ranges
-            .iter()
-            .map(|&(_start, count)| count as u64 * SYMBOL_SIZE as u64)
-            .sum();
+        // NOTE 3 (spec v3.12b, [cross:A]): the quota is asked for what is NEW here — the offer's
+        // ESIs this node does not hold yet for (owner, block). The owner re-offers the whole
+        // range of the placement after a yield; what the holder already stores is in
+        // `held_bytes` of the snapshot and is not counted twice. The offer itself keeps its
+        // meaning (the whole range); a DB error reads as "nothing held" (the stricter side).
+        let held_esis: Vec<(u32, u32)> = self
+            .db
+            .get_holding(&offer.source_block_id, &owner_id)
+            .ok()
+            .flatten()
+            .map(|h| h.esi_ranges)
+            .unwrap_or_default();
+        let offer_bytes: u64 = unheld_esi_count(&offer.esi_ranges, &held_esis) * SYMBOL_SIZE as u64;
 
         let snap = match self.offer_snapshot() {
             Ok(v) => v,
@@ -1421,4 +1429,38 @@ impl Processor {
             .await;
         Ok(())
     }
+}
+
+/// How many ESIs of `offer` are not in `held` (both lists of `(start, count)`; overlaps and
+/// order do not matter).
+pub(crate) fn unheld_esi_count(offer: &[(u32, u32)], held: &[(u32, u32)]) -> u64 {
+    fn merged(ranges: &[(u32, u32)]) -> Vec<(u64, u64)> {
+        let mut v: Vec<(u64, u64)> = ranges
+            .iter()
+            .filter(|&&(_, c)| c > 0)
+            .map(|&(s, c)| (u64::from(s), u64::from(s) + u64::from(c)))
+            .collect();
+        v.sort_unstable();
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        for (s, e) in v {
+            match out.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => out.push((s, e)),
+            }
+        }
+        out
+    }
+    let held = merged(held);
+    let mut total = 0u64;
+    for (start, end) in merged(offer) {
+        let mut covered = 0u64;
+        for &(hs, he) in &held {
+            let (lo, hi) = (start.max(hs), end.min(he));
+            if lo < hi {
+                covered += hi - lo;
+            }
+        }
+        total += (end - start) - covered;
+    }
+    total
 }

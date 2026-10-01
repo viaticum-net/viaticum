@@ -257,3 +257,86 @@ async fn budget_lease_that_is_dropped_while_waiting_leaves_the_queue() {
     drop(held);
     assert_eq!(budget.outstanding_bytes(), 0);
 }
+
+/// M97 (v3.12b WARN-3, Q-V9 (a)). A DR session on this node's budget raises the backup worker's
+/// gate: from the first lease request (even one that still waits for the memory) until 30 s of
+/// REAL time after the last lease was given back or dropped — the pause between two SS blocks
+/// does not let the worker start. The clock is the runtime's, paused here. The wake fires when the
+/// window runs out. Without the session in the gate (a lease that raises nothing) the first
+/// assertion after the request fails.
+#[tokio::test(start_paused = true)]
+async fn dr_lease_session_pauses_the_worker_and_releases_it_30s_after_the_last_lease() {
+    use crate::daemon::work_pipeline::{RestoreGate, new_gate_wake};
+
+    let wake = new_gate_wake();
+    let need = need_of(SS_SIZE);
+    let budget = MemBudget::new(need + MIB);
+    let leases = DrLeases::with_gate_wake(
+        Arc::clone(&budget),
+        Duration::from_secs(3600),
+        Arc::clone(&wake),
+    );
+    let gate = {
+        let leases = Arc::clone(&leases);
+        RestoreGate::new(&wake, move || leases.session_active())
+    };
+    let mut woken = wake.subscribe();
+    let linger = Duration::from_secs(30);
+    assert!(!gate.is_up(), "no DR: the gate is down");
+
+    // A request that waits for the memory is already the session.
+    let held = budget
+        .try_acquire(HolderKind::Pos, &block(1), 2 * MIB)
+        .unwrap();
+    let waiting = Arc::clone(&leases);
+    let task = tokio::spawn(async move { waiting.lease(block(2), SS_SIZE).await });
+    until("the lease queues", || {
+        budget.priority_waiters(PriorityKind::Restore) == 1
+    })
+    .await;
+    assert!(gate.is_up(), "the first lease request raises the gate");
+    assert!(woken.has_changed().unwrap(), "and wakes the worker");
+    drop(held);
+    let first = task.await.unwrap().expect("granted");
+    assert!(gate.is_up());
+
+    // The lease is given back: the window keeps the gate up for 30 s.
+    drop(first);
+    tokio::time::advance(linger - Duration::from_secs(1)).await;
+    assert!(gate.is_up(), "29 s after the last lease: still up");
+    // The DR fetches the next SS block and leases again: one session, the window starts afresh.
+    let second = leases.lease(block(3), SS_SIZE).await.unwrap();
+    tokio::time::advance(Duration::from_secs(120)).await;
+    assert!(gate.is_up(), "a lease held for minutes keeps the gate up");
+    drop(second);
+    woken.borrow_and_update();
+    tokio::time::advance(linger - Duration::from_secs(1)).await;
+    assert!(gate.is_up(), "29 s after the last lease: up");
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(!gate.is_up(), "30 s after the last lease: down");
+    // Let the timer of the window run: it wakes the worker.
+    tokio::task::yield_now().await;
+    assert!(
+        woken.has_changed().unwrap(),
+        "the worker is woken when the window runs out"
+    );
+
+    // A DR that gives up while its request waits leaves the session the same way.
+    let held = budget
+        .try_acquire(HolderKind::Pos, &block(1), 2 * MIB)
+        .unwrap();
+    let waiting = Arc::clone(&leases);
+    let task = tokio::spawn(async move { waiting.lease(block(4), SS_SIZE).await });
+    until("the lease queues again", || {
+        budget.priority_waiters(PriorityKind::Restore) == 1
+    })
+    .await;
+    assert!(gate.is_up());
+    task.abort();
+    let _ = task.await;
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert!(gate.is_up(), "a dropped request: the window runs");
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(!gate.is_up());
+    drop(held);
+}
