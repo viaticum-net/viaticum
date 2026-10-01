@@ -199,7 +199,7 @@ if run_b; then
         "work_pipeline: yielding memory to overdue PoS" "work_pipeline: yielding memory to restore"
         "work_pipeline: symbols confirmed stored, placement Offered→Alive"
         "work_pipeline: iteration complete"
-        "work_pipeline: paused while a restore job runs"
+        "work_pipeline: paused while a restore job runs or a DR session leases memory"
         "restore: waiting for memory budget" "restore: regrant for plaintext"
         "processor: PosHashChallenge — responding with chain hash"
         "processor: sending RestoreResponse"
@@ -808,8 +808,8 @@ step3b_judge() {
         END { for (i = 1; i < ny; i++) { ok = 0; for (j = 1; j <= np; j++) if (p[j] > y[i] && p[j] <= y[i + 1]) ok = 1; if (!ok) printf "%.1f-%.1f ", y[i], y[i + 1] } }')
     if [ -n "$gap_bad" ]; then fail "3b: no stored chunk (new ESIs) and no failed-offer WARN between two yields of the worker for B2 (backup-i24-a): $gap_bad"
     else pass "3b: $nys yield(s) for B2; every gap between two yields has a stored chunk with new ESIs or a failed-offer WARN"; fi
-    local paused; paused=$(clog 0 "$F" | grep -aF "work_pipeline: paused while a restore job runs" | head -3 | cut -c1-30 | tr '\n' ' ')
-    note "3b: INFO 'paused while a restore job runs' (once per job, Q-V9 (a)): ${paused:-none}; worker grants during the restore job: $(ev 0 "$F" "mem_budget: granted" kind block | awk -v a="$RST_T0" -v b="$RST_TEND" '$3 == "worker" && $1 >= a && $1 <= b' | wc -l)"
+    local paused; paused=$(clog 0 "$F" | grep -aF "work_pipeline: paused while a restore job runs or a DR session leases memory" | head -3 | cut -c1-30 | tr '\n' ' ')
+    note "3b: INFO paused-while-restore line (once per pause, Q-V9 (a)): ${paused:-none}; worker grants during the restore job: $(ev 0 "$F" "mem_budget: granted" kind block | awk -v a="$RST_T0" -v b="$RST_TEND" '$3 == "worker" && $1 >= a && $1 <= b' | wc -l)"
     # ---- memory
     local bar_kib=$((2656 * 1024))
     if [ -z "$S3B_HWMD" ]; then fail "3b: cannot read VmHWM of node-00"
