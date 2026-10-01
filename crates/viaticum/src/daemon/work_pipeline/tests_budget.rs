@@ -274,6 +274,10 @@ struct Hooks {
     reject_offers: Option<Arc<AtomicBool>>,
     /// Answer a SymbolTransfer with a bare `Ack` instead of `SymbolStored`.
     ack_transfers: bool,
+    /// Answer with `SymbolStored` naming THIS block instead of the transferred one (M101).
+    stored_names_block: Option<SourceBlockId>,
+    /// Answer with a `SymbolStored` whose range is far wider than the chunk (M101).
+    stored_wide: bool,
 }
 
 struct Net {
@@ -364,8 +368,14 @@ impl Net {
                         } else {
                             Message::SymbolStored(SymbolStoredMsg {
                                 v: 1,
-                                source_block_id: transfer.source_block_id,
-                                esi_ranges: transfer.symbols.iter().map(|s| (s.esi, 1)).collect(),
+                                source_block_id: hooks
+                                    .stored_names_block
+                                    .unwrap_or(transfer.source_block_id),
+                                esi_ranges: if hooks.stored_wide {
+                                    vec![(0, 100_000)]
+                                } else {
+                                    transfer.symbols.iter().map(|s| (s.esi, 1)).collect()
+                                },
                                 timestamp: Timestamp::now(),
                             })
                         }
@@ -401,6 +411,8 @@ struct Rig {
     config: WorkPipelineConfig,
     /// What the pipeline keeps between the turns of one block (`last_attempt`, RAM only).
     last_attempt: tokio::sync::Mutex<worker::TurnMemory>,
+    /// The restore gate the turns see (spec v3.12b); `None`: no gate.
+    gate: Option<super::RestoreGate>,
 }
 
 impl Rig {
@@ -417,6 +429,7 @@ impl Rig {
             budget,
             config,
             last_attempt: tokio::sync::Mutex::new(worker::TurnMemory::default()),
+            gate: None,
         }
     }
 
@@ -444,6 +457,7 @@ impl Rig {
                 pool,
                 yields_before,
                 &mut last_attempt,
+                self.gate.as_ref(),
             ),
         )
         .await
@@ -690,6 +704,7 @@ async fn worker_waits_for_the_budget_before_reading_the_source() {
                 &pool,
                 0,
                 &mut worker::TurnMemory::default(),
+                None,
             )
             .await
         })
@@ -1047,6 +1062,7 @@ async fn worker_does_not_yield_to_a_waiter_granted_by_its_shrink() {
                 &pool,
                 0,
                 &mut worker::TurnMemory::default(),
+                None,
             )
             .await
         })
@@ -1099,6 +1115,7 @@ async fn worker_turn_yields_only_after_its_first_attempt_or_holder() {
             holders_started,
             attempts,
             restore_at_chunk: false,
+            gate: None,
         }
     }
     let budget = MemBudget::new(100 * MIB);
@@ -1816,6 +1833,7 @@ async fn worker_wait_logs_once_after_slow_after() {
                 &pool,
                 0,
                 &mut worker::TurnMemory::default(),
+                None,
             )
             .await
         })
@@ -2320,6 +2338,7 @@ async fn turn_yields_to_restore_at_a_chunk_only_when_built_for_it() {
             holders_started: 1,
             attempts,
             restore_at_chunk,
+            gate: None,
         }
     }
     let budget = MemBudget::new(100 * MIB);
@@ -2390,6 +2409,7 @@ async fn delivery_memory_is_dropped_on_park_and_when_the_holder_leaves_the_plan(
         &pool_of(&[p, other]),
         0,
         &mut memory,
+        None,
     )
     .await;
     assert!(
@@ -2453,15 +2473,204 @@ async fn delivery_memory_of_a_block_that_left_service_is_dropped() {
     assert!(pipeline.last_attempt.contains_key(&kept) && pipeline.yields.contains_key(&kept));
 }
 
-// ─── Q-V9 (a): the worker does not start while a restore job runs (M92) ───────────────────────
+// ─── The restore gate (К-b2a⁗, spec v3.12b WARN-1..3, Q-V9 (a)) ───────────────────────────────
 
-/// M92 (v3.12a). With a restore job running the worker starts no iteration — nothing is picked,
-/// the block keeps no cooldown — and says so ONCE per job; a second job gets its own line; when
-/// the job ends the next iteration works. With `restore_pauses_backup = false` it does not wait.
+/// A gate the test raises and lowers by hand; the notifier is returned too (a gate whose
+/// notifier is dropped closes the wake of a running loop).
+fn flag_gate() -> (Arc<AtomicBool>, super::RestoreGate, super::GateWake) {
+    let wake = super::new_gate_wake();
+    let flag = Arc::new(AtomicBool::new(false));
+    let f = Arc::clone(&flag);
+    let gate = super::RestoreGate::new(&wake, move || f.load(Ordering::SeqCst));
+    (flag, gate, wake)
+}
+
+/// A hook that raises the flag ONCE (a restore job starts at that moment); holders that share the
+/// hook share the shot.
+fn raise_gate(flag: &Arc<AtomicBool>) -> Hook {
+    let (flag, armed) = (Arc::clone(flag), Arc::new(AtomicBool::new(true)));
+    hook(move || {
+        let (flag, armed) = (Arc::clone(&flag), Arc::clone(&armed));
+        async move {
+            if armed.swap(false, Ordering::SeqCst) {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
+    })
+}
+
+/// M94 (v3.12b WARN-1). A restore job starts while the turn delivers, and NO restore waits for
+/// the memory (the budget has no waiter): the turn stops at the next chunk boundary — after the
+/// chunk that was on the wire — not at the end of the holder or of the block. The placements stay
+/// `Offered`; the next turn, with the gate down, sends the rest and encodes only that.
 #[tokio::test]
-async fn worker_does_not_start_while_a_restore_job_runs() {
+async fn job_started_mid_turn_stops_the_turn_at_the_next_chunk_boundary() {
+    let (logs, _guard) = capture_logs();
+    let (flag, gate, _wake) = flag_gate();
+    let mut rig = Rig::new(YIELD_BUDGET_MIB, BIG_CHUNK);
+    rig.gate = Some(gate);
+    let rec = retained(rig.data_dir.path(), 0x35, BIG_K, BIG_T);
+    rig.db.upsert_source_block(&rec).unwrap();
+    let hooks = Hooks {
+        on_first_transfer: Some(raise_gate(&flag)),
+        ..Hooks::default()
+    };
+    let mut net = Net::new(0x69).await;
+    let holders = [
+        net.holder(0x7a, &rig.budget, hooks.clone()).await,
+        net.holder(0x7b, &rig.budget, hooks).await,
+    ];
+    let swarm = net.ready();
+    let devices: Vec<DeviceId> = holders.iter().map(|h| h.device_id).collect();
+    assert_eq!(
+        rig.budget.priority_waiters(PriorityKind::Restore),
+        0,
+        "stand: no restore waits for the memory"
+    );
+
+    let outcome = rig
+        .turn(&plain_encoder(), &swarm, &rec, &pool_of(&devices), 0)
+        .await
+        .unwrap();
+
+    assert!(outcome.yielded, "{outcome:?}");
+    assert_eq!(
+        transfers_total(&holders),
+        1,
+        "one chunk, then the turn stops: not the holder, not the block"
+    );
+    assert_eq!((outcome.acked, outcome.failed), (0, 0));
+    let statuses = placement_statuses(&rig.db, &rec.block_id);
+    assert!(
+        !statuses.is_empty() && statuses.iter().all(|s| *s == PlacementStatus::Offered),
+        "{statuses:?}"
+    );
+    assert_eq!(rig.budget.outstanding_bytes(), 0, "the permit is back");
+    assert!(
+        logs.text()
+            .lines()
+            .any(|l| l.contains("work_pipeline: yielding memory to restore")),
+        "{}",
+        logs.text()
+    );
+
+    // The job is over: the next turn goes on from where it stopped (one re-encode, of the rest).
+    flag.store(false, Ordering::SeqCst);
+    let next = rig
+        .turn(&plain_encoder(), &swarm, &rec, &pool_of(&devices), 1)
+        .await
+        .unwrap();
+    assert!(!next.yielded, "{next:?}");
+    let encoded = encoded_symbols(&logs.text());
+    assert_eq!(encoded.len(), 2, "{encoded:?}");
+    assert!(
+        encoded[1] < encoded[0],
+        "the second turn encodes the rest only: {encoded:?}"
+    );
+}
+
+/// The boundary rule of the turn without a network: with the gate up the turn stops before a next
+/// chunk and before a next holder, never before the first attempt; with the gate down, or not
+/// given, the rule is not there (no restore waits: the budget has none).
+#[tokio::test]
+async fn turn_stops_at_a_boundary_only_while_the_gate_is_up_and_after_an_attempt() {
+    let (flag, gate, _wake) = flag_gate();
+    let budget = MemBudget::new(100 * MIB);
+    let held = budget
+        .try_acquire(HolderKind::Worker, &SourceBlockId([1; 32]), 10 * MIB)
+        .unwrap();
+    fn turn<'a>(
+        budget: &'a MemBudget,
+        permit: &'a MemPermit,
+        attempts: u32,
+        gate: Option<&'a super::RestoreGate>,
+    ) -> Turn<'a> {
+        Turn {
+            budget,
+            permit,
+            chunk_budget_bytes: 1024,
+            holders_started: 1,
+            attempts,
+            restore_at_chunk: false,
+            gate,
+        }
+    }
+    let turn = |attempts, gate| turn(&budget, &held, attempts, gate);
+
+    flag.store(true, Ordering::SeqCst);
+    assert!(!turn(0, Some(&gate)).restore_wants_the_budget_at_a_chunk());
+    assert!(turn(0, Some(&gate)).yield_before_next_holder().is_none());
+    assert!(turn(1, Some(&gate)).restore_wants_the_budget_at_a_chunk());
+    assert!(turn(1, Some(&gate)).yield_before_next_holder().is_some());
+    assert!(!turn(1, None).restore_wants_the_budget_at_a_chunk());
+    assert!(turn(1, None).yield_before_next_holder().is_none());
+    flag.store(false, Ordering::SeqCst);
+    assert!(!turn(1, Some(&gate)).restore_wants_the_budget_at_a_chunk());
+    assert!(turn(1, Some(&gate)).yield_before_next_holder().is_none());
+}
+
+/// M95 (v3.12b WARN-1). A restore job starts while the worker WAITS for its permit: the moment it
+/// is granted the turn gives it back — before the rebuild and the encode. Nothing is encoded,
+/// nothing is offered, no holder is asked, the budget is whole again. Without the check after the
+/// grant the turn rebuilds and encodes the block first.
+#[tokio::test]
+async fn job_started_while_the_worker_waits_for_its_permit_stops_it_before_encoding() {
+    let (flag, gate, _wake) = flag_gate();
+    let mut rig = Rig::new(YIELD_BUDGET_MIB, BIG_CHUNK);
+    rig.gate = Some(gate);
+    let rec = retained(rig.data_dir.path(), 0x36, BIG_K, BIG_T);
+    rig.db.upsert_source_block(&rec).unwrap();
+    let mut net = Net::new(0x6a).await;
+    let holders = [
+        net.holder(0x7c, &rig.budget, Hooks::default()).await,
+        net.holder(0x7d, &rig.budget, Hooks::default()).await,
+    ];
+    let swarm = net.ready();
+    let devices: Vec<DeviceId> = holders.iter().map(|h| h.device_id).collect();
+    let encodes = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&encodes);
+    let encoder = SpyEncoder::spying(move |_| {
+        counted.fetch_add(1, Ordering::SeqCst);
+    });
+    // Everything is taken: the worker waits for its permit.
+    let everything = rig
+        .budget
+        .try_acquire(
+            HolderKind::Pos,
+            &SourceBlockId([1; 32]),
+            YIELD_BUDGET_MIB * MIB,
+        )
+        .unwrap();
+    let budget = Arc::clone(&rig.budget);
+    let driver = async {
+        until("the worker waits for its permit", || {
+            budget.queued_waiters() == 1
+        })
+        .await;
+        // The job starts now; then the memory comes free.
+        flag.store(true, Ordering::SeqCst);
+        drop(everything);
+    };
+
+    let pool = pool_of(&devices);
+    let (outcome, ()) = tokio::join!(rig.turn(&encoder, &swarm, &rec, &pool, 0), driver);
+    let outcome = outcome.unwrap();
+
+    assert!(outcome.yielded && !outcome.encoded, "{outcome:?}");
+    assert_eq!(outcome.offered, 0, "{outcome:?}");
+    assert_eq!(encodes.load(Ordering::SeqCst), 0, "nothing was encoded");
+    assert_eq!(offers_total(&holders), 0, "nobody was asked");
+    assert!(placement_statuses(&rig.db, &rec.block_id).is_empty());
+    assert_eq!(rig.budget.outstanding_bytes(), 0, "the permit is back");
+}
+
+/// M92, rewritten for the computed gate (v3.12b). With the gate up the worker starts no iteration
+/// — nothing is picked, the block keeps no cooldown — and says so ONCE per pause; a second pause
+/// gets its own line; when the gate comes down the next iteration works. With
+/// `restore_pauses_backup = false` the gate is not looked at.
+#[tokio::test]
+async fn worker_does_not_start_while_the_restore_gate_is_up() {
     use super::tests::{add_pool_peers, device_id, lonely_swarm, pipeline_with, retained_block};
-    use crate::daemon::restore::staging::JobId;
 
     let (logs, _guard) = capture_logs();
     let data_dir = tempfile::tempdir().unwrap();
@@ -2472,12 +2681,11 @@ async fn worker_does_not_start_while_a_restore_job_runs() {
     db_a.upsert_source_block(&rec).unwrap();
     let mut config = super::tests::make_config();
     config.data_dir = data_dir.path().to_path_buf();
-    let (tx, rx) = tokio::sync::watch::channel(None::<JobId>);
-    let mut pipeline =
-        pipeline_with(&db_a, config.clone(), Some(lonely_swarm(0x3f).await)).with_restore_gate(rx);
+    let (flag, gate, _wake) = flag_gate();
+    let mut pipeline = pipeline_with(&db_a, config.clone(), Some(lonely_swarm(0x3f).await))
+        .with_restore_gate(gate);
 
-    let job = JobId::new();
-    tx.send_replace(Some(job));
+    flag.store(true, Ordering::SeqCst);
     for _ in 0..3 {
         assert!(
             !pipeline.run_iteration().await.unwrap(),
@@ -2497,30 +2705,28 @@ async fn worker_does_not_start_while_a_restore_job_runs() {
             .filter(|l| l.contains("work_pipeline: paused while a restore job runs"))
             .count()
     };
-    assert_eq!(paused(&text), 1, "once per job:\n{text}");
-    let line = text
-        .lines()
-        .find(|l| l.contains("work_pipeline: paused while a restore job runs"))
-        .unwrap();
+    assert_eq!(paused(&text), 1, "once per pause:\n{text}");
     assert!(
-        line.contains("INFO") && line.contains(&job.to_string()),
-        "{line}"
+        text.lines()
+            .any(|l| l.contains("INFO") && l.contains("work_pipeline: paused while")),
+        "{text}"
     );
 
-    // The next job gets its own line.
-    tx.send_replace(None);
-    tx.send_replace(Some(JobId::new()));
-    assert!(!pipeline.run_iteration().await.unwrap());
-    assert_eq!(paused(&logs.text()), 2, "{}", logs.text());
-
-    // The job ends: the worker works.
-    tx.send_replace(None);
-    assert!(pipeline.run_iteration().await.unwrap());
+    // The next pause gets its own line.
+    flag.store(false, Ordering::SeqCst);
+    assert!(
+        pipeline.run_iteration().await.unwrap(),
+        "the gate is down: works"
+    );
     assert!(
         db_a.block_cooldown(&rec.block_id)
             .last_attempted_at
             .is_some()
     );
+    db_a.clear_all_block_cooldowns();
+    flag.store(true, Ordering::SeqCst);
+    assert!(!pipeline.run_iteration().await.unwrap());
+    assert_eq!(paused(&logs.text()), 2, "{}", logs.text());
 
     // (b): not paused at all.
     let db_b = db();
@@ -2528,12 +2734,261 @@ async fn worker_does_not_start_while_a_restore_job_runs() {
     db_b.upsert_source_block(&rec).unwrap();
     let mut config_b = config;
     config_b.restore_pauses_backup = false;
-    let (tx_b, rx_b) = tokio::sync::watch::channel(Some(JobId::new()));
+    let (flag_b, gate_b, _wake_b) = flag_gate();
+    flag_b.store(true, Ordering::SeqCst);
     let mut pipeline_b =
-        pipeline_with(&db_b, config_b, Some(lonely_swarm(0x40).await)).with_restore_gate(rx_b);
+        pipeline_with(&db_b, config_b, Some(lonely_swarm(0x40).await)).with_restore_gate(gate_b);
     assert!(
         pipeline_b.run_iteration().await.unwrap(),
         "(b) works beside a restore"
     );
-    drop(tx_b);
+}
+
+/// M96 (v3.12b WARN-2). The gate is what the registry of jobs says at every reading: any job
+/// `Queued` or `Running` raises it; `finish` or `remove` of the last one lowers it, and the
+/// RUNNING worker loop starts a turn at once (the wake), not at some later tick. The tick of the
+/// loop is an hour here: a gate that `finish` does not lower leaves the block unworked until the
+/// deadline of the `until` — the unit goes red, it does not hang.
+#[tokio::test]
+async fn backup_resumes_when_the_last_restore_job_finishes_or_is_removed() {
+    use super::tests::{add_pool_peers, device_id, lonely_swarm, retained_block};
+    use crate::daemon::restore::{jobs::RestoreJobs, staging::JobId};
+
+    let staging = tempfile::tempdir().unwrap();
+    let wake = super::new_gate_wake();
+    let jobs = RestoreJobs::new(staging.path().to_path_buf()).with_gate_wake(Arc::clone(&wake));
+    let gate = {
+        let jobs = jobs.clone();
+        super::RestoreGate::new(&wake, move || jobs.has_unfinished())
+    };
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let db = db();
+    add_pool_peers(&db, &[device_id(0xC4), device_id(0xC5)]);
+    let rec = retained_block(data_dir.path(), 0xC6, 1.0);
+    db.upsert_source_block(&rec).unwrap();
+    let mut config = super::tests::make_config();
+    config.data_dir = data_dir.path().to_path_buf();
+    config.tick_interval = Duration::from_secs(3600);
+    let (_events_tx, events_rx) = tokio::sync::mpsc::channel(4);
+    let pipeline = super::WorkPipeline::new(
+        db.clone(),
+        config,
+        plain_encoder(),
+        Some(lonely_swarm(0x41).await),
+        None,
+        None,
+        None,
+        events_rx,
+    )
+    .with_restore_gate(gate.clone());
+
+    // submit -> the gate is up, the loop's first tick finds it so.
+    let first = JobId::new();
+    jobs.submit(first, "a", 1);
+    assert!(gate.is_up(), "a queued job raises the gate");
+    let worker = tokio::spawn(pipeline.run());
+    let worked = || db.block_cooldown(&rec.block_id).last_attempted_at.is_some();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!worked(), "queued: the worker stands");
+
+    // mark_running -> still up.
+    jobs.mark_running(first, "a", 1);
+    assert!(gate.is_up());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!worked(), "running: the worker stands");
+
+    // finish -> down, the worker starts a turn.
+    jobs.finish(first, false);
+    assert!(!gate.is_up(), "the last job finished: the gate is down");
+    until("the worker works after the last job finished", worked).await;
+
+    // The second job: submit -> up; removed (never reached the coordinator) -> the worker goes on.
+    db.clear_all_block_cooldowns();
+    let second = JobId::new();
+    jobs.submit(second, "b", 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!worked(), "a second queued job: the worker stands");
+    jobs.remove(second);
+    assert!(!gate.is_up());
+    until("the worker works after the last job was removed", worked).await;
+
+    worker.abort();
+}
+
+/// M99 (v3.12b NOTE 1). A holder that has acknowledged its whole range has nothing left to send:
+/// the turn turns the placement `Alive` WITHOUT a network call — no offer, no chunk — and counts
+/// it acked.
+#[tokio::test]
+async fn empty_rest_turns_alive_without_network() {
+    let rig = Rig::new(YIELD_BUDGET_MIB, BIG_CHUNK);
+    let rec = retained(rig.data_dir.path(), 0x37, BIG_K, BIG_T);
+    rig.db.upsert_source_block(&rec).unwrap();
+    let mut net = Net::new(0x6b).await;
+    let holders = [
+        net.holder(0x7e, &rig.budget, Hooks::default()).await,
+        net.holder(0x7f, &rig.budget, Hooks::default()).await,
+    ];
+    let swarm = net.ready();
+    let devices: Vec<DeviceId> = holders.iter().map(|h| h.device_id).collect();
+    let pool = pool_of(&devices);
+    // Every holder has acknowledged its whole range in an earlier turn.
+    let plan = super::offer_plan::plan_offers(&rig.db, &rec, &pool.candidates, 0).unwrap();
+    let super::offer_plan::OfferPlan::Planned { offers, .. } = plan else {
+        panic!("stand: the plan has offers");
+    };
+    {
+        let mut memory = rig.last_attempt.lock().await;
+        for o in &offers {
+            memory.holders.insert(
+                o.device_id,
+                worker::HolderDelivery {
+                    acked: o.esi_ranges.clone(),
+                    state: worker::HolderState::InProgress,
+                },
+            );
+        }
+    }
+
+    let outcome = rig
+        .turn(&plain_encoder(), &swarm, &rec, &pool, 3)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.acked, offers.len(), "{outcome:?}");
+    assert_eq!((outcome.failed, outcome.yielded), (0, false), "{outcome:?}");
+    assert_eq!(offers_total(&holders), 0, "no offer was sent");
+    assert_eq!(transfers_total(&holders), 0, "no chunk was sent");
+    assert_eq!(alive_count(&rig.db, &rec.block_id), offers.len());
+}
+
+/// M100 (v3.12b NOTE 2). `run_iteration` forgets the delivery memory of a block that left service
+/// — the unit goes through the iteration, not through a direct call of the helper (a helper nobody
+/// calls is dead code that only its own test keeps alive).
+#[tokio::test]
+async fn out_of_service_block_memory_is_forgotten_by_the_pipeline() {
+    use super::tests::{block_id, device_id, lonely_swarm, pipeline_with};
+
+    let db = db();
+    let (gone, kept) = (block_id(0xB9), block_id(0xBA));
+    let holder = device_id(0xBB);
+    let mut leaving = super::tests::make_block_record(gone, 1.0, 0.99999);
+    leaving.status = SourceBlockStatus::Deleting;
+    db.upsert_source_block(&leaving).unwrap();
+    let mut staying = super::tests::make_block_record(kept, 1.0, 0.99999);
+    staying.status = SourceBlockStatus::Active;
+    db.upsert_source_block(&staying).unwrap();
+
+    let mut pipeline = pipeline_with(
+        &db,
+        super::tests::make_config(),
+        Some(lonely_swarm(0x42).await),
+    );
+    for b in [gone, kept] {
+        pipeline.yields.insert(b, 2);
+        pipeline.last_attempt.insert(b, memory_of(holder));
+    }
+
+    pipeline.run_iteration().await.unwrap();
+
+    assert!(
+        !pipeline.last_attempt.contains_key(&gone) && !pipeline.yields.contains_key(&gone),
+        "the iteration dropped the memory of the block that left service"
+    );
+}
+
+/// M101 (v3.12b NOTE 4). What goes into `acked` is the ESIs of THIS chunk of THIS block. A holder
+/// that answers `SymbolStored` with a range far wider than the chunk is acknowledged for the
+/// chunk only (the memory ends up with exactly the ESIs that went out); one that answers for
+/// ANOTHER block is acknowledged for nothing and the placement stays `Offered`.
+#[tokio::test]
+async fn acked_takes_only_this_block_and_the_chunk_esis() {
+    // A wide answer; the gate cuts the turn after the first chunk, so the memory is not wiped by
+    // an `Alive` and shows what the first answer was counted for.
+    let (flag, gate, _wake) = flag_gate();
+    let mut rig = Rig::new(YIELD_BUDGET_MIB, BIG_CHUNK);
+    rig.gate = Some(gate);
+    let rec = retained(rig.data_dir.path(), 0x38, BIG_K, BIG_T);
+    rig.db.upsert_source_block(&rec).unwrap();
+    let wide_hooks = Hooks {
+        stored_wide: true,
+        on_first_transfer: Some(raise_gate(&flag)),
+        ..Hooks::default()
+    };
+    let mut net = Net::new(0x6c).await;
+    let holders = [
+        net.holder(0x80, &rig.budget, wide_hooks.clone()).await,
+        net.holder(0x81, &rig.budget, wide_hooks).await,
+    ];
+    let swarm = net.ready();
+    let devices: Vec<DeviceId> = holders.iter().map(|h| h.device_id).collect();
+    let outcome = rig
+        .turn(&plain_encoder(), &swarm, &rec, &pool_of(&devices), 0)
+        .await
+        .unwrap();
+    assert!(outcome.yielded, "{outcome:?}");
+    let first = holders
+        .iter()
+        .find(|h| h.transfers() > 0)
+        .expect("stand: one holder got the first chunk");
+    let sent = first.esis();
+    assert!(!sent.is_empty());
+    let memory = rig.last_attempt.lock().await;
+    let acked: Vec<u32> = memory
+        .holders
+        .get(&first.device_id)
+        .expect("the holder is in progress")
+        .acked
+        .iter()
+        .flat_map(|&(s, c)| s..s + c)
+        .collect();
+    assert_eq!(
+        acked, sent,
+        "acked = the ESIs of the chunk that went out, not the range of the answer"
+    );
+    drop(memory);
+
+    // An answer for another block: nothing is acknowledged.
+    let rig2 = Rig::new(YIELD_BUDGET_MIB, BIG_CHUNK);
+    let rec2 = retained(rig2.data_dir.path(), 0x39, BIG_K, BIG_T);
+    rig2.db.upsert_source_block(&rec2).unwrap();
+    let mut net2 = Net::new(0x6d).await;
+    let liar = net2
+        .holder(
+            0x82,
+            &rig2.budget,
+            Hooks {
+                stored_names_block: Some(SourceBlockId([0x5A; 32])),
+                ..Hooks::default()
+            },
+        )
+        .await;
+    let swarm2 = net2.ready();
+    let outcome = rig2
+        .turn(
+            &plain_encoder(),
+            &swarm2,
+            &rec2,
+            &pool_of(&[liar.device_id, DeviceId([0x83; 32])]),
+            0,
+        )
+        .await
+        .unwrap();
+    let memory = rig2.last_attempt.lock().await;
+    assert!(
+        memory
+            .holders
+            .get(&liar.device_id)
+            .is_none_or(|h| h.acked.is_empty()),
+        "an answer for another block acknowledges nothing: {:?}",
+        memory.holders.get(&liar.device_id)
+    );
+    assert_ne!(
+        rig2.db
+            .get_placement(&rec2.block_id, &liar.device_id)
+            .unwrap()
+            .map(|p| p.status),
+        Some(PlacementStatus::Alive),
+        "{outcome:?}"
+    );
 }

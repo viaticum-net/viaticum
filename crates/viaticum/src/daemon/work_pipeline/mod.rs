@@ -23,8 +23,8 @@ use viaticum_core::types::{DeviceId, SourceBlockId, SourceBlockRecord, Timestamp
 use crate::daemon::mem_budget::MemBudget;
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
-use crate::daemon::restore::staging::JobId;
 
+mod gate;
 mod offer_plan;
 mod pool;
 mod worker;
@@ -34,6 +34,7 @@ mod tests;
 #[cfg(test)]
 mod tests_budget;
 
+pub use gate::{GateWake, RestoreGate, new_gate_wake, notify_gate};
 pub use pool::{PoolSnapshot, pool_signature, snapshot_pool};
 
 // ─── Q-V9: restore or backup first ────────────────────────────────────────────
@@ -41,9 +42,11 @@ pub use pool::{PoolSnapshot, pool_signature, snapshot_pool};
 /// Q-V9 (spec v3.12a): the decision of Ilya, 2026-10-01 — (a), restore first. The value is final;
 /// the constant stays so that the pause is one switch and has its mutation (M92).
 ///
-/// `true` (a): while a restore job runs the worker starts no new iteration (`status`: «backup
-/// paused while restoring», one INFO line per job); an iteration already running still yields
-/// the budget to a waiting restore between two holders (J13). PoS is not affected.
+/// `true` (a): while the gate is up (an unfinished restore job, or a DR session, spec v3.12b) the
+/// worker starts no new iteration (`status`: «backup paused while restoring», one INFO line per
+/// pause); an iteration already running sees the gate too (it is in its `Turn`): it gives the
+/// permit back right after it got it, before the rebuild and the encode, and in the delivery it
+/// stops at the chunk boundary after its first attempt. PoS is not affected.
 /// `false` (b), kept as the minimal variant behind the switch: the worker works on and gives the
 /// budget to a waiting restore at a chunk boundary (after the turn's first attempt, before every
 /// next send), then takes it again and re-encodes the rest — restore-i39's bound per block is then
@@ -102,8 +105,9 @@ pub struct WorkPipelineConfig {
     /// `SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES`; tests shrink it to get several chunks out of a
     /// small block (the worker yields between chunks).
     pub chunk_budget_bytes: usize,
-    /// `RESTORE_PAUSES_BACKUP` (Q-V9): no new iteration while a restore job runs. A field, so the
-    /// tests can run both variants; the daemon passes the constant.
+    /// `RESTORE_PAUSES_BACKUP` (Q-V9): no new iteration, and the running one stops, while the
+    /// restore gate is up. A field, so the tests can run both variants; the daemon passes the
+    /// constant.
     pub restore_pauses_backup: bool,
 }
 
@@ -177,6 +181,10 @@ enum BlockAttempt {
     /// The block left service before its offers were written (repair-i16); parked; the
     /// next block may do better.
     LeftService,
+    /// The turn stopped before it encoded anything: the restore gate went up while it waited for
+    /// its permit (spec v3.12b WARN-1). Not parked, no cooldown: the block is picked again when
+    /// the gate comes down; the iteration ends.
+    Paused,
 }
 
 /// Forget a block's turn memory: the yield count and the delivery memory of its holders (v3.5a
@@ -241,18 +249,17 @@ pub struct WorkPipeline {
     /// attempted (RAM only; cleared together with `yields`). The next turn goes through the
     /// holders by it, the longest ago first (LRU, backup-i24-a).
     last_attempt: std::collections::HashMap<SourceBlockId, TurnMemory>,
-    /// The restore job that runs now, if any (the registry's gate; Q-V9). With
-    /// `config.restore_pauses_backup` the worker starts no iteration while it is `Some`.
-    restore_gate: Option<tokio::sync::watch::Receiver<Option<JobId>>>,
-    /// The job the INFO line «paused while a restore job runs» was written for (once per job).
-    pause_announced_for: Option<JobId>,
+    /// The restore gate (Q-V9, spec v3.12b): an unfinished restore job or a DR session, computed
+    /// from their state at every reading. With `config.restore_pauses_backup` the worker starts
+    /// no iteration while it is up, and a running turn stops at its boundaries.
+    restore_gate: Option<RestoreGate>,
+    /// The INFO line «paused» was written for the pause that is on now (once per pause).
+    pause_announced: bool,
 }
 
-/// Resolves when the restore gate changes; never while there is no gate (or its sender is gone,
-/// in which case the gate is dropped: a closed channel must not spin the loop).
-async fn restore_gate_changed(
-    gate: &mut Option<tokio::sync::watch::Receiver<Option<JobId>>>,
-) -> bool {
+/// Resolves when a source of the restore gate changed; never while there is no gate (or its
+/// sender is gone, in which case the gate is dropped: a closed channel must not spin the loop).
+async fn restore_gate_changed(gate: &mut Option<tokio::sync::watch::Receiver<u64>>) -> bool {
     match gate {
         Some(rx) => match rx.changed().await {
             Ok(()) => true,
@@ -290,29 +297,36 @@ impl WorkPipeline {
             yields: std::collections::HashMap::new(),
             last_attempt: std::collections::HashMap::new(),
             restore_gate: None,
-            pause_announced_for: None,
+            pause_announced: false,
         }
     }
 
-    /// Give the worker the restore gate (`RestoreJobs::running_job_gate`): the job that runs now.
-    /// A change wakes the worker, so it starts again when the job ends (Q-V9 (a)).
-    pub fn with_restore_gate(mut self, gate: tokio::sync::watch::Receiver<Option<JobId>>) -> Self {
+    /// Give the worker the restore gate. A change of its sources wakes the worker, so it starts
+    /// again when the last job ends or the DR session runs out (Q-V9 (a)).
+    pub fn with_restore_gate(mut self, gate: RestoreGate) -> Self {
         self.restore_gate = Some(gate);
         self
     }
 
-    /// Q-V9 (a): a restore job runs and the constant says it comes first — no new iteration.
-    /// One INFO line per job.
+    /// The gate for a running turn: `Some` only when the constant says restore comes first.
+    fn turn_gate(&self) -> Option<&RestoreGate> {
+        self.restore_gate
+            .as_ref()
+            .filter(|_| self.config.restore_pauses_backup)
+    }
+
+    /// Q-V9 (a): the gate is up and the constant says restore comes first — no new iteration.
+    /// One INFO line per pause.
     fn paused_for_restore(&mut self) -> bool {
-        if !self.config.restore_pauses_backup {
+        if !self.turn_gate().is_some_and(RestoreGate::is_up) {
+            self.pause_announced = false;
             return false;
         }
-        let Some(job) = self.restore_gate.as_ref().and_then(|g| *g.borrow()) else {
-            return false;
-        };
-        if self.pause_announced_for != Some(job) {
-            self.pause_announced_for = Some(job);
-            tracing::info!(job = %job, "work_pipeline: paused while a restore job runs");
+        if !self.pause_announced {
+            self.pause_announced = true;
+            tracing::info!(
+                "work_pipeline: paused while a restore job runs or a DR session leases memory"
+            );
         }
         true
     }
@@ -343,7 +357,7 @@ impl WorkPipeline {
 
         tracing::info!("work_pipeline: started (tick={}s)", tick_secs);
         // Its own receiver for the wake-up (the one in `self` is read by `run_iteration`).
-        let mut gate = self.restore_gate.clone();
+        let mut gate = self.restore_gate.as_ref().map(RestoreGate::subscribe);
 
         loop {
             tokio::select! {
@@ -526,6 +540,9 @@ impl WorkPipeline {
             pool,
             self.yields.get(&block.block_id).copied().unwrap_or(0),
             self.last_attempt.entry(block.block_id).or_default(),
+            self.restore_gate
+                .as_ref()
+                .filter(|_| self.config.restore_pauses_backup),
         )
         .await;
 
@@ -550,6 +567,9 @@ impl WorkPipeline {
                 if wo.left_service {
                     self.update_block_cooldown(block, pool, now, Some(ParkReason::LeftService));
                     Ok(BlockAttempt::LeftService)
+                } else if wo.yielded && !wo.encoded {
+                    // Stopped by the gate before the encode: nothing was tried, nothing parked.
+                    Ok(BlockAttempt::Paused)
                 } else if wo.offered > 0 {
                     // Offers went out (accepted or not): retry after the normal
                     // cooldown — a network failure is not "nobody can take it".

@@ -39,7 +39,7 @@ use viaticum_core::types::{
 };
 
 use super::offer_plan::{self, OfferPlan, add_ranges, subtract_ranges, union_of};
-use super::{WorkPipelineConfig, pool::PoolSnapshot};
+use super::{RestoreGate, WorkPipelineConfig, pool::PoolSnapshot};
 use crate::daemon::mem_budget::{
     self, HolderKind, MemBudget, MemPermit, PriorityKind, estimate_worker, estimate_worker_delivery,
 };
@@ -188,6 +188,11 @@ pub(super) struct Turn<'a> {
     /// `!RESTORE_PAUSES_BACKUP` (Q-V9 (b), spec v3.12): a waiting restore gets the budget after
     /// the turn's first attempt, before every next send — not only between holders.
     pub(super) restore_at_chunk: bool,
+    /// The restore gate (Q-V9 (a), spec v3.12b WARN-1): `Some` when restore comes first. A turn
+    /// in progress sees it: while it is up the turn stops at the next boundary — after the
+    /// turn's first attempt, before every next send — whether or not a restore waits for the
+    /// memory at that moment (at most one re-encode per job).
+    pub(super) gate: Option<&'a RestoreGate>,
 }
 
 impl Turn<'_> {
@@ -199,13 +204,21 @@ impl Turn<'_> {
                 .worker_must_yield(PriorityKind::OverduePos, self.permit)
     }
 
-    /// Before a next chunk, only when restore yields at the chunk boundary (Q-V9 (b)).
+    /// The gate is up now (an unfinished restore job or a DR session; computed at the reading).
+    pub(super) fn gate_is_up(&self) -> bool {
+        self.gate.is_some_and(RestoreGate::is_up)
+    }
+
+    /// Before a next chunk: restore stops the worker here when the gate is up (Q-V9 (a), after
+    /// the turn's first attempt) or, with the gate not given, when restore yields at the chunk
+    /// boundary and waits for the memory (Q-V9 (b)).
     pub(super) fn restore_wants_the_budget_at_a_chunk(&self) -> bool {
-        self.restore_at_chunk
-            && self.attempts >= 1
-            && self
-                .budget
-                .worker_must_yield(PriorityKind::Restore, self.permit)
+        self.attempts >= 1
+            && (self.gate_is_up()
+                || (self.restore_at_chunk
+                    && self
+                        .budget
+                        .worker_must_yield(PriorityKind::Restore, self.permit)))
     }
 
     /// Before a next holder.
@@ -217,10 +230,11 @@ impl Turn<'_> {
         };
         if self.overdue_pos_wants_the_budget() {
             Some(YieldTo::OverduePos)
-        } else if started
-            && self
-                .budget
-                .worker_must_yield(PriorityKind::Restore, self.permit)
+        } else if (self.attempts >= 1 && self.gate_is_up())
+            || (started
+                && self
+                    .budget
+                    .worker_must_yield(PriorityKind::Restore, self.permit))
         {
             Some(YieldTo::Restore)
         } else {
@@ -336,6 +350,7 @@ pub(crate) async fn run_block_iteration(
     pool: &PoolSnapshot,
     yields_before: u32,
     memory: &mut TurnMemory,
+    gate: Option<&RestoreGate>,
 ) -> anyhow::Result<WorkOutcome> {
     // 1. Compute ErasureParams.
     let k = block.k;
@@ -458,6 +473,26 @@ pub(crate) async fn run_block_iteration(
         )
         .await;
 
+    // 3c. The gate may have gone up while the permit was waited for (spec v3.12b WARN-1): the
+    //     permit goes back before the rebuild and the encode, the turn ends (`yielded`, nothing
+    //     encoded, nothing offered). The check follows the grant, whatever the wait was.
+    if gate.is_some_and(RestoreGate::is_up) {
+        drop(permit);
+        tracing::info!(
+            block = %block.block_id,
+            yields_for_block = yields_before + 1,
+            "work_pipeline: restore gate is up after the permit was granted — permit released, no encode"
+        );
+        return Ok(WorkOutcome {
+            acked: 0,
+            failed: 0,
+            encoded: false,
+            offered: 0,
+            left_service: false,
+            yielded: true,
+        });
+    }
+
     // 4. Obtain the source blob — only now that someone can take symbols. SystemState
     //    blocks have no backing watch-dir file: their encoded blob is retained on disk
     //    (blake3 == block_id), so load it directly. All other blocks rebuild from
@@ -526,6 +561,7 @@ pub(crate) async fn run_block_iteration(
         holders_started: 0,
         attempts: 0,
         restore_at_chunk: !config.restore_pauses_backup,
+        gate,
     };
 
     for (idx, offer) in offers.iter().enumerate() {
@@ -859,6 +895,17 @@ async fn deliver_transfer_worker(
         };
 
         match reply {
+            // A `SymbolStored` for another block acknowledges nothing of this one (spec v3.12b
+            // NOTE 4): it is not counted, whatever ESIs it names.
+            Message::SymbolStored(stored) if stored.source_block_id != *block_id => {
+                log_chunk_sent(placement, block_id, idx, total_chunks, &chunk_esis, "other");
+                tracing::warn!(
+                    holder = %placement.holder_id,
+                    block_id = %block_id,
+                    replied_block = %stored.source_block_id,
+                    "work_pipeline: SymbolStored names another block — not counted"
+                );
+            }
             Message::SymbolStored(stored) => {
                 stored_ok += 1;
                 log_chunk_sent(
@@ -869,7 +916,8 @@ async fn deliver_transfer_worker(
                     &chunk_esis,
                     "stored",
                 );
-                // What the holder acknowledged, as far as it is what this chunk carried.
+                // What the holder acknowledged, as far as it is what this chunk carried (the
+                // ESIs of THIS chunk only: a range wider than the chunk counts for the chunk).
                 let confirmed = subtract_ranges(
                     &chunk_esis,
                     &subtract_ranges(&chunk_esis, &stored.esi_ranges),
