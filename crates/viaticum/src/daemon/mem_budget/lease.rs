@@ -195,12 +195,15 @@ impl DrLeases {
     }
 
     /// Whether a DR session is on (spec v3.12b WARN-3): from the first lease request until
-    /// `DR_SESSION_LINGER` after the last lease was given back or dropped. Computed from the
-    /// state and the clock at every call (the backup worker's gate reads it).
+    /// `DR_SESSION_LINGER` after the last lease was given back, dropped or revoked. Computed from
+    /// the state and the clock at every call (the backup worker's gate reads it). A lease the
+    /// ceiling took back does not count (K-b2a^5 NOTE 3): its memory is the others' by the
+    /// write-off, and a hung DR with an open stream must not hold the backup pause for ever —
+    /// the pause lasts no longer than the lease ceiling.
     pub fn session_active(&self) -> bool {
         let inner = self.lock();
         inner.waiting > 0
-            || !inner.leases.is_empty()
+            || inner.leases.values().any(|e| !e.revoked)
             || inner
                 .idle_since
                 .is_some_and(|t| t.elapsed() < DR_SESSION_LINGER)
@@ -209,7 +212,7 @@ impl DrLeases {
     /// The session may have just become idle: start its window and make the worker look again
     /// when the window runs out. Called under the lock after a request or a lease went.
     fn note_idle(&self, inner: &mut Inner) {
-        if inner.waiting > 0 || !inner.leases.is_empty() {
+        if inner.waiting > 0 || inner.leases.values().any(|e| !e.revoked) {
             return;
         }
         inner.idle_since = Some(Instant::now());
@@ -376,6 +379,8 @@ impl DrLeases {
             age_s,
             "mem_budget: lease revoked"
         );
+        // The revoked lease no longer holds the session: when it was the last, the window starts.
+        self.note_idle(&mut inner);
         Revoke::Done
     }
 }

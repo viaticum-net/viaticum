@@ -1098,12 +1098,11 @@ impl DaemonHandle {
                     Some(cluster_state.clone()),
                     work_event_rx,
                 )
-                .with_restore_gate({
-                    let (jobs, leases) = (restore_jobs.clone(), Arc::clone(&dr_leases));
-                    crate::daemon::work_pipeline::RestoreGate::new(&gate_wake, move || {
-                        jobs.has_unfinished() || leases.session_active()
-                    })
-                });
+                .with_restore_gate(crate::daemon::work_pipeline::restore_gate(
+                    &restore_jobs,
+                    &dr_leases,
+                    &gate_wake,
+                ));
                 tasks.push((
                     "work_pipeline",
                     tokio::spawn(async move { worker.run().await }),

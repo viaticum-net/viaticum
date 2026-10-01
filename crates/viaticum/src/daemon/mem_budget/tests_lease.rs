@@ -340,3 +340,47 @@ async fn dr_lease_session_pauses_the_worker_and_releases_it_30s_after_the_last_l
     assert!(!gate.is_up());
     drop(held);
 }
+
+/// K-b2a^5 NOTE 3. A lease the ceiling took back does not hold the backup pause: a hung DR whose
+/// stream stays open (the revoked lease stays in `leases` while the connection lives) would
+/// otherwise keep the gate up for ever. The session ends with the revoke — after the 30 s window
+/// like any last lease — although the guard is still held, and the worker is woken when the window
+/// runs out. Counting the revoked lease in `session_active` leaves the gate up: the unit fails at
+/// the last assertion.
+#[tokio::test(start_paused = true)]
+async fn revoked_lease_does_not_hold_the_session() {
+    use crate::daemon::work_pipeline::new_gate_wake;
+
+    let wake = new_gate_wake();
+    let mut woken = wake.subscribe();
+    let budget = MemBudget::new(1 << 30);
+    let leases = DrLeases::with_gate_wake(
+        Arc::clone(&budget),
+        Duration::from_secs(600),
+        Arc::clone(&wake),
+    );
+    let guard = leases.lease(block(1), SS_SIZE).await.unwrap();
+    assert!(leases.session_active(), "a live lease: the session is on");
+
+    tokio::time::sleep(Duration::from_secs(590)).await;
+    assert!(leases.session_active(), "below the ceiling: on");
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    assert!(leases.status().is_some_and(|s| s.revoked), "stand: revoked");
+    assert!(
+        leases.session_active(),
+        "the window of the last lease runs from the revoke"
+    );
+    woken.borrow_and_update();
+
+    tokio::time::sleep(Duration::from_secs(40)).await;
+    assert!(
+        leases.status().is_some_and(|s| s.revoked),
+        "the revoked lease is still held by the open connection"
+    );
+    assert!(
+        !leases.session_active(),
+        "a revoked lease does not hold the session"
+    );
+    assert!(woken.has_changed().unwrap(), "the worker was woken");
+    drop(guard);
+}

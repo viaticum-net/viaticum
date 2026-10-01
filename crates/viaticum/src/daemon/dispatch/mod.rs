@@ -360,6 +360,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
                     .dr_leases
                     .as_ref()
                     .is_some_and(|leases| leases.session_active())),
+        backup_pause_overlong: state.restore_jobs.backup_pause_overlong(),
         dr_lease: state
             .dr_leases
             .as_ref()

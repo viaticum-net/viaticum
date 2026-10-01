@@ -533,6 +533,28 @@ pub(crate) async fn run_block_iteration(
         "work_pipeline: encoded raw symbols"
     );
 
+    // 5b. The gate may have gone up while the encoder ran (K-b2a^5 WARN-1: up to minutes on a
+    //     big block): the first holder must not get an offer and a first chunk. The permit and
+    //     the symbols go back, nothing is offered, no placement is written; the turn ends as a
+    //     pause (the block is encoded again after the restore: one re-encode per job).
+    if gate.is_some_and(RestoreGate::is_up) {
+        drop(raw_symbols);
+        drop(permit);
+        tracing::info!(
+            block = %block.block_id,
+            yields_for_block = yields_before + 1,
+            "work_pipeline: restore gate is up after the encode — permit released, no offer"
+        );
+        return Ok(WorkOutcome {
+            acked: 0,
+            failed: 0,
+            encoded: true,
+            offered: 0,
+            left_service: false,
+            yielded: true,
+        });
+    }
+
     // 6. Insert all Offered placements before delivery (so retries see them). The write
     //    re-checks that the block is still in service (repair-i16); only the offers it
     //    wrote are delivered.
