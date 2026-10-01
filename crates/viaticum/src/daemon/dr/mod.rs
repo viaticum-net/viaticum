@@ -56,6 +56,7 @@ use crate::daemon::mailbox::routing::MailboxRouter;
 use crate::daemon::network::swarm::{SwarmConfig, SwarmHandle};
 
 mod commit;
+mod memory;
 mod net;
 mod preflight;
 mod restored;
@@ -64,6 +65,8 @@ pub(crate) use net::addr_rank;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_memory;
 
 // ─── Options and errors ──────────────────────────────────────────────────────
 
@@ -129,6 +132,13 @@ pub enum DrError {
     /// dr-i23: SIGINT / SIGTERM during the network phase.
     #[error("DR interrupted. Nothing was changed.")]
     Interrupted,
+    /// К-b3 (spec v3.9a): a node of this machine holds the block work lock and does not know the
+    /// lease request.
+    #[error(
+        "dr: the node on this machine is older and cannot share memory; update or stop it. \
+         Nothing was changed."
+    )]
+    NodeCannotShareMemory,
 }
 
 fn dr_failed(reason: impl std::fmt::Display) -> DrError {
@@ -193,12 +203,16 @@ pub async fn run_dr(opts: DrOptions) -> Result<(), DrError> {
         println!("Using the existing identity.key in this folder (same identity, device id kept).");
     }
 
+    // ── Block work memory (К-b3): the machine's lock decides whose budget DR works on ────
+    let memory = memory::Memory::open().inspect_err(|_| commit::abort(&mut plan))?;
+
     // ── 2-8. Network phase, interruptible ─────────────────────────────────────
     let work = recover_into_staging(
         plan.staging.file.take(),
         plan.keyfile.clone(),
         opts.peers.clone(),
         opts.catalog.clone(),
+        memory,
     );
     let summary = guarded_network_phase(&mut plan, work, signals.recv()).await?;
 
@@ -273,6 +287,7 @@ async fn recover_into_staging(
     keyfile: IdentityKeyFile,
     peer_addrs: Vec<String>,
     requested_catalog: Option<String>,
+    mut memory: memory::Memory,
 ) -> Result<RecoveredSummary, DrError> {
     // ── 3. Fresh DB in the staging file ───────────────────────────────────────
     let staging_file =
@@ -449,12 +464,28 @@ async fn recover_into_staging(
             p.diffs.len(),
             p.created_at.0
         );
-        fetch_state(&swarm_handle, &mut event_rx, &db, &encoder, &dr_key, p).await
+        if memory.is_fatal() {
+            return Err("DR stops: the node on this machine cannot share memory".to_string());
+        }
+        fetch_state(
+            &swarm_handle,
+            &mut event_rx,
+            &db,
+            &encoder,
+            &dr_key,
+            &mut memory,
+            p,
+        )
+        .await
     })
     .await;
     let (used, state) = match fetched {
         Ok(ok) => ok,
         Err(errors) => {
+            // An old node on this machine ends DR whatever pointer is tried (v3.9a #5).
+            if let Some(fatal) = memory.take_fatal() {
+                return Err(fatal);
+            }
             let last = errors.last().cloned().unwrap_or_default();
             return Err(DrError::Failed {
                 reason: format!(
@@ -630,17 +661,18 @@ async fn fetch_state(
     db: &viaticum_core::db::Db,
     encoder: &Arc<dyn viaticum_core::erasure::ErasureEncoder>,
     dr_key: &[u8; 32],
+    memory: &mut memory::Memory,
     pointer: &SelfPointer,
 ) -> Result<SystemState, String> {
     net::dial_pointer_holders(swarm, event_rx, db, pointer).await;
-    let base_bytes = net::fetch_ss_block(swarm, encoder, &pointer.base, dr_key)
+    let base_bytes = net::fetch_ss_block(swarm, encoder, &pointer.base, dr_key, memory)
         .await
         .map_err(|e| format!("failed to fetch SS base block: {e}"))?;
     let base_state: SystemState =
         from_cbor_bytes(&base_bytes).map_err(|e| format!("decode base SystemState: {e}"))?;
     let mut diffs: Vec<Vec<DiffOp>> = Vec::with_capacity(pointer.diffs.len());
     for dref in &pointer.diffs {
-        let bytes = net::fetch_ss_block(swarm, encoder, dref, dr_key)
+        let bytes = net::fetch_ss_block(swarm, encoder, dref, dr_key, memory)
             .await
             .map_err(|e| format!("failed to fetch SS diff block: {e}"))?;
         diffs.push(from_cbor_bytes(&bytes).map_err(|e| format!("decode diff block: {e}"))?);

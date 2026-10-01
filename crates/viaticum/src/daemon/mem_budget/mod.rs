@@ -233,6 +233,9 @@ pub struct MemBudget {
     warned_over: [AtomicBool; 4],
     /// Permits written off (pos-i7-d-d) whose holder has not ended yet.
     written_off_live: AtomicUsize,
+    /// A budget created closed (a DR holds the machine's memory lock) grants nothing until
+    /// [`MemBudget::open`]; waiters queue as usual.
+    closed: AtomicBool,
     #[cfg(test)]
     grants: AtomicU64,
 }
@@ -240,14 +243,19 @@ pub struct MemBudget {
 impl MemBudget {
     /// A budget of `total_bytes` (whole MiB, at least 1).
     pub fn new(total_bytes: u64) -> Arc<Self> {
+        Self::with_gate(total_bytes, false)
+    }
+
+    fn with_gate(total_bytes: u64, closed: bool) -> Arc<Self> {
         let total_mib = (total_bytes / MIB).clamp(1, u32::MAX as u64) as u32;
         Arc::new(MemBudget {
-            sem: Arc::new(Semaphore::new(total_mib as usize)),
+            sem: Arc::new(Semaphore::new(if closed { 0 } else { total_mib as usize })),
             total_mib,
             held_mib: AtomicU64::new(0),
             waiters: Mutex::new(Waiters::default()),
             warned_over: [const { AtomicBool::new(false) }; 4],
             written_off_live: AtomicUsize::new(0),
+            closed: AtomicBool::new(closed),
             #[cfg(test)]
             grants: AtomicU64::new(0),
         })
@@ -815,6 +823,49 @@ pub fn estimate_restore_local(k: u32, t: u16, s: u64) -> u64 {
     round_up_mib(2 * k as u128 * t as u128 + s as u128 + ZSTD_WINDOW_BYTES as u128)
 }
 
+// ─── Closed budget and the DR lease (К-b3, spec v3.9a) ────────────────────────────────────────────
+
+impl MemBudget {
+    /// A budget that grants nothing until [`open`](Self::open): the daemon starts so while a DR
+    /// holds this machine's memory lock. Waiters queue, in order, as with a busy budget.
+    pub fn new_closed(total_bytes: u64) -> Arc<Self> {
+        Self::with_gate(total_bytes, true)
+    }
+
+    /// Open a closed budget (idempotent). The total becomes available at once.
+    pub fn open(&self) {
+        if self.closed.swap(false, Ordering::SeqCst) {
+            let _queue = self.lock_waiters();
+            self.sem.add_permits(self.total_mib as usize);
+        }
+    }
+
+    /// Whether the budget still waits for [`open`](Self::open).
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// The wait of a DR's lease on this node: a restore-priority waiter (the worker and the
+    /// batch of PoS checks yield to it like to a restore), shown in the log as `kind=dr`.
+    pub async fn acquire_dr_lease(
+        self: &Arc<Self>,
+        block: &SourceBlockId,
+        estimate_bytes: u64,
+        slow_after: Duration,
+        on_slow: impl FnOnce(),
+    ) -> MemPermit {
+        self.wait(
+            WaitKind::Priority(PriorityKind::Restore),
+            HolderKind::Dr,
+            block,
+            estimate_bytes,
+            slow_after,
+            move |_ahead| on_slow(),
+        )
+        .await
+    }
+}
+
 /// The block work budget of a machine with `ram_limit_bytes` of RAM: `M·14/32`.
 pub fn block_work_budget_bytes(ram_limit_bytes: u64) -> u64 {
     (ram_limit_bytes as u128 * 14 / 32) as u64
@@ -845,7 +896,16 @@ pub fn resolve_block_work_budget(ram_bytes: u64, test_override_mb: Option<&str>)
     block_work_budget_bytes(ram_bytes)
 }
 
+mod lease;
+pub mod machine_lock;
+
+pub use lease::{DrLeases, LeaseError, LeaseGuard, LeaseStatus, ReleaseOutcome, lease_ceiling};
+
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_lease;
+#[cfg(test)]
+mod tests_lock;
 #[cfg(test)]
 mod tests_restore;

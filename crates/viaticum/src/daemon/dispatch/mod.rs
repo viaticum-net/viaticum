@@ -354,6 +354,14 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         files_too_large: count_too_large_under_watches(state),
         max_file_size_bytes: state.max_file_size_bytes,
         block_work_budget_bytes: state.block_work_budget_bytes,
+        dr_lease: state
+            .dr_leases
+            .as_ref()
+            .and_then(|leases| leases.status())
+            .map(|s| crate::cli::types::DrLeaseStatus {
+                holds_mib: s.holds_mib,
+                age_s: s.age_s,
+            }),
     }))
 }
 

@@ -69,6 +69,7 @@ async fn make_test_state_with(
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
         block_work_budget_bytes: 0,
+        dr_leases: None,
     })
 }
 
@@ -303,6 +304,7 @@ async fn dispatch_device_revoke_returns_device_revoked_with_no_router() {
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
         block_work_budget_bytes: 0,
+        dr_leases: None,
     });
 
     // Revoke device B.
@@ -935,6 +937,7 @@ async fn revocation_published_only_to_storage_relationship_peers() {
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
         block_work_budget_bytes: 0,
+        dr_leases: None,
     });
 
     // Revoke device.
@@ -1095,6 +1098,7 @@ async fn revocation_dedup_peer_is_holder_and_owner() {
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
         block_work_budget_bytes: 0,
+        dr_leases: None,
     });
 
     let revoked_hex: String = revoked_device_id
@@ -1335,6 +1339,7 @@ fn staging_test_state(
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
         block_work_budget_bytes: 0,
+        dr_leases: None,
     })
 }
 

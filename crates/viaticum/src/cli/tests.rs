@@ -301,6 +301,7 @@ fn make_status_zero_peers() -> StatusData {
         files_too_large: 0,
         max_file_size_bytes: 0,
         block_work_budget_bytes: 0,
+        dr_lease: None,
     }
 }
 
@@ -522,6 +523,7 @@ fn format_status_top_peers_printed() {
         files_too_large: 0,
         max_file_size_bytes: 0,
         block_work_budget_bytes: 0,
+        dr_lease: None,
     };
     let rendered = output::render_status(&data);
     assert!(rendered.contains("a1b2c3d4"), "got: {rendered}");
@@ -987,6 +989,7 @@ fn cli_response_roundtrips_cbor() {
             files_too_large: 0,
             max_file_size_bytes: 0,
             block_work_budget_bytes: 0,
+            dr_lease: None,
         })),
         CliResponse::DeviceList(vec![]),
         CliResponse::Error("oops".into()),
