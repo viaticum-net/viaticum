@@ -124,7 +124,7 @@ fn preparation_peak(holders: usize, params: &ErasureParams) -> (usize, usize) {
         })
         .collect();
 
-    let need = estimate_pos_issue(e_pad as u64, params.t);
+    let need = estimate_pos_issue(params.k, params.t);
     let budget = MemBudget::new(need * 2);
     let block_id = SourceBlockId([9; 32]);
     let permit = budget
@@ -179,10 +179,9 @@ fn check_within_estimate(params: &ErasureParams, holder_counts: &[usize]) {
     );
 }
 
-/// K = 4096 (a block of 256 MiB at T = 65535): the large-K figure the estimate `3.1·E_pad + 4·T`
-/// is derived for — L/K is 1.03 there and the walk peaks at ≈ 3.075 E_pad. M26 (a copy of the
-/// padded blob: +1 E_pad) and M27 (the symbols collected: +0.19 E_pad ≈ 50 MiB) both exceed the
-/// permit. One holder count: the core test `encode_raw_ranges_each_alloc_peak_within_model`
+/// K = 4096 (a block of 256 MiB at T = 65535): L/K is 1.04 there and the walk peaks at ≈ 3.076
+/// E_pad against a permit of `k·t + encoder_bytes + 4·T` ≈ 3.09 E_pad. M26 (a copy of the padded
+/// blob: +1 E_pad) and M27 (the symbols collected: +0.19 E_pad ≈ 50 MiB) both exceed the permit. One holder count: the core test `encode_raw_ranges_each_alloc_peak_within_model`
 /// shows the walk does not grow with the holders, and this block is heavy in a debug build.
 #[test]
 fn block_prep_alloc_peak_within_estimate() {
@@ -190,11 +189,10 @@ fn block_prep_alloc_peak_within_estimate() {
 }
 
 /// K = 257 (a block of 16 MiB at T = 65535): the LDPC and HDPC rows are ~10% of K, so the
-/// intermediate symbols are 1.08 E and the walk peaks at ≈ 3.16 E_pad, above `3.1·E_pad + 4·T`.
-/// The estimate is reworked for small K (review N1; v3.4 `encoder_bytes(k, t)`, К-b2a′) — until
-/// then this variant documents the gap and is not run.
+/// intermediate symbols are 1.15 E and the walk peaks at ≈ 3.19 E_pad. The permit is the
+/// function of K (`estimate_pos_issue`: the input, `encoder_bytes(k, t)` from the RFC 6330 table,
+/// four symbol buffers) — 3.217 E_pad, no slack added to make it pass (v3.4 N1).
 #[test]
-#[ignore = "N1: оценка на малых K — К-b2a′ (v3.4)"]
 fn block_prep_alloc_peak_within_estimate_small_k() {
     check_within_estimate(&params_of(257, 65_535), &[1, 4, 8]);
 }

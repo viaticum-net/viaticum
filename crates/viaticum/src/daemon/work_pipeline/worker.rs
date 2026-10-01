@@ -17,13 +17,17 @@
 //       the source is read, shrunk after the encode, held through the delivery (the named
 //       exception to "no network await under a permit"), released at the end. The worker
 //       takes no other permit; it yields the budget to an overdue PoS preparation (after
-//       at least one chunk this turn) and to a restore (after at least one holder).
+//       at least one attempt this turn) and to a restore (after at least one holder), and
+//       only when the waiter (or one ahead of it) cannot fit beside the worker's permit at
+//       all (`MemBudget::worker_must_yield`, J13, rule (Б′) of the spec v3.5).
 //
 // TODO: this function duplicates deliver_to_holder from BackupCoordinator.
 // See spec R6: duplication is intentional — worker context differs from coordinator.
 // Future: extract shared delivery helper if the implementations diverge.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use viaticum_core::cluster::ClusterState;
 use viaticum_core::constants::DECODE_OVERHEAD;
@@ -37,7 +41,7 @@ use viaticum_core::types::{
 use super::offer_plan::{self, OfferPlan};
 use super::{WorkPipelineConfig, pool::PoolSnapshot};
 use crate::daemon::mem_budget::{
-    self, HolderKind, MemBudget, PriorityKind, estimate_worker, estimate_worker_delivery,
+    self, HolderKind, MemBudget, MemPermit, PriorityKind, estimate_worker, estimate_worker_delivery,
 };
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
@@ -85,22 +89,33 @@ pub(super) enum YieldTo {
     Restore,
 }
 
+/// How long the worker waits for the budget before the INFO line says so (N4).
+const WAIT_LOG_AFTER: Duration = Duration::from_secs(5);
+
 /// Progress of one turn (one `run_block_iteration`) — the yield rules need it: a turn always
-/// delivers at least one chunk before it yields to an overdue PoS, and at least one holder
-/// before it yields to a restore (J13, backup-i24-a).
+/// makes at least one attempt before it yields to an overdue PoS, and at least one holder before
+/// it yields to a restore (J13, backup-i24-a).
 pub(super) struct Turn<'a> {
     pub(super) budget: &'a MemBudget,
+    /// The worker's permit, after its shrink: W of the yield rule.
+    pub(super) permit: &'a MemPermit,
     pub(super) chunk_budget_bytes: usize,
     /// Holders whose delivery began this turn.
     pub(super) holders_started: usize,
-    /// Chunks the holders acked this turn.
-    pub(super) chunks_stored: u32,
+    /// Attempts this turn (spec v3.5 BLOCK-1): an offer that ended WITHOUT a `SymbolAccept`
+    /// (error, timeout, reject, a foreign reply), and every chunk sent, whatever it came to. An
+    /// accepted offer counts for nothing by itself: it and the holder's first chunk are one
+    /// attempt — so a holder who accepts always gets one chunk per turn.
+    pub(super) attempts: u32,
 }
 
 impl Turn<'_> {
-    /// Before a next chunk (never before the first of the turn).
+    /// Before a next chunk or holder (never before the first attempt of the turn).
     pub(super) fn overdue_pos_wants_the_budget(&self) -> bool {
-        self.chunks_stored >= 1 && self.budget.priority_is_starved(PriorityKind::OverduePos)
+        self.attempts >= 1
+            && self
+                .budget
+                .worker_must_yield(PriorityKind::OverduePos, self.permit)
     }
 
     /// Before a next holder.
@@ -108,7 +123,9 @@ impl Turn<'_> {
         if self.overdue_pos_wants_the_budget() {
             Some(YieldTo::OverduePos)
         } else if self.holders_started >= 1
-            && self.budget.priority_is_starved(PriorityKind::Restore)
+            && self
+                .budget
+                .worker_must_yield(PriorityKind::Restore, self.permit)
         {
             Some(YieldTo::Restore)
         } else {
@@ -134,6 +151,24 @@ fn log_yield(to: YieldTo, block: &SourceBlockId, holders_done: usize, of: usize,
             "work_pipeline: yielding memory to restore"
         ),
     }
+}
+
+/// One DEBUG line per chunk sent: the observable of backup-i24-a (an `Ack` without
+/// `SymbolStored` leaves no other line).
+fn log_chunk_sent(
+    placement: &SymbolPlacement,
+    block_id: &SourceBlockId,
+    idx: usize,
+    total_chunks: usize,
+    reply: &str,
+) {
+    tracing::debug!(
+        holder = %placement.holder_id,
+        block_id = %block_id,
+        chunk = %format!("{}/{}", idx + 1, total_chunks),
+        reply = %reply,
+        "work_pipeline: chunk sent"
+    );
 }
 
 /// Holders excluded from a new offer of one block (repair-i2).
@@ -168,6 +203,12 @@ pub(crate) struct ExcludedHolders {
 ///     holder or chunk, give the budget away to a waiting restore / overdue PoS (J13).
 ///  7. Drop raw symbols (no disk spill), release the permit.
 ///
+/// `yields_before` is the number of turns on this block that ended in a yield since it was last
+/// delivered in full (the number of THIS turn); `last_attempt` (RAM, per block, cleared with the
+/// yield count) holds, per holder, the number of the turn in which it was last tried: the turn
+/// goes through the holders in that order, never-tried first, then the longest ago (LRU, spec
+/// v3.5 WARN-4), and records the holders it tries.
+///
 /// The caller records the attempt after this returns (`last_attempted_at`,
 /// `last_pool_signature`): an ordinary cooldown when `offered > 0`, otherwise (or on
 /// error) the block is parked (repair-i4).
@@ -183,6 +224,7 @@ pub(crate) async fn run_block_iteration(
     block: &SourceBlockRecord,
     pool: &PoolSnapshot,
     yields_before: u32,
+    last_attempt: &mut HashMap<DeviceId, u32>,
 ) -> anyhow::Result<WorkOutcome> {
     // 1. Compute ErasureParams.
     let k = block.k;
@@ -256,6 +298,16 @@ pub(crate) async fn run_block_iteration(
         }
     };
 
+    // The order of the turn: holders never tried first (plan order), then those tried longest ago
+    // (stable sort). Every yielded turn tries at least its first holder, so within h yielded
+    // turns every live holder is first once, however the list shrinks or grows.
+    let mut offers = offers;
+    offers.sort_by_key(|o| {
+        last_attempt
+            .get(&o.device_id)
+            .map_or((0u8, 0u32), |&turn| (1u8, turn))
+    });
+
     // 3b. The memory permit (J8): one for the whole iteration, taken now — after the plan, so
     //     the early exits above never touch the budget, and before the source is read. It
     //     waits its turn behind whoever is queued; nothing is held meanwhile. Sized by the
@@ -268,12 +320,23 @@ pub(crate) async fn run_block_iteration(
         params.k_eff
     );
     let e_pad = k as u64 * t as u64;
+    let estimate = estimate_worker(k, t, out_symbols);
     let mut permit = config
         .mem_budget
         .acquire(
             HolderKind::Worker,
             &block.block_id,
-            estimate_worker(e_pad, out_symbols, t),
+            estimate,
+            WAIT_LOG_AFTER,
+            |queued_ahead| {
+                tracing::info!(
+                    block = %block.block_id,
+                    need_mib = estimate.min(config.mem_budget.total_bytes()) >> 20,
+                    outstanding_mib = config.mem_budget.outstanding_bytes() >> 20,
+                    queued_ahead,
+                    "work_pipeline: waiting for memory budget"
+                );
+            },
         )
         .await;
 
@@ -340,14 +403,15 @@ pub(crate) async fn run_block_iteration(
     let mut yielded = false;
     let mut turn = Turn {
         budget: &config.mem_budget,
+        permit: &permit,
         chunk_budget_bytes: config.chunk_budget_bytes,
         holders_started: 0,
-        chunks_stored: 0,
+        attempts: 0,
     };
 
     for (idx, offer) in offers.iter().enumerate() {
         // J13: a restore (after this turn's first holder) or an overdue PoS (after its
-        // first chunk) that cannot run beside this permit gets the budget now.
+        // first attempt) that cannot run beside this permit gets the budget now.
         if let Some(to) = turn.yield_before_next_holder() {
             log_yield(to, &block.block_id, idx, offers.len(), yields_before + 1);
             yielded = true;
@@ -377,6 +441,7 @@ pub(crate) async fn run_block_iteration(
         };
 
         turn.holders_started += 1;
+        last_attempt.insert(offer.device_id, yields_before);
         match deliver_to_holder_worker(
             db,
             encoder,
@@ -469,10 +534,17 @@ async fn deliver_to_holder_worker(
             signing_key,
         );
 
-        let reply = swarm
+        let reply = match swarm
             .send_to_device(placement.holder_id, Message::SymbolOffer(offer))
             .await
-            .map_err(|e| anyhow::anyhow!("send SymbolOffer: {e}"))?;
+        {
+            Ok(reply) => reply,
+            Err(e) => {
+                // An offer that ended without an accept is an attempt (BLOCK-1).
+                turn.attempts += 1;
+                return Err(anyhow::anyhow!("send SymbolOffer: {e}"));
+            }
+        };
 
         match reply {
             Message::SymbolAccept(_) => {
@@ -492,6 +564,7 @@ async fn deliver_to_holder_worker(
                 .await
             }
             Message::SymbolReject(reject) => {
+                turn.attempts += 1;
                 if let Some(backoff) = peer_backoff {
                     backoff.record_reject(placement.holder_id);
                 }
@@ -503,6 +576,7 @@ async fn deliver_to_holder_worker(
                 )
             }
             other => {
+                turn.attempts += 1;
                 anyhow::bail!(
                     "unexpected reply to SymbolOffer from {}: {:?}",
                     placement.holder_id,
@@ -564,8 +638,9 @@ pub(crate) fn bind_placement_symbols(
 /// Send SymbolTransfer chunks to a holder, wait for SymbolStored acks.
 ///
 /// On full ack: transitions placement Offered→Alive + runs W11a hook.
-/// Before each chunk but the turn's first, an overdue PoS that cannot run beside this permit
-/// makes the worker stop (`Yielded`, backup-i24-a); the placement stays `Offered`.
+/// Before each chunk once the turn has made an attempt, an overdue PoS that cannot run beside this
+/// permit makes the worker stop (`Yielded`, backup-i24-a); the placement stays `Offered`. Every
+/// chunk sent counts as an attempt, whatever the holder answers.
 async fn deliver_transfer_worker(
     db: &Db,
     encoder: &Arc<dyn ErasureEncoder>,
@@ -598,22 +673,28 @@ async fn deliver_transfer_worker(
             symbols: chunk,
             timestamp: Timestamp::now(),
         };
-        let reply = swarm
+        let sent = swarm
             .send_to_device(placement.holder_id, Message::SymbolTransfer(msg))
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
+            .await;
+        // A chunk sent is an attempt, whatever it came to (BLOCK-1).
+        turn.attempts += 1;
+        let reply = match sent {
+            Ok(reply) => reply,
+            Err(e) => {
+                log_chunk_sent(placement, block_id, idx, total_chunks, "err");
+                return Err(anyhow::anyhow!(
                     "send SymbolTransfer chunk {}/{}: {}",
                     idx + 1,
                     total_chunks,
                     e
-                )
-            })?;
+                ));
+            }
+        };
 
         match reply {
             Message::SymbolStored(_) => {
                 stored_ok += 1;
-                turn.chunks_stored += 1;
+                log_chunk_sent(placement, block_id, idx, total_chunks, "stored");
                 tracing::debug!(
                     holder = %placement.holder_id,
                     block_id = %block_id,
@@ -640,8 +721,10 @@ async fn deliver_transfer_worker(
                 // Holder did not confirm storage with SymbolStored (transfer handler
                 // failed, or an older/unhandled path replied with a generic Ack).
                 saw_old_protocol = true;
+                log_chunk_sent(placement, block_id, idx, total_chunks, "ack");
             }
             other => {
+                log_chunk_sent(placement, block_id, idx, total_chunks, "other");
                 tracing::warn!(
                     holder = %placement.holder_id,
                     "work_pipeline: unexpected reply to SymbolTransfer: {:?}",

@@ -220,7 +220,7 @@ pub struct StatusData {
     /// backup-i4: this machine's file size limit in bytes.
     #[serde(default)]
     pub max_file_size_bytes: u64,
-    /// backup-i24: this machine's block work budget in bytes; 0 until R1-d-b sets one.
+    /// backup-i24: this machine's block work budget in bytes; 0 from a daemon older than R1-d-b.
     #[serde(default)]
     pub block_work_budget_bytes: u64,
 }

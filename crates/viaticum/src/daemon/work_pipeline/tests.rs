@@ -1894,6 +1894,7 @@ async fn worker_iteration_does_not_overwrite_uncertain_placement() {
         &rec,
         &pool,
         0,
+        &mut std::collections::HashMap::new(),
     )
     .await
     .unwrap();
@@ -1945,6 +1946,7 @@ async fn worker_does_not_read_source_when_no_candidates() {
         &rec,
         &pool,
         0,
+        &mut std::collections::HashMap::new(),
     )
     .await
     .expect("no candidates must not touch the source");
@@ -2211,7 +2213,17 @@ async fn worker_iteration_delivers_only_recorded_offers() {
         let (db, config, encoder, swarm, pool) = (&db, &config, &encoder, &swarm, &pool);
         async move {
             super::worker::run_block_iteration(
-                db, config, encoder, swarm, None, None, None, &rec, pool, 0,
+                db,
+                config,
+                encoder,
+                swarm,
+                None,
+                None,
+                None,
+                &rec,
+                pool,
+                0,
+                &mut std::collections::HashMap::new(),
             )
             .await
             .unwrap()

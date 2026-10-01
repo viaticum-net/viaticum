@@ -8,35 +8,44 @@
 // rounded UP (a 0-byte `try_acquire` would pass a queue).
 //
 // Who waits: the worker (plain `acquire`, J12-ex: it keeps ONE permit, shrunk after the
-// encode, while it delivers), restore and an overdue PoS preparation (`acquire_priority`:
-// they are counted, so the worker can see them and yield, J13). A permit holder never takes a
-// second permit (J12).
+// encode, while it delivers), restore and an overdue PoS preparation (`acquire_priority`).
+// EVERY waiter stands in one list, in the order of the semaphore's queue (`Queued`): the
+// worker reads it to decide whether to yield (`worker_must_yield`, J13). A permit holder never
+// takes a second permit (J12).
+//
+// The order of the list equals the order of the semaphore because (1) a waiter is listed under
+// our lock in the same critical section as its first poll of the tokio `Acquire` (tokio queues
+// it on that poll), (2) the `Acquire` is polled inside `tokio::task::unconstrained`: with the
+// cooperative budget spent it would answer `Pending` WITHOUT queueing, and the list and the
+// queue would part, (3) the lock order is ours, then tokio's — nothing that holds tokio's takes
+// ours (`MemPermit::drop` and `shrink_to` do not), (4) a waiter leaves the list under the same
+// lock that grants it (`held` grows there) or that drops its `Acquire` (`Queued::drop`).
 //
 // Spec: private/beta-planning/tasks/r1_bigfile_refusal.md §2B.2, v3.2 V2, v3.3.
 
 // The wrappers below are the only place in the daemon that calls the erasure entry points.
 #![allow(clippy::disallowed_methods)]
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use viaticum_core::erasure::{ErasureEncoder, ErasureError, Symbol, SymbolSink};
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
+use viaticum_core::constants::RAPTORQ_MAX_SOURCE_SYMBOLS;
+use viaticum_core::erasure::{ErasureEncoder, ErasureError, Symbol, SymbolSink, encoder_bytes};
 use viaticum_core::types::{ErasureParams, SourceBlockId};
+
+pub use viaticum_core::erasure::POS_SYMBOL_BUFFERS;
 
 const MIB: u64 = 1 << 20;
 
-/// Volumes of one block the encoder holds at the build stage: the source, the raptorq
-/// source symbols' share, the intermediate symbols (≈ 1.03) and the plan (0.035) —
-/// `3.1`, in hundredths (spec §1.3, frozen).
-pub const ENCODE_BASE_X100: u64 = 310;
 /// What delivery holds on top of the symbols and the copy of one share: the wire frame and its
 /// CBOR copy.
 pub const DELIVERY_SLACK_BYTES: u64 = 160 << 20;
-/// `Vec` buffers per symbol a PoS preparation holds at a time: the raptorq symbol, the binding
-/// buffer, the keystream (NOTE 2, v3.3: ≈ 3; one more as margin).
-pub const POS_SYMBOL_BUFFERS: u64 = 4;
 
 // ─── Who holds / who waits ────────────────────────────────────────────────────
 
@@ -78,32 +87,131 @@ impl PriorityKind {
     }
 }
 
-#[derive(Default)]
-struct Waiters {
-    next_id: u64,
-    /// `(id, kind, need in MiB)` of every priority waiter now queued.
-    queued: Vec<(u64, PriorityKind, u32)>,
-}
-
-/// Removes a waiter from the count when its wait ends: granted, or the future dropped.
-struct WaiterGuard {
-    budget: Arc<MemBudget>,
-    id: u64,
-}
-
-impl Drop for WaiterGuard {
-    fn drop(&mut self) {
-        let mut w = self.budget.lock_waiters();
-        w.queued.retain(|(id, _, _)| *id != self.id);
+impl HolderKind {
+    fn index(self) -> usize {
+        match self {
+            HolderKind::Worker => 0,
+            HolderKind::Pos => 1,
+            HolderKind::Restore => 2,
+            HolderKind::Dr => 3,
+        }
     }
 }
 
-/// Takes a caller out of the queue count when its wait ends: granted, or the future dropped.
-struct QueuedGuard<'a>(&'a AtomicUsize);
+/// Who a queued waiter is: a plain `acquire` (the worker; J12-ex) or a priority waiter the worker
+/// yields to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitKind {
+    Plain(HolderKind),
+    Priority(PriorityKind),
+}
 
-impl Drop for QueuedGuard<'_> {
+/// One waiter in the list: `need_mib` is what it asks the semaphore for.
+struct Waiter {
+    id: u64,
+    kind: WaitKind,
+    need_mib: u32,
+}
+
+/// Every waiter in the semaphore's queue, in its order.
+#[derive(Default)]
+struct Waiters {
+    next_id: u64,
+    queued: Vec<Waiter>,
+}
+
+type AcquireFut = Pin<Box<dyn Future<Output = Result<OwnedSemaphorePermit, AcquireError>> + Send>>;
+
+/// A wait for the semaphore that is listed while it is queued (spec v3.5 WARN-1).
+///
+/// The first poll registers the waiter under our lock together with the poll of the tokio
+/// `Acquire` (tokio queues it on that poll), so the list is in the semaphore's order. The grant
+/// removes the entry and counts the bytes held under the same lock. Cancelling (drop) removes the
+/// entry and drops the `Acquire` under the lock as well: `Acquire::drop` hands partly assigned
+/// units to the next waiter at once, and an entry that outlived it would count a need whose units
+/// are already somebody else's (a false yield). Lock order: ours, then the semaphore's.
+struct Queued {
+    budget: Arc<MemBudget>,
+    kind: WaitKind,
+    mib: u32,
+    acquire: Option<AcquireFut>,
+    /// `Some` while the entry is in the list. A granted `Queued` has `None`: its drop takes no
+    /// lock.
+    id: Option<u64>,
+}
+
+impl Queued {
+    fn new(budget: &Arc<MemBudget>, kind: WaitKind, mib: u32) -> Queued {
+        Queued {
+            budget: Arc::clone(budget),
+            kind,
+            mib,
+            acquire: None,
+            id: None,
+        }
+    }
+
+    /// Waiters queued ahead of this one now.
+    fn ahead(&self) -> usize {
+        let Some(id) = self.id else { return 0 };
+        let w = self.budget.lock_waiters();
+        w.queued.iter().position(|x| x.id == id).unwrap_or(0)
+    }
+}
+
+impl Future for Queued {
+    type Output = OwnedSemaphorePermit;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<OwnedSemaphorePermit> {
+        let this = self.get_mut();
+        let budget = Arc::clone(&this.budget);
+        let mut w = budget.lock_waiters();
+        let mib = this.mib;
+        let acquire = this.acquire.get_or_insert_with(|| {
+            // `unconstrained`: a spent cooperative budget would make `Acquire::poll` answer
+            // `Pending` without queueing, and this entry would stand in the list without a place
+            // in the semaphore's queue.
+            Box::pin(tokio::task::unconstrained(
+                Arc::clone(&budget.sem).acquire_many_owned(mib),
+            ))
+        });
+        match acquire.as_mut().poll(cx) {
+            Poll::Ready(Ok(permit)) => {
+                if let Some(id) = this.id.take() {
+                    w.queued.retain(|x| x.id != id);
+                }
+                budget.held_mib.fetch_add(mib as u64, Ordering::SeqCst);
+                Poll::Ready(permit)
+            }
+            // The semaphore is private and never closed.
+            Poll::Ready(Err(_)) => unreachable!("the memory budget semaphore is never closed"),
+            Poll::Pending => {
+                if this.id.is_none() {
+                    w.next_id += 1;
+                    let id = w.next_id;
+                    w.queued.push(Waiter {
+                        id,
+                        kind: this.kind,
+                        need_mib: mib,
+                    });
+                    this.id = Some(id);
+                }
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl Drop for Queued {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        // Only a cancelled waiter is still in the list.
+        if let Some(id) = self.id.take() {
+            let mut w = self.budget.lock_waiters();
+            w.queued.retain(|x| x.id != id);
+            // Under the lock, after the `retain` (WARN-1 b).
+            drop(self.acquire.take());
+            drop(w);
+        }
     }
 }
 
@@ -114,13 +222,12 @@ pub struct MemBudget {
     sem: Arc<Semaphore>,
     total_mib: u32,
     /// MiB held by live permits. Counts a grant only once the permit exists, so a unit the
-    /// semaphore already assigned to a waiter that has not run yet still counts as free (the
-    /// worker must not yield to a waiter its own shrink has just satisfied).
+    /// semaphore already assigned to a waiter that has not run yet still counts as free.
     held_mib: AtomicU64,
     waiters: Mutex<Waiters>,
-    warned_over: AtomicBool,
-    /// Every caller now waiting in the semaphore's queue (plain and priority).
-    queued: AtomicUsize,
+    /// The over-budget WARN was printed, per kind of holder (N7): the worker's WARN does not hide
+    /// the first WARN of a restore.
+    warned_over: [AtomicBool; 4],
     /// Permits written off (pos-i7-d-d) whose holder has not ended yet.
     written_off_live: AtomicUsize,
     #[cfg(test)]
@@ -136,8 +243,7 @@ impl MemBudget {
             total_mib,
             held_mib: AtomicU64::new(0),
             waiters: Mutex::new(Waiters::default()),
-            warned_over: AtomicBool::new(false),
-            queued: AtomicUsize::new(0),
+            warned_over: [const { AtomicBool::new(false) }; 4],
             written_off_live: AtomicUsize::new(0),
             #[cfg(test)]
             grants: AtomicU64::new(0),
@@ -164,11 +270,12 @@ impl MemBudget {
     }
 
     /// Permits for `estimate_bytes`: whole MiB, at least 1, at most the total. An estimate above
-    /// the total runs alone (clamped) with one WARN — refusing it would stop the work for good.
+    /// the total runs alone (clamped) with one WARN per kind of holder — refusing it would stop
+    /// the work for good.
     fn permits_for(&self, estimate_bytes: u64, kind: HolderKind, block: &SourceBlockId) -> u32 {
         let mib = to_mib(estimate_bytes);
         if mib > self.total_mib as u64 {
-            if !self.warned_over.swap(true, Ordering::Relaxed) {
+            if !self.warned_over[kind.index()].swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     kind = %kind.as_str(),
                     block = %block,
@@ -182,20 +289,23 @@ impl MemBudget {
         mib as u32
     }
 
-    fn grant(
+    /// The permit for units already counted as held (the queued path counts them under the lock
+    /// that removes the waiter from the list).
+    fn permit_counted(
         self: &Arc<Self>,
         permit: OwnedSemaphorePermit,
         kind: HolderKind,
         block: &SourceBlockId,
         mib: u32,
+        waited: Duration,
     ) -> MemPermit {
-        self.held_mib.fetch_add(mib as u64, Ordering::SeqCst);
         #[cfg(test)]
         self.grants.fetch_add(1, Ordering::SeqCst);
         tracing::debug!(
             kind = %kind.as_str(),
             block = %block,
             bytes = mib as u64 * MIB,
+            waited_ms = waited.as_millis() as u64,
             "mem_budget: granted"
         );
         MemPermit {
@@ -208,17 +318,25 @@ impl MemBudget {
         }
     }
 
-    /// Waits for the permit, behind everybody already queued (FIFO). The caller holds no other
-    /// permit (J12).
+    /// Waits for the permit, behind everybody already queued (FIFO). `on_slow(queued_ahead)` runs
+    /// once if the wait outlasts `slow_after`. The caller holds no other permit (J12).
     pub async fn acquire(
         self: &Arc<Self>,
         kind: HolderKind,
         block: &SourceBlockId,
         estimate_bytes: u64,
+        slow_after: Duration,
+        on_slow: impl FnOnce(usize),
     ) -> MemPermit {
-        let mib = self.permits_for(estimate_bytes, kind, block);
-        let permit = self.take(mib).await;
-        self.grant(permit, kind, block, mib)
+        self.wait(
+            WaitKind::Plain(kind),
+            kind,
+            block,
+            estimate_bytes,
+            slow_after,
+            on_slow,
+        )
+        .await
     }
 
     /// Never waits; `None` when the budget is busy. Does not pass a queue: while somebody waits,
@@ -231,27 +349,38 @@ impl MemBudget {
     ) -> Option<MemPermit> {
         let mib = self.permits_for(estimate_bytes, kind, block);
         let permit = Arc::clone(&self.sem).try_acquire_many_owned(mib).ok()?;
-        Some(self.grant(permit, kind, block, mib))
+        self.held_mib.fetch_add(mib as u64, Ordering::SeqCst);
+        Some(self.permit_counted(permit, kind, block, mib, Duration::ZERO))
     }
 
-    async fn take(&self, mib: u32) -> OwnedSemaphorePermit {
-        // Free at once: not a waiter (a waiter is counted only while it is queued).
-        if let Ok(p) = Arc::clone(&self.sem).try_acquire_many_owned(mib) {
-            return p;
-        }
-        self.queued.fetch_add(1, Ordering::SeqCst);
-        let _counted = QueuedGuard(&self.queued);
-        match Arc::clone(&self.sem).acquire_many_owned(mib).await {
-            Ok(p) => p,
-            // The semaphore is private and never closed.
-            Err(_) => unreachable!("the memory budget semaphore is never closed"),
-        }
+    /// The one path into the semaphore's queue (B1): plain and priority waiters alike stand in the
+    /// list while they wait.
+    async fn wait(
+        self: &Arc<Self>,
+        wait_kind: WaitKind,
+        holder: HolderKind,
+        block: &SourceBlockId,
+        estimate_bytes: u64,
+        slow_after: Duration,
+        on_slow: impl FnOnce(usize),
+    ) -> MemPermit {
+        let started = Instant::now();
+        let mib = self.permits_for(estimate_bytes, holder, block);
+        let queued = Queued::new(self, wait_kind, mib);
+        tokio::pin!(queued);
+        let permit = tokio::select! {
+            p = &mut queued => p,
+            _ = tokio::time::sleep(slow_after) => {
+                on_slow(queued.ahead());
+                queued.await
+            }
+        };
+        self.permit_counted(permit, holder, block, mib, started.elapsed())
     }
 
-    /// Like `acquire`, but counted in [`priority_waiters`](Self::priority_waiters) while it waits
-    /// (and forgotten on grant or when the future is dropped), so the worker can yield to it
-    /// (J13). `on_slow` runs once if the wait outlasts `slow_after`. The caller holds no other
-    /// permit (J12).
+    /// Like `acquire`, but the waiter is one the worker yields to while it is queued (J13); it
+    /// leaves the list on grant or when the future is dropped. `on_slow` runs once if the wait
+    /// outlasts `slow_after`. The caller holds no other permit (J12).
     pub async fn acquire_priority(
         self: &Arc<Self>,
         kind: PriorityKind,
@@ -260,37 +389,20 @@ impl MemBudget {
         slow_after: Duration,
         on_slow: impl FnOnce(),
     ) -> MemPermit {
-        let holder = kind.holder_kind();
-        let mib = self.permits_for(estimate_bytes, holder, block);
-        let guard = {
-            let mut w = self.lock_waiters();
-            w.next_id += 1;
-            let id = w.next_id;
-            w.queued.push((id, kind, mib));
-            WaiterGuard {
-                budget: Arc::clone(self),
-                id,
-            }
-        };
-        let taking = self.take(mib);
-        tokio::pin!(taking);
-        let permit = tokio::select! {
-            p = &mut taking => p,
-            _ = tokio::time::sleep(slow_after) => {
-                on_slow();
-                taking.await
-            }
-        };
-        // The permit counts as held BEFORE the waiter stops counting: no moment shows a
-        // waiter gone and its bytes free.
-        let granted = self.grant(permit, holder, block, mib);
-        drop(guard);
-        granted
+        self.wait(
+            WaitKind::Priority(kind),
+            kind.holder_kind(),
+            block,
+            estimate_bytes,
+            slow_after,
+            move |_ahead| on_slow(),
+        )
+        .await
     }
 
     /// Callers waiting in the queue now, of any kind (the DEBUG line of a deferred PoS block).
     pub fn queued_waiters(&self) -> usize {
-        self.queued.load(Ordering::SeqCst)
+        self.lock_waiters().queued.len()
     }
 
     /// Priority waiters of `kind` queued now.
@@ -298,29 +410,32 @@ impl MemBudget {
         self.lock_waiters()
             .queued
             .iter()
-            .filter(|(_, k, _)| *k == kind)
+            .filter(|x| x.kind == WaitKind::Priority(kind))
             .count()
     }
 
-    /// The smallest need of the `kind` waiters queued now.
-    pub fn min_need_bytes(&self, kind: PriorityKind) -> Option<u64> {
-        self.lock_waiters()
-            .queued
-            .iter()
-            .filter(|(_, k, _)| *k == kind)
-            .map(|(_, _, need)| *need as u64 * MIB)
-            .min()
-    }
-
-    /// A `kind` waiter is queued AND the free budget does not cover even the smallest need among
-    /// them: only then does a holder's release help, and only then does the worker yield (NOTE 4).
-    /// A waiter the holder's own shrink has just satisfied does not count: the free budget
-    /// already covers it, even if its task has not run yet.
-    pub fn priority_is_starved(&self, kind: PriorityKind) -> bool {
-        match self.min_need_bytes(kind) {
-            Some(need) => self.available_bytes() < need,
-            None => false,
+    /// Whether the worker, holding `permit` (after its shrink), must give the budget to a waiter
+    /// of `kind` (J13, rule (Б′) of the spec v3.5): some `kind` waiter has, at or before it in the
+    /// queue, a need that does not fit beside the worker EVER — `max need(1..i) > total − W`.
+    /// Everyone else releases by himself (J14), so a waiter whose prefix fits beside the worker is
+    /// served without a yield; the bytes held now do not enter the rule.
+    pub fn worker_must_yield(&self, kind: PriorityKind, permit: &MemPermit) -> bool {
+        let fits_beside_worker = self.total_mib.saturating_sub(permit.mib);
+        let w = self.lock_waiters();
+        debug_assert!(
+            !w.queued
+                .iter()
+                .any(|x| x.kind == WaitKind::Plain(HolderKind::Worker)),
+            "A4: a worker waits for the budget while another worker holds a permit"
+        );
+        let mut prefix_max = 0u32;
+        for x in &w.queued {
+            prefix_max = prefix_max.max(x.need_mib);
+            if x.kind == WaitKind::Priority(kind) && prefix_max > fits_beside_worker {
+                return true;
+            }
         }
+        false
     }
 
     /// Write a stuck holder's permit off (pos-i7-d-d, variant (a)): its bytes go back to the budget
@@ -343,8 +458,13 @@ impl MemBudget {
             return None;
         }
         // The state flag is ours now: the holder's drop will only forget its semaphore units.
-        self.held_mib.fetch_sub(handle.mib as u64, Ordering::SeqCst);
-        self.sem.add_permits(handle.mib as usize);
+        // `held` shrinks and the units reach the semaphore (and its first waiter) under the lock
+        // that also grants waiters, so no waiter is granted between the two halves.
+        {
+            let _queue = self.lock_waiters();
+            self.held_mib.fetch_sub(handle.mib as u64, Ordering::SeqCst);
+            self.sem.add_permits(handle.mib as usize);
+        }
         tracing::debug!(
             kind = %handle.kind.as_str(),
             block = %handle.block,
@@ -352,6 +472,34 @@ impl MemBudget {
             "mem_budget: released (written off)"
         );
         Some(handle.mib as u64 * MIB)
+    }
+
+    /// `acquire` without the slow-wait line (tests).
+    #[cfg(test)]
+    pub(crate) async fn acquire_plain(
+        self: &Arc<Self>,
+        kind: HolderKind,
+        block: &SourceBlockId,
+        estimate_bytes: u64,
+    ) -> MemPermit {
+        self.acquire(
+            kind,
+            block,
+            estimate_bytes,
+            Duration::from_secs(3600),
+            |_| {},
+        )
+        .await
+    }
+
+    /// The needs (MiB) of the queued waiters, in the list's order (tests).
+    #[cfg(test)]
+    pub(crate) fn queued_needs_mib(&self) -> Vec<u32> {
+        self.lock_waiters()
+            .queued
+            .iter()
+            .map(|x| x.need_mib)
+            .collect()
     }
 
     /// Units the semaphore itself has free (tests: nothing is returned twice).
@@ -366,10 +514,10 @@ impl MemBudget {
         self.grants.load(Ordering::SeqCst)
     }
 
-    /// Whether the over-budget WARN has been printed.
+    /// Whether the over-budget WARN of this kind of holder has been printed.
     #[cfg(test)]
-    pub(crate) fn warned_over(&self) -> bool {
-        self.warned_over.load(Ordering::Relaxed)
+    pub(crate) fn warned_over(&self, kind: HolderKind) -> bool {
+        self.warned_over[kind.index()].load(Ordering::Relaxed)
     }
 }
 
@@ -552,16 +700,24 @@ fn round_up_mib(bytes: u128) -> u64 {
     (mib.min(u64::MAX as u128 / MIB as u128) as u64) * MIB
 }
 
-/// `3.1·E_pad` in bytes.
-fn encode_base(e_pad: u64) -> u128 {
-    e_pad as u128 * ENCODE_BASE_X100 as u128 / 100
+/// What the encoder holds beyond its input: `encoder_bytes` of the core (K source-symbol copies,
+/// `L(K)` intermediate symbols from the RFC 6330 table, the plan). A K the encoder refuses
+/// (above the RaptorQ limit) is clamped: it fails at once, before it allocates, and an estimate
+/// must not panic on it.
+fn encoder_held(k: u32, t: u16) -> u128 {
+    encoder_bytes(k.min(RAPTORQ_MAX_SOURCE_SYMBOLS), t) as u128
 }
 
-/// The worker encoding one block: the encoder (3.1·E_pad), the `out_symbols` raw symbols it
-/// returns (`out·T`) and the delivery slack.
-pub fn estimate_worker(e_pad: u64, out_symbols: u64, t: u16) -> u64 {
+/// The worker encoding one block (spec v3.4 N1): the input (`k·t`, padded in place), the encoder
+/// (`encoder_bytes`), the `out_symbols` raw symbols it returns (`out·(T + σ)`, σ = the `Symbol`
+/// struct), the packet `repair_packets` hands out (`T`) and the delivery slack.
+pub fn estimate_worker(k: u32, t: u16, out_symbols: u64) -> u64 {
     round_up_mib(
-        encode_base(e_pad) + out_symbols as u128 * t as u128 + DELIVERY_SLACK_BYTES as u128,
+        k as u128 * t as u128
+            + encoder_held(k, t)
+            + out_symbols as u128 * (t as u128 + std::mem::size_of::<Symbol>() as u128)
+            + t as u128
+            + DELIVERY_SLACK_BYTES as u128,
     )
 }
 
@@ -571,10 +727,12 @@ pub fn estimate_worker_delivery(e_pad: u64, out_symbols: u64, t: u16) -> u64 {
     round_up_mib(out_symbols as u128 * t as u128 + e_pad as u128 + DELIVERY_SLACK_BYTES as u128)
 }
 
-/// A PoS preparation: one encoder build (3.1·E_pad) and a few symbol buffers, whatever the number
-/// of holders (F8′, NOTE 2).
-pub fn estimate_pos_issue(e_pad: u64, t: u16) -> u64 {
-    round_up_mib(encode_base(e_pad) + POS_SYMBOL_BUFFERS as u128 * t as u128)
+/// A PoS preparation: the input, one encoder build (`encoder_bytes`) and a few symbol buffers,
+/// whatever the number of holders (F8′, NOTE 2).
+pub fn estimate_pos_issue(k: u32, t: u16) -> u64 {
+    round_up_mib(
+        k as u128 * t as u128 + encoder_held(k, t) + POS_SYMBOL_BUFFERS as u128 * t as u128,
+    )
 }
 
 /// Restore from the network: the fetched symbols, the decoder's copy and work area, the output,

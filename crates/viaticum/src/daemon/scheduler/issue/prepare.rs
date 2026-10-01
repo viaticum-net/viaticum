@@ -558,7 +558,7 @@ impl BlockPrep {
 /// and a few symbol buffers (`estimate_pos_issue`).
 fn pos_need_bytes(record: &viaticum_core::types::SourceBlockRecord) -> u64 {
     let params = record.erasure_params();
-    estimate_pos_issue(params.k as u64 * params.t as u64, params.t)
+    estimate_pos_issue(params.k, params.t)
 }
 
 /// Load source block data for PoS challenge computation. Blocking.

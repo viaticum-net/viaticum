@@ -11,6 +11,12 @@ use std::borrow::Cow;
 use crate::constants::RAPTORQ_MAX_SOURCE_SYMBOLS;
 use crate::types::{DeviceId, ErasureParams, SourceBlockId};
 
+mod raptorq_table;
+pub use raptorq_table::{
+    PLAN_BYTES_PER_SOURCE_SYMBOL, POS_SYMBOL_BUFFERS, encoder_bytes, intermediate_symbols,
+    table_row,
+};
+
 /// One encoding symbol: ESI (which symbol) + T bytes of data.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Symbol {

@@ -5,6 +5,7 @@
 // at chosen moments — that is how a test puts a waiter into the budget at a precise point of the
 // worker's turn.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +16,9 @@ use tempfile::tempdir;
 use tokio::task::JoinHandle;
 use viaticum_core::db::Db;
 use viaticum_core::erasure::{ErasureEncoder, ErasureError, RaptorQEncoder, Symbol, SymbolSink};
-use viaticum_core::messages::{Message, SymbolAcceptMsg, SymbolStoredMsg};
+use viaticum_core::messages::{
+    AckMsg, Message, RejectReason, SymbolAcceptMsg, SymbolRejectMsg, SymbolStoredMsg,
+};
 use viaticum_core::placement::HolderCandidate;
 use viaticum_core::types::{
     DeviceId, ErasureParams, PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus,
@@ -261,6 +264,11 @@ struct Hooks {
     on_offer: Option<Hook>,
     /// Run before replying to the first SymbolTransfer this holder gets.
     on_first_transfer: Option<Hook>,
+    /// While set, the holder answers every SymbolOffer with `SymbolReject` (a dead or full
+    /// holder: the offer ends without an accept).
+    reject_offers: Option<Arc<AtomicBool>>,
+    /// Answer a SymbolTransfer with a bare `Ack` instead of `SymbolStored`.
+    ack_transfers: bool,
 }
 
 struct Net {
@@ -309,12 +317,26 @@ impl Net {
                         if let Some(h) = &hooks.on_offer {
                             h().await;
                         }
-                        Message::SymbolAccept(SymbolAcceptMsg {
-                            v: 1,
-                            source_block_id: offer.source_block_id,
-                            offer_msg_id: offer.msg_id,
-                            timestamp: Timestamp::now(),
-                        })
+                        if hooks
+                            .reject_offers
+                            .as_ref()
+                            .is_some_and(|r| r.load(Ordering::SeqCst))
+                        {
+                            Message::SymbolReject(SymbolRejectMsg {
+                                v: 1,
+                                source_block_id: offer.source_block_id,
+                                offer_msg_id: offer.msg_id,
+                                reason: RejectReason::QuotaFull,
+                                timestamp: Timestamp::now(),
+                            })
+                        } else {
+                            Message::SymbolAccept(SymbolAcceptMsg {
+                                v: 1,
+                                source_block_id: offer.source_block_id,
+                                offer_msg_id: offer.msg_id,
+                                timestamp: Timestamp::now(),
+                            })
+                        }
                     }
                     Message::SymbolTransfer(transfer) => {
                         let first = {
@@ -331,12 +353,16 @@ impl Net {
                         if first && let Some(h) = &hooks.on_first_transfer {
                             h().await;
                         }
-                        Message::SymbolStored(SymbolStoredMsg {
-                            v: 1,
-                            source_block_id: transfer.source_block_id,
-                            esi_ranges: transfer.symbols.iter().map(|s| (s.esi, 1)).collect(),
-                            timestamp: Timestamp::now(),
-                        })
+                        if hooks.ack_transfers {
+                            Message::Ack(AckMsg { v: 1 })
+                        } else {
+                            Message::SymbolStored(SymbolStoredMsg {
+                                v: 1,
+                                source_block_id: transfer.source_block_id,
+                                esi_ranges: transfer.symbols.iter().map(|s| (s.esi, 1)).collect(),
+                                timestamp: Timestamp::now(),
+                            })
+                        }
                     }
                     _ => continue,
                 };
@@ -367,6 +393,8 @@ struct Rig {
     data_dir: tempfile::TempDir,
     budget: Arc<MemBudget>,
     config: WorkPipelineConfig,
+    /// What the pipeline keeps between the turns of one block (`last_attempt`, RAM only).
+    last_attempt: tokio::sync::Mutex<HashMap<DeviceId, u32>>,
 }
 
 impl Rig {
@@ -382,6 +410,7 @@ impl Rig {
             data_dir,
             budget,
             config,
+            last_attempt: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -394,6 +423,7 @@ impl Rig {
         yields_before: u32,
     ) -> anyhow::Result<WorkOutcome> {
         let key = signing_key();
+        let mut last_attempt = self.last_attempt.lock().await;
         tokio::time::timeout(
             Duration::from_secs(120),
             worker::run_block_iteration(
@@ -407,6 +437,7 @@ impl Rig {
                 rec,
                 pool,
                 yields_before,
+                &mut last_attempt,
             ),
         )
         .await
@@ -449,6 +480,17 @@ fn register_waiter_once(
         let (budget, armed, slot) = (Arc::clone(&budget), Arc::clone(&armed), Arc::clone(&slot));
         async move {
             if armed.swap(false, Ordering::SeqCst) {
+                // Precondition of every yield test (spec v3.5a): the worker holds ITS permit
+                // only, and the waiter cannot fit beside it — `need > total − W`. Otherwise the
+                // worker would not yield, for another reason than the one under test, and a
+                // mutation of the yield rule could not turn the unit red.
+                let worker_mib = budget.outstanding_bytes() / MIB;
+                let total_mib = budget.total_bytes() / MIB;
+                assert!(
+                    need_mib > total_mib - worker_mib,
+                    "stand: the waiter ({need_mib} MiB) must not fit beside the worker \
+                     ({worker_mib} of {total_mib} MiB)"
+                );
                 *slot.lock().unwrap() = Some(spawn_waiter(&budget, kind, need_mib));
                 until("the waiter is counted", || {
                     budget.priority_waiters(kind) == 1
@@ -533,7 +575,7 @@ async fn worker_takes_budget_before_rebuild_shrinks_after_encode_releases_after_
     let placements = rig.db.list_placements_for_block(&rec.block_id).unwrap();
     let out_symbols: u64 = placements.iter().map(|p| p.symbol_count() as u64).sum();
     let e_pad = rec.k as u64 * rec.t as u64;
-    let est = estimate_worker(e_pad, out_symbols, rec.t);
+    let est = estimate_worker(rec.k, rec.t, out_symbols);
     let kept = estimate_worker_delivery(e_pad, out_symbols, rec.t);
     assert!(kept < est, "the shrink has something to give back");
 
@@ -631,7 +673,17 @@ async fn worker_waits_for_the_budget_before_reading_the_source() {
         );
         tokio::spawn(async move {
             worker::run_block_iteration(
-                &db, &config, &encoder, &swarm, None, None, None, &rec, &pool, 0,
+                &db,
+                &config,
+                &encoder,
+                &swarm,
+                None,
+                None,
+                None,
+                &rec,
+                &pool,
+                0,
+                &mut HashMap::new(),
             )
             .await
         })
@@ -713,6 +765,11 @@ async fn worker_left_service_releases_permit() {
 /// needs 400 MiB cannot run beside it.
 const YIELD_BUDGET_MIB: u64 = 512;
 const YIELD_WAITER_MIB: u64 = 400;
+// Rule (Б′) of the spec v3.5: the worker yields only to a waiter that does not fit beside its
+// permit, `need > total − W`. W after the shrink is at least the delivery slack (160 MiB), so
+// `need + 160 > total` guarantees it for every turn below; `register_waiter_once` checks it
+// against the real permit when the waiter is put in.
+const _: () = assert!(YIELD_WAITER_MIB + 160 > YIELD_BUDGET_MIB);
 /// A block of 16 symbols of 64 KiB (1 MiB): each holder gets many of them, one per chunk.
 const BIG_K: u32 = 16;
 const BIG_T: u16 = 65535;
@@ -973,7 +1030,17 @@ async fn worker_does_not_yield_to_a_waiter_granted_by_its_shrink() {
         );
         tokio::spawn(async move {
             worker::run_block_iteration(
-                &db, &config, &encoder, &swarm, None, None, None, &rec, &pool, 0,
+                &db,
+                &config,
+                &encoder,
+                &swarm,
+                None,
+                None,
+                None,
+                &rec,
+                &pool,
+                0,
+                &mut HashMap::new(),
             )
             .await
         })
@@ -1009,10 +1076,24 @@ async fn worker_does_not_yield_to_a_waiter_granted_by_its_shrink() {
     assert!(permit.bytes() > free_during_encode);
 }
 
-/// The yield rules, without a network: never before the first chunk (overdue PoS) or the first
-/// holder (restore) of a turn; afterwards only while the free budget is below the waiter's need.
+/// The yield rules, without a network: never before the first attempt (overdue PoS) or the first
+/// holder (restore) of a turn; afterwards only while the waiter does not fit beside the permit.
 #[tokio::test]
-async fn worker_turn_yields_only_after_its_first_chunk_or_holder() {
+async fn worker_turn_yields_only_after_its_first_attempt_or_holder() {
+    fn turn<'a>(
+        budget: &'a MemBudget,
+        permit: &'a MemPermit,
+        holders_started: usize,
+        attempts: u32,
+    ) -> Turn<'a> {
+        Turn {
+            budget,
+            permit,
+            chunk_budget_bytes: 1024,
+            holders_started,
+            attempts,
+        }
+    }
     let budget = MemBudget::new(100 * MIB);
     let mut held = budget
         .try_acquire(HolderKind::Worker, &SourceBlockId([1; 32]), 80 * MIB)
@@ -1024,37 +1105,44 @@ async fn worker_turn_yields_only_after_its_first_chunk_or_holder() {
             && budget.priority_waiters(PriorityKind::Restore) == 1
     })
     .await;
-    let turn = |holders_started, chunks_stored| Turn {
-        budget: &budget,
-        chunk_budget_bytes: 1024,
-        holders_started,
-        chunks_stored,
-    };
+    assert_eq!(budget.queued_waiters(), 2, "precondition: both are queued");
 
     assert!(
-        !turn(0, 0).overdue_pos_wants_the_budget(),
-        "not before the first chunk"
+        !turn(&budget, &held, 0, 0).overdue_pos_wants_the_budget(),
+        "not before the first attempt"
     );
     assert!(
-        turn(0, 0).yield_before_next_holder().is_none(),
+        turn(&budget, &held, 0, 0)
+            .yield_before_next_holder()
+            .is_none(),
         "nor before the first holder"
     );
     assert!(
-        turn(1, 0).yield_before_next_holder().is_some(),
+        turn(&budget, &held, 1, 0)
+            .yield_before_next_holder()
+            .is_some(),
         "a holder is done: restore is next"
     );
-    assert!(turn(1, 1).overdue_pos_wants_the_budget());
-    assert!(turn(0, 1).yield_before_next_holder().is_some());
+    assert!(turn(&budget, &held, 1, 1).overdue_pos_wants_the_budget());
+    assert!(
+        turn(&budget, &held, 0, 1)
+            .yield_before_next_holder()
+            .is_some()
+    );
 
-    // The shrink frees 70 MiB: both needs are covered, nobody is to be yielded to (even though
-    // the waiters have not had a chance to run yet).
+    // The shrink leaves 90 beside the worker: both needs fit, nobody is to be yielded to (even
+    // though the waiters have not had a chance to run yet).
     held.shrink_to(10 * MIB);
     assert!(
         budget.priority_waiters(PriorityKind::OverduePos) == 1,
         "not polled yet"
     );
-    assert!(!turn(5, 5).overdue_pos_wants_the_budget());
-    assert!(turn(5, 5).yield_before_next_holder().is_none());
+    assert!(!turn(&budget, &held, 5, 5).overdue_pos_wants_the_budget());
+    assert!(
+        turn(&budget, &held, 5, 5)
+            .yield_before_next_holder()
+            .is_none()
+    );
 }
 
 // ─── J10 ──────────────────────────────────────────────────────────────────────
@@ -1102,33 +1190,544 @@ fn worker_iteration_symbols_never_exceed_ten_k_eff() {
 // ─── The count of yields ─────────────────────────────────────────────────────
 
 /// `yields_for_block` of the yield line: counted per block, reset by a delivery in full, left
-/// alone by a turn that neither yielded nor finished.
+/// alone by a turn that neither yielded nor finished; the holders' turn memory (`last_attempt`)
+/// goes with it, and with a block that left service or was parked (v3.5a NOTE 3).
 #[test]
 fn yield_counter_counts_per_block_and_resets_on_full_delivery() {
-    let outcome = |acked, failed, offered, yielded| WorkOutcome {
+    let outcome = |acked, failed, offered, yielded, left_service| WorkOutcome {
         acked,
         failed,
         encoded: true,
         offered,
-        left_service: false,
+        left_service,
         yielded,
     };
     let (a, b) = (SourceBlockId([1; 32]), SourceBlockId([2; 32]));
-    let mut yields = std::collections::HashMap::new();
+    let holder = DeviceId([9; 32]);
+    let mut yields = HashMap::new();
+    let mut last = HashMap::new();
+    for id in [a, b] {
+        last.insert(id, HashMap::from([(holder, 0u32)]));
+    }
 
-    super::count_yields(&mut yields, a, &outcome(0, 0, 2, true));
-    super::count_yields(&mut yields, a, &outcome(1, 0, 2, true));
-    super::count_yields(&mut yields, b, &outcome(0, 0, 2, true));
+    super::count_yields(&mut yields, &mut last, a, &outcome(0, 0, 2, true, false));
+    super::count_yields(&mut yields, &mut last, a, &outcome(1, 0, 2, true, false));
+    super::count_yields(&mut yields, &mut last, b, &outcome(0, 0, 2, true, false));
     assert_eq!((yields[&a], yields[&b]), (2, 1), "per block");
 
-    // Some holders failed: not a full delivery, the count stays.
-    super::count_yields(&mut yields, a, &outcome(1, 1, 2, false));
+    // Some holders failed: not a full delivery, the count and the memory stay.
+    super::count_yields(&mut yields, &mut last, a, &outcome(1, 1, 2, false, false));
     assert_eq!(yields[&a], 2);
-    // Nothing offered (parked): stays.
-    super::count_yields(&mut yields, a, &outcome(0, 0, 0, false));
-    assert_eq!(yields[&a], 2);
-    // Every offer acked: reset, for this block only.
-    super::count_yields(&mut yields, a, &outcome(2, 0, 2, false));
-    assert!(!yields.contains_key(&a));
+    assert!(last.contains_key(&a));
+    // Every offer acked: reset, for this block only — the memory of its holders too.
+    super::count_yields(&mut yields, &mut last, a, &outcome(2, 0, 2, false, false));
+    assert!(!yields.contains_key(&a) && !last.contains_key(&a));
     assert_eq!(yields[&b], 1);
+    assert!(last.contains_key(&b));
+    // The block left service without a full delivery: both go.
+    super::count_yields(&mut yields, &mut last, b, &outcome(0, 0, 0, false, true));
+    assert!(!yields.contains_key(&b) && !last.contains_key(&b));
+    // Parked (nobody to offer to): both go too.
+    yields.insert(a, 3);
+    last.insert(a, HashMap::from([(holder, 2u32)]));
+    super::count_yields(&mut yields, &mut last, a, &outcome(0, 0, 0, false, false));
+    assert!(!yields.contains_key(&a) && !last.contains_key(&a));
+    // A turn that entered an empty map leaves none behind.
+    last.insert(b, HashMap::new());
+    super::count_yields(&mut yields, &mut last, b, &outcome(1, 1, 2, false, false));
+    assert!(!last.contains_key(&b));
+}
+
+// ─── Attempts, not stored chunks (spec v3.5 BLOCK-1, M30, M34) ────────────────
+
+/// Holders that reject every offer while `flag` is set, and put ONE waiter of `kind` into the
+/// budget on an offer (once per `armed`).
+fn dead_holder_hooks(flag: &Arc<AtomicBool>, waiter: Hook) -> Hooks {
+    Hooks {
+        on_offer: Some(waiter),
+        reject_offers: Some(Arc::clone(flag)),
+        ..Hooks::default()
+    }
+}
+
+fn offers_total(holders: &[Holder]) -> usize {
+    holders.iter().map(Holder::offers).sum()
+}
+
+fn transfers_total(holders: &[Holder]) -> usize {
+    holders.iter().map(Holder::transfers).sum()
+}
+
+/// Serve the waiter a yield made room for, and let it go.
+async fn drain_waiter(slot: &Arc<Mutex<Option<JoinHandle<MemPermit>>>>) {
+    let granted = slot.lock().unwrap().take().expect("a waiter was put in");
+    let permit = tokio::time::timeout(Duration::from_secs(10), granted)
+        .await
+        .expect("the waiter is served after the yield")
+        .unwrap();
+    drop(permit);
+}
+
+/// M30: an offer that ended without an accept is an attempt. The first holder rejects; before the
+/// second one an overdue PoS that does not fit beside the worker gets the budget. Counting only
+/// stored chunks would see zero attempts and offer the second holder too.
+#[tokio::test]
+async fn worker_yields_to_overdue_pos_after_a_failed_first_offer() {
+    let (logs, _guard) = capture_logs();
+    let rig = Rig::new(YIELD_BUDGET_MIB, BIG_CHUNK);
+    let rec = retained(rig.data_dir.path(), 0x1a, BIG_K, BIG_T);
+    rig.db.upsert_source_block(&rec).unwrap();
+    let (armed, slot) = (Arc::new(AtomicBool::new(true)), Arc::new(Mutex::new(None)));
+    let reject = Arc::new(AtomicBool::new(true));
+    let waiter = register_waiter_once(
+        &rig.budget,
+        PriorityKind::OverduePos,
+        YIELD_WAITER_MIB,
+        &armed,
+        &slot,
+    );
+    let mut net = Net::new(0x49).await;
+    let holders = [
+        net.holder(
+            0x5c,
+            &rig.budget,
+            dead_holder_hooks(&reject, waiter.clone()),
+        )
+        .await,
+        net.holder(0x5d, &rig.budget, dead_holder_hooks(&reject, waiter))
+            .await,
+    ];
+    let swarm = net.ready();
+    let devices: Vec<DeviceId> = holders.iter().map(|h| h.device_id).collect();
+
+    let outcome = rig
+        .turn(&plain_encoder(), &swarm, &rec, &pool_of(&devices), 0)
+        .await
+        .unwrap();
+
+    assert!(outcome.yielded, "{outcome:?}");
+    assert_eq!(
+        outcome.failed, 1,
+        "the rejected offer is a failure, not a yield"
+    );
+    assert_eq!(
+        offers_total(&holders),
+        1,
+        "the second holder was not offered: the budget went to the PoS"
+    );
+    assert_eq!(transfers_total(&holders), 0);
+    let text = logs.text();
+    let line = text
+        .lines()
+        .find(|l| l.contains("work_pipeline: yielding memory to overdue PoS"))
+        .unwrap_or_else(|| panic!("no yield line:\n{text}"));
+    assert!(line.contains("holders_done=1"), "{line}");
+    drain_waiter(&slot).await;
+}
+
+/// M30: a chunk answered with a bare `Ack` (no `SymbolStored`) is an attempt, and leaves a
+/// `chunk sent ... reply=ack` line; the worker yields before the next chunk. Counting stored
+/// chunks only would send every chunk.
+#[tokio::test]
+async fn worker_yields_to_overdue_pos_after_an_ack_without_symbol_stored() {
+    let (logs, _guard) = capture_logs();
+    let rig = Rig::new(YIELD_BUDGET_MIB, BIG_CHUNK);
+    let rec = retained(rig.data_dir.path(), 0x1b, BIG_K, BIG_T);
+    rig.db.upsert_source_block(&rec).unwrap();
+    let (armed, slot) = (Arc::new(AtomicBool::new(true)), Arc::new(Mutex::new(None)));
+    let waiter = register_waiter_once(
+        &rig.budget,
+        PriorityKind::OverduePos,
+        YIELD_WAITER_MIB,
+        &armed,
+        &slot,
+    );
+    let hooks = Hooks {
+        on_first_transfer: Some(waiter),
+        ack_transfers: true,
+        ..Hooks::default()
+    };
+    let mut net = Net::new(0x4a).await;
+    let holders = [
+        net.holder(0x5e, &rig.budget, hooks.clone()).await,
+        net.holder(0x5f, &rig.budget, hooks).await,
+    ];
+    let swarm = net.ready();
+    let devices: Vec<DeviceId> = holders.iter().map(|h| h.device_id).collect();
+
+    let outcome = rig
+        .turn(&plain_encoder(), &swarm, &rec, &pool_of(&devices), 0)
+        .await
+        .unwrap();
+
+    assert!(outcome.yielded, "{outcome:?}");
+    assert_eq!(
+        transfers_total(&holders),
+        1,
+        "one chunk sent (and answered with an Ack), then the budget went away"
+    );
+    let text = logs.text();
+    let sent: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("work_pipeline: chunk sent"))
+        .collect();
+    assert_eq!(sent.len(), 1, "{text}");
+    assert!(
+        sent[0].contains("DEBUG") && sent[0].contains("reply=ack"),
+        "{}",
+        sent[0]
+    );
+    assert!(
+        sent[0].contains("chunk=1/") && sent[0].contains(&format!("block_id={}", rec.block_id)),
+        "{}",
+        sent[0]
+    );
+    assert!(sent[0].contains("holder="), "{}", sent[0]);
+    drain_waiter(&slot).await;
+}
+
+/// Every chunk sent leaves its DEBUG line with the holder's reply (`stored` here) — the observable
+/// of backup-i24-a.
+#[tokio::test]
+async fn worker_logs_every_chunk_sent_with_its_reply() {
+    let (logs, _guard) = capture_logs();
+    let rig = Rig::new(512, 1024);
+    let rec = retained(rig.data_dir.path(), 0x1c, 3, 1024);
+    rig.db.upsert_source_block(&rec).unwrap();
+    let mut net = Net::new(0x4b).await;
+    let holders = [
+        net.holder(0x60, &rig.budget, Hooks::default()).await,
+        net.holder(0x61, &rig.budget, Hooks::default()).await,
+    ];
+    let swarm = net.ready();
+    let devices: Vec<DeviceId> = holders.iter().map(|h| h.device_id).collect();
+    let outcome = rig
+        .turn(&plain_encoder(), &swarm, &rec, &pool_of(&devices), 0)
+        .await
+        .unwrap();
+    assert!(outcome.acked > 0, "{outcome:?}");
+    let text = logs.text();
+    let sent = text
+        .lines()
+        .filter(|l| l.contains("work_pipeline: chunk sent") && l.contains("reply=stored"))
+        .count();
+    assert_eq!(
+        sent,
+        transfers_total(&holders),
+        "one line per chunk: {text}"
+    );
+    assert!(sent >= 2);
+}
+
+/// M34: a restore is served after the first holder's attempt has come to an outcome, whatever the
+/// outcome: the first holder rejects, the restore waits (it does not fit beside the worker), the
+/// worker yields before the second. Counting only delivered holders would offer the second too.
+#[tokio::test]
+async fn worker_yields_to_restore_after_a_failed_first_holder() {
+    let (logs, _guard) = capture_logs();
+    let rig = Rig::new(YIELD_BUDGET_MIB, BIG_CHUNK);
+    let rec = retained(rig.data_dir.path(), 0x1d, BIG_K, BIG_T);
+    rig.db.upsert_source_block(&rec).unwrap();
+    let (armed, slot) = (Arc::new(AtomicBool::new(true)), Arc::new(Mutex::new(None)));
+    let reject = Arc::new(AtomicBool::new(true));
+    let waiter = register_waiter_once(
+        &rig.budget,
+        PriorityKind::Restore,
+        YIELD_WAITER_MIB,
+        &armed,
+        &slot,
+    );
+    let mut net = Net::new(0x4c).await;
+    let holders = [
+        net.holder(
+            0x62,
+            &rig.budget,
+            dead_holder_hooks(&reject, waiter.clone()),
+        )
+        .await,
+        net.holder(0x63, &rig.budget, dead_holder_hooks(&reject, waiter))
+            .await,
+    ];
+    let swarm = net.ready();
+    let devices: Vec<DeviceId> = holders.iter().map(|h| h.device_id).collect();
+
+    let outcome = rig
+        .turn(&plain_encoder(), &swarm, &rec, &pool_of(&devices), 0)
+        .await
+        .unwrap();
+
+    assert!(outcome.yielded, "{outcome:?}");
+    assert_eq!(
+        offers_total(&holders),
+        1,
+        "the second holder was not offered"
+    );
+    let text = logs.text();
+    let line = text
+        .lines()
+        .find(|l| l.contains("work_pipeline: yielding memory to restore"))
+        .unwrap_or_else(|| panic!("no yield line:\n{text}"));
+    assert!(line.contains("holders_done=1"), "{line}");
+    drain_waiter(&slot).await;
+}
+
+// ─── Rotation: least recently tried first (spec v3.5 WARN-4, M35) ─────────────
+
+/// One turn under a constant overdue PoS: the waiter is put in at the first offer of the turn.
+async fn constant_pos_turn(
+    rig: &Rig,
+    swarm: &Arc<SwarmHandle>,
+    rec: &SourceBlockRecord,
+    pool: &PoolSnapshot,
+    yields_before: u32,
+    armed: &Arc<AtomicBool>,
+    slot: &Arc<Mutex<Option<JoinHandle<MemPermit>>>>,
+) -> WorkOutcome {
+    armed.store(true, Ordering::SeqCst);
+    let outcome = rig
+        .turn(&plain_encoder(), swarm, rec, pool, yields_before)
+        .await
+        .unwrap();
+    assert!(outcome.yielded, "turn {yields_before}: {outcome:?}");
+    drain_waiter(slot).await;
+    outcome
+}
+
+/// M35: a dead first holder does not eat every yielded turn. Holders [D, L]: D rejects. Turn 0
+/// offers D only (the PoS takes the budget after that attempt); turn 1 starts with the holder
+/// tried least recently — L — which gets a chunk. Without the rotation D is first again and L
+/// never gets one.
+#[tokio::test]
+async fn a_dead_first_holder_does_not_stall_live_holders_under_constant_overdue_pos() {
+    let rig = Rig::new(YIELD_BUDGET_MIB, BIG_CHUNK);
+    let rec = retained(rig.data_dir.path(), 0x1e, BIG_K, BIG_T);
+    rig.db.upsert_source_block(&rec).unwrap();
+    let (armed, slot) = (Arc::new(AtomicBool::new(true)), Arc::new(Mutex::new(None)));
+    let waiter = register_waiter_once(
+        &rig.budget,
+        PriorityKind::OverduePos,
+        YIELD_WAITER_MIB,
+        &armed,
+        &slot,
+    );
+    let flags = [
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(true)),
+    ];
+    let mut net = Net::new(0x4d).await;
+    let holders = [
+        net.holder(
+            0x64,
+            &rig.budget,
+            dead_holder_hooks(&flags[0], waiter.clone()),
+        )
+        .await,
+        net.holder(0x65, &rig.budget, dead_holder_hooks(&flags[1], waiter))
+            .await,
+    ];
+    let swarm = net.ready();
+    let devices: Vec<DeviceId> = holders.iter().map(|h| h.device_id).collect();
+    let pool = pool_of(&devices);
+
+    // Turn 0: both reject; the holder the plan puts first is the dead one.
+    constant_pos_turn(&rig, &swarm, &rec, &pool, 0, &armed, &slot).await;
+    assert_eq!(offers_total(&holders), 1);
+    let dead = holders.iter().position(|h| h.offers() == 1).unwrap();
+    let live = 1 - dead;
+    flags[live].store(false, Ordering::SeqCst);
+
+    // Turn 1: the live holder, never tried, goes first and gets its chunk.
+    constant_pos_turn(&rig, &swarm, &rec, &pool, 1, &armed, &slot).await;
+    assert_eq!(
+        holders[live].transfers(),
+        1,
+        "the live holder got a chunk within two turns (dead: {} offers)",
+        holders[dead].offers()
+    );
+    assert_eq!(
+        holders[dead].offers(),
+        1,
+        "the dead one was not first again"
+    );
+}
+
+/// M35, the shrinking list (WARN-4): holders [D, X, Y]. D rejects; X completes its whole share in
+/// one chunk on turn 1 and drops out of the plan; on turn 2 the plan is [D, Y] and Y must be
+/// first. A rotation by `yields mod len` starts turn 2 with D (2 mod 2 = 0) and Y waits for turn 3.
+#[tokio::test]
+async fn a_dead_first_holder_does_not_stall_live_holders_when_a_holder_completes_and_drops_out() {
+    // One chunk holds a whole share.
+    let rig = Rig::new(YIELD_BUDGET_MIB, 80 << 20);
+    let rec = retained(rig.data_dir.path(), 0x1f, BIG_K, BIG_T);
+    rig.db.upsert_source_block(&rec).unwrap();
+    let (armed, slot) = (Arc::new(AtomicBool::new(true)), Arc::new(Mutex::new(None)));
+    let waiter = register_waiter_once(
+        &rig.budget,
+        PriorityKind::OverduePos,
+        YIELD_WAITER_MIB,
+        &armed,
+        &slot,
+    );
+    let flags: Vec<Arc<AtomicBool>> = (0..3).map(|_| Arc::new(AtomicBool::new(true))).collect();
+    let mut net = Net::new(0x4e).await;
+    let mut holders = Vec::new();
+    for (i, flag) in flags.iter().enumerate() {
+        holders.push(
+            net.holder(
+                0x66 + i as u8,
+                &rig.budget,
+                dead_holder_hooks(flag, waiter.clone()),
+            )
+            .await,
+        );
+    }
+    let swarm = net.ready();
+    let devices: Vec<DeviceId> = holders.iter().map(|h| h.device_id).collect();
+    let pool = pool_of(&devices);
+
+    // Turn 0: all reject; the first in the plan is D.
+    constant_pos_turn(&rig, &swarm, &rec, &pool, 0, &armed, &slot).await;
+    assert_eq!(offers_total(&holders), 1);
+    let dead = holders.iter().position(|h| h.offers() == 1).unwrap();
+    for (i, flag) in flags.iter().enumerate() {
+        flag.store(i == dead, Ordering::SeqCst);
+    }
+
+    // Turn 1: a never-tried holder first; its whole share is one chunk, so it completes.
+    constant_pos_turn(&rig, &swarm, &rec, &pool, 1, &armed, &slot).await;
+    let first_live = holders
+        .iter()
+        .position(|h| h.transfers() == 1)
+        .expect("a live holder got its chunk on turn 1");
+    assert_ne!(first_live, dead);
+    let statuses = placement_statuses(&rig.db, &rec.block_id);
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == PlacementStatus::Alive)
+            .count(),
+        1,
+        "it completed and dropped out of the plan: {statuses:?}"
+    );
+
+    // Turn 2: the plan is [D, Y]; Y (never tried) is first and gets its chunk.
+    constant_pos_turn(&rig, &swarm, &rec, &pool, 2, &armed, &slot).await;
+    let second_live = (0..3)
+        .find(|&i| i != dead && i != first_live)
+        .expect("the third holder");
+    assert_eq!(
+        holders[second_live].transfers(),
+        1,
+        "the second live holder got its chunk by turn 2 (dead holder offers: {})",
+        holders[dead].offers()
+    );
+}
+
+// ─── N4: the wait for the budget is visible ──────────────────────────────────
+
+/// A worker that waits for the budget says so once, after `WAIT_LOG_AFTER`, with the numbers; the
+/// `granted` line of the same permit carries `waited_ms`. Virtual time while it waits (the clock
+/// is paused only around the wait: the network work before and after runs in real time).
+#[tokio::test]
+async fn worker_wait_logs_once_after_slow_after() {
+    let (logs, _guard) = capture_logs();
+    let rig = Rig::new(200, 80 << 20);
+    let rec = retained(rig.data_dir.path(), 0x20, 3, 1024);
+    rig.db.upsert_source_block(&rec).unwrap();
+    let mut net = Net::new(0x4f).await;
+    let holders = [
+        net.holder(0x68, &rig.budget, Hooks::default()).await,
+        net.holder(0x69, &rig.budget, Hooks::default()).await,
+    ];
+    let swarm = net.ready();
+    let devices: Vec<DeviceId> = holders.iter().map(|h| h.device_id).collect();
+    let everything = rig
+        .budget
+        .try_acquire(HolderKind::Pos, &SourceBlockId([1; 32]), 200 * MIB)
+        .unwrap();
+
+    tokio::time::pause();
+    let worker = {
+        let (db, config, swarm, rec, pool) = (
+            rig.db.clone(),
+            rig.config.clone(),
+            Arc::clone(&swarm),
+            rec.clone(),
+            pool_of(&devices),
+        );
+        tokio::spawn(async move {
+            let key = signing_key();
+            worker::run_block_iteration(
+                &db,
+                &config,
+                &plain_encoder(),
+                &swarm,
+                Some(&key),
+                None,
+                None,
+                &rec,
+                &pool,
+                0,
+                &mut HashMap::new(),
+            )
+            .await
+        })
+    };
+    let wait_lines = || {
+        logs.text()
+            .lines()
+            .filter(|l| l.contains("work_pipeline: waiting for memory budget"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    // The worker has reached the wait (its 5 s timer is armed) before the clock moves.
+    until("the worker waits for the budget", || {
+        rig.budget.queued_waiters() == 1
+    })
+    .await;
+    tokio::time::advance(Duration::from_secs(4)).await;
+    assert!(
+        wait_lines().is_empty(),
+        "not before 5 s: {:?}",
+        wait_lines()
+    );
+    tokio::time::advance(Duration::from_secs(2)).await;
+    until("the line after 5 s", || !wait_lines().is_empty()).await;
+    tokio::time::advance(Duration::from_secs(30)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(wait_lines().len(), 1, "once per wait, not per period");
+    tokio::time::resume();
+
+    let line = wait_lines().remove(0);
+    assert!(line.contains("INFO"), "{line}");
+    assert!(
+        line.contains(&format!("block={}", rec.block_id))
+            && line.contains("need_mib=")
+            && line.contains("outstanding_mib=200")
+            && line.contains("queued_ahead=0"),
+        "{line}"
+    );
+
+    drop(everything);
+    let outcome = tokio::time::timeout(Duration::from_secs(60), worker)
+        .await
+        .expect("the worker goes on when the budget frees")
+        .unwrap()
+        .unwrap();
+    assert!(outcome.acked > 0, "{outcome:?}");
+    let text = logs.text();
+    let granted = text
+        .lines()
+        .find(|l| l.contains("mem_budget: granted kind=worker"))
+        .unwrap_or_else(|| panic!("no granted line:\n{text}"));
+    let waited: u64 = granted
+        .split("waited_ms=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no waited_ms: {granted}"));
+    assert!(waited >= 36_000, "waited_ms = {waited}: {granted}");
+    assert_eq!(wait_lines().len(), 1);
 }

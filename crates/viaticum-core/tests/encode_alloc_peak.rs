@@ -1,10 +1,11 @@
 //! Allocation-peak measurements for the encoder (R1-d-b, backup-i24).
 //!
 //! A separate test binary: the counting global allocator must not leak into the other unit
-//! tests. Peaks are measured ABOVE the input the caller already holds (the padded block), so
-//! "2.1 * E_pad" is what the operation adds on top of the 1 * E_pad input: with the input that
-//! is the 3.1 * E model of the spec (§1.2). Tests serialise on one lock because the counters are
-//! process-wide; under nextest each test is its own process anyway.
+//! tests. Peaks are measured ABOVE the input the caller already holds (the padded block). The
+//! bars are a function of K (spec v3.4/v3.5): the model has one named tolerance, `δ = 0.02 *
+//! E_pad`, and NO other slack — a bar that does not hold is a STOP for that unit and a model
+//! change by a spec delta, never a looser number here. Tests serialise on one lock because the
+//! counters are process-wide; under nextest each test is its own process anyway.
 
 // A counting GlobalAlloc is unsafe by definition; it only forwards to System.
 #![allow(unsafe_code)]
@@ -13,11 +14,14 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use raptorq::{ObjectTransmissionInformation, SourceBlockEncoder, SourceBlockEncodingPlan};
-use viaticum_core::erasure::{ErasureEncoder, RaptorQEncoder, pad_for_encoding};
+use viaticum_core::erasure::{
+    ErasureEncoder, POS_SYMBOL_BUFFERS, RaptorQEncoder, Symbol, encoder_bytes,
+    intermediate_symbols, pad_for_encoding,
+};
 use viaticum_core::pos::ChainHasher;
 use viaticum_core::types::ErasureParams;
 
@@ -26,15 +30,64 @@ struct Counting;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
+// A histogram of the live blocks of at least `HIST_MIN` bytes by exact size, snapshotted at every
+// new peak while `HIST_ON` (the S/H unit). Fixed tables: the allocator must not allocate.
+const HIST_MIN: usize = 32 * 1024;
+const SLOTS: usize = 512;
+static HIST_ON: AtomicBool = AtomicBool::new(false);
+static SIZES: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
+static COUNT: [AtomicIsize; SLOTS] = [const { AtomicIsize::new(0) }; SLOTS];
+static AT_PEAK: [AtomicIsize; SLOTS] = [const { AtomicIsize::new(0) }; SLOTS];
+static HIST_OVERFLOW: AtomicUsize = AtomicUsize::new(0);
+
+fn hist_slot(size: usize) -> Option<usize> {
+    let start = size.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
+    for i in 0..SLOTS {
+        let idx = (start + i) % SLOTS;
+        let cur = SIZES[idx].load(Ordering::Relaxed);
+        if cur == size {
+            return Some(idx);
+        }
+        if cur == 0 {
+            match SIZES[idx].compare_exchange(0, size, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Some(idx),
+                Err(c) if c == size => return Some(idx),
+                Err(_) => continue,
+            }
+        }
+    }
+    None
+}
+
+fn hist_add(size: usize, delta: isize) {
+    if size < HIST_MIN {
+        return;
+    }
+    match hist_slot(size) {
+        Some(idx) => {
+            COUNT[idx].fetch_add(delta, Ordering::Relaxed);
+        }
+        None => {
+            HIST_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 fn grew(by: usize) {
     let now = LIVE.fetch_add(by, Ordering::Relaxed) + by;
-    PEAK.fetch_max(now, Ordering::Relaxed);
+    let prev = PEAK.fetch_max(now, Ordering::Relaxed);
+    if now > prev && HIST_ON.load(Ordering::Relaxed) {
+        for i in 0..SLOTS {
+            AT_PEAK[i].store(COUNT[i].load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
 }
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let p = unsafe { System.alloc(layout) };
         if !p.is_null() {
+            hist_add(layout.size(), 1);
             grew(layout.size());
         }
         p
@@ -42,17 +95,21 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let p = unsafe { System.alloc_zeroed(layout) };
         if !p.is_null() {
+            hist_add(layout.size(), 1);
             grew(layout.size());
         }
         p
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) };
+        hist_add(layout.size(), -1);
         LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let p = unsafe { System.realloc(ptr, layout, new_size) };
         if !p.is_null() {
+            hist_add(layout.size(), -1);
+            hist_add(new_size, 1);
             if new_size >= layout.size() {
                 grew(new_size - layout.size());
             } else {
@@ -70,11 +127,8 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 const MIB: usize = 1 << 20;
 const E: usize = 16 * MIB;
-
-/// At E = 16 MiB (K = 257) the LDPC and HDPC rows are ~10% of K, not the ~3% of a large block, so
-/// the intermediate symbols are 1.11 E instead of 1.03 E (measured 2.157 E_pad for the build
-/// stage). The model's 2.1 is the large-K figure; this slack is what a small K adds.
-const SMALL_K_SLACK: f64 = 0.1;
+/// The symbol size of the daemon (`SYMBOL_SIZE`).
+const T: usize = 65_535;
 
 fn live() -> usize {
     LIVE.load(Ordering::Relaxed)
@@ -106,114 +160,334 @@ fn ratio(peak: usize, e_pad: usize) -> f64 {
     peak as f64 / e_pad as f64
 }
 
-/// Peak of `encode_raw` for `count` symbols from ESI `start`, in units of E_pad.
-fn raw_peak(start: u32, count: u32) -> (usize, usize) {
+/// What the plan of `k` source symbols holds after `SourceBlockEncodingPlan::generate(k)`:
+/// P(K) of the model. The caller holds the serial lock.
+fn plan_held(k: u32) -> usize {
+    let base = live();
+    let plan = SourceBlockEncodingPlan::generate(k as u16);
+    let held = live().saturating_sub(base);
+    drop(plan);
+    held
+}
+
+// ─── The model (spec v3.4 "Бары", v3.5 NOTE 2, WARN-3) ──────────────────────────────────────────
+//
+// With the input already padded to k*t, in bytes above it (L = L(K) of RFC 6330, σ = size of a
+// `Symbol`, P = the plan held after generation, n = output symbols):
+//   build        B   = (K + L)·T + P                      source copies, intermediates, plan
+//   end of raw   (K + L)·T + n·(T + σ) [+ T]              the encoder lives while output piles up;
+//                                                         + T only when a repair ESI is in the
+//                                                         range (the `repair_packets` packet)
+//   walk (each)       (K + L)·T + T                       no output piles up
+//   peak = max of the stages; bar = peak + δ, δ = 0.02·E_pad.
+
+struct Model {
+    k: u32,
+    t: usize,
+    l: usize,
+    e_pad: usize,
+    plan: usize,
+}
+
+impl Model {
+    fn new(params: &ErasureParams, plan: usize) -> Model {
+        Model {
+            k: params.k,
+            t: params.t as usize,
+            l: intermediate_symbols(params.k) as usize,
+            e_pad: e_pad(params),
+            plan,
+        }
+    }
+    /// `(1 + L/K)·E_pad`: the source copies and the intermediate symbols.
+    fn encoder(&self) -> usize {
+        (self.k as usize + self.l) * self.t
+    }
+    fn build(&self) -> usize {
+        self.encoder() + self.plan
+    }
+    fn end_of_raw(&self, n: usize, repair: bool) -> usize {
+        self.encoder()
+            + n * (self.t + std::mem::size_of::<Symbol>())
+            + if repair { self.t } else { 0 }
+    }
+    fn walk(&self) -> usize {
+        self.encoder() + self.t
+    }
+    fn delta(&self) -> usize {
+        self.e_pad / 50
+    }
+    fn bar(&self, model: usize) -> usize {
+        model + self.delta()
+    }
+}
+
+fn report(name: &str, m: &Model, model: usize, peak: usize) {
+    println!(
+        "{name}: K = {} L = {} P = {:.4} E_pad | model {:.4} bar {:.4} measured {:.4} (E_pad units)",
+        m.k,
+        m.l,
+        ratio(m.plan, m.e_pad),
+        ratio(model, m.e_pad),
+        ratio(m.bar(model), m.e_pad),
+        ratio(peak, m.e_pad),
+    );
+}
+
+/// Peak of `encode_raw` for `count` symbols from ESI `start`, with the model of its stages.
+fn raw_peak_checked(name: &str, start: u32, count: u32) {
     let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let (blob, params) = padded_block();
+    let m = Model::new(&params, plan_held(params.k));
     let enc = RaptorQEncoder::new();
     let (symbols, peak) = measure(|| enc.encode_raw(&blob, &params, start, count).unwrap());
     assert_eq!(symbols.len(), count as usize);
-    (peak, e_pad(&params))
+    let n = count as usize;
+    let repair = start + count > params.k;
+    let model = m.build().max(m.end_of_raw(n, repair));
+    report(name, &m, model, peak);
+    assert!(
+        peak <= m.bar(model),
+        "{name}: peak {:.4} E_pad above the bar {:.4} (model {:.4})",
+        ratio(peak, m.e_pad),
+        ratio(m.bar(model), m.e_pad),
+        ratio(model, m.e_pad)
+    );
+    // The estimate of the daemon must cover the measurement: `estimate_worker` takes
+    // `encoder_bytes` plus the output and the packet on top of the input (M36).
+    let covered = encoder_bytes(params.k, params.t) as usize
+        + n * (m.t + std::mem::size_of::<Symbol>())
+        + m.t;
+    assert!(
+        peak <= covered,
+        "{name}: peak {} B is above the estimate {covered} B",
+        peak
+    );
 }
-
-// Model (spec §1.2, v3.3 B2): with the input already padded to k*t the operation adds the source
-// symbols (1.0 E) + the intermediate symbols (~1.03-1.1 E) + the plan (~0.035 E) while building,
-// plus the output symbols the caller asked for (R * E). A copy of the padded input (F5) or of the
-// source packets (F6) adds another 1.0 E on top.
 
 #[test]
 fn encode_raw_alloc_peak_r0_25_within_model() {
     let params = ErasureParams::compute(E as u64, 0.5).unwrap();
-    let (peak, e_pad) = raw_peak(0, params.k / 4);
-    let r = 0.25;
-    println!("r0.25: peak/E_pad = {:.3}", ratio(peak, e_pad));
-    assert!(
-        peak as f64 <= (2.1 + SMALL_K_SLACK + r) * e_pad as f64 + MIB as f64,
-        "peak {} MiB = {:.3} E_pad",
-        peak / MIB,
-        ratio(peak, e_pad)
-    );
+    // ESI 0..k/4: source ESIs only, no repair packet (no `+T`).
+    raw_peak_checked("r0.25", 0, params.k / 4);
 }
 
 #[test]
 fn encode_raw_alloc_peak_r2_within_model() {
     let params = ErasureParams::compute(E as u64, 0.5).unwrap();
-    let (peak, e_pad) = raw_peak(params.k, 2 * params.k);
-    println!("r2: peak/E_pad = {:.3}", ratio(peak, e_pad));
-    assert!(
-        peak as f64 <= (2.1 + SMALL_K_SLACK + 2.0) * e_pad as f64 + MIB as f64,
-        "peak {} MiB = {:.3} E_pad",
-        peak / MIB,
-        ratio(peak, e_pad)
-    );
+    raw_peak_checked("r2", params.k, 2 * params.k);
 }
 
 #[test]
 fn encode_raw_alloc_peak_r10_within_model() {
     let params = ErasureParams::compute(E as u64, 0.5).unwrap();
-    let (peak, e_pad) = raw_peak(params.k, 10 * params.k);
-    println!("r10: peak/E_pad = {:.3}", ratio(peak, e_pad));
+    raw_peak_checked("r10", params.k, 10 * params.k);
+}
+
+/// One encoder build and no walk (`encode_raw_ranges_each` with no ranges): the build stage alone,
+/// `B + δ`.
+#[test]
+fn encoder_build_alloc_peak_within_model() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let (blob, params) = padded_block();
+    let m = Model::new(&params, plan_held(params.k));
+    let peak = build_peak(&blob, &params);
+    report("build", &m, m.build(), peak);
     assert!(
-        peak as f64 <= (2.1 + SMALL_K_SLACK + 10.0) * e_pad as f64 + MIB as f64,
-        "peak {} MiB = {:.3} E_pad",
-        peak / MIB,
-        ratio(peak, e_pad)
+        peak <= m.bar(m.build()),
+        "build: peak {:.4} E_pad above the bar {:.4}",
+        ratio(peak, m.e_pad),
+        ratio(m.bar(m.build()), m.e_pad)
     );
 }
 
-/// F8': the walk over the union hands each symbol to the holders' hashers and drops it; the
-/// peak is the build stage, whatever the number of holders and of symbols.
-#[test]
-fn encode_raw_ranges_each_alloc_peak_within_model() {
-    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-    let (blob, params) = padded_block();
+fn build_peak(blob: &[u8], params: &ErasureParams) -> usize {
+    let enc = RaptorQEncoder::new();
+    let ((), peak) = measure(|| {
+        enc.encode_raw_ranges_each(blob, params, &[], &mut |_, _| Ok(()))
+            .unwrap();
+    });
+    peak
+}
+
+/// F8': the walk over the union hands each symbol to the holders' hashers and drops it. Returns
+/// the peak for `holders` hashers.
+fn each_peak(blob: &[u8], params: &ErasureParams, holders: u32) -> usize {
     let enc = RaptorQEncoder::new();
     let k = params.k;
     // Union: part of the source ESIs, then R_due = 2 of repair symbols.
     let union = [(0u32, k / 2), (k + 10, 2 * k)];
-    let bound = (2.1 + SMALL_K_SLACK) * e_pad(&params) as f64 + 4.0 * params.t as f64 + MIB as f64;
-
-    let mut peaks = Vec::new();
-    for holders in [1u32, 4, 8] {
-        let challenge = [7u8; 16];
-        let mut hashers: Vec<ChainHasher> =
-            (0..holders).map(|_| ChainHasher::new(&challenge)).collect();
-        let mut pushed = vec![0usize; holders as usize];
-        let ((), peak) = measure(|| {
-            enc.encode_raw_ranges_each(&blob, &params, &union, &mut |esi, data| {
-                for (j, h) in hashers.iter_mut().enumerate() {
-                    // Holders overlap: every third ESI goes to all of them.
-                    if esi % holders == j as u32 || esi % 3 == 0 {
-                        h.push(esi, data);
-                        pushed[j] += 1;
-                    }
+    let challenge = [7u8; 16];
+    let mut hashers: Vec<ChainHasher> =
+        (0..holders).map(|_| ChainHasher::new(&challenge)).collect();
+    let mut pushed = vec![0usize; holders as usize];
+    let ((), peak) = measure(|| {
+        enc.encode_raw_ranges_each(blob, params, &union, &mut |esi, data| {
+            for (j, h) in hashers.iter_mut().enumerate() {
+                // Holders overlap: every third ESI goes to all of them.
+                if esi % holders == j as u32 || esi % 3 == 0 {
+                    h.push(esi, data);
+                    pushed[j] += 1;
                 }
-                Ok(())
-            })
-            .unwrap();
-        });
-        for (h, n) in hashers.into_iter().zip(pushed) {
-            assert!(n > 0, "fixture: every holder must hash something");
-            h.finish().unwrap();
-        }
+            }
+            Ok(())
+        })
+        .unwrap();
+    });
+    for (h, n) in hashers.into_iter().zip(pushed) {
+        assert!(n > 0, "fixture: every holder must hash something");
+        h.finish().unwrap();
+    }
+    peak
+}
+
+/// F8' (WARN-3, v3.5): the MODEL bar of the walk. The model explains 2.157 E_pad (build stage with
+/// the plan) but the measurement is ≈ 2.192 — about 0.035 E_pad ≈ 9 T the model does not name. No
+/// slack is allowed in a model bar (that was W2 of v3.4), so this unit stays ignored until a spec
+/// delta names the term; it is run by hand with `--ignored` and its numbers go to `runs.jsonl`.
+/// The live units below hold the estimate (M7, M37) and the independence of the holders.
+#[test]
+#[ignore = "STOP v3.4 each: model term unnamed, spec v3.5 WARN-3"]
+fn encode_raw_ranges_each_alloc_peak_within_model() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let (blob, params) = padded_block();
+    let m = Model::new(&params, plan_held(params.k));
+    let build = build_peak(&blob, &params);
+    let model = m.build().max(m.walk());
+    let mut failures = Vec::new();
+    for holders in [1u32, 4, 8] {
+        let peak = each_peak(&blob, &params, holders);
+        report(&format!("each h={holders}"), &m, model, peak);
         println!(
-            "each h={holders}: peak/E_pad = {:.3} (bound {:.3})",
+            "each h={holders}: build {} B, each {} B, P {} B, each - build = {} B = {:.2} T",
+            build,
+            peak,
+            m.plan,
+            peak as i64 - build as i64,
+            (peak as f64 - build as f64) / m.t as f64
+        );
+        if peak > m.bar(model) {
+            failures.push((holders, peak));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "each above the model bar: {failures:?}"
+    );
+}
+
+/// What `estimate_pos_issue` takes above the input — `encoder_bytes` plus the symbol buffers —
+/// covers the measured walk (held by M7, M37; the model bar above is ignored, WARN-3).
+#[test]
+fn encode_raw_ranges_each_peak_is_covered_by_the_estimate() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let (blob, params) = padded_block();
+    let covered = encoder_bytes(params.k, params.t) as usize + POS_SYMBOL_BUFFERS as usize * T;
+    for holders in [1u32, 4, 8] {
+        let peak = each_peak(&blob, &params, holders);
+        println!(
+            "each h={holders}: peak {:.4} E_pad, estimate above the input {:.4} E_pad",
             ratio(peak, e_pad(&params)),
-            bound / e_pad(&params) as f64
+            ratio(covered, e_pad(&params))
         );
         assert!(
-            peak as f64 <= bound,
-            "h={holders}: peak {} MiB = {:.3} E_pad",
-            peak / MIB,
-            ratio(peak, e_pad(&params))
+            peak <= covered,
+            "h={holders}: peak {peak} B above encoder_bytes + {POS_SYMBOL_BUFFERS}·T = {covered} B"
         );
-        peaks.push(peak);
     }
+}
+
+#[test]
+fn encode_raw_ranges_each_peak_does_not_depend_on_holders() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let (blob, params) = padded_block();
+    let peaks: Vec<usize> = [1u32, 4, 8]
+        .iter()
+        .map(|&h| each_peak(&blob, &params, h))
+        .collect();
     let (lo, hi) = (*peaks.iter().min().unwrap(), *peaks.iter().max().unwrap());
     assert!(
         hi - lo <= MIB,
         "the peak must not depend on the number of holders: {peaks:?}"
     );
+}
+
+/// By hand (E = 256 MiB, K = 4096): the build peak of the production K against what the estimate
+/// reserves (`encoder_bytes`). One run per fix round, numbers to `runs.jsonl` (v3.5 NOTE 4).
+#[test]
+#[ignore = "manual measurement: K = 4096 (E = 256 MiB), one run per fix round"]
+fn encoder_build_alloc_peak_k4096() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let params = ErasureParams::compute(4096 * T as u64, 0.5).unwrap();
+    assert_eq!(params.k, 4096);
+    let mut blob = vec![5u8; 4096 * T];
+    pad_for_encoding(&mut blob, &params);
+    let m = Model::new(&params, plan_held(params.k));
+    let peak = build_peak(&blob, &params);
+    let est = encoder_bytes(params.k, params.t) as usize;
+    report("build K=4096", &m, m.build(), peak);
+    println!(
+        "build K=4096: measured {peak} B = {:.4} E_pad, encoder_bytes {est} B = {:.4} E_pad",
+        ratio(peak, m.e_pad),
+        ratio(est, m.e_pad)
+    );
+    assert!(peak <= est, "measured {peak} B above encoder_bytes {est} B");
+}
+
+// ─── S and H of the table, against what the encoder allocates (v3.5a WARN-A) ────────────────────
+
+/// Build a raptorq encoder directly (T = 65 535) and read the histogram of the live blocks at the
+/// peak of the allocations, by exact size. The source symbols are K separate blocks of exactly T
+/// bytes (`create_symbols`) and the intermediate symbols ONE `SymbolSlab` of exactly L(K)·T. The
+/// asserts are exact integers, no byte tolerance: an error of one symbol in S or H of the table
+/// changes the integer L(K)·T and turns the unit red. If raptorq ever allocated the slab per
+/// symbol, the blocks of size T would be K + L(K) and the form of this check changes here, in the
+/// open, not the number.
+#[test]
+fn table_s_and_h_match_the_encoder_build() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    for k in [10u32, 257, 306, 1307] {
+        let l = intermediate_symbols(k) as usize;
+        let data = vec![3u8; k as usize * T];
+        let config = ObjectTransmissionInformation::new(k as u64 * T as u64, T as u16, 1, 1, 1);
+
+        for slot in &AT_PEAK {
+            slot.store(0, Ordering::Relaxed);
+        }
+        HIST_ON.store(true, Ordering::Relaxed);
+        let (encoder, peak) = measure(|| {
+            let plan = SourceBlockEncodingPlan::generate(k as u16);
+            SourceBlockEncoder::with_encoding_plan(0, &config, &data, &plan)
+        });
+        HIST_ON.store(false, Ordering::Relaxed);
+        drop(encoder);
+
+        let mut hist: Vec<(usize, isize)> = (0..SLOTS)
+            .filter_map(|i| {
+                let c = AT_PEAK[i].load(Ordering::Relaxed);
+                (c != 0).then(|| (SIZES[i].load(Ordering::Relaxed), c))
+            })
+            .collect();
+        hist.sort();
+        println!(
+            "K = {k} (L = {l}): peak {peak} B; live blocks >= {HIST_MIN} B at the peak \
+             (size: count): {hist:?}; overflow {}",
+            HIST_OVERFLOW.load(Ordering::Relaxed)
+        );
+        let count_of = |size: usize| hist.iter().find(|(s, _)| *s == size).map_or(0, |(_, c)| *c);
+        assert_eq!(
+            count_of(T),
+            k as isize,
+            "K = {k}: blocks of exactly T bytes (the source symbol copies)"
+        );
+        assert_eq!(
+            count_of(l * T),
+            1,
+            "K = {k}: blocks of exactly L(K)·T = {} bytes (the intermediate symbols, one slab); \
+             S or H of the table is wrong if this fails",
+            l * T
+        );
+    }
 }
 
 // ─── raptorq plan: size, retention in the process-wide cache, time ──────────────────────────────
@@ -272,6 +546,12 @@ fn plan_alloc_and_retention(k: u16) {
         (held as f64) <= threshold,
         "plan {held} B exceeds 0.05 * K * T = {threshold}"
     );
+    // Generation itself (v3.4): the peak while the plan is built stays under the same bound
+    // (measured 0.0448).
+    assert!(
+        (peak as f64) <= threshold,
+        "plan generation peak {peak} B exceeds 0.05 * K * T = {threshold}"
+    );
     assert!(
         after_drop < 64 * 1024,
         "dropping the plan must free it: {after_drop} B left"
@@ -291,4 +571,28 @@ fn raptorq_plan_generate_4096_alloc_peak_and_retention() {
 #[test]
 fn raptorq_plan_generate_16384_alloc_peak_and_retention() {
     plan_alloc_and_retention(16384);
+}
+
+/// By hand, once before release (v3.5 NOTE 5, a release gate): the plan at the largest K the
+/// daemon can meet (56 403, a block over 3 GiB). Prediction: peak <= 0.06 * K * T. Above 0.05 the
+/// model needs its own constant for K > 16 384 (measured x 1.1; procedure in the spec, v3.4).
+#[test]
+#[ignore = "manual measurement: K = 56 403, numbers go to runs.jsonl (release gate)"]
+fn raptorq_plan_generate_56403_alloc_peak() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let k: u16 = 56_403;
+    let started = Instant::now();
+    let (plan, peak) = measure(|| SourceBlockEncodingPlan::generate(k));
+    let gen_time = started.elapsed();
+    let kt = k as f64 * 65_535.0;
+    println!(
+        "plan K={k}: generate {gen_time:?}, peak {peak} B = {:.4} K*T",
+        peak as f64 / kt
+    );
+    drop(plan);
+    assert!(
+        peak as f64 <= 0.06 * kt,
+        "plan generation peak {:.4} K*T is above the 0.06 prediction",
+        peak as f64 / kt
+    );
 }

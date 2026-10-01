@@ -137,7 +137,9 @@ opt-level = 3
 
 # raptorq's debug assertions make its encoding-plan generation cubic in K (K = 1024: 9 s,
 # K = 2048: 35-70 s; release: 4 ms at 1024). The plan tests of R1-d-b (K = 4096, 16384) need it
-# as fast as in production; the library's checks are not what our tests exercise.
+# as fast as in production. Only raptorq's `debug_assert!`s go: its `assert!`s stay (among them
+# K <= 56 403 in `systematic_constants.rs`, A1), and our own `check_source_symbol_limit` refuses
+# such a K before raptorq is called, so the guard does not depend on them.
 [profile.dev.package.raptorq]
 opt-level = 3
 debug-assertions = false

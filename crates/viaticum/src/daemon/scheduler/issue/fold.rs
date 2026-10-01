@@ -5,7 +5,8 @@
 // times as the ESI occurs in the holder's expanded range list (the holder answers without
 // removing duplicates, so a duplicate is hashed twice in a row) — and then dropped. Nothing but
 // the encoder's own state, one raw symbol, one binding buffer and a keystream is alive, so the
-// peak is ≈ 3.1·E_pad + 3·T whatever the number of holders (`mem_budget::estimate_pos_issue`).
+// peak is ≈ (1 + L(K)/K)·E_pad + P(K) above the input whatever the number of holders
+// (`mem_budget::estimate_pos_issue`, `erasure::encoder_bytes`).
 //
 // `pub` (and re-exported `#[doc(hidden)]` by `scheduler`) only so the allocation-peak test
 // binary `tests/block_prep_alloc_peak.rs` can run this very path under a counting allocator.

@@ -1086,3 +1086,50 @@ fn encode_raw_ranges_each_empty_block_returns_error() {
     let err = each_collect(&enc, &[], &params, &[(0, 1)]).unwrap_err();
     assert!(matches!(err, ErasureError::EmptyBlock));
 }
+
+// ─── RFC 6330 table (intermediate_symbols) ─────────────────────────────────────────────────────
+
+#[test]
+fn intermediate_symbols_table_matches_raptorq() {
+    // K' of the table equals raptorq's own extended size for every supported K.
+    for k in 1..=56_403u32 {
+        let (k_prime, s, h) = super::table_row(k);
+        assert_eq!(
+            k_prime,
+            raptorq::extended_source_block_symbols(k),
+            "K' differs at K = {k}"
+        );
+        assert_eq!(super::intermediate_symbols(k), k_prime + s + h);
+    }
+    // S and H of spot rows, from RFC 6330 table 2.
+    for (k, k_prime, s, h) in [
+        (1, 10, 7, 10),
+        (10, 10, 7, 10),
+        (11, 12, 7, 10),
+        (257, 257, 29, 10),
+        (4096, 4112, 137, 11),
+        (16_385, 16_505, 347, 12),
+        (56_403, 56_403, 907, 16),
+    ] {
+        assert_eq!(super::table_row(k), (k_prime, s, h), "row for K = {k}");
+    }
+}
+
+#[test]
+fn intermediate_symbols_known_values() {
+    assert_eq!(super::intermediate_symbols(1), 27);
+    assert_eq!(super::intermediate_symbols(257), 257 + 29 + 10);
+}
+
+#[test]
+#[should_panic(expected = "exceeds the RaptorQ limit")]
+fn intermediate_symbols_above_the_limit_panics() {
+    super::intermediate_symbols(56_404);
+}
+
+#[test]
+fn encoder_bytes_is_the_documented_formula() {
+    let (k, t) = (257u32, 65_535u16);
+    let l = super::intermediate_symbols(k) as u64;
+    assert_eq!(super::encoder_bytes(k, t), (257 + l) * 65_535 + 3277 * 257);
+}

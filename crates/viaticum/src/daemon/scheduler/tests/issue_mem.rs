@@ -33,7 +33,7 @@ use crate::daemon::scheduler::issue::{Ended, InFlight, PrepOutcome, load_failed_
 const MIB: u64 = 1 << 20;
 /// The permit of a PoS preparation of a test block (`k·t` = 640 B): one MiB, the estimate's floor.
 fn permit_of_test_block() -> u64 {
-    estimate_pos_issue(TEST_K as u64 * TEST_T as u64, TEST_T)
+    estimate_pos_issue(TEST_K, TEST_T)
 }
 
 /// The budget of these tests: generous, so only what a test holds makes it busy.

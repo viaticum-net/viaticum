@@ -88,6 +88,9 @@ pub struct WorkPipelineConfig {
     pub chunk_budget_bytes: usize,
 }
 
+// Only tests build a config this way (`..Default::default()`): the daemon sets every field, and
+// no production path is left with an unbounded budget (N2).
+#[cfg(test)]
 impl Default for WorkPipelineConfig {
     fn default() -> Self {
         WorkPipelineConfig {
@@ -101,7 +104,6 @@ impl Default for WorkPipelineConfig {
             min_pool_size: 2,
             recheck_tx: None,
             max_source_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
-            // Only for tests and `default()` users: the daemon always sets its own.
             mem_budget: MemBudget::new(u64::MAX),
             chunk_budget_bytes: viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,
         }
@@ -157,19 +159,36 @@ enum BlockAttempt {
     LeftService,
 }
 
-/// The yield counter of one block after a turn (RAM only, backup-i24-a): a yield counts, a
-/// delivery in full starts the count afresh, anything else leaves it.
+/// The yield counter of one block after a turn, and with it the turn memory of its holders
+/// (`last_attempt`; both RAM only, backup-i24-a): a yield counts; a delivery in full starts the
+/// count afresh; a block that left service (or was parked: nobody to offer to) without a full
+/// delivery loses both — the memory of a block that is no longer served must not live on
+/// (spec v3.5a NOTE 3); anything else leaves them.
 fn count_yields(
     yields: &mut std::collections::HashMap<SourceBlockId, u32>,
+    last_attempt: &mut std::collections::HashMap<SourceBlockId, HolderTurns>,
     block_id: SourceBlockId,
     outcome: &worker::WorkOutcome,
 ) {
+    let delivered_in_full =
+        outcome.failed == 0 && outcome.offered > 0 && outcome.acked == outcome.offered;
     if outcome.yielded {
         *yields.entry(block_id).or_insert(0) += 1;
-    } else if outcome.failed == 0 && outcome.offered > 0 && outcome.acked == outcome.offered {
+    } else if delivered_in_full || outcome.left_service || outcome.offered == 0 {
         yields.remove(&block_id);
+        last_attempt.remove(&block_id);
+    }
+    // The turn entered an empty map for the block; do not keep it.
+    if last_attempt
+        .get(&block_id)
+        .is_some_and(HolderTurns::is_empty)
+    {
+        last_attempt.remove(&block_id);
     }
 }
+
+/// Per holder of one block: the number of the yielded turn in which it was last tried.
+type HolderTurns = std::collections::HashMap<DeviceId, u32>;
 
 // ─── WorkPipeline ─────────────────────────────────────────────────────────────
 
@@ -189,6 +208,10 @@ pub struct WorkPipeline {
     /// How many times the worker gave the budget away on each block since it last delivered the
     /// block in full (RAM only; the `yields_for_block` of the yield line, backup-i24-a).
     yields: std::collections::HashMap<SourceBlockId, u32>,
+    /// Per block, per holder: the number of the yielded turn in which the holder was last tried
+    /// (RAM only; cleared together with `yields`). The next turn goes through the holders by
+    /// it, the longest ago first (LRU, backup-i24-a).
+    last_attempt: std::collections::HashMap<SourceBlockId, HolderTurns>,
 }
 
 impl WorkPipeline {
@@ -214,6 +237,7 @@ impl WorkPipeline {
             cluster_state,
             event_rx,
             yields: std::collections::HashMap::new(),
+            last_attempt: std::collections::HashMap::new(),
         }
     }
 
@@ -392,6 +416,7 @@ impl WorkPipeline {
             block,
             pool,
             self.yields.get(&block.block_id).copied().unwrap_or(0),
+            self.last_attempt.entry(block.block_id).or_default(),
         )
         .await;
 
@@ -407,7 +432,12 @@ impl WorkPipeline {
                     yielded = wo.yielded,
                     "work_pipeline: iteration complete"
                 );
-                count_yields(&mut self.yields, block.block_id, &wo);
+                count_yields(
+                    &mut self.yields,
+                    &mut self.last_attempt,
+                    block.block_id,
+                    &wo,
+                );
                 if wo.left_service {
                     self.update_block_cooldown(block, pool, now, Some(ParkReason::LeftService));
                     Ok(BlockAttempt::LeftService)
@@ -429,6 +459,13 @@ impl WorkPipeline {
                     error = %e,
                     "work_pipeline: iteration error — parking block"
                 );
+                if self
+                    .last_attempt
+                    .get(&block.block_id)
+                    .is_some_and(HolderTurns::is_empty)
+                {
+                    self.last_attempt.remove(&block.block_id);
+                }
                 self.update_block_cooldown(block, pool, now, Some(ParkReason::IterationError));
                 Ok(BlockAttempt::Error)
             }
