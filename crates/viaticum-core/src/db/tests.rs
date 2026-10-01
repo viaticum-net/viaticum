@@ -4541,3 +4541,57 @@ fn pointer_publications_roundtrip() {
     assert_eq!(meta.in_place(PointerPlace::B), Some(&record));
     assert_eq!(meta.in_place(PointerPlace::A), None);
 }
+
+/// C-DK C4 fix round 1: `update_peer` reads and writes in one write
+/// transaction — concurrent updates of one PeerRecord (an identify setting the
+/// addresses, announces bumping a counter) lose nothing.
+#[test]
+fn update_peer_keeps_concurrent_changes() {
+    let db = test_db();
+    let d = DeviceId([7u8; 32]);
+    db.upsert_peer(&make_peer(d)).unwrap();
+    let mut threads = Vec::new();
+    for t in 0..8u64 {
+        let db = db.clone();
+        threads.push(std::thread::spawn(move || {
+            for i in 0..50u64 {
+                db.update_peer(&d, |rec| {
+                    let mut rec = rec.expect("record exists");
+                    if t == 0 && i == 25 {
+                        rec.addrs = vec!["/ip4/127.0.0.1/tcp/4001".to_string()];
+                    }
+                    rec.bytes_we_store_for_peer += 1;
+                    Some(rec)
+                })
+                .unwrap();
+            }
+        }));
+    }
+    for th in threads {
+        th.join().unwrap();
+    }
+    let rec = db.get_peer(&d).unwrap().unwrap();
+    assert_eq!(rec.bytes_we_store_for_peer, 400, "every update counted");
+    assert_eq!(
+        rec.addrs,
+        vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
+        "the addresses survived"
+    );
+}
+
+#[test]
+fn update_peer_none_leaves_the_table_and_returns_current() {
+    let db = test_db();
+    let d = DeviceId([8u8; 32]);
+    let out = db
+        .update_peer(&d, |rec| {
+            assert!(rec.is_none());
+            None
+        })
+        .unwrap();
+    assert!(out.is_none());
+    assert!(db.get_peer(&d).unwrap().is_none());
+    db.upsert_peer(&make_peer(d)).unwrap();
+    let kept = db.update_peer(&d, |_| None).unwrap().expect("current");
+    assert_eq!(kept.device_id, d);
+}

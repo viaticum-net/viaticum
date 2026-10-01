@@ -131,7 +131,8 @@ async fn handshake_only_peer_evicted_before_app_active() {
     assert!(c.send_to_device(a.device_id, pa_c).await.is_ok());
     let pa_a = Message::PeerAnnounce(a.build_peer_announce(Timestamp::now()));
     assert!(a.send_if_connected(c.device_id, pa_a).await.is_ok());
-    tokio::time::sleep(Duration::from_millis(1200)).await; // C's grace is over
+    // C's grace (1 s) and the linger after A's answer to its PeerAnnounce are over.
+    tokio::time::sleep(super::conn_lru::ANSWER_LINGER + Duration::from_millis(300)).await;
     let s = a.conn_stats().await.unwrap();
     assert_eq!(s.evictions_total, 1, "{s:?}");
     let (auth, _) = a.peer_sets().await.unwrap();
@@ -272,4 +273,167 @@ async fn send_or_dial_is_atomic_under_eviction() {
         matches!(r, Ok(Message::Ack(_))),
         "the send must not land on the dying connection: {r:?}"
     );
+}
+
+// ── Fix round 1 ──────────────────────────────────────────────────────────────
+
+/// BLOCK-T (а): a peer whose request to us is in flight is busy — the pass of
+/// ConnStats on B spares A until B answered, then B closes A in that turn.
+#[tokio::test]
+async fn lru_does_not_evict_peer_mid_inbound_request() {
+    let (b, addr_b) =
+        acking_peer_cfg(cached_config(240, 0, 1000), Duration::from_millis(4500)).await;
+    let (a, _ev) = SwarmHandle::start(make_swarm_config(241)).await.expect("A");
+    let a = Arc::new(a);
+    connect(&a, &b, addr_b).await;
+    wait_auth(&b, a.device_id, true).await;
+    let (a2, dev_b) = (a.clone(), b.device_id);
+    let req = tokio::spawn(async move { a2.send_to_device(dev_b, app_message()).await });
+    // B's grace for A (1 s) and the linger of its cert answer (2 s) are over.
+    tokio::time::sleep(super::conn_lru::ANSWER_LINGER + Duration::from_millis(800)).await;
+    let s = b.conn_stats().await.unwrap();
+    assert_eq!(
+        s.evictions_total, 0,
+        "A's request is in flight on B: busy ({s:?})"
+    );
+    let r = req.await.expect("join");
+    assert!(
+        matches!(r, Ok(Message::Ack(_))),
+        "the answer arrives whole: {r:?}"
+    );
+    // Freed by the answer; after the answer's linger the next pass closes it.
+    tokio::time::sleep(super::conn_lru::ANSWER_LINGER + Duration::from_millis(200)).await;
+    assert_eq!(b.conn_stats().await.unwrap().evictions_total, 1);
+    wait_auth(&b, a.device_id, false).await;
+}
+
+/// BLOCK-T (б): inbound app traffic is activity — of two peers that sent B a
+/// request, the one that sent last survives B's cap of 1.
+#[tokio::test]
+async fn inbound_app_traffic_is_activity() {
+    let (b, addr_b) = acking_peer_cfg(cached_config(242, 1, 20_000), Duration::ZERO).await;
+    let (c, _evc) = SwarmHandle::start(make_swarm_config(243)).await.expect("C");
+    let (d, _evd) = SwarmHandle::start(make_swarm_config(244)).await.expect("D");
+    connect(&c, &b, addr_b.clone()).await;
+    connect(&d, &b, addr_b).await;
+    wait_auth(&b, c.device_id, true).await;
+    wait_auth(&b, d.device_id, true).await;
+    ack(&c, &b).await;
+    ack(&d, &b).await; // D last
+    // Both linger after B's answers; the first pass after that closes C.
+    tokio::time::sleep(super::conn_lru::ANSWER_LINGER + Duration::from_millis(200)).await;
+    assert_eq!(b.conn_stats().await.unwrap().evictions_total, 1);
+    wait_auth(&b, c.device_id, false).await;
+    let (auth, _) = b.peer_sets().await.unwrap();
+    assert!(auth.contains(&d.device_id), "the last sender stays");
+}
+
+/// WARN-1: a late cert (second connection) of a peer the cache just evicted
+/// does not put it back into `authenticated`, and its `closing` mark goes with
+/// the close.
+#[tokio::test]
+async fn late_cert_of_evicted_peer_leaves_no_stale_closing() {
+    let (a, _ev) = SwarmHandle::start(cached_config(245, 48, 10_000))
+        .await
+        .expect("A");
+    let (b, addr_b) = acking_peer(246, Duration::ZERO).await;
+    connect(&a, &b, addr_b).await;
+    let (before, after) = a.test_evict_late_cert(b.peer_id).await;
+    assert!(before, "precondition: B authenticated");
+    assert!(
+        !after,
+        "a closing peer is not authenticated again (same turn)"
+    );
+    let (auth, _) = a.peer_sets().await.unwrap();
+    assert!(!auth.contains(&b.device_id));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let s = a.conn_stats().await.unwrap();
+            if s.closing == 0 && s.connected == 0 && s.authenticated == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("closed, nothing left in closing");
+}
+
+/// WARN-3: a sibling (same master: not "known") evicted by the cache is not
+/// dialed back by discovery — it was met by cert.
+#[tokio::test]
+async fn discovery_does_not_dial_evicted_sibling() {
+    let (a, _ev) = SwarmHandle::start(cached_config(247, 48, 10_000))
+        .await
+        .expect("A");
+    let (b, addr_b) = acking_peer(248, Duration::ZERO).await;
+    connect(&a, &b, addr_b.clone()).await;
+    assert!(a.test_evict(b.peer_id).await);
+    wait_closed(&a).await;
+    let stranger = libp2p::PeerId::random();
+    let chosen = a
+        .test_discovery_pass(vec![
+            (b.peer_id, vec![addr_b.clone()]),
+            (stranger, vec![addr_b]),
+        ])
+        .await;
+    assert_eq!(
+        chosen,
+        vec![stranger],
+        "the sibling is met: not dialed again"
+    );
+}
+
+async fn wait_closed(a: &SwarmHandle) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let s = a.conn_stats().await.unwrap();
+            if s.closing == 0 && s.connected == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("closed");
+}
+
+/// WARN-4: the `origin=` of a re-dial of an evicted peer is the one its dial
+/// was made with.
+#[tokio::test]
+async fn redial_of_evicted_peer_logs_its_origin() {
+    use super::conn_lru::DialOrigin;
+    let (a, _ev) = SwarmHandle::start(cached_config(249, 48, 10_000))
+        .await
+        .expect("A");
+    let (b, addr_b) = acking_peer(250, Duration::ZERO).await;
+    connect(&a, &b, addr_b.clone()).await;
+    for (origin, name) in [
+        (DialOrigin::Redial, "redial"),
+        (DialOrigin::Discovery, "discovery"),
+    ] {
+        assert!(a.test_evict(b.peer_id).await);
+        wait_closed(&a).await;
+        a.dial_addrs_from(b.peer_id, vec![addr_b.clone()], origin)
+            .await
+            .expect("dial");
+        wait_auth(&a, b.device_id, true).await;
+        let origins = a.test_redial_origins().await;
+        assert_eq!(origins.last(), Some(&(b.peer_id, name)), "{origins:?}");
+    }
+}
+
+/// N-1: the listener counts the cert exchange finished only once its answer is
+/// sent — a cache that evicts at once (cap 0, no grace) does not cut the answer
+/// off: the dialer authenticates the listener all the same.
+#[tokio::test]
+async fn listener_answers_cert_before_its_cache_closes_the_peer() {
+    let (b, addr_b) = acking_peer_cfg(cached_config(251, 0, 0), Duration::ZERO).await;
+    let (a, mut ev_a) = SwarmHandle::start(make_swarm_config(252)).await.expect("A");
+    a.dial(b.peer_id, addr_b).await.expect("dial");
+    super::swarm_test_helpers::wait_for_authenticated(&mut ev_a, b.device_id).await;
+    // Then, after the linger of its cert answer, B's cache closes A.
+    tokio::time::sleep(super::conn_lru::ANSWER_LINGER + Duration::from_millis(200)).await;
+    assert!(b.conn_stats().await.unwrap().evictions_total >= 1);
+    wait_auth(&b, a.device_id, false).await;
 }

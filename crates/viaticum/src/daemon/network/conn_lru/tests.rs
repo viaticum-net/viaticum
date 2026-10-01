@@ -303,7 +303,7 @@ fn busy_counts_only_connected_peers() {
     let t0 = Instant::now();
     let mut c = lru(48);
     let waiting = PeerId::random();
-    c.begin(&waiting); // an on-demand dial to a peer not connected yet
+    c.add_waiter(&waiting); // an on-demand dial to a peer not connected yet
     assert_eq!(
         c.counts(t0).busy,
         0,
@@ -314,10 +314,69 @@ fn busy_counts_only_connected_peers() {
     assert_eq!(
         c.counts(at(t0, 30)).busy,
         1,
-        "the waiter merged into the entry"
+        "a connected peer with a waiter is busy"
     );
-    assert!(c.release_waiter(&waiting, at(t0, 31)).is_empty());
+    assert!(c.remove_waiter(&waiting, at(t0, 31)).is_empty());
     assert_eq!(c.counts(at(t0, 31)).busy, 0);
+}
+
+/// Fix round 1, WARN-2: waiters outlive a connection. A waiter counted while
+/// a (foreign) connection lived still makes the peer busy on the next one.
+#[test]
+fn waiter_count_survives_reconnect() {
+    let t0 = Instant::now();
+    let mut c = lru(0);
+    let p = PeerId::random();
+    c.on_connected(p, t0);
+    c.add_waiter(&p);
+    c.on_disconnected(&p); // closed before the cert
+    c.on_connected(p, at(t0, 1)); // our own dial
+    let _ = c.on_authenticated(&p, at(t0, 1));
+    assert!(
+        c.victims(at(t0, 30)).is_empty(),
+        "past the grace, still waited for: busy"
+    );
+    assert_eq!(c.counts(at(t0, 30)).busy, 1);
+}
+
+/// Fix round 1, WARN-2: an expired waiter does not end somebody's request.
+#[test]
+fn removed_waiter_does_not_end_a_request() {
+    let t0 = Instant::now();
+    let mut c = lru(0);
+    let p = PeerId::random();
+    c.on_connected(p, t0);
+    let _ = c.on_authenticated(&p, t0);
+    c.begin(&p); // a request in flight
+    c.add_waiter(&p);
+    assert!(
+        c.remove_waiter(&p, at(t0, 30)).is_empty(),
+        "the request keeps it busy"
+    );
+    assert_eq!(c.counts(at(t0, 30)).busy, 1);
+    assert_eq!(
+        c.end(&p, at(t0, 31)).len(),
+        1,
+        "evicted once the request ends"
+    );
+}
+
+/// Fix round 1, WARN-1: a request `begin` for a peer without an entry is a
+/// no-op — nothing would ever end it.
+#[test]
+fn begin_without_entry_is_a_noop() {
+    let t0 = Instant::now();
+    let mut c = lru(0);
+    let p = PeerId::random();
+    c.begin(&p);
+    c.on_connected(p, t0);
+    let _ = c.on_authenticated(&p, t0);
+    let v = c.victims(at(t0, 11));
+    assert_eq!(
+        v.len(),
+        1,
+        "no phantom request keeps it: evicted after the grace"
+    );
 }
 
 #[test]
@@ -372,4 +431,25 @@ fn seed_infra_rule_counts_up_to_the_limit() {
         "the third is beyond the infra limit"
     );
     assert!(c.is_infra(&peers[0]) && c.is_infra(&peers[1]));
+}
+
+/// Fix round 1: after our answer the peer lingers — closing it in the same
+/// turn cut the answer off — and goes at the first pass after the linger.
+#[test]
+fn answered_peer_lingers_before_eviction() {
+    let t0 = Instant::now();
+    let mut c = lru(0);
+    let p = PeerId::random();
+    c.on_connected(p, t0);
+    let _ = c.on_authenticated(&p, t0);
+    c.begin(&p); // an inbound request
+    c.touch(&p, at(t0, 20));
+    assert!(
+        c.end_inbound(&p, at(t0, 20)).is_empty(),
+        "answered just now: lingers"
+    );
+    assert!(c.victims(at(t0, 21)).is_empty());
+    let v = c.victims(at(t0, 23));
+    assert_eq!(v.len(), 1, "gone after the linger");
+    assert!(v[0].evictable_for <= Duration::from_secs(2));
 }

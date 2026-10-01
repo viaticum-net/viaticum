@@ -279,6 +279,15 @@ async fn on_demand_foreign_dial_timeout_is_not_cached() {
         "{r:?}"
     );
     assert_eq!(a.conn_stats().await.unwrap().on_demand_neg_cached, 0);
+    // The target comes up and connects (a connection that is not ours): the
+    // given-up waiter left the cache's count (BLOCK-T в).
+    let (t, _evt) = SwarmHandle::start(make_swarm_config(179))
+        .await
+        .expect("target");
+    let addr_a = get_listen_addr(&a).await;
+    t.dial(a.peer_id, addr_a).await.expect("dial A");
+    wait_auth(&a, target, true).await;
+    assert_eq!(a.test_lru_entry(peer).await.map(|e| e.2), Some(0));
 }
 
 /// W1 a: a foreign dial that fails does not fail the waiter: we dial then.
@@ -314,6 +323,8 @@ async fn negative_cache_reset_by_inbound_connection() {
     b.dial(a.peer_id, addr_a).await.expect("dial A");
     wait_auth(&a, b_dev, true).await;
     assert_eq!(a.conn_stats().await.unwrap().on_demand_neg_cached, 0);
+    // The failed waiter left the cache's count (BLOCK-T в).
+    assert_eq!(a.test_lru_entry(b.peer_id).await.map(|e| e.2), Some(0));
 }
 
 /// N-3 / WARN-5: the processor's path never dials.

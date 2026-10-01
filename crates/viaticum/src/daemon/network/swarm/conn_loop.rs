@@ -47,7 +47,7 @@ impl EventLoopState {
         if let Some(peer) = self.device_to_peer.get(&device).copied()
             && self.authenticated.contains_key(&peer)
         {
-            self.send_app_request(peer, message, reply, false);
+            self.send_app_request(peer, message, reply);
             return;
         }
         if !(dial && self.dial_on_demand) {
@@ -75,7 +75,7 @@ impl EventLoopState {
             deadline: self.on_demand.deadline(now),
         };
         if let Some(lru) = self.lru.as_mut() {
-            lru.begin(&peer);
+            lru.add_waiter(&peer);
         }
         let sit = Situation {
             closing: self.closing.contains_key(&peer),
@@ -87,17 +87,16 @@ impl EventLoopState {
     }
 
     /// Send a /viaticum/1 request to an authenticated `peer`. The cache counts
-    /// it in flight until its response or failure; `counted` = a waiter's
-    /// `begin` already counts it. App traffic (not PeerAnnounce) is activity.
+    /// it in flight until its response or failure; app traffic (not
+    /// PeerAnnounce) is activity, stamped when the exchange ends — while it is
+    /// in flight the peer is busy anyway (fix round 1: one touch, not two).
     pub(super) fn send_app_request(
         &mut self,
         peer: PeerId,
         message: Box<Message>,
         reply: oneshot::Sender<Result<Message, SwarmError>>,
-        counted: bool,
     ) {
         let app = is_app_traffic(&message);
-        let now = Instant::now();
         let req_id = self
             .swarm
             .behaviour_mut()
@@ -105,12 +104,7 @@ impl EventLoopState {
             .send_request(&peer, *message);
         self.pending_requests.insert(req_id, reply);
         if let Some(lru) = self.lru.as_mut() {
-            if !counted {
-                lru.begin(&peer);
-            }
-            if app {
-                lru.touch(&peer, now);
-            }
+            lru.begin(&peer);
             self.lru_out.insert(req_id, (peer, app));
         }
     }
@@ -120,7 +114,7 @@ impl EventLoopState {
         let Some((peer, app)) = self.lru_out.remove(&req_id) else {
             return;
         };
-        self.lru_request_ended(peer, app);
+        self.lru_request_ended(peer, app, false);
     }
 
     /// An inbound request from an authenticated peer is being delivered.
@@ -133,12 +127,9 @@ impl EventLoopState {
         let Some(lru) = self.lru.as_mut() else {
             return;
         };
-        let app = is_app_traffic(message);
         lru.begin(&peer);
-        if app {
-            lru.touch(&peer, Instant::now());
-        }
-        self.lru_in.insert(req_id, (peer, app));
+        // Activity is stamped when the response is sent (`lru_request_ended`).
+        self.lru_in.insert(req_id, (peer, is_app_traffic(message)));
     }
 
     /// An inbound request ended (response sent, or failed / dropped).
@@ -146,10 +137,12 @@ impl EventLoopState {
         let Some((peer, app)) = self.lru_in.remove(&req_id) else {
             return;
         };
-        self.lru_request_ended(peer, app);
+        self.lru_request_ended(peer, app, true);
     }
 
-    fn lru_request_ended(&mut self, peer: PeerId, app: bool) {
+    /// `inbound`: we answered — the peer lingers (ANSWER_LINGER) so the answer
+    /// is not cut off by closing the connection in this turn.
+    fn lru_request_ended(&mut self, peer: PeerId, app: bool, inbound: bool) {
         let now = Instant::now();
         let Some(lru) = self.lru.as_mut() else {
             return;
@@ -157,7 +150,11 @@ impl EventLoopState {
         if app {
             lru.touch(&peer, now);
         }
-        let victims = lru.end(&peer, now);
+        let victims = if inbound {
+            lru.end_inbound(&peer, now)
+        } else {
+            lru.end(&peer, now)
+        };
         self.evict(victims, "end", now);
     }
 
@@ -197,7 +194,7 @@ impl EventLoopState {
                 // An unknown peer without addresses: as before C4.
                 if let Some((device, waiters)) = self.on_demand.dial_refused(&peer) {
                     for w in waiters {
-                        self.release_waiter(&peer, now);
+                        self.remove_waiter(&peer, now);
                         let _ = w.reply.send(Err(SwarmError::PeerNotAuthenticated(device)));
                     }
                 }
@@ -207,7 +204,7 @@ impl EventLoopState {
                 info!(peer_id = %peer, msg = %kinds, reason = %reason, "swarm: on-demand dial failed");
                 if let Some((device, waiters)) = self.on_demand.dial_refused(&peer) {
                     for w in waiters {
-                        self.release_waiter(&peer, now);
+                        self.remove_waiter(&peer, now);
                         let _ = w
                             .reply
                             .send(Err(SwarmError::Unreachable(device, reason.clone())));
@@ -217,10 +214,10 @@ impl EventLoopState {
         }
     }
 
-    /// Undo a resolved waiter's `begin` in the cache.
-    fn release_waiter(&mut self, peer: &PeerId, now: Instant) {
+    /// A resolved waiter leaves the cache's waiter count.
+    fn remove_waiter(&mut self, peer: &PeerId, now: Instant) {
         if let Some(lru) = self.lru.as_mut() {
-            let victims = lru.release_waiter(peer, now);
+            let victims = lru.remove_waiter(peer, now);
             self.evict(victims, "end", now);
         }
     }
@@ -241,7 +238,7 @@ impl EventLoopState {
             }
         };
         for w in r.waiters {
-            self.release_waiter(&r.peer, now);
+            self.remove_waiter(&r.peer, now);
             let _ = w
                 .reply
                 .send(Err(SwarmError::Unreachable(r.device, reason.clone())));
@@ -302,6 +299,8 @@ impl EventLoopState {
                 evicted_secs_ago = now.duration_since(*at).as_secs(),
                 "lru: re-dial of evicted peer"
             );
+            #[cfg(test)]
+            self.test_redial_origins.push((peer, origin.as_str()));
         }
         self.check_over_cap(now);
     }
@@ -348,19 +347,38 @@ impl EventLoopState {
         origin == Some(DialOrigin::OnDemand)
     }
 
-    /// `peer` completed the cert exchange: its waiters go out, then the
-    /// cache's pass (the newcomer may push the oldest protected out).
-    pub(super) fn conn_authenticated(&mut self, peer: PeerId, now: Instant) {
+    /// `peer` completed the cert exchange: its waiters go out; when
+    /// `cert_finished` (the dialer side — the listener's ends with its answer,
+    /// `cert_answer_sent`) the cache's pass (the newcomer may push the oldest
+    /// protected out).
+    pub(super) fn conn_authenticated(&mut self, peer: PeerId, now: Instant, cert_finished: bool) {
         if let Some((_, waiters)) = self.on_demand.on_authenticated(&peer) {
             for w in waiters {
-                self.send_app_request(peer, w.message, w.reply, true);
+                // The request counts by itself before the waiter goes: the
+                // peer is never free in between.
+                self.send_app_request(peer, w.message, w.reply);
+                self.remove_waiter(&peer, now);
             }
         }
-        if let Some(lru) = self.lru.as_mut() {
+        if cert_finished && let Some(lru) = self.lru.as_mut() {
             let victims = lru.on_authenticated(&peer, now);
             self.evict(victims, "auth", now);
         }
         self.promote_queued();
+    }
+
+    /// Listener side: our cert answer to `peer` was sent — the exchange is
+    /// finished for the cache (fix round 1, N-1).
+    pub(super) fn cert_answer_sent(&mut self, peer: PeerId, now: Instant) {
+        if !self.authenticated.contains_key(&peer) {
+            return;
+        }
+        if let Some(lru) = self.lru.as_mut() {
+            // Our cert answer may still be on its way out: linger first.
+            lru.linger(&peer, now);
+            let victims = lru.on_authenticated(&peer, now);
+            self.evict(victims, "auth", now);
+        }
     }
 
     /// Remember where an outbound dial came from (`origin=`).

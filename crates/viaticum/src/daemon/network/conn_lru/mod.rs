@@ -40,6 +40,12 @@ use libp2p::PeerId;
 /// stand from a tick that does not run its pass.
 pub(crate) const LRU_TICK_LATE_MS: u64 = 12_000;
 
+/// After we ANSWERED a peer (a /viaticum/1 response, our cert answer) it stays
+/// busy this long: `ResponseSent` means the stream is closed on our side, not
+/// that yamux has flushed it — closing the connection in the same turn lost the
+/// answer (fix round 1). The next pass (an event, or the tick ≤ 10 s) closes it.
+pub(crate) const ANSWER_LINGER: Duration = Duration::from_secs(2);
+
 /// Who is infrastructure: outside the cap, never evicted (network-i41). The
 /// single point: R2 replaces the seed rule with "holds a relay reservation"
 /// (Р-8 (а)) here and nowhere else (T8).
@@ -141,12 +147,16 @@ struct Entry {
     cert_done: bool,
     /// App traffic only: /viaticum/1 except PeerAnnounce, either direction.
     last_activity: Option<Instant>,
-    /// /viaticum/1 requests in flight (either direction) + on-demand waiters.
+    /// /viaticum/1 requests in flight (either direction). On-demand waiters
+    /// are counted apart (`ConnLru::waiters`): they outlive a connection.
     in_flight: u32,
     /// Decided once by `is_infra` in `on_connected`.
     infra: bool,
-    /// When the entry last stopped being busy (cert done, in_flight → 0).
+    /// When the entry last stopped being busy (cert done, in_flight → 0, the
+    /// last waiter gone, an answer's linger over).
     evictable_since: Option<Instant>,
+    /// Busy until then: an answer of ours may still be on its way out.
+    linger_until: Option<Instant>,
 }
 
 impl Entry {
@@ -165,9 +175,10 @@ pub(crate) struct ConnLru {
     /// How long a connection without a cert exchange counts as busy.
     cert_grace: Duration,
     entries: HashMap<PeerId, Entry>,
-    /// `begin` for a peer without an entry yet (an on-demand dial waiting for
-    /// its connection): merged into the entry by `on_connected`.
-    pending_busy: HashMap<PeerId, u32>,
+    /// On-demand waiters per peer (network-i42), whether or not the peer is
+    /// connected: a connection that closes before the cert (and the redial that
+    /// follows) keeps them. A connected peer with waiters is busy.
+    waiters: HashMap<PeerId, u32>,
     evictions_total: u64,
     last_pass: Option<Instant>,
 }
@@ -187,7 +198,7 @@ impl ConnLru {
             max_protected,
             cert_grace,
             entries: HashMap::new(),
-            pending_busy: HashMap::new(),
+            waiters: HashMap::new(),
             evictions_total: 0,
             last_pass: None,
         }
@@ -219,24 +230,23 @@ impl ConnLru {
         }
     }
 
-    /// First connection to `peer`: a busy entry (cert pending). Merges the
-    /// waiters `begin` counted before the connection. A second call for a peer
-    /// already present changes nothing (one entry per peer).
+    /// First connection to `peer`: a busy entry (cert pending). A second call
+    /// for a peer already present changes nothing (one entry per peer).
     pub(crate) fn on_connected(&mut self, peer: PeerId, now: Instant) {
         if self.entries.contains_key(&peer) {
             return;
         }
         let infra = self.is_infra(&peer);
-        let in_flight = self.pending_busy.remove(&peer).unwrap_or(0);
         self.entries.insert(
             peer,
             Entry {
                 established: now,
                 cert_done: false,
                 last_activity: None,
-                in_flight,
+                in_flight: 0,
                 infra,
                 evictable_since: None,
+                linger_until: None,
             },
         );
     }
@@ -250,8 +260,9 @@ impl ConnLru {
         {
             e.cert_done = true;
             if e.in_flight == 0 {
-                e.evictable_since = Some(now);
+                e.evictable_since = Some(e.linger_until.map_or(now, |t| t.max(now)));
             }
+            // (waiters keep it busy all the same: see `is_busy`)
         }
         self.victims(now)
     }
@@ -268,14 +279,42 @@ impl ConnLru {
         }
     }
 
-    /// A request or an on-demand waiter is in flight with `peer`: never evicted
-    /// meanwhile. Works for a peer without an entry yet (counted until it
-    /// connects).
+    /// A /viaticum/1 request is in flight with `peer`: never evicted
+    /// meanwhile. A peer without an entry (it is not connected: the request
+    /// cannot be on its way) is left alone — its `end` would find nothing.
     pub(crate) fn begin(&mut self, peer: &PeerId) {
-        match self.entries.get_mut(peer) {
-            Some(e) => e.in_flight += 1,
-            None => *self.pending_busy.entry(*peer).or_default() += 1,
+        if let Some(e) = self.entries.get_mut(peer) {
+            e.in_flight += 1;
         }
+    }
+
+    /// We answered `peer` (a response, our cert answer): busy for ANSWER_LINGER.
+    pub(crate) fn linger(&mut self, peer: &PeerId, now: Instant) {
+        if let Some(e) = self.entries.get_mut(peer) {
+            let until = now + ANSWER_LINGER;
+            e.linger_until = Some(until);
+            e.evictable_since = Some(until);
+        }
+    }
+
+    /// An inbound request of `peer` ended with our answer: like `end`, but the
+    /// peer lingers (ANSWER_LINGER) before it can be closed.
+    #[must_use]
+    pub(crate) fn end_inbound(&mut self, peer: &PeerId, now: Instant) -> Vec<Victim> {
+        let Some(e) = self.entries.get_mut(peer) else {
+            return Vec::new();
+        };
+        e.in_flight = e.in_flight.saturating_sub(1);
+        let until = now + ANSWER_LINGER;
+        e.linger_until = Some(until);
+        e.evictable_since = Some(until);
+        // The pass may close OTHER peers; this one lingers.
+        self.victims(now)
+    }
+
+    /// An on-demand waiter for `peer` arrived (network-i42).
+    pub(crate) fn add_waiter(&mut self, peer: &PeerId) {
+        *self.waiters.entry(*peer).or_default() += 1;
     }
 
     /// A request with `peer` ended. Returns the victims to close NOW when this
@@ -297,20 +336,32 @@ impl ConnLru {
         self.victims(now)
     }
 
-    /// An on-demand waiter of `peer` is resolved without a request (failure,
-    /// deadline): undoes its `begin` wherever it was counted.
+    /// An on-demand waiter of `peer` is gone: sent (its request then counts
+    /// by `begin`), failed or expired. Runs the pass when it was the last one
+    /// of a connected peer.
     #[must_use]
-    pub(crate) fn release_waiter(&mut self, peer: &PeerId, now: Instant) -> Vec<Victim> {
-        if self.entries.contains_key(peer) {
-            return self.end(peer, now);
+    pub(crate) fn remove_waiter(&mut self, peer: &PeerId, now: Instant) -> Vec<Victim> {
+        let Some(n) = self.waiters.get_mut(peer) else {
+            return Vec::new();
+        };
+        *n = n.saturating_sub(1);
+        if *n > 0 {
+            return Vec::new();
         }
-        if let Some(n) = self.pending_busy.get_mut(peer) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                self.pending_busy.remove(peer);
+        self.waiters.remove(peer);
+        match self.entries.get_mut(peer) {
+            Some(e) => {
+                if e.cert_done && e.in_flight == 0 {
+                    e.evictable_since = Some(now);
+                }
+                self.victims(now)
             }
+            None => Vec::new(),
         }
-        Vec::new()
+    }
+
+    fn has_waiters(&self, peer: &PeerId) -> bool {
+        self.waiters.get(peer).is_some_and(|n| *n > 0)
     }
 
     /// The young handshake-only peers that are protected now: younger than the
@@ -338,7 +389,12 @@ impl ConnLru {
     }
 
     fn is_busy(&self, e: &Entry, peer: &PeerId, protected: &[PeerId], now: Instant) -> bool {
-        !e.infra && (self.cert_pending(e, now) || e.in_flight > 0 || protected.contains(peer))
+        !e.infra
+            && (self.cert_pending(e, now)
+                || e.linger_until.is_some_and(|t| now < t)
+                || e.in_flight > 0
+                || self.has_waiters(peer)
+                || protected.contains(peer))
     }
 
     /// The eviction pass (tick, ConnStats, auth, end). REMOVES the victims'
@@ -430,11 +486,16 @@ impl ConnLru {
         c
     }
 
-    /// Tests: (cert_done, has app activity, in_flight) of `peer`.
+    /// Tests: (cert_done, has app activity, in_flight + waiters) of `peer`.
     #[cfg(test)]
     pub(crate) fn entry_state(&self, peer: &PeerId) -> Option<(bool, bool, u32)> {
-        self.entries
-            .get(peer)
-            .map(|e| (e.cert_done, e.last_activity.is_some(), e.in_flight))
+        self.entries.get(peer).map(|e| {
+            let waiters = self.waiters.get(peer).copied().unwrap_or(0);
+            (
+                e.cert_done,
+                e.last_activity.is_some(),
+                e.in_flight + waiters,
+            )
+        })
     }
 }

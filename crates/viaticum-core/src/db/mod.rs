@@ -1669,6 +1669,38 @@ impl Db {
         Ok(())
     }
 
+    /// Read-modify-write of one PeerRecord in ONE write transaction: `f` gets
+    /// the stored record (None when there is none) and returns what to store
+    /// (None = leave the table as it is). Returns the record as stored now.
+    /// redb serializes write transactions, so two updates of the same peer never
+    /// lose each other's change — the lost update of separate `get_peer` +
+    /// `upsert_peer` calls (C-DK C4 fix round 1: identify addresses wiped by a
+    /// concurrent authentication / announce write).
+    pub fn update_peer<F>(&self, device_id: &DeviceId, f: F) -> Result<Option<PeerRecord>, DbError>
+    where
+        F: FnOnce(Option<PeerRecord>) -> Option<PeerRecord>,
+    {
+        let tx = self.inner.begin_write()?;
+        let stored = {
+            let mut peers = tx.open_table(PEERS)?;
+            let current: Option<PeerRecord> = match peers.get(&device_id.0)? {
+                Some(v) => Some(from_cbor_bytes(v.value())?),
+                None => None,
+            };
+            match f(current.clone()) {
+                Some(next) => {
+                    debug_assert_eq!(next.device_id, *device_id, "update_peer keeps the key");
+                    let bytes = to_cbor_bytes(&next);
+                    peers.insert(&device_id.0, bytes.as_slice())?;
+                    Some(next)
+                }
+                None => current,
+            }
+        };
+        tx.commit()?;
+        Ok(stored)
+    }
+
     pub fn get_peer(&self, device_id: &DeviceId) -> Result<Option<PeerRecord>, DbError> {
         let tx = self.inner.begin_read()?;
         let table = tx.open_table(PEERS)?;

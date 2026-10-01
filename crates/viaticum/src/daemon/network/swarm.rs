@@ -485,8 +485,21 @@ enum SwarmCommand {
         peer_id: PeerId,
         reply: oneshot::Sender<bool>,
     },
-    /// Unit tests only: (cert_done, has app activity, in_flight) of the cache
-    /// entry of `peer_id`.
+    /// Unit tests only: evict `peer_id`, then deliver its cert again in the
+    /// same turn (a late cert on a second connection); replies (authenticated
+    /// before, authenticated right after the late cert — same turn).
+    #[cfg(test)]
+    TestEvictLateCert {
+        peer_id: PeerId,
+        reply: oneshot::Sender<(bool, bool)>,
+    },
+    /// Unit tests only: (peer, origin) of every `lru: re-dial of evicted peer`.
+    #[cfg(test)]
+    TestRedialOrigins {
+        reply: oneshot::Sender<Vec<(PeerId, &'static str)>>,
+    },
+    /// Unit tests only: (cert_done, has app activity, in_flight + waiters) of
+    /// the cache entry of `peer_id`.
     #[cfg(test)]
     TestLruEntry {
         peer_id: PeerId,
@@ -923,6 +936,7 @@ impl SwarmHandle {
             our_bootstraps: HashSet::new(),
             #[cfg(test)]
             test_kad_lookups: Vec::new(),
+            met: known.clone(),
             known,
             lru,
             closing: HashMap::new(),
@@ -942,6 +956,8 @@ impl SwarmHandle {
             bootstrap_called: false,
             #[cfg(test)]
             test_kad_new_peer: HashMap::new(),
+            #[cfg(test)]
+            test_redial_origins: Vec::new(),
             relay_reservations: HashSet::new(),
             last_empty_lookup_warn: None,
             #[cfg(feature = "e2e-tools")]
@@ -1368,6 +1384,31 @@ impl SwarmHandle {
         rx.await.expect("swarm loop replied")
     }
 
+    /// Unit tests only: evict `peer` and deliver its cert again (late cert).
+    #[cfg(test)]
+    pub(crate) async fn test_evict_late_cert(&self, peer: PeerId) -> (bool, bool) {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestEvictLateCert {
+                peer_id: peer,
+                reply,
+            })
+            .await
+            .expect("swarm loop alive");
+        rx.await.expect("swarm loop replied")
+    }
+
+    /// Unit tests only: (peer, origin) of every re-dial of an evicted peer.
+    #[cfg(test)]
+    pub(crate) async fn test_redial_origins(&self) -> Vec<(PeerId, &'static str)> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestRedialOrigins { reply })
+            .await
+            .expect("swarm loop alive");
+        rx.await.expect("swarm loop replied")
+    }
+
     /// Unit tests only: the Kademlia lookups started so far and the cadence's
     /// settle reason.
     #[cfg(test)]
@@ -1521,6 +1562,12 @@ struct EventLoopState {
     /// Only grows.
     known: HashSet<PeerId>,
 
+    /// Peers met by a cert exchange on ANY path (siblings too) plus `known` at
+    /// start: discovery never dials them and they never make a discovery round
+    /// "not quiet" (fix round 1, WARN-3). `known` stays "other masters" for the
+    /// status and the settle threshold.
+    met: HashSet<PeerId>,
+
     // ── Connection cache and on-demand dial (C-DK C4) ─────────────────────────
     /// The connection cache (network-i41); None = no cache (ConnPolicy cap None).
     lru: Option<ConnLru>,
@@ -1562,6 +1609,10 @@ struct EventLoopState {
     /// Unit tests only: `RoutingUpdated { is_new_peer: true }` per peer.
     #[cfg(test)]
     test_kad_new_peer: HashMap<PeerId, usize>,
+
+    /// Unit tests only: (peer, origin) of every `lru: re-dial of evicted peer`.
+    #[cfg(test)]
+    test_redial_origins: Vec<(PeerId, &'static str)>,
 
     // ── Relay (ε.4) ───────────────────────────────────────────────────────────
     /// PeerIds of relay servers for which we have an active reservation.
@@ -1690,10 +1741,12 @@ impl EventLoopState {
                 }
                 // An evicted peer left `authenticated` already; its device waits
                 // in `closing` for this event (v3.1 W1 в).
-                let device_id = match self.authenticated.remove(&peer_id) {
-                    Some((did, _, _)) => Some(did),
-                    None => self.closing.remove(&peer_id).flatten(),
-                };
+                let closing_device = self.closing.remove(&peer_id).flatten();
+                let device_id = self
+                    .authenticated
+                    .remove(&peer_id)
+                    .map(|(did, _, _)| did)
+                    .or(closing_device);
                 if let Some(did) = device_id {
                     self.device_to_peer.remove(&did);
                 }
@@ -1977,7 +2030,10 @@ impl EventLoopState {
             request_response::Event::InboundFailure { peer, error, .. } => {
                 warn!(peer_id = %peer, error = %error, "cert inbound failure");
             }
-            request_response::Event::ResponseSent { .. } => {}
+            request_response::Event::ResponseSent { peer, .. } => {
+                // Listener side: our cert answer left (fix round 1, N-1).
+                self.cert_answer_sent(peer, Instant::now());
+            }
         }
     }
 
@@ -2018,7 +2074,7 @@ impl EventLoopState {
             return;
         }
 
-        self.record_authenticated(peer_id, request, path).await;
+        self.record_authenticated(peer_id, request, path, true);
     }
 
     async fn on_cert_response(&mut self, peer_id: PeerId, response: DeviceCertExchangeMsg) {
@@ -2037,23 +2093,36 @@ impl EventLoopState {
             }
         };
 
-        self.record_authenticated(peer_id, response, path).await;
+        self.record_authenticated(peer_id, response, path, false);
     }
 
     /// Record a successfully verified peer in the authenticated maps.
-    async fn record_authenticated(
+    /// `listener`: we answered the peer's cert request; the cache counts the
+    /// exchange as finished only once that answer is sent (`ResponseSent` of
+    /// the cert protocol), so an eviction cannot cut the answer off and leave
+    /// the knowledge one-sided (fix round 1, N-1).
+    fn record_authenticated(
         &mut self,
         peer_id: PeerId,
         msg: DeviceCertExchangeMsg,
         path: CertTrustPath,
+        listener: bool,
     ) {
         let device_id = msg.cert.device_id;
         let identity_pub = msg.cert.master_pub_key;
 
+        // Met by cert on any path (siblings too): discovery leaves it alone.
+        self.met.insert(peer_id);
+        self.pending_cert.remove(&peer_id);
+        if self.closing.contains_key(&peer_id) {
+            // A late cert on a second connection of a peer the cache just
+            // evicted: it stays closing, not authenticated (fix round 1, WARN-1).
+            debug!(peer_id = %peer_id, "cert of a closing peer ignored");
+            return;
+        }
         self.authenticated
             .insert(peer_id, (device_id, identity_pub, msg.cert.clone()));
         self.device_to_peer.insert(device_id, peer_id);
-        self.pending_cert.remove(&peer_id);
         if matches!(path, CertTrustPath::Cross) {
             // Another master: known from now on, discovery leaves it alone (Р-5′).
             if self.known.insert(peer_id)
@@ -2097,8 +2166,9 @@ impl EventLoopState {
         }
 
         // network-i42: requests waiting for this peer go out; network-i41: the
-        // cert exchange is done, the cache's pass runs.
-        self.conn_authenticated(peer_id, Instant::now());
+        // cert exchange is done (the dialer's now, the listener's when its
+        // answer is sent), the cache's pass runs.
+        self.conn_authenticated(peer_id, Instant::now(), !listener);
     }
 
     /// All addresses we know for `peer_id`: the address we last dialed it on
@@ -2275,6 +2345,7 @@ impl EventLoopState {
         let dials = discovery_dial_candidates(peer_list, |p| {
             *p == local
                 || self.known.contains(p)
+                || self.met.contains(p)
                 || self.authenticated.contains_key(p)
                 || self.dialing.contains(p)
                 || self.swarm.is_connected(p)
@@ -2295,13 +2366,13 @@ impl EventLoopState {
 
     /// Р-17 (network-i43): a discovery round of the timer ended — a quiet one
     /// (found peers, none unknown) counts towards settling the cadence. A
-    /// sibling (authenticated, our own master) is not "unknown" either.
+    /// sibling met by cert is not "unknown" either.
     fn discovery_round_done(&mut self, peer_list: &[(PeerId, Vec<Multiaddr>)]) {
         let local = *self.swarm.local_peer_id();
         let found_any = peer_list.iter().any(|(p, _)| *p != local);
-        let found_unknown = peer_list.iter().any(|(p, _)| {
-            *p != local && !self.known.contains(p) && !self.authenticated.contains_key(p)
-        });
+        let found_unknown = peer_list
+            .iter()
+            .any(|(p, _)| *p != local && !self.known.contains(p) && !self.met.contains(p));
         if let Some(reason) = self
             .kad_cadence
             .on_discovery_round(found_any, found_unknown)
@@ -2548,7 +2619,7 @@ impl EventLoopState {
                         let _ = reply.send(Err(SwarmError::MasterNotAuthenticated(master)));
                     }
                     Some(pid) => {
-                        self.send_app_request(pid, message, reply, false);
+                        self.send_app_request(pid, message, reply);
                     }
                 }
             }
@@ -2690,6 +2761,26 @@ impl EventLoopState {
             #[cfg(test)]
             SwarmCommand::TestEvict { peer_id, reply } => {
                 let _ = reply.send(self.test_evict(peer_id));
+            }
+            #[cfg(test)]
+            SwarmCommand::TestEvictLateCert { peer_id, reply } => {
+                let Some((_, _, cert)) = self.authenticated.get(&peer_id).cloned() else {
+                    let _ = reply.send((false, false));
+                    return;
+                };
+                self.test_evict(peer_id);
+                let path = verify_cert_for_peer(&peer_id, &cert, &self.cluster_master_pub)
+                    .expect("a cert that authenticated before verifies again");
+                let msg = DeviceCertExchangeMsg {
+                    cert,
+                    x25519_pub: None,
+                };
+                self.record_authenticated(peer_id, msg, path, false);
+                let _ = reply.send((true, self.authenticated.contains_key(&peer_id)));
+            }
+            #[cfg(test)]
+            SwarmCommand::TestRedialOrigins { reply } => {
+                let _ = reply.send(self.test_redial_origins.clone());
             }
             #[cfg(test)]
             SwarmCommand::TestLruEntry { peer_id, reply } => {

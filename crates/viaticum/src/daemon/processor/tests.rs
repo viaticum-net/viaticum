@@ -4345,9 +4345,7 @@ async fn on_peer_identified_persists_addrs_for_inbound_peer() {
 
     // Simulate identify protocol delivering listen addrs for the peer.
     let addr: libp2p::Multiaddr = "/ip4/192.168.1.100/tcp/4001".parse().unwrap();
-    processor
-        .on_peer_identified(device_id, vec![addr.clone()])
-        .await;
+    processor.on_peer_identified(device_id, vec![addr.clone()]);
 
     // Verify the addrs are now persisted on the PeerRecord.
     let record = db
@@ -4670,6 +4668,8 @@ mod four_r_shadow_wedge;
 mod symbol_transfer_reply;
 // F-Q: the offer rule over the quota states (holder-i1..i3).
 mod quota_states;
+// C-DK C4 fix round 1: identify addresses survive an authentication in flight.
+mod peer_event_order;
 
 // ─── pos-i5-a: a holder answers only a fresh challenge (replay guard) ───────────
 

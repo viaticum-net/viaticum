@@ -326,13 +326,21 @@ impl Processor {
                             x25519_pub,
                             listen_addrs,
                         }) => {
-                            let this2 = this.clone();
-                            tokio::spawn(async move {
-                                this2.on_peer_authenticated(
-                                    peer_id, device_id, identity_pub, device_cert, x25519_pub,
-                                    listen_addrs,
-                                ).await;
-                            });
+                            // The record steps run INLINE, in the swarm's event
+                            // order: the PeerRecord exists before the PeerIdentified
+                            // that follows (C-DK C4 fix round 1). The rest (cluster
+                            // add, PeerAnnounce, wake) may wait on the network: spawned.
+                            let _ = peer_id;
+                            if let Some(is_new_peer) = this.record_peer_authenticated(
+                                device_id, identity_pub, &device_cert, x25519_pub, &listen_addrs,
+                            ) {
+                                let this2 = this.clone();
+                                tokio::spawn(async move {
+                                    this2.after_peer_authenticated(
+                                        device_id, identity_pub, device_cert, is_new_peer,
+                                    ).await;
+                                });
+                            }
                         }
                         Some(ProtocolEvent::InboundRequest {
                             from_device,
@@ -393,10 +401,8 @@ impl Processor {
                             });
                         }
                         Some(ProtocolEvent::PeerIdentified { device_id, listen_addrs }) => {
-                            let this2 = this.clone();
-                            tokio::spawn(async move {
-                                this2.on_peer_identified(device_id, listen_addrs).await;
-                            });
+                            // Inline, after the authentication that created the record.
+                            this.on_peer_identified(device_id, listen_addrs);
                         }
                     }
                 }

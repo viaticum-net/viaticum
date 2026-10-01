@@ -83,8 +83,9 @@
 #                  lru24/lru, NOTE main)
 #               8c. black-hole holder H (>= 2 of 6 blocks), restore 6 files -> <= 180 s hashes
 #                  match; in the restore window on-demand failures to H with msg=RestoreRequest
-#                  <= 1 + ceil(T/60), cached-unreachable lines (msg=RestoreRequest) >= blocks(H)
-#                  - failures; `on-demand: gave up` lines are not failures (i42; lru24/lru only)
+#                  <= 1 + ceil(T/60); `on-demand: gave up` lines are not failures; NOTE:
+#                  cached-unreachable answers (restore need not ask H again; the negative
+#                  cache is guarded in-process, M16) (i42; lru24/lru only)
 #               7. NOTE for line B (dr-i63): SIGKILL node-05, DR of its phrase onto a clean
 #                  node-42 — postmen asked/answered/pointers, Kademlia candidates, dr_ready
 #                  (runs last: it kills node-05, an X of step 8a)
@@ -417,6 +418,52 @@ check_cap_sample() {
         [ $(( b - pr )) -gt "$MAX_BUSY_NOT_PROT" ] && MAX_BUSY_NOT_PROT=$(( b - pr ))
     done
     return 0
+}
+
+# known ⊇ authenticated (fix round 1, network-i14): every peer a node has been
+# authenticated with for more than 30 s is in its known_devices. All owners of this run
+# are different masters (no siblings), so every authenticated peer must become known; a
+# miss is the PeerRecord-without-address race (authentication and identify written by
+# racing tasks). Independent of TIME_SCALE. AUTH_SINCE[i:hex8] = first sample time.
+declare -A AUTH_SINCE
+KNOWN_AUTH_BAD=""
+check_known_covers_auth() {
+    local i h now key seen
+    now=$(date -u +%s)
+    for i in $(alive_nodes); do
+        [ -n "${K[$i]:-}" ] || continue
+        for key in "${!AUTH_SINCE[@]}"; do   # left authenticated: forget the start
+            [ "${key%%:*}" = "$i" ] || continue
+            in_list "${key#*:}" "${AD[$i]:-,}" || unset "AUTH_SINCE[$key]"
+        done
+        for h in $(echo "${AD[$i]:-}" | tr ',' ' '); do
+            key="$i:$h"
+            seen="${AUTH_SINCE[$key]:-}"
+            if [ -z "$seen" ]; then AUTH_SINCE[$key]=$now; continue; fi
+            if [ $(( now - seen )) -gt 30 ] && ! in_list "$h" "${KD[$i]:-,}"; then
+                [[ "$KNOWN_AUTH_BAD" == *" node-$i>$h"* ]] || KNOWN_AUTH_BAD="$KNOWN_AUTH_BAD node-$i>$h"
+            fi
+        done
+    done
+    return 0
+}
+known_auth_verdict() {
+    if [ -z "$KNOWN_AUTH_BAD" ]; then
+        pass "every peer authenticated for > 30 s is in the node's known_devices (known ⊇ authenticated)"
+    else
+        fail "authenticated > 30 s but not known (PeerRecord without an address) — node>peer:$(echo "$KNOWN_AUTH_BAD" | cut -c1-400)"
+    fi
+}
+
+# redial_carousel_split NODE LINE0 : "counted excused" — re-dials of evicted peers with
+# origin=redial after LINE0. Excused (i43's exception "auth fell below the floor") when
+# the node's latest `auto-dial pass` before the re-dial line says below_floor=true;
+# those go to a NOTE, not to the carousel bar (fix round 1, N-2).
+redial_carousel_split() {
+    tail -n +$(( $2 + 1 )) "$(node_log "$1")" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk '
+        /auto-dial pass/ { below = ($0 ~ /below_floor=true/) ? 1 : 0; next }
+        /lru: re-dial of evicted peer/ && /origin=redial( |$)/ { if (below) e++; else c++ }
+        END { printf "%d %d\n", c + 0, e + 0 }' || echo "0 0"
 }
 
 # Р-17 v3.3 NOTE: the swarm settles its lookup cadence on ITS known set (peers without an
@@ -827,7 +874,7 @@ done
 if [ "$MODE" = hold ]; then BAR1=600; ROUGH1=300; else BAR1=300; ROUGH1=120; fi
 CONVERGED_AT=""
 while :; do
-    sample_all; check_cap_sample; check_sockets_sample; scan_cadence_settled
+    sample_all; check_cap_sample; check_sockets_sample; scan_cadence_settled; check_known_covers_auth
     LAG=""
     for i in $(alive_nodes); do
         if [ "$i" = "$SEED" ]; then
@@ -889,6 +936,7 @@ if [ -z "$CAP_VIOLATIONS" ]; then
 else
     fail "cap invariant broken:$(echo "$CAP_VIOLATIONS" | cut -c1-300)"
 fi
+known_auth_verdict
 SEED_OK=""
 for t in $(seq 1 12); do
     sample_all
@@ -949,6 +997,8 @@ wait_placed() {
 
 if runs_step 2; then
     step 2 "each friend adds a 64 KB .jpg"
+    note "load average at the start of step 2: $(cut -d' ' -f1-3 /proc/loadavg)"
+    T2=$(date -u +%s)
     KEYS=""
     for i in $(alive_friends); do add_file "$i" photo.jpg; KEYS="$KEYS $i:photo.jpg"; done
     if [ "$MODE" = main ]; then BAR2=180; else BAR2=300; fi
@@ -960,6 +1010,23 @@ if runs_step 2; then
         fi
     else
         fail "after ${BAR2}s not placed:$(echo "$NOT_PLACED" | cut -c1-400)${CAP:+ (lru24: stop point v3-B)}"
+        # Diagnostics only (fix round 1): how long the photo block waited for the work
+        # pipeline. "file added -> first `work_pipeline: picked block for work`" of its
+        # block, and the picks of other blocks meanwhile (importance 1.0 = SystemState).
+        for k in $NOT_PLACED; do
+            k="${k%%(*}"; idx="${k%%:*}"
+            blk=$(file_block_hex "$idx" "${FILE_PATH[$k]}")
+            if [ -z "$blk" ]; then note "node-$idx: photo has no block yet (not backed up)"; continue; fi
+            first=$(events "$(node_log "$idx")" "work_pipeline: picked block for work" block_id importance \
+                | awk -v b="${blk:0:16}" -v t2=$(( T2 - T_BASE )) '$1 >= t2 && index($3, b) == 1 { print $1; exit }')
+            others=$(events "$(node_log "$idx")" "work_pipeline: picked block for work" block_id importance \
+                | awk -v b="${blk:0:16}" -v t2=$(( T2 - T_BASE )) '$1 >= t2 && index($3, b) != 1 { n++; if ($4 + 0 >= 1) hi++ } END { printf "%d (importance 1.0: %d)", n, hi }')
+            if [ -n "$first" ]; then
+                note "node-$idx: photo block ${blk:0:16} first picked $(awk -v f="$first" -v t2=$(( T2 - T_BASE )) 'BEGIN { printf "%.0f", f - t2 }') s after the file was added; other picks since: $others"
+            else
+                note "node-$idx: photo block ${blk:0:16} never picked; other picks since the file was added: $others"
+            fi
+        done
     fi
 fi
 
@@ -971,7 +1038,7 @@ if runs_step 3; then
     declare -A LINE3 PREV_K
     for i in $(alive_nodes); do LINE3[$i]=$(log_line_count "$i"); done
     T3=$(date -u +%s)
-    KNOW_BAD=""; CAP_VIOLATIONS=""; MAX_BUSY_NOT_PROT=0; SAMPLES=0; RESAMPLED=""; RESAMPLE_N=0
+    KNOW_BAD=""; CAP_VIOLATIONS=""; KNOWN_AUTH_BAD=""; MAX_BUSY_NOT_PROT=0; SAMPLES=0; RESAMPLED=""; RESAMPLE_N=0
     sample_all; resample_missing $(alive_nodes)
     for i in $(alive_nodes); do
         if [ -z "${K[$i]:-}" ]; then KNOW_BAD="$KNOW_BAD $i:no-status"; fi
@@ -980,7 +1047,7 @@ if runs_step 3; then
     while [ $(( $(date -u +%s) - T3 )) -lt "$HOLD_SECS" ]; do
         sleep "$SAMPLE_SECS"
         sample_all; resample_missing $(alive_nodes); check_cap_sample; check_sockets_sample
-        scan_cadence_settled
+        scan_cadence_settled; check_known_covers_auth
         SAMPLES=$((SAMPLES + 1))
         for i in $(alive_nodes); do
             k="${K[$i]:-}"
@@ -1005,8 +1072,9 @@ if runs_step 3; then
     else
         fail "cap invariant broken:$(echo "$CAP_VIOLATIONS" | cut -c1-300)"
     fi
+    known_auth_verdict
     # Log bars (spec v3.2 BL-2). Lines of a build without the cache are simply absent.
-    EVICT=0; SLOW_EVICT=""; SLOW_EVICT_LATE=""; REDIAL_CAR=0; DISC_CAR=0; KAD_CAR=0; OND_CAR=0
+    EVICT=0; SLOW_EVICT=""; SLOW_EVICT_LATE=""; REDIAL_CAR=0; REDIAL_EXCUSED=0; DISC_CAR=0; KAD_CAR=0; OND_CAR=0
     LOOKUPS_MAX=0; BOOTS_MAX=0; AUTO_BOOTS=0; OVER_MS=0; KEEPALIVE=0; TICK_LATE=0
     for i in $(alive_nodes); do
         L="$(plain_log_since "$i" "${LINE3[$i]}")"
@@ -1025,7 +1093,8 @@ if runs_step 3; then
         done < <(events "$(node_log "$i")" "lru: evicted peer" evictable_for_ms | awk -v l0="${LINE3[$i]}" '$2 > l0')
         n=$(grep -a "kademlia bootstrap started" <<< "$L" | grep -acE "origin=auto( |$)" || true); AUTO_BOOTS=$((AUTO_BOOTS + n))
         LF=$(node_log "$i"); L0I="${LINE3[$i]}"
-        REDIAL_CAR=$((REDIAL_CAR + $(carousel_count "$LF" redial "$L0I")))
+        read -r RC_N RC_EX <<< "$(redial_carousel_split "$i" "$L0I")"
+        REDIAL_CAR=$((REDIAL_CAR + RC_N)); REDIAL_EXCUSED=$((REDIAL_EXCUSED + RC_EX))
         DISC_CAR=$((DISC_CAR + $(carousel_count "$LF" discovery "$L0I")))
         KAD_CAR=$((KAD_CAR + $(carousel_count "$LF" kad "$L0I")))
         OND_CAR=$((OND_CAR + $(carousel_count "$LF" on_demand "$L0I")))
@@ -1054,7 +1123,7 @@ if runs_step 3; then
     else
         note "0 evictions (cap 48 > peers): the carousel check has nothing to see in this mode"
     fi
-    note "evictions $EVICT; re-dials of evicted peers: origin=kad $KAD_CAR, origin=on_demand $OND_CAR"
+    note "evictions $EVICT; re-dials of evicted peers: origin=kad $KAD_CAR, origin=on_demand $OND_CAR, origin=redial below the floor (i43 exception, not in the bar) $REDIAL_EXCUSED"
     if [ -n "$CAP" ]; then
         if [ "$LOOKUPS_MAX" -eq 0 ] || [ "$BOOTS_MAX" -eq 0 ]; then
             fail "no 'kademlia discovery lookup started' / 'kademlia bootstrap started' lines (max $LOOKUPS_MAX / $BOOTS_MAX): the lookup cadence is not observable"
@@ -1373,8 +1442,10 @@ run_8c() {
     FAIL_BAR=$(( 1 + (T_RESTORE + 59) / 60 ))
     [ "$FAILS" -le "$FAIL_BAR" ] && pass "on-demand dial failures to node-$H in the restore window: $FAILS <= $FAIL_BAR" \
         || fail "on-demand dial failures to node-$H: $FAILS > $FAIL_BAR (M16: no negative cache)"
-    [ "$CACHED" -ge $(( HB - FAILS )) ] && pass "cached-unreachable answers for node-$H: $CACHED >= $HB - $FAILS" \
-        || fail "cached-unreachable answers for node-$H: $CACHED < $HB blocks - $FAILS failures (no negative cache on this build?)"
+    # Not a bar (fix round 1): after one failure restore takes the blocks from the other
+    # holders and need not ask H again, so the cache may have nothing to answer. The
+    # negative cache is guarded in-process (M16: on_demand_black_hole_fails_fast_after_first_timeout).
+    note "cached-unreachable answers for node-$H in the window: $CACHED (blocks on H: $HB, failures: $FAILS; 0 = restore did not ask H again after the failure — nothing for the cache to answer)"
     kill "$BH_PID" 2>/dev/null || true; BH_PID=""
 }
 if runs_step 8c && [ "$SKIP_8BC" = 0 ]; then run_8c; fi
