@@ -460,7 +460,7 @@ impl BlockPrep {
             return true;
         }
         let why = match precheck_sources(&self.db, record, &self.rebuild_scope) {
-            Ok(SourceCheck::Ready) | Err(_) => return true,
+            Ok(SourceCheck::Ready { .. }) | Err(_) => return true,
             Ok(SourceCheck::Missing) => "its source files are missing",
             Ok(SourceCheck::OverLimit) => "its source files are over the size limit",
         };

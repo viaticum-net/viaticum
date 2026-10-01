@@ -55,15 +55,13 @@ pub fn parse_pack_index(data: &[u8]) -> anyhow::Result<ParsedPack> {
 
 /// Extract file bytes for a given FileId from decoded (decrypted + decompressed) plaintext.
 ///
-/// Returns `None` if `file_id` is not found in the pack.
-pub fn extract_file_from_pack(
-    plaintext: &[u8],
-    file_id: FileId,
-) -> anyhow::Result<Option<Vec<u8>>> {
+/// Returns `None` if `file_id` is not found in the pack. The member is a slice of `plaintext`,
+/// not a copy (К-b3: a restore holds one copy of a block outside its permit, not two).
+pub fn extract_file_from_pack(plaintext: &[u8], file_id: FileId) -> anyhow::Result<Option<&[u8]>> {
     let parsed = parse_pack_index(plaintext)?;
     let file_data = &plaintext[parsed.index_len..];
     match parsed.entries.iter().find(|e| e.file_id == file_id) {
-        Some(entry) => Ok(Some(entry_bytes(file_data, entry)?.to_vec())),
+        Some(entry) => Ok(Some(entry_bytes(file_data, entry)?)),
         None => Ok(None),
     }
 }
@@ -71,17 +69,17 @@ pub fn extract_file_from_pack(
 /// The bytes of the pack member whose content hashes to `content_hash`, or `None`
 /// (restore-i38): a path that got its content by a rename, a copy or a swap points at a
 /// member packed under another `file_id`. The first matching member wins — members with
-/// the same hash hold the same bytes.
-pub fn extract_pack_entry_by_hash(
-    plaintext: &[u8],
+/// the same hash hold the same bytes. A slice of `plaintext`, not a copy.
+pub fn extract_pack_entry_by_hash<'a>(
+    plaintext: &'a [u8],
     content_hash: &[u8; 32],
-) -> anyhow::Result<Option<Vec<u8>>> {
+) -> anyhow::Result<Option<&'a [u8]>> {
     let parsed = parse_pack_index(plaintext)?;
     let file_data = &plaintext[parsed.index_len..];
     for entry in &parsed.entries {
         let bytes = entry_bytes(file_data, entry)?;
         if blake3::hash(bytes).as_bytes() == content_hash {
-            return Ok(Some(bytes.to_vec()));
+            return Ok(Some(bytes));
         }
     }
     Ok(None)

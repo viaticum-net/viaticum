@@ -695,6 +695,8 @@ impl DaemonHandle {
                 }),
                 time_scale: cfg.time_scale.max(1),
                 max_source_bytes: max_file_size_bytes,
+                // restore-i39: one permit per block, as a priority waiter of the budget.
+                mem_budget: Arc::clone(&mem_budget),
             },
             encoder.clone(),
         );

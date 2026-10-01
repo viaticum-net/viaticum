@@ -16,10 +16,19 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use viaticum::daemon::mem_budget::{HolderKind, MemBudget, estimate_pos_issue};
+use viaticum::daemon::backup::pipeline::compress_and_encrypt;
+use viaticum::daemon::mem_budget::{
+    HolderKind, MemBudget, encode_block, estimate_pos_issue, estimate_restore_network,
+    estimate_restore_plaintext,
+};
+use viaticum::daemon::restore::staging::{JobId, StagingWriter};
+use viaticum::daemon::restore::{decode_decrypt_stage, member_bytes, plaintext_stage};
 use viaticum::daemon::scheduler::{FoldHolder, hash_holders};
-use viaticum_core::erasure::RaptorQEncoder;
-use viaticum_core::types::{DeviceId, ErasureParams, SourceBlockId};
+use viaticum_core::erasure::{RaptorQEncoder, pad_for_encoding};
+use viaticum_core::types::{
+    DeviceId, ErasureParams, FileId, FileRecord, FileVersion, SourceBlockId, SourceBlockType,
+    Timestamp,
+};
 
 struct Counting;
 
@@ -196,4 +205,198 @@ fn block_prep_alloc_peak_within_estimate() {
 #[test]
 fn block_prep_alloc_peak_within_estimate_small_k() {
     check_within_estimate(&params_of(257, 65_535), &[1, 4, 8]);
+}
+
+// ─── Restore, the network tier (К-b3, restore-i39; spec v3.8 §3, v3.9 WARN-2) ───────────────────────
+//
+// The very stages the restore runs on the blocking pool (`decode_decrypt_stage`, `plaintext_stage`),
+// each under a permit of the size the coordinator holds for it, on a block whose plaintext is four
+// times its encrypted size (compressible: S ≈ 4E). The base of the counting allocator is taken
+// BEFORE the symbols exist — the fixture makes them inside the measurement, as the fetch does — and
+// every stage is judged by the ABSOLUTE live bytes above it against the permit of that stage:
+//   decode stage     ≤ estimate_restore_network  + δ   (includes the k_eff·T of symbols in hand)
+//   plaintext stage  ≤ estimate_restore_plaintext + δ   (the compressed block and the plaintext)
+// M59 (the symbols kept alive into the plaintext stage: +E) and M60 (`decode_all` instead of the
+// exact allocation: up to 2S) both exceed the second.
+
+fn reset_peak() {
+    PEAK.store(live(), Ordering::Relaxed);
+}
+
+/// `len` bytes that compress about four to one at zstd's level 3: per 64 KiB, 16 KiB of noise
+/// and the same 16 KiB three more times (within the window).
+fn compressible_plaintext(len: usize) -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        let mut chunk = Vec::with_capacity(16 * 1024);
+        for _ in 0..16 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            chunk.push((state >> 32) as u8);
+        }
+        for _ in 0..4 {
+            out.extend_from_slice(&chunk);
+        }
+    }
+    out.truncate(len);
+    out
+}
+
+#[test]
+fn restore_network_peak_follows_the_permit() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let key = [42u8; 32];
+    let block = SourceBlockId([5; 32]);
+    let budget = MemBudget::new(4 << 30);
+    let enc = RaptorQEncoder::new();
+
+    let base = live();
+    // The fixture: what the fetch hands over — the raw symbols, ESIs from the repair range (the
+    // worst case of the decode) — made inside the measurement; everything else of it is gone
+    // before the stages run.
+    let (symbols, params, encrypted_size, want_hash, plain_len) = {
+        let plaintext = compressible_plaintext(64 << 20);
+        let want_hash = blake3::hash(&plaintext);
+        let plain_len = plaintext.len() as u64;
+        let mut stored = compress_and_encrypt(&plaintext, &key).unwrap();
+        drop(plaintext);
+        let encrypted_size = stored.len() as u64;
+        let params = ErasureParams::compute(encrypted_size, 1.0).unwrap();
+        assert!(
+            (256..=260).contains(&params.k),
+            "fixture: a block of about 16 MiB (K = {})",
+            params.k
+        );
+        pad_for_encoding(&mut stored, &params);
+        let permit = budget
+            .try_acquire(HolderKind::Restore, &block, 2 << 30)
+            .unwrap();
+        let symbols =
+            encode_block(&permit, &enc, &stored, &params, &[(params.k, params.k_eff)]).unwrap();
+        (symbols, params, encrypted_size, want_hash, plain_len)
+    };
+    let e_pad = params.k as usize * params.t as usize;
+    let delta = e_pad / 50;
+    println!(
+        "fixture: E = {:.4} E_pad, S = {:.4} E_pad, symbols in hand {:.4} E_pad",
+        encrypted_size as f64 / e_pad as f64,
+        plain_len as f64 / e_pad as f64,
+        (live() - base) as f64 / e_pad as f64,
+    );
+
+    // Stage one: decode, decrypt, count — under the decode permit.
+    let permit = budget
+        .try_acquire(
+            HolderKind::Restore,
+            &block,
+            estimate_restore_network(params.k, params.t),
+        )
+        .unwrap();
+    reset_peak();
+    let decrypted = decode_decrypt_stage(
+        &permit,
+        &enc,
+        symbols,
+        &params,
+        encrypted_size,
+        &key,
+        &block,
+    )
+    .expect("the decode stage");
+    let peak_one = PEAK.load(Ordering::Relaxed) - base;
+    println!(
+        "decode stage: permit {:.4} E_pad bar {:.4} measured {:.4} (E_pad units)",
+        permit.bytes() as f64 / e_pad as f64,
+        (permit.bytes() as usize + delta) as f64 / e_pad as f64,
+        peak_one as f64 / e_pad as f64,
+    );
+    assert!(
+        peak_one <= permit.bytes() as usize + delta,
+        "decode stage: {:.4} E_pad live above the base, the permit holds {:.4} (+ delta {:.4})",
+        peak_one as f64 / e_pad as f64,
+        permit.bytes() as f64 / e_pad as f64,
+        delta as f64 / e_pad as f64,
+    );
+    assert_eq!(decrypted.plaintext_len, plain_len, "the counted length");
+    drop(permit);
+
+    // Stage two: the plaintext — under the permit cut to (or taken again for) it.
+    let need =
+        estimate_restore_plaintext(decrypted.compressed.len() as u64, decrypted.plaintext_len);
+    let permit = budget
+        .try_acquire(HolderKind::Restore, &block, need)
+        .unwrap();
+    reset_peak();
+    let plaintext = plaintext_stage(&permit, &block, decrypted).expect("the plaintext stage");
+    let peak_two = PEAK.load(Ordering::Relaxed) - base;
+    println!(
+        "plaintext stage: permit {:.4} E_pad bar {:.4} measured {:.4} (E_pad units)",
+        permit.bytes() as f64 / e_pad as f64,
+        (permit.bytes() as usize + delta) as f64 / e_pad as f64,
+        peak_two as f64 / e_pad as f64,
+    );
+    assert!(
+        peak_two <= permit.bytes() as usize + delta,
+        "plaintext stage: {:.4} E_pad live above the base, the permit holds {:.4} (+ delta {:.4})",
+        peak_two as f64 / e_pad as f64,
+        permit.bytes() as f64 / e_pad as f64,
+        delta as f64 / e_pad as f64,
+    );
+    assert_eq!(
+        blake3::hash(&plaintext),
+        want_hash,
+        "the plaintext is the block's"
+    );
+}
+
+/// M65: a single-file block is written from the slice of its plaintext — the writer makes no copy
+/// of it (the memory outside the budget while the file is written is the one plaintext, not two).
+#[test]
+fn restore_single_writes_from_a_slice_without_a_copy() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let plaintext = vec![0xABu8; 16 * MIB];
+    let dir = tempfile::tempdir().unwrap();
+    let staging_root = dir.path().join("restore");
+    std::fs::create_dir_all(&staging_root).unwrap();
+    let writer = StagingWriter::open(&staging_root, dir.path(), JobId::new()).unwrap();
+    let record = FileRecord {
+        file_id: FileId(1),
+        path: "/data/single.bin".to_string(),
+        importance: 0.5,
+        devices: vec![],
+        versions: vec![],
+        first_seen: Timestamp(0),
+        on_disk_confirmed: true,
+    };
+    let version = FileVersion {
+        content_hash: *blake3::hash(&plaintext).as_bytes(),
+        source_block_id: SourceBlockId([1; 32]),
+        k: 256,
+        t: 65_535,
+        created_at: Timestamp(1),
+        backed_up_at: Some(Timestamp(2)),
+    };
+    let validated = viaticum_core::path_safety::validate_record_path(&record.path).unwrap();
+
+    let (path, peak) = measure(|| {
+        let bytes = member_bytes(&SourceBlockType::Single, &plaintext, &record, &version)
+            .expect("the whole block is the file");
+        writer.write_file(&validated, bytes).unwrap()
+    });
+
+    println!(
+        "single write: peak {peak} B above the plaintext (T = {} B)",
+        65_535
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        plaintext.len() as u64
+    );
+    assert!(
+        peak <= 65_535,
+        "writing a single-file block allocated {peak} B: a copy of the plaintext is {} B",
+        plaintext.len()
+    );
 }

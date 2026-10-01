@@ -180,11 +180,12 @@ pub fn compress_and_encrypt(plaintext: &[u8], epoch_key: &[u8; 32]) -> anyhow::R
     seal_plaintext(plaintext, epoch_key, 0)
 }
 
-/// Decrypt and decompress a stored block (output of `compress_and_encrypt`).
+/// Decrypt a stored block to its compressed bytes (the first half of
+/// [`decrypt_and_decompress`]); the restore decrypts, counts and decompresses in steps so
+/// that its memory permit follows the block (K-b3).
 ///
-/// Input format: `[12-byte nonce][ciphertext]`.
-/// Returns decompressed plaintext.
-pub fn decrypt_and_decompress(stored: &[u8], epoch_key: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
+/// Input format: `[12-byte nonce][ciphertext][tag]`.
+pub fn decrypt(stored: &[u8], epoch_key: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
     if stored.len() < 12 {
         anyhow::bail!("stored block too short: {} bytes", stored.len());
     }
@@ -194,10 +195,35 @@ pub fn decrypt_and_decompress(stored: &[u8], epoch_key: &[u8; 32]) -> anyhow::Re
     let key = derive_block_key(epoch_key);
     let cipher = ChaCha20Poly1305::new(&key.into());
 
-    let compressed = cipher
+    cipher
         .decrypt(nonce, ciphertext)
-        .map_err(|e| anyhow::anyhow!("chacha20poly1305 decrypt: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("chacha20poly1305 decrypt: {e}"))
+}
 
+/// The length of the plaintext of compressed bytes, counted while the frame is decompressed
+/// into a sink: the memory is zstd's window, whatever the output (the frames the backup writes
+/// carry no content size, `compress_framed`).
+pub fn plaintext_len(compressed: &[u8]) -> anyhow::Result<u64> {
+    let mut decoder = zstd::stream::read::Decoder::new(compressed)
+        .map_err(|e| anyhow::anyhow!("zstd decompress: {e}"))?;
+    std::io::copy(&mut decoder, &mut std::io::sink())
+        .map_err(|e| anyhow::anyhow!("zstd decompress: {e}"))
+}
+
+/// Decompress into one allocation of `capacity` bytes (`zstd::bulk`): no growth by doubling,
+/// as `zstd::decode_all` does. `capacity` is at least the plaintext length ([`plaintext_len`],
+/// or an upper bound that is close); a frame that does not fit is an error.
+pub fn decompress_exact(compressed: &[u8], capacity: u64) -> anyhow::Result<Vec<u8>> {
+    zstd::bulk::decompress(compressed, capacity as usize)
+        .map_err(|e| anyhow::anyhow!("zstd decompress: {e}"))
+}
+
+/// Decrypt and decompress a stored block (output of `compress_and_encrypt`).
+///
+/// Input format: `[12-byte nonce][ciphertext]`.
+/// Returns decompressed plaintext.
+pub fn decrypt_and_decompress(stored: &[u8], epoch_key: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
+    let compressed = decrypt(stored, epoch_key)?;
     let plaintext = zstd::decode_all(std::io::Cursor::new(&compressed))
         .map_err(|e| anyhow::anyhow!("zstd decompress: {e}"))?;
     Ok(plaintext)

@@ -594,3 +594,127 @@ fn raptorq_plan_generate_56403_alloc_peak() {
         peak as f64 / kt
     );
 }
+
+// ─── The decoder (spec v3.9 WARN-1, К-b3) ────────────────────────────────────────────────────────
+//
+// Peaks of `decode` ABOVE the input symbols the caller holds (`k_eff·T`), with `o = k_eff − K`
+// (`DECODE_OVERHEAD`) and the model read off `raptorq` 2.0.1 `decoder.rs`:
+//   worst (only repair symbols)  dec_worst = (k_eff + L + o + K)·T + T + X
+//                                 the packets' copy in our wrapper, `D` (L + o rows, solved in place),
+//                                 the one `rebuilt_buf`, the output `result`; X is the sparse matrix and
+//                                 the HDPC rows;
+//   best (every source symbol)   dec_src = (k_eff + K)·T     no solution, no `rebuilt_buf`.
+// X is pre-registered as at most `0.05·E_pad` (the bound of the plan); bar = model + X-limit + δ with
+// `δ = 0.02·E_pad` and no other slack. A peak above the bar is a STOP for that unit, with the member
+// named; a peak below the model by more than `0.05·E_pad` says the model is too high (a spec delta
+// tightens the bar, never loosens it).
+
+struct DecModel {
+    k: u32,
+    k_eff: u32,
+    t: usize,
+    l: usize,
+    e_pad: usize,
+}
+
+impl DecModel {
+    fn new(params: &ErasureParams) -> DecModel {
+        DecModel {
+            k: params.k,
+            k_eff: params.k_eff,
+            t: params.t as usize,
+            l: intermediate_symbols(params.k) as usize,
+            e_pad: e_pad(params),
+        }
+    }
+    fn o(&self) -> usize {
+        (self.k_eff - self.k) as usize
+    }
+    /// `dec_worst` without X.
+    fn worst(&self) -> usize {
+        (self.k_eff as usize + self.l + self.o() + self.k as usize) * self.t + self.t
+    }
+    /// `dec_src`.
+    fn src(&self) -> usize {
+        (self.k_eff as usize + self.k as usize) * self.t
+    }
+    fn x_limit(&self) -> usize {
+        self.e_pad / 20
+    }
+    fn delta(&self) -> usize {
+        self.e_pad / 50
+    }
+    fn bar(&self, model: usize) -> usize {
+        model + self.x_limit() + self.delta()
+    }
+}
+
+/// Peak of `decode` over `k_eff` symbols of a block of K = 257: the repair ones only
+/// (`repair_only`) or every source ESI and three repair ones.
+fn decode_peak_checked(name: &str, repair_only: bool) {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let (blob, params) = padded_block();
+    decode_peak_of(name, repair_only, &blob, &params);
+}
+
+fn decode_peak_of(name: &str, repair_only: bool, blob: &[u8], params: &ErasureParams) {
+    let m = DecModel::new(params);
+    let enc = RaptorQEncoder::new();
+    let first = if repair_only { params.k } else { 0 };
+    let symbols = enc.encode_raw(blob, params, first, params.k_eff).unwrap();
+    assert_eq!(symbols.len(), params.k_eff as usize);
+    let (out, peak) = measure(|| enc.decode(&symbols, params).unwrap());
+    assert!(out == blob, "{name}: the decoded block is not the block");
+    let model = if repair_only { m.worst() } else { m.src() };
+    println!(
+        "{name}: K = {} L = {} o = {} | model {:.4} (+ X <= 0.05) bar {:.4} measured {:.4} (E_pad units)",
+        m.k,
+        m.l,
+        m.o(),
+        ratio(model, m.e_pad),
+        ratio(m.bar(model), m.e_pad),
+        ratio(peak, m.e_pad),
+    );
+    assert!(
+        peak <= m.bar(model),
+        "{name}: peak {:.4} E_pad above the bar {:.4} (model {:.4} + X-limit 0.05 + delta 0.02)",
+        ratio(peak, m.e_pad),
+        ratio(m.bar(model), m.e_pad),
+        ratio(model, m.e_pad)
+    );
+}
+
+/// The worst case: only repair symbols are received, the decoder solves the whole system.
+#[test]
+fn decode_alloc_peak_within_model_all_repair() {
+    decode_peak_checked("decode all repair", true);
+}
+
+/// The best case: every source symbol is received, nothing to solve.
+#[test]
+fn decode_alloc_peak_within_model_all_source() {
+    decode_peak_checked("decode all source", false);
+}
+
+/// By hand (E = 256 MiB, K = 4096): the same two bars at the production K. One run per fix round.
+#[test]
+#[ignore = "manual measurement: K = 4096 (E = 256 MiB), one run per fix round"]
+fn decode_alloc_peak_within_model_all_repair_k4096() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let params = ErasureParams::compute(4096 * T as u64, 0.5).unwrap();
+    assert_eq!(params.k, 4096);
+    let mut blob: Vec<u8> = (0..4096 * T).map(|i| (i % 251) as u8 + 1).collect();
+    pad_for_encoding(&mut blob, &params);
+    decode_peak_of("decode all repair K=4096", true, &blob, &params);
+}
+
+#[test]
+#[ignore = "manual measurement: K = 4096 (E = 256 MiB), one run per fix round"]
+fn decode_alloc_peak_within_model_all_source_k4096() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let params = ErasureParams::compute(4096 * T as u64, 0.5).unwrap();
+    assert_eq!(params.k, 4096);
+    let mut blob: Vec<u8> = (0..4096 * T).map(|i| (i % 251) as u8 + 1).collect();
+    pad_for_encoding(&mut blob, &params);
+    decode_peak_of("decode all source K=4096", false, &blob, &params);
+}

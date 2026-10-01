@@ -263,6 +263,10 @@ pub fn render_restore_progress(job: &RestoreJob, now_unix: u64) -> String {
                     retry_in(until, now_unix)
                 ));
             }
+            // restore-i39: a big block of this node holds the memory this one needs.
+            if job.waiting_for_memory {
+                line.push_str("; waiting for memory (another big block is being worked on)");
+            }
             line.push('\n');
             line
         }

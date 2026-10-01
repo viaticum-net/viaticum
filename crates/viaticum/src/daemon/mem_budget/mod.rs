@@ -35,8 +35,11 @@ use std::time::Duration;
 
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
-use viaticum_core::constants::RAPTORQ_MAX_SOURCE_SYMBOLS;
-use viaticum_core::erasure::{ErasureEncoder, ErasureError, Symbol, SymbolSink, encoder_bytes};
+use viaticum_core::constants::{DECODE_OVERHEAD, RAPTORQ_MAX_SOURCE_SYMBOLS};
+use viaticum_core::erasure::{
+    ErasureEncoder, ErasureError, PLAN_BYTES_PER_SOURCE_SYMBOL, Symbol, SymbolSink, encoder_bytes,
+    intermediate_symbols,
+};
 use viaticum_core::types::{ErasureParams, SourceBlockId};
 
 pub use viaticum_core::erasure::POS_SYMBOL_BUFFERS;
@@ -777,17 +780,39 @@ pub fn estimate_pos_issue(k: u32, t: u16) -> u64 {
     )
 }
 
-/// Restore from the network: the fetched symbols, the decoder's copy and work area, the output,
-/// and the decryption — `5·E_pad`.
-pub fn estimate_restore_network(e_pad: u64) -> u64 {
-    round_up_mib(e_pad as u128 * 5)
+// ─── Restore estimates (К-b3, restore-i39; spec v3.8 §3, v3.9 WARN-1) ─────────────────────────────
+//
+// The decoder model, over the input symbols the caller holds (`k_eff·T`): the copy of the packets in
+// our wrapper (`k_eff·T`), the intermediate symbols and their solution in place (`(L(K) + o)·T`,
+// o = `DECODE_OVERHEAD`), the one `rebuilt_buf` (`T`) and the output (`K·T`), plus X(K), the sparse
+// matrix and the HDPC rows, bounded by `0.05·K·T` (`PLAN_BYTES_PER_SOURCE_SYMBOL·K`, the plan bound
+// of the encoder). `dec_worst = (k_eff + L + o + K)·T + T + X`; with every source symbol present
+// there is no solution and no `rebuilt_buf`: `dec_src = (k_eff + K)·T`.
+
+/// What zstd holds besides its output while it decompresses a frame of level 3: the window and
+/// the block buffers (2 MiB + 128 KiB measured at the backup's level; the spec predicts ≤ 8 MiB).
+pub const ZSTD_WINDOW_BYTES: u64 = 8 * MIB;
+
+/// Restore from the network, the decode stage: the fetched symbols the caller already holds
+/// (`k_eff·t`) and the decoder's worst case — `(2·k_eff + L(k) + o + k + 1)·t + 3277·k`. K is
+/// clamped like `encoder_held`: a K the decoder refuses fails before it allocates.
+pub fn estimate_restore_network(k: u32, t: u16) -> u64 {
+    let k = k.min(RAPTORQ_MAX_SOURCE_SYMBOLS) as u128;
+    let o = DECODE_OVERHEAD as u128;
+    let k_eff = k + o;
+    let l = intermediate_symbols(k as u32) as u128;
+    round_up_mib((2 * k_eff + l + o + k + 1) * t as u128 + PLAN_BYTES_PER_SOURCE_SYMBOL as u128 * k)
 }
 
-/// Restore from the local source: the rebuilt blob (`E_pad`) and the decrypted and compressed
-/// copy (≈ E_pad) plus the plaintext `s` — `2·E_pad + S`. A caller that does not know the
-/// plaintext size passes an upper bound (zstd's `decode_all` may grow its buffer to twice S).
-pub fn estimate_restore_local(e_pad: u64, s: u64) -> u64 {
-    round_up_mib(e_pad as u128 * 2 + s as u128)
+/// Restore, after the decode: the decrypted compressed block, the plaintext and zstd's window.
+pub fn estimate_restore_plaintext(compressed: u64, s: u64) -> u64 {
+    round_up_mib(compressed as u128 + s as u128 + ZSTD_WINDOW_BYTES as u128)
+}
+
+/// Restore from the local source: the rebuilt blob (`k·t`), its decrypted compressed copy (≤ `k·t`)
+/// and the plaintext `s` — `2·k·t + s + window`. `s` comes from the files' `metadata`.
+pub fn estimate_restore_local(k: u32, t: u16, s: u64) -> u64 {
+    round_up_mib(2 * k as u128 * t as u128 + s as u128 + ZSTD_WINDOW_BYTES as u128)
 }
 
 /// The block work budget of a machine with `ram_limit_bytes` of RAM: `M·14/32`.
@@ -822,3 +847,5 @@ pub fn resolve_block_work_budget(ram_bytes: u64, test_override_mb: Option<&str>)
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_restore;

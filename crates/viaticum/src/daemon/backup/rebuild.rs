@@ -151,7 +151,10 @@ pub fn rebuild_candidate(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceCheck {
     /// Every source has a candidate file within the size limit: a rebuild may succeed.
-    Ready,
+    /// `plaintext_bytes` is the sum of the sizes (`metadata`) of the candidates it would read
+    /// first — the block's plaintext without its pack index (the local tier of a restore sizes
+    /// its memory permit by it, К-b3).
+    Ready { plaintext_bytes: u64 },
     /// A source has no candidate file at all: a rebuild cannot succeed.
     Missing,
     /// A source has candidate files, all above the size limit of this machine (backup-i5).
@@ -187,6 +190,7 @@ fn precheck(catalog: &Catalog<'_>, block: &SourceBlockRecord) -> SourceCheck {
             }
         }
         SourceBlockType::Pack { entries } => {
+            let mut total = 0u64;
             for entry in entries {
                 let verdict = match catalog.by_id.get(&entry.file_id).copied() {
                     None => SourceCheck::Missing,
@@ -200,20 +204,27 @@ fn precheck(catalog: &Catalog<'_>, block: &SourceBlockRecord) -> SourceCheck {
                         None => path_check(&owner.path, catalog.limit),
                     },
                 };
-                if verdict != SourceCheck::Ready {
-                    return verdict;
+                match verdict {
+                    SourceCheck::Ready { plaintext_bytes } => {
+                        total = total.saturating_add(plaintext_bytes)
+                    }
+                    other => return other,
                 }
             }
-            SourceCheck::Ready
+            SourceCheck::Ready {
+                plaintext_bytes: total,
+            }
         }
     }
 }
 
-/// One candidate path by `metadata`: `Ready` if a file within `limit`, `OverLimit` if a file
-/// above it, `Missing` otherwise (absent or unreadable).
+/// One candidate path by `metadata`: `Ready` (with its size) if a file within `limit`,
+/// `OverLimit` if a file above it, `Missing` otherwise (absent or unreadable).
 fn path_check(path: &str, limit: u64) -> SourceCheck {
     match std::fs::metadata(path) {
-        Ok(m) if m.len() <= limit => SourceCheck::Ready,
+        Ok(m) if m.len() <= limit => SourceCheck::Ready {
+            plaintext_bytes: m.len(),
+        },
         Ok(_) => SourceCheck::OverLimit,
         Err(_) => SourceCheck::Missing,
     }
@@ -424,7 +435,7 @@ impl<'a> Catalog<'a> {
         let mut over = false;
         for candidate in own.into_iter().chain(others) {
             match path_check(&candidate.path, self.limit) {
-                SourceCheck::Ready => return SourceCheck::Ready,
+                ready @ SourceCheck::Ready { .. } => return ready,
                 SourceCheck::OverLimit => over = true,
                 SourceCheck::Missing => {}
             }

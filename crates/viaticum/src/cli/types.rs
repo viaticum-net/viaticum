@@ -300,6 +300,10 @@ pub struct RestoreJob {
     /// answer (redialed, retried at this time, restore-i26); absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_for_holders_until: Option<String>,
+    /// The running job waits for the node's block work memory (restore-i39, К-b3): another
+    /// big block holds it. Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_memory: bool,
 }
 
 /// Lifecycle of a restore job. `Queued` exists only in the daemon's memory; the
