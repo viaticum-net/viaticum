@@ -604,13 +604,25 @@ step3b() {
     echo ""
     echo "=== Step 3b: ADVERSARIAL budget under load: node-03/04 stopped, r.bin removed, big2.bin delivered, restore of r.bin ==="
     mkdir -p "$T/stash"
-    kill -STOP "${DPID[3]}" "${DPID[4]}"
     mv "$RB_FILE" "$T/stash/"
     hwm_reset "${DPID[0]}" || { fail "setup: VmHWM reset failed"; exit 1; }
     L3B=$(log_line_count 0); T3B=$(date +%s)
     B2_FILE="$FILES/big2.bin"
     make_random "$B2_FILE" $((B2_MB * MIB))
     B2=""; RST_PID=""; T_CONT=""; RST_DONE=0
+    # v3.12c: node-03/04 are stopped only after the worker's first grant for B2 (the step checks the
+    # memory budget, not the pick order: a small block with dead holders can outrank B2, repair-i5).
+    local gend=$(( $(date +%s) + 120 ))
+    while [ "$(date +%s)" -lt "$gend" ]; do
+        B2=$(ev 0 "$((L3B + 1))" "mem_budget: granted" kind block bytes | awk -v nb="$NB" -v rb="$RB16" '$3 == "worker" && $4 != nb && $4 != rb && $5 + 0 >= 1000 * 1048576 { if (!_d++) print $4 }')
+        [ -n "$B2" ] && break
+        sleep 0.5
+    done
+    kill -STOP "${DPID[3]}" "${DPID[4]}"
+    if [ -n "$B2" ]; then info "step 3b: worker granted for B2 = $B2 at +$(( $(date +%s) - T3B )) s: node-03/04 stopped"
+    else
+        rough "3b: B2 never picked within 120 s of big2.bin (node-03/04 stopped anyway); picks in the window: $(clog 0 "$((L3B + 1))" | grep -aF 'picked block for work' | grep -ao 'block_id=[0-9a-f]*' | sort | uniq -c | tr '\n' ' ')"
+    fi
     local now line tend restore_deadline=0
     while :; do
         now=$(date +%s)
@@ -687,7 +699,7 @@ step3b_judge() {
     elif [ -n "$marked" ] && [ -n "$batched" ]; then
         pass "3b (a): blocks marked at a busy queue, then 'marked blocks now wait for memory as a batch'"
     else
-        local ht mx; ht=$(held_trace 0 $((S3_L0 + 1)) "$L3B_END"); mx=$(sed -E 's/^max=([0-9]+).*/\1/' <<< "$ht")
+        local ht mx; ht=$(held_trace 0 "$((L3B + 1))" "$L3B_END"); mx=$(sed -E 's/^max=([0-9]+).*/\1/' <<< "$ht")
         if [ "$mx" -gt $((BUDGET_MB_0 * MIB)) ]; then
             fail "3b (a): budget does not hold: max sum of held = $((mx / MIB)) MiB > $BUDGET_MB_0 MiB, and NB was neither deferred nor marked"
         else
