@@ -149,6 +149,53 @@ async fn closest_peers_answer_fits_when_peers_have_many_addrs() {
     );
 }
 
+/// network-i20: FIND_NODE to a node whose 25 peers each announce five
+/// 255-character DNS names (≈ 300 B each, Global rank, a 4 KiB identify holds
+/// them) is answered with a frame the asker decodes: the names are over
+/// MAX_KAD_ADDR_BYTES and never reach the table, so the answer stays small
+/// however few addresses there are. M (byte limits off) → each record holds the
+/// five names first (rank, cap 6) → ≈ 20 × 1.5 KB > 16 KiB → no success.
+///
+/// The sixth address is the black hole on loopback: S has no DNS transport,
+/// and when its Kademlia bootstrap dials a peer whose record is ONLY such names
+/// the dial fails at once and libp2p strips all but one of them
+/// (`address_failed`), hiding the regression; a dial that hangs on the black
+/// hole fails nothing during the test.
+#[tokio::test]
+async fn closest_peers_answer_fits_when_peers_announce_long_dns_names() {
+    let (s, _events) = SwarmHandle::start(make_swarm_config(115))
+        .await
+        .expect("swarm S");
+    let bh = black_hole_port().await;
+    for _ in 0..25 {
+        let mut announce: Vec<Multiaddr> = (0..5)
+            .map(|k| {
+                format!("/dns4/{}{k}/tcp/4001", "a".repeat(254))
+                    .parse()
+                    .expect("ma")
+            })
+            .collect();
+        let hole: Multiaddr = format!("/ip4/127.0.0.2/tcp/{bh}").parse().expect("ma");
+        announce.push(hole.clone());
+        let peer = PeerId::random();
+        let held = s.test_feed_kad(peer, announce).await;
+        assert!(
+            held.contains(&hole.with(libp2p::multiaddr::Protocol::P2p(peer))),
+            "the peer is in S's table: {held:?}"
+        );
+    }
+    let addr = get_listen_addr(&s).await;
+    let mut client = client_of(&s, &addr);
+    let qid = client.behaviour_mut().get_closest_peers(PeerId::random());
+    let (_result, stats) = finish(&mut client, qid).await;
+    assert!(
+        stats.num_successes() >= 1,
+        "S's FIND_NODE answer did not decode: requests={} failures={}",
+        stats.num_requests(),
+        stats.num_failures()
+    );
+}
+
 /// network-i20: a stranger publishes a provider record with ~13 KB of
 /// addresses (ADD_PROVIDER fits the frame), another asks GET_PROVIDERS. With
 /// FilterBoth S stores nothing, so its answer carries only the closer peers and
@@ -218,8 +265,26 @@ async fn server_mode_answers_foreign_find_node() {
     }
 }
 
+/// Wait until Kademlia has reported `peer` as a new table entry `n` times.
+async fn wait_new_peer_events(s: &SwarmHandle, peer: PeerId, n: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while s.test_kad_new_peer_count(peer).await < n {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("RoutingUpdated reached the swarm loop in 5 s");
+}
+
 /// network-i18 (W7): a peer restarted on a new port; its next identify
-/// replaces the stale addresses in our record instead of piling up next to them.
+/// replaces the stale addresses in our record instead of piling up next to them
+/// — and the peer stays in the table the whole time: no second
+/// `RoutingUpdated { is_new_peer: true }`. Removing first (M: remove before
+/// add) empties the record, libp2p drops the peer (`remove_address` on its
+/// last address) and re-inserts it as new: the final set is the same, but on a
+/// seed (friends dial in, so no dialed address protects the record) the peer
+/// loses its place in the bucket, and next to a full bucket it may not get one
+/// back.
 #[tokio::test]
 async fn identify_with_new_port_replaces_stale_kad_addrs() {
     let (s, _events) = SwarmHandle::start(make_swarm_config(114))
@@ -237,11 +302,24 @@ async fn identify_with_new_port_replaces_stale_kad_addrs() {
     };
     let before = s.test_feed_kad(peer, on(old_port)).await;
     assert_eq!(before.len(), 3);
+    wait_new_peer_events(&s, peer, 1).await;
+
     let after = s.test_feed_kad(peer, on(new_port)).await;
+    // Barrier: Kademlia queues its events in order, so once a peer fed after
+    // the second feed is reported, any event of that feed has been seen.
+    let barrier = PeerId::random();
+    s.test_feed_kad(barrier, on(old_port)).await;
+    wait_new_peer_events(&s, barrier, 1).await;
+
     let want: HashSet<Multiaddr> = on(new_port)
         .into_iter()
         .map(|a| a.with(libp2p::multiaddr::Protocol::P2p(peer)))
         .collect();
     let got: HashSet<Multiaddr> = after.into_iter().collect();
     assert_eq!(got, want, "only the new port's addresses remain");
+    assert_eq!(
+        s.test_kad_new_peer_count(peer).await,
+        1,
+        "the peer left the table while its addresses were replaced"
+    );
 }

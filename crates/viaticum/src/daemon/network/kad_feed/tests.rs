@@ -3,7 +3,10 @@
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 
-use super::{MAX_KAD_ADDRS_PER_PEER, kad_feed_addrs, kad_replace_plan};
+use super::{
+    MAX_KAD_ADDR_BYTES, MAX_KAD_ADDR_BYTES_PER_PEER, MAX_KAD_ADDRS_PER_PEER, kad_dialed_addr,
+    kad_feed_addrs, kad_replace_plan,
+};
 
 fn ma(s: &str) -> Multiaddr {
     s.parse().expect("valid multiaddr")
@@ -161,4 +164,97 @@ fn kad_replace_plan_is_empty_when_record_matches() {
     let (add, remove) = kad_replace_plan(peer, &current, &want, None);
     assert!(add.is_empty(), "same address with and without /p2p/");
     assert!(remove.is_empty());
+}
+
+/// `/dns4/<name of `len` characters>/tcp/<port>`: Global rank, length chosen.
+fn dns(len: usize, port: u16) -> Multiaddr {
+    ma(&format!("/dns4/{}/tcp/{port}", "a".repeat(len)))
+}
+
+/// The DNS name length whose address, `/p2p/<peer>` included, is `bytes` long
+/// (names under 128 characters: one length byte).
+fn dns_of_bytes(peer: PeerId, bytes: usize, port: u16) -> Multiaddr {
+    let overhead = dns(0, port).with(Protocol::P2p(peer)).len();
+    let addr = dns(bytes - overhead, port);
+    assert_eq!(addr.clone().with(Protocol::P2p(peer)).len(), bytes);
+    addr
+}
+
+/// network-i20: an address longer than MAX_KAD_ADDR_BYTES (suffix included)
+/// is dropped, however well it ranks; one at the limit is kept. A 255-character
+/// DNS name — what a hostile peer announces to inflate our answers — is out.
+#[test]
+fn kad_feed_drops_oversized_addresses() {
+    let peer = PeerId::random();
+    let at_limit = dns_of_bytes(peer, MAX_KAD_ADDR_BYTES, 1);
+    let over_limit = dns_of_bytes(peer, MAX_KAD_ADDR_BYTES + 1, 2);
+    let input = vec![
+        dns(255, 3),
+        over_limit,
+        at_limit.clone(),
+        ma("/ip4/10.0.0.1/tcp/4001"),
+    ];
+    let out = kad_feed_addrs(peer, &input, None);
+    assert_eq!(
+        out,
+        vec![
+            at_limit.with(Protocol::P2p(peer)),
+            p2p("/ip4/10.0.0.1/tcp/4001", peer)
+        ],
+        "oversized names dropped, not counted against the cap"
+    );
+    assert!(out.iter().all(|a| a.len() <= MAX_KAD_ADDR_BYTES));
+}
+
+/// network-i20: the byte budget holds the dialed address (first) and the
+/// identify addresses taken in rank order; one that does not fit is skipped
+/// and a shorter one after it still goes in. Four 120 B names fit next to a
+/// ≈ 45 B dialed address (≈ 525 B), a fifth would make ≈ 645 B > 640.
+#[test]
+fn kad_feed_respects_per_peer_byte_budget() {
+    let peer = PeerId::random();
+    let dialed = ma("/ip4/127.0.0.1/tcp/4001");
+    let names: Vec<Multiaddr> = (1..=6).map(|k| dns_of_bytes(peer, 120, k)).collect();
+    let mut input = names.clone();
+    input.push(ma("/ip4/8.8.8.8/tcp/1")); // Global too, announced last, ≈ 45 B
+    let out = kad_feed_addrs(peer, &input, Some(&dialed));
+
+    let mut want = vec![dialed.with(Protocol::P2p(peer))];
+    want.extend(
+        names[..4]
+            .iter()
+            .map(|a| a.clone().with(Protocol::P2p(peer))),
+    );
+    want.push(p2p("/ip4/8.8.8.8/tcp/1", peer));
+    assert_eq!(out, want);
+    let bytes: usize = out.iter().map(Multiaddr::len).sum();
+    assert!(
+        bytes <= MAX_KAD_ADDR_BYTES_PER_PEER,
+        "{bytes} B over the budget"
+    );
+    assert!(out.len() <= MAX_KAD_ADDRS_PER_PEER + 1);
+}
+
+/// network-i20 over i18: a dialed address over MAX_KAD_ADDR_BYTES is neither
+/// fed nor protected, so the record left by libp2p with it is cleaned by the
+/// replace plan (after the new addresses go in).
+#[test]
+fn kad_feed_oversized_dialed_addr_is_not_kept() {
+    let peer = PeerId::random();
+    let dialed = dns_of_bytes(peer, MAX_KAD_ADDR_BYTES + 1, 4001);
+    assert_eq!(kad_dialed_addr(peer, Some(&dialed)), None);
+    let short = ma("/ip4/127.0.0.1/tcp/4001");
+    assert_eq!(
+        kad_dialed_addr(peer, Some(&short)),
+        Some(short.with(Protocol::P2p(peer)))
+    );
+
+    let identify = vec![ma("/ip4/10.0.0.1/tcp/4001")];
+    let want = kad_feed_addrs(peer, &identify, Some(&dialed));
+    assert_eq!(want, vec![p2p("/ip4/10.0.0.1/tcp/4001", peer)]);
+    let current = vec![dialed.clone().with(Protocol::P2p(peer))];
+    let keep = kad_dialed_addr(peer, Some(&dialed));
+    let (add, remove) = kad_replace_plan(peer, &current, &want, keep.as_ref());
+    assert_eq!(add, want);
+    assert_eq!(remove, current, "the oversized dialed address goes");
 }

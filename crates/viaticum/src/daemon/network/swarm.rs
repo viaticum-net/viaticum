@@ -41,7 +41,7 @@ use viaticum_core::messages::Message;
 use viaticum_core::types::{DeviceId, IdentityPub};
 
 use super::address_book::AddressBook;
-use super::kad_feed::{kad_feed_addrs, kad_replace_plan};
+use super::kad_feed::{kad_dialed_addr, kad_feed_addrs, kad_replace_plan};
 
 // ─── Type aliases ────────────────────────────────────────────────────────────
 
@@ -80,9 +80,10 @@ pub const KAD_INITIAL_DISCOVERY_DELAY: Duration = Duration::from_secs(15);
 /// Kademlia frame limit, stated explicitly: the libp2p default, NOT raised
 /// (network-i20). Our largest answer is FIND_NODE (GET_PROVIDERS / GET_VALUE
 /// carry only closer peers here: nothing is provided or stored) with ≤ 20
-/// closer peers × (44 B id + ≤ 7 addresses × ≤ 63 B) ≈ 9.7 KB — the address
-/// count is bounded by `kad_feed` (network-i18). Raising the limit would hide a
-/// regression of that bound instead of fixing it.
+/// closer peers × (≈45 B + ≤ 640 B of addresses + tags) ≈ 14 KB — the address
+/// bytes per peer are bounded by `kad_feed` (network-i18, i20,
+/// `MAX_KAD_ADDR_BYTES_PER_PEER`). Raising the limit would hide a regression of
+/// that bound instead of fixing it.
 pub const KAD_MAX_PACKET_SIZE: usize = 16 * 1024;
 
 /// Scale a real-time Kademlia cadence by the daemon's `time_scale` so peer discovery keeps
@@ -411,6 +412,21 @@ enum SwarmCommand {
         peer_id: PeerId,
         addrs: Vec<Multiaddr>,
         reply: oneshot::Sender<Vec<Multiaddr>>,
+    },
+    /// Unit tests only: how many times Kademlia reported `peer_id` as a NEW
+    /// entry of its table (`RoutingUpdated { is_new_peer: true }`) so far.
+    #[cfg(test)]
+    TestKadNewPeerCount {
+        peer_id: PeerId,
+        reply: oneshot::Sender<usize>,
+    },
+    /// Unit tests only: one discovery pass over `peers` as if a discovery
+    /// lookup had found them (`dial_discovery_result`, the timer's path);
+    /// replies with the peers it chose to dial.
+    #[cfg(test)]
+    TestDiscoveryPass {
+        peers: Vec<(PeerId, Vec<Multiaddr>)>,
+        reply: oneshot::Sender<Vec<PeerId>>,
     },
     /// Unit tests only: open one more connection to `addr` whatever is already
     /// connected (no dial condition) and reply with its id.
@@ -846,6 +862,8 @@ impl SwarmHandle {
             known,
             dialing: HashSet::new(),
             bootstrap_called: false,
+            #[cfg(test)]
+            test_kad_new_peer: HashMap::new(),
             relay_reservations: HashSet::new(),
             last_empty_lookup_warn: None,
             #[cfg(feature = "e2e-tools")]
@@ -1097,6 +1115,38 @@ impl SwarmHandle {
         rx.await.expect("swarm loop replied")
     }
 
+    /// Unit tests only: how many times Kademlia reported `peer` as a new entry
+    /// of its table so far (`RoutingUpdated { is_new_peer: true }`). Events
+    /// reach the loop after the command that caused them: wait on another
+    /// peer's later event before trusting a count.
+    #[cfg(test)]
+    pub(crate) async fn test_kad_new_peer_count(&self, peer: PeerId) -> usize {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestKadNewPeerCount {
+                peer_id: peer,
+                reply,
+            })
+            .await
+            .expect("swarm loop alive");
+        rx.await.expect("swarm loop replied")
+    }
+
+    /// Unit tests only: run one discovery pass over `peers` (what a discovery
+    /// lookup found) and return the peers it chose to dial (C-DK Р-5′).
+    #[cfg(test)]
+    pub(crate) async fn test_discovery_pass(
+        &self,
+        peers: Vec<(PeerId, Vec<Multiaddr>)>,
+    ) -> Vec<PeerId> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestDiscoveryPass { peers, reply })
+            .await
+            .expect("swarm loop alive");
+        rx.await.expect("swarm loop replied")
+    }
+
     /// Unit tests only: open an extra connection to `addr` (a duplicate when
     /// already connected) and return its id.
     #[cfg(test)]
@@ -1267,6 +1317,10 @@ struct EventLoopState {
 
     /// True once bootstrap has been called at least once.
     bootstrap_called: bool,
+
+    /// Unit tests only: `RoutingUpdated { is_new_peer: true }` per peer.
+    #[cfg(test)]
+    test_kad_new_peer: HashMap<PeerId, usize>,
 
     // ── Relay (ε.4) ───────────────────────────────────────────────────────────
     /// PeerIds of relay servers for which we have an active reservation.
@@ -1462,17 +1516,18 @@ impl EventLoopState {
         }
     }
 
-    /// network-i18 (C-DK Р-3): replace `peer_id`'s Kademlia record with the
-    /// bounded set [`kad_feed_addrs`] picks from its identify addresses (plus
-    /// the address we dialed it on). New addresses are added BEFORE stale ones
-    /// are removed, and the dialed address is never removed, so the peer never
-    /// drops out of the table on the way. Returns how many addresses the record
-    /// holds afterwards.
+    /// network-i18, i20 (C-DK Р-3): replace `peer_id`'s Kademlia record with
+    /// the bounded set [`kad_feed_addrs`] picks from its identify addresses
+    /// (plus the address we dialed it on). New addresses are added BEFORE stale
+    /// ones are removed, and the dialed address is never removed (unless it is
+    /// oversized, see [`kad_dialed_addr`]), so the peer never drops out of the
+    /// table on the way. Returns how many addresses the record holds afterwards.
     fn feed_kad(&mut self, peer_id: PeerId, identify_addrs: &[Multiaddr]) -> usize {
-        let dialed = self.dialed_addrs.get(&peer_id).cloned();
-        let want = kad_feed_addrs(peer_id, identify_addrs, dialed.as_ref());
+        let dialed = self.dialed_addrs.get(&peer_id);
+        let want = kad_feed_addrs(peer_id, identify_addrs, dialed);
+        let keep = kad_dialed_addr(peer_id, dialed);
         let current = self.kad_addrs_of(&peer_id);
-        let (add, remove) = kad_replace_plan(peer_id, &current, &want, dialed.as_ref());
+        let (add, remove) = kad_replace_plan(peer_id, &current, &want, keep.as_ref());
         let kad = &mut self.swarm.behaviour_mut().kad;
         for addr in add {
             kad.add_address(&peer_id, addr);
@@ -1746,8 +1801,9 @@ impl EventLoopState {
     /// All addresses we know for `peer_id`: the address we last dialed it on
     /// (first — it is known to work) ∪ its identify listen addrs. Normalized by
     /// [`normalize_peer_addrs`]. Used for every address set the swarm hands out
-    /// (PeerAuthenticated, PeerIdentified, GetPeerAddrs); Kademlia is fed the raw
-    /// identify addrs separately.
+    /// (PeerAuthenticated, PeerIdentified, GetPeerAddrs). Kademlia gets a
+    /// different, bounded set: `feed_kad` filters, ranks and caps the identify
+    /// addrs (network-i18, i20); this one is not bounded (R2, network-i2/i4).
     fn peer_known_addrs(&self, peer_id: &PeerId) -> Vec<Multiaddr> {
         let dialed = self.dialed_addrs.get(peer_id).into_iter();
         let identified = self.peer_addrs.get(peer_id).into_iter().flatten();
@@ -1856,6 +1912,38 @@ impl EventLoopState {
         debug!(query_id = ?qid, "kademlia get_closest_peers (discovery) issued");
     }
 
+    /// Discovery path (C-DK Р-5′, network-i43): dial the peers a discovery
+    /// lookup (`query`) found that we do not know yet, WITH their addresses.
+    /// Returns the peers it chose to dial (`dial_discovered_peer` may still
+    /// find a dial already under way).
+    fn dial_discovery_result(
+        &mut self,
+        query: Option<QueryId>,
+        peer_list: Vec<(PeerId, Vec<Multiaddr>)>,
+    ) -> Vec<PeerId> {
+        let found = peer_list.len();
+        let local = *self.swarm.local_peer_id();
+        let dials = discovery_dial_candidates(peer_list, |p| {
+            *p == local
+                || self.known.contains(p)
+                || self.authenticated.contains_key(p)
+                || self.dialing.contains(p)
+                || self.swarm.is_connected(p)
+        });
+        debug!(
+            query_id = ?query,
+            found,
+            count = dials.len(),
+            known = self.known.len(),
+            "dht: dialing discovered peers (address-carrying)"
+        );
+        let chosen = dials.iter().map(|(peer_id, _)| *peer_id).collect();
+        for (peer_id, addrs) in dials {
+            self.dial_discovered_peer(peer_id, addrs);
+        }
+        chosen
+    }
+
     /// Dial a peer discovered via DHT if not already connected or dialing.
     fn dial_discovered_peer(&mut self, peer_id: PeerId, addrs: Vec<Multiaddr>) {
         // Skip self.
@@ -1958,27 +2046,7 @@ impl EventLoopState {
                         // on the oneshot receiving exactly this list).
                         let _ = reply.send(Ok(peer_list));
                     } else if self.discovery_queries.remove(&id) {
-                        // Discovery path: dial the discovered peers we do not
-                        // know yet, WITH their addresses (Р-5′).
-                        let found = peer_list.len();
-                        let local = *self.swarm.local_peer_id();
-                        let dials = discovery_dial_candidates(peer_list, |p| {
-                            *p == local
-                                || self.known.contains(p)
-                                || self.authenticated.contains_key(p)
-                                || self.dialing.contains(p)
-                                || self.swarm.is_connected(p)
-                        });
-                        debug!(
-                            query_id = ?id,
-                            found,
-                            count = dials.len(),
-                            known = self.known.len(),
-                            "dht: dialing discovered peers (address-carrying)"
-                        );
-                        for (peer_id, addrs) in dials {
-                            self.dial_discovered_peer(peer_id, addrs);
-                        }
+                        self.dial_discovery_result(Some(id), peer_list);
                     } else {
                         debug!(
                             query_id = ?id,
@@ -2001,6 +2069,10 @@ impl EventLoopState {
                     addrs = addresses.len(),
                     "kademlia routing table updated"
                 );
+                #[cfg(test)]
+                if is_new_peer {
+                    *self.test_kad_new_peer.entry(peer).or_default() += 1;
+                }
             }
             Event::UnroutablePeer { peer } => {
                 debug!(peer_id = %peer, "kademlia: peer is unroutable");
@@ -2217,6 +2289,15 @@ impl EventLoopState {
             } => {
                 self.feed_kad(peer_id, &addrs);
                 let _ = reply.send(self.kad_addrs_of(&peer_id));
+            }
+            #[cfg(test)]
+            SwarmCommand::TestKadNewPeerCount { peer_id, reply } => {
+                let n = self.test_kad_new_peer.get(&peer_id).copied().unwrap_or(0);
+                let _ = reply.send(n);
+            }
+            #[cfg(test)]
+            SwarmCommand::TestDiscoveryPass { peers, reply } => {
+                let _ = reply.send(self.dial_discovery_result(None, peers));
             }
             #[cfg(test)]
             SwarmCommand::TestDialNewConnection { addr, reply } => {

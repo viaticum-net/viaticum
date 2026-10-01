@@ -84,6 +84,9 @@
 #   MODE=hold  CAP=12, TIME_SCALE=1:  0, 1, 3 (30 min), 8a.
 #   AMP=0 = the realistic control run. FAST=1 = step 3 of 3 min (debugging only).
 #   SEED_NEW_PORT=1 = the seed restarts on P+1 (mutation M7). STEPS="..." overrides the set.
+#   BASELINE=1 = a C1 baseline run (M0 / M0+amp on a build BEFORE the C2 fix): only then
+#   step 1 prints the W2 stop rule's verdict. Without it W2_VERDICT=n/a — on a fixed build
+#   "M0+amp not RED" is the expected result, not "H1 refuted".
 #   A build without the connection cap (before C-DK C4) cannot run lru/lru24/hold: step 0
 #   FAILs(setup) on the missing `e2e: connection cap N` line.
 #
@@ -91,8 +94,10 @@
 #   bash experiments/local_discovery_test.sh              # main run, ~35 min
 #   MODE=lru24 bash experiments/local_discovery_test.sh
 # Takes the server: 41 daemons (~5-9 GB RAM). Run it detached under the E2E lock with
-# TIMEOUT >= 3600 (the main run is ~35-45 min). C1 baselines M0 / M0+amp:
-#   STEPS="0 1" AMP=0 …   /   STEPS="0 1" AMP=20 …  -> steps 0, 1, 6 and W2_VERDICT=.
+# TIMEOUT >= 3600 (the main run is ~35-45 min). C1 baselines M0 / M0+amp (pre-C2 build):
+#   BASELINE=1 STEPS="0 1" AMP=0 …   /   BASELINE=1 STEPS="0 1" AMP=20 …
+#   -> steps 0, 1, 6 and W2_VERDICT=continue|stop. Any run without BASELINE=1 prints
+#   W2_VERDICT=n/a (not a baseline run).
 # Exit: 0 pass, 1 fail, 2 FAIL(setup), 3 pass-rough. TEST_DIR defaults to
 # ~/viaticum-e2e-runs (not tmpfs); on a non-PASS only logs and configs are kept.
 
@@ -121,6 +126,7 @@ STEPS=" ${STEPS:-$STEPS_DEF} "
 AMP="${AMP:-20}"
 SEED_PORT="${SEED_PORT:-27411}"
 SEED_NEW_PORT="${SEED_NEW_PORT:-0}"
+BASELINE="${BASELINE:-0}"
 NUM_FRIENDS=39
 SEED=0
 LATE=40          # the late joiner (step 5)
@@ -455,14 +461,17 @@ print_lookup_signature() {
     echo "  STEP1_SIGNATURE=$SIGNATURE"
 }
 
-# W2 (spec Part 0, "Правило остановки после C1"), meaningful on the C1 baseline runs:
-# stop if (a) M0 (AMP=0) is RED on the knowledge bar with a signature other than H1, or
-# (b) M0+amp (AMP>0) is not RED with H1. A mixed signature is not H1: the mechanism is
-# ambiguous, the architect decides.
+# W2 (spec Part 0, "Правило остановки после C1"), meaningful ONLY on the C1 baseline runs
+# (BASELINE=1, a build before the C2 fix): stop if (a) M0 (AMP=0) is RED on the knowledge
+# bar with a signature other than H1, or (b) M0+amp (AMP>0) is not RED with H1. A mixed
+# signature is not H1: the mechanism is ambiguous, the architect decides. On a fixed build
+# M0+amp is GREEN by design, so the rule would read "H1 refuted" falsely: n/a there.
 W2_VERDICT=""
 print_w2_verdict() {
     local v
-    if [ "$AMP" -eq 0 ]; then
+    if [ "$BASELINE" != 1 ]; then
+        v="n/a (not a baseline run)"
+    elif [ "$AMP" -eq 0 ]; then
         if [ "$KNOW_BAR" = RED ] && [ "$SIGNATURE" != H1 ]; then
             v="stop (M0 RED with signature $SIGNATURE, not H1)"
         elif [ "$KNOW_BAR" = RED ]; then

@@ -9,14 +9,18 @@
 //   - addresses no other machine can dial are dropped (link-local, unspecified,
 //     documentation ranges), so are relay circuits and addresses whose terminal
 //     `/p2p/` names another peer;
-//   - the rest are ranked global → private → loopback and capped at
-//     MAX_KAD_ADDRS_PER_PEER;
-//   - the address we dialed the peer on is kept beyond the cap: it is known to
-//     work (network-i4), and it is never removed from the record, so a record
-//     never empties while its addresses are replaced.
-// Per answer that is 20 × (44 + 7 × 63) ≈ 9.7 KB, under the 16 KiB frame
-// (`KAD_MAX_PACKET_SIZE` in swarm.rs). The PeerRecord is NOT touched by this:
-// it keeps every identify address (R2, network-i2/i4).
+//   - so is any address longer than MAX_KAD_ADDR_BYTES (a DNS name may be 255
+//     characters, and nothing else bounds an announced address);
+//   - the rest are ranked global → private → loopback and taken in that order
+//     while they fit MAX_KAD_ADDRS_PER_PEER and the per-peer byte budget
+//     MAX_KAD_ADDR_BYTES_PER_PEER;
+//   - the address we dialed the peer on comes first and is kept beyond the
+//     count cap (inside the byte budget): it is known to work (network-i4), and
+//     it is never removed from the record, so a record never empties while its
+//     addresses are replaced.
+// The byte budget, not the count, is what bounds the answer: see the arithmetic
+// at MAX_KAD_ADDR_BYTES_PER_PEER. The PeerRecord is NOT touched by this: it
+// keeps every identify address (R2, network-i2/i4).
 
 #[cfg(test)]
 mod tests;
@@ -31,6 +35,22 @@ use super::swarm::strip_peer_suffix;
 /// Identify addresses per peer that go into our Kademlia table (network-i18),
 /// on top of the address we dialed the peer on.
 pub(crate) const MAX_KAD_ADDRS_PER_PEER: usize = 6;
+
+/// Longest address (bytes, `/p2p/<peer>` suffix included — the form Kademlia
+/// stores and sends) that goes into our Kademlia table (network-i20). Real
+/// routes are far shorter: `/ip6/…/tcp/…/p2p/<ed25519 id>` is 61 B,
+/// `/dns4/<40 characters>/tcp/…/p2p/…` 86 B. A longer one is dropped, not cut.
+pub(crate) const MAX_KAD_ADDR_BYTES: usize = 128;
+
+/// Bytes of addresses per peer in our Kademlia table, the dialed address
+/// included (network-i20). This, not the count, is what bounds our largest
+/// answer, FIND_NODE with k = 20 closer peers, each a protobuf `Peer` of
+/// ≈ 45 B (id 38 B + tags, connection type) plus its addresses with ≤ 2 B of
+/// tag and length each (≤ 7 of them):
+///   20 × (≈45 + 640 + 7 × 2) ≈ 14 KB < 16384 (`KAD_MAX_PACKET_SIZE`).
+/// Without it, nine peers announcing six 300 B DNS names each (it fits a
+/// 4 KiB identify) are enough to push an answer over the frame.
+pub(crate) const MAX_KAD_ADDR_BYTES_PER_PEER: usize = 640;
 
 /// Rank of an address for the Kademlia record: lower goes first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -99,14 +119,33 @@ fn reach_v6(ip: Ipv6Addr) -> Option<Reach> {
     Some(Reach::Global)
 }
 
-/// network-i18: the addresses of `peer` to hold in our Kademlia table after it
-/// announced `identify_addrs`, each ending in exactly one `/p2p/<peer>`.
+/// The address we dialed `peer` on as it may stay in our Kademlia record
+/// (`/p2p/<peer>` suffix), or `None`: not dialed, a terminal `/p2p/` naming
+/// another peer, or longer than MAX_KAD_ADDR_BYTES. An oversized dialed address
+/// gets no exemption: the caller does not protect it in [`kad_replace_plan`],
+/// so it is removed like any stale one (network-i20 over "the dialed address
+/// stays"). It cannot arise today — we dial over TCP only, with no DNS
+/// transport, so a dialed address is ≤ 61 B; the rule keeps the bound from
+/// resting on that.
+pub(crate) fn kad_dialed_addr(peer: PeerId, dialed: Option<&Multiaddr>) -> Option<Multiaddr> {
+    dialed
+        .and_then(|a| strip_peer_suffix(a, peer).ok())
+        .map(|t| t.with(Protocol::P2p(peer)))
+        .filter(|a| a.len() <= MAX_KAD_ADDR_BYTES)
+}
+
+/// network-i18, i20: the addresses of `peer` to hold in our Kademlia table
+/// after it announced `identify_addrs`, each ending in exactly one
+/// `/p2p/<peer>`.
 ///
 /// The address we dialed `peer` on (`dialed`, relay circuits never stored there)
-/// comes first and is not counted against the cap. Then up to
-/// MAX_KAD_ADDRS_PER_PEER identify addresses: dialable from another machine,
-/// deduplicated, ranked global → private → loopback, announcement order kept
-/// within a rank.
+/// comes first ([`kad_dialed_addr`] decides whether it may) and is not counted
+/// against the count cap, only against the byte budget. Then identify
+/// addresses: dialable from another machine, at most MAX_KAD_ADDR_BYTES each,
+/// deduplicated, ranked global → private → loopback (announcement order kept
+/// within a rank), taken in that order while they fit MAX_KAD_ADDRS_PER_PEER
+/// and MAX_KAD_ADDR_BYTES_PER_PEER (one that does not fit the budget is
+/// skipped, a shorter one after it may still fit).
 pub(crate) fn kad_feed_addrs(
     peer: PeerId,
     identify_addrs: &[Multiaddr],
@@ -130,23 +169,31 @@ pub(crate) fn kad_feed_addrs(
     }
     // Stable: announcement order stays within a rank.
     ranked.sort_by_key(|(rank, _)| *rank);
-    dialed_transport
-        .into_iter()
-        .chain(
-            ranked
-                .into_iter()
-                .take(MAX_KAD_ADDRS_PER_PEER)
-                .map(|(_, t)| t),
-        )
-        .map(|t| t.with(Protocol::P2p(peer)))
-        .collect()
+
+    let mut out: Vec<Multiaddr> = kad_dialed_addr(peer, dialed).into_iter().collect();
+    let mut bytes: usize = out.iter().map(Multiaddr::len).sum();
+    let mut taken = 0;
+    for (_, transport) in ranked {
+        if taken == MAX_KAD_ADDRS_PER_PEER {
+            break;
+        }
+        let addr = transport.with(Protocol::P2p(peer));
+        if addr.len() > MAX_KAD_ADDR_BYTES || bytes + addr.len() > MAX_KAD_ADDR_BYTES_PER_PEER {
+            continue;
+        }
+        bytes += addr.len();
+        taken += 1;
+        out.push(addr);
+    }
+    out
 }
 
 /// How to turn the record `current` (what our table holds for `peer`) into
 /// `want` (from [`kad_feed_addrs`]): addresses to add, then addresses to remove.
 /// The caller applies them in that order, so the record never empties on the
 /// way (removing a peer's last address drops the peer from the table). The
-/// address we dialed `peer` on is never removed. Addresses are compared without
+/// address we dialed `peer` on — as [`kad_dialed_addr`] passes it, `None` when
+/// it is oversized — is never removed. Addresses are compared without
 /// their `/p2p/` suffix (libp2p stores the dialed one without it).
 pub(crate) fn kad_replace_plan(
     peer: PeerId,
