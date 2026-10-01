@@ -525,14 +525,17 @@ async fn try_dial_holder_via_kademlia(
 
 /// Fetch one SystemState block (base or diff) from its holder hints and return the
 /// decrypted plaintext.
-// К-b3: DR takes one permit per SS block (`mem_budget::decode_block`); until then the decode is
-// outside the budget (clippy `disallowed-methods`).
-#[allow(clippy::disallowed_methods)]
+///
+/// The memory of the decode is DR's one permit for this block (`memory`, К-b3): the symbols are
+/// fetched first, outside the budget; then the decode and the decryption run on the blocking pool
+/// under the permit; the permit goes back before the plaintext is parsed and before the next
+/// fetch.
 pub(super) async fn fetch_ss_block(
     swarm: &Arc<SwarmHandle>,
     encoder: &Arc<dyn viaticum_core::erasure::ErasureEncoder>,
     bref: &BlockRef,
     dr_key: &[u8; 32],
+    memory: &mut super::memory::Memory,
 ) -> anyhow::Result<Vec<u8>> {
     use viaticum_core::types::{ErasureParams, FileId, PlacementStatus, SymbolPlacement};
 
@@ -567,17 +570,74 @@ pub(super) async fn fetch_ss_block(
     .await
     .map_err(|e| anyhow::anyhow!("fetch_unbound_symbols: {e}"))?;
 
-    let padded = encoder
-        .decode(&symbols, &params)
-        .map_err(|e| anyhow::anyhow!("decode SS block: {e}"))?;
-    let size = bref.encrypted_size as usize;
-    if padded.len() < size {
-        anyhow::bail!(
-            "decoded SS block ({} bytes) smaller than encrypted_size ({size})",
-            padded.len()
+    decode_ss_block(
+        memory,
+        encoder,
+        symbols,
+        &bref.block_id,
+        bref.encrypted_size,
+        &params,
+        dr_key,
+    )
+    .await
+}
+
+/// The memory half of an SS block's fetch (К-b3): a permit for the decode (DR's own budget, or a
+/// lease from the node on this machine), the decode and the decryption on the blocking pool under
+/// it, and the permit back — before the plaintext is parsed and before the next fetch.
+pub(super) async fn decode_ss_block(
+    memory: &mut super::memory::Memory,
+    encoder: &Arc<dyn viaticum_core::erasure::ErasureEncoder>,
+    symbols: Vec<viaticum_core::erasure::Symbol>,
+    block: &viaticum_core::types::SourceBlockId,
+    encrypted_size: u64,
+    params: &viaticum_core::types::ErasureParams,
+    dr_key: &[u8; 32],
+) -> anyhow::Result<Vec<u8>> {
+    let held = memory.acquire(block, encrypted_size, params).await?;
+    let decoder = Arc::clone(encoder);
+    let (key, block, params) = (*dr_key, *block, *params);
+    let (plaintext, held) = tokio::task::spawn_blocking(move || {
+        let r = decode_under(
+            &held,
+            decoder.as_ref(),
+            symbols,
+            &params,
+            encrypted_size,
+            &key,
+            &block,
         );
-    }
-    let stored = &padded[..size];
-    crate::daemon::backup::pipeline::decrypt_and_decompress(stored, dr_key)
+        (r, held)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("decode SS block task failed: {e}"))?;
+    held.release().await;
+    plaintext
+}
+
+/// The decode and the decryption of an SS block under its permit: the stages of the restore's
+/// network tier (`restore::decode_decrypt_stage`, `plaintext_stage`), so that the peak follows the
+/// permit here as there.
+fn decode_under(
+    held: &super::memory::BlockMemory,
+    encoder: &dyn viaticum_core::erasure::ErasureEncoder,
+    symbols: Vec<viaticum_core::erasure::Symbol>,
+    params: &viaticum_core::types::ErasureParams,
+    encrypted_size: u64,
+    key: &[u8; 32],
+    block: &viaticum_core::types::SourceBlockId,
+) -> anyhow::Result<Vec<u8>> {
+    use crate::daemon::restore::{decode_decrypt_stage, plaintext_stage};
+    let decrypted = decode_decrypt_stage(
+        held.permit(),
+        encoder,
+        symbols,
+        params,
+        encrypted_size,
+        key,
+        block,
+    )
+    .map_err(|e| anyhow::anyhow!("decode SS block: {e}"))?;
+    plaintext_stage(held.permit(), block, decrypted)
         .map_err(|e| anyhow::anyhow!("decrypt SS block: {e}"))
 }

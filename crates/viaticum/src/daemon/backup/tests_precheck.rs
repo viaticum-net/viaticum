@@ -59,7 +59,14 @@ fn precheck_is_ready_when_every_member_file_is_there() {
     let mut w = World::new();
     let block = w.block_of(&[("a.txt", b"alpha alpha"), ("b.txt", b"beta beta beta")]);
     assert!(matches!(block.block_type, SourceBlockType::Pack { .. }));
-    assert_eq!(w.check(&block, &scope()), SourceCheck::Ready);
+    // `plaintext_bytes`: the sizes of the members, 11 + 14 (К-b3: the local restore sizes its
+    // permit by it).
+    assert_eq!(
+        w.check(&block, &scope()),
+        SourceCheck::Ready {
+            plaintext_bytes: 25
+        }
+    );
 }
 
 #[test]
@@ -79,7 +86,9 @@ fn precheck_is_over_limit_when_a_member_is_above_the_limit() {
     // The same files are fine under a limit that holds them.
     assert_eq!(
         w.check(&block, &scope().with_max_source_bytes(4096)),
-        SourceCheck::Ready
+        SourceCheck::Ready {
+            plaintext_bytes: 11 + 4096
+        }
     );
 }
 
@@ -90,7 +99,12 @@ fn precheck_of_a_single_block_follows_its_file() {
     let mut w = World::new();
     let mut block = w.block_of(&[("only.txt", b"just one file here")]);
     block.block_type = SourceBlockType::Single;
-    assert_eq!(w.check(&block, &scope()), SourceCheck::Ready);
+    assert_eq!(
+        w.check(&block, &scope()),
+        SourceCheck::Ready {
+            plaintext_bytes: 18
+        }
+    );
     assert_eq!(
         w.check(&block, &scope().with_max_source_bytes(4)),
         SourceCheck::OverLimit
@@ -112,7 +126,12 @@ fn precheck_finds_the_content_on_another_path() {
     w.c.process_event(e).unwrap();
     flush(&mut w.c);
     std::fs::remove_file(w.path("orig.txt")).unwrap();
-    assert_eq!(w.check(&block, &scope()), SourceCheck::Ready);
+    assert_eq!(
+        w.check(&block, &scope()),
+        SourceCheck::Ready {
+            plaintext_bytes: 18
+        }
+    );
 }
 
 /// No catalog record at all for the block's content: nothing to look for.

@@ -48,12 +48,17 @@ struct Entry {
     /// Unix seconds until which the running job waits for holders to answer
     /// (restore-i26). Transient: never written to the job record on disk.
     waiting_until: Option<u64>,
+    /// The running job waits for the block work memory budget (restore-i39). Transient.
+    waiting_memory: bool,
+    /// The INFO line of that wait was written for this job (once per job).
+    memory_wait_announced: bool,
 }
 
 impl Entry {
     fn to_wire(&self, staging_root: &Path) -> RestoreJob {
         let mut wire = self.record.to_wire(staging_root);
         wire.waiting_for_holders_until = self.waiting_until.map(iso_utc);
+        wire.waiting_for_memory = self.waiting_memory;
         wire
     }
 }
@@ -68,6 +73,8 @@ impl JobsInner {
                 record,
                 seq,
                 waiting_until: None,
+                waiting_memory: false,
+                memory_wait_announced: false,
             },
         );
     }
@@ -205,6 +212,26 @@ impl RestoreJobs {
         }
     }
 
+    /// The running job waits for the block work memory budget (`true`) or got it (`false`):
+    /// the phase `waiting_for_memory` of `status` (restore-i39, restore-i4). Returns `true`
+    /// when this is the first wait of the job — the caller writes the INFO line then, once per
+    /// job. No-op for an unknown or finished job.
+    pub fn set_waiting_for_memory(&self, job_id: JobId, waiting: bool) -> bool {
+        let mut inner = self.lock();
+        let Some(e) = inner.jobs.get_mut(&job_id) else {
+            return false;
+        };
+        if e.record.state == RestoreJobState::Finished {
+            return false;
+        }
+        e.waiting_memory = waiting;
+        if waiting && !e.memory_wait_announced {
+            e.memory_wait_announced = true;
+            return true;
+        }
+        false
+    }
+
     /// Finish the job: outcome from its counts, `interrupted` when the daemon
     /// stopped it. Returns the final record (the coordinator writes it to the job
     /// dir). A job already finished is returned unchanged; unknown → `None`.
@@ -212,6 +239,7 @@ impl RestoreJobs {
         let mut inner = self.lock();
         let entry = inner.jobs.get_mut(&job_id)?;
         entry.waiting_until = None;
+        entry.waiting_memory = false;
         let r = &mut entry.record;
         if r.state != RestoreJobState::Finished {
             r.state = RestoreJobState::Finished;

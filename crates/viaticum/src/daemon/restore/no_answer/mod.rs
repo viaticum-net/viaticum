@@ -71,6 +71,11 @@ impl NoAnswerPauses {
         }
     }
 
+    /// The job this budget belongs to.
+    pub(crate) fn job_id(&self) -> JobId {
+        self.job_id
+    }
+
     /// The next pause, or `None` when the budget is spent.
     pub(crate) fn take(&mut self) -> Option<Duration> {
         let pause = self.schedule.get(self.used).copied()?;

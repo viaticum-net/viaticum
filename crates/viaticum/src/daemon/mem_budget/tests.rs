@@ -108,10 +108,16 @@ fn estimate_functions_match_model() {
         estimate_worker_delivery(3201 * t as u64, out, t),
         1161 * MIB
     );
-    // Restore (К-b3 reshapes these): 5·E and 2·E + S as before.
-    let e = 200 * MIB;
-    assert_eq!(estimate_restore_network(e), 1000 * MIB);
-    assert_eq!(estimate_restore_local(e, 180 * MIB), 580 * MIB);
+    // Restore (К-b3, spec v3.9 WARN-1): the (k, t) form, K = 4096 → 4.09·E_pad.
+    let network = (2 * (k as u64 + 3) + 4260 + 3 + k as u64 + 1) * t as u64 + 3277 * k as u64;
+    assert_eq!(estimate_restore_network(k, t), network.div_ceil(MIB) * MIB);
+    assert_eq!(estimate_restore_network(k, t), 1048 * MIB);
+    let local = 2 * input + 180 * MIB + 8 * MIB;
+    assert_eq!(
+        estimate_restore_local(k, t, 180 * MIB),
+        local.div_ceil(MIB) * MIB
+    );
+    assert_eq!(estimate_restore_plaintext(100 * MIB, 400 * MIB), 508 * MIB);
     // The worker shrinks: delivery never needs more than the encode (R ≥ 0).
     assert!(estimate_worker_delivery(input, out, t) < estimate_worker(k, t, out));
     // σ is the size of the `Symbol` struct.
@@ -148,12 +154,13 @@ fn estimates_cover_the_encoder_at_every_k() {
 fn estimates_round_up_and_are_at_least_one_mib() {
     // Every estimate is a whole number of MiB, never 0 (a 0-byte try_acquire would pass a queue).
     assert_eq!(estimate_pos_issue(0, 0), MIB);
-    assert_eq!(estimate_restore_network(0), MIB);
-    assert_eq!(estimate_restore_local(0, 0), MIB);
-    assert_eq!(estimate_restore_network(1), MIB);
-    // One byte over a MiB boundary → the next MiB.
-    assert_eq!(estimate_restore_network(MIB / 5 + 1), 2 * MIB);
-    assert_eq!(estimate_restore_network(MIB / 5), MIB);
+    assert_eq!(estimate_restore_network(0, 0), MIB);
+    // The window of zstd is always there: 8 MiB.
+    assert_eq!(estimate_restore_local(0, 0, 0), 8 * MIB);
+    assert_eq!(estimate_restore_network(1, 1), MIB);
+    // Over a MiB boundary → the next MiB: K = 1 is (2·4 + 27 + 3 + 1 + 1)·t + 3277 bytes.
+    assert_eq!(estimate_restore_network(1, 26_214), 2 * MIB);
+    assert_eq!(estimate_restore_network(1, 25_000), MIB);
     // The worker's slack alone is 160 MiB; the encoder of one symbol (27 of 1024 bytes) pushes it
     // into the next MiB.
     assert_eq!(estimate_worker(0, 1024, 0), 161 * MIB);
@@ -162,8 +169,9 @@ fn estimates_round_up_and_are_at_least_one_mib() {
         estimate_worker(12_345, 1024, 7),
         estimate_worker_delivery(12_345, 7, 1024),
         estimate_pos_issue(12_345, 1024),
-        estimate_restore_network(12_345),
-        estimate_restore_local(12_345, 999),
+        estimate_restore_network(12_345, 1024),
+        estimate_restore_local(12_345, 1024, 999),
+        estimate_restore_plaintext(12_345, 999),
     ] {
         assert_eq!(v % MIB, 0);
         assert!(v >= MIB);

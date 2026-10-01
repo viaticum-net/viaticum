@@ -125,6 +125,9 @@ pub struct DaemonState {
     pub max_file_size_bytes: u64,
     /// backup-i24: this machine's block work budget in bytes (`status`).
     pub block_work_budget_bytes: u64,
+    /// К-b3 (spec v3.9a): the leases a `viaticum dr` on this machine holds on the budget, one SS
+    /// block at a time. `None` in tests that do not wire a budget.
+    pub dr_leases: Option<Arc<crate::daemon::mem_budget::DrLeases>>,
 }
 
 /// Web API pieces prepared before the swarm starts (see step 9.4 of `start`).
@@ -546,13 +549,27 @@ impl DaemonHandle {
         );
         // backup-i24: the one budget of block work (encode/decode), shared by the worker today and
         // by the scheduler and restore in R1-d-b's later commits.
-        let mem_budget = crate::daemon::mem_budget::MemBudget::new(
-            crate::daemon::mem_budget::resolve_block_work_budget(
-                size_limits.ram_bytes,
-                std::env::var(crate::daemon::mem_budget::TEST_BUDGET_ENV)
-                    .ok()
-                    .as_deref(),
-            ),
+        // К-b3 (spec v3.9a #4): the machine's lock for block work. Free → this node takes it;
+        // a `viaticum dr` holds it → the budget starts closed and opens when the DR is done.
+        let machine_lock_dir = crate::daemon::mem_budget::machine_lock::machine_lock_dir();
+        let machine_lock_record =
+            crate::daemon::mem_budget::machine_lock::LockRecord::daemon(&cfg.data_dir);
+        let (mem_budget, machine_lock_startup) =
+            crate::daemon::mem_budget::machine_lock::start_daemon_budget(
+                crate::daemon::mem_budget::resolve_block_work_budget(
+                    size_limits.ram_bytes,
+                    std::env::var(crate::daemon::mem_budget::TEST_BUDGET_ENV)
+                        .ok()
+                        .as_deref(),
+                ),
+                &machine_lock_dir,
+                &machine_lock_record,
+            );
+        let dr_leases = crate::daemon::mem_budget::DrLeases::new(
+            Arc::clone(&mem_budget),
+            crate::daemon::mem_budget::lease_ceiling(std::time::Duration::from_secs(
+                crate::daemon::scheduler::scaled_timer_secs(3600, cfg.time_scale.max(1)),
+            )),
         );
         size_limits.log_start(mem_budget.total_bytes());
         let source_block_size = size_limits.pack_size;
@@ -671,6 +688,16 @@ impl DaemonHandle {
         // Created before the restore coordinator: a running restore job stops on it
         // and is recorded `interrupted` within the drain (T10).
         let cancel = CancellationToken::new();
+        // К-b3: the node keeps the machine's block work lock for its life (and takes it when a DR
+        // that held it is done).
+        crate::daemon::mem_budget::machine_lock::spawn_keeper(
+            machine_lock_startup,
+            machine_lock_dir,
+            machine_lock_record,
+            Arc::clone(&mem_budget),
+            cancel.clone(),
+            crate::daemon::mem_budget::machine_lock::RETRY_EVERY,
+        );
 
         let restore = RestoreCoordinator::new(
             db.clone(),
@@ -695,6 +722,8 @@ impl DaemonHandle {
                 }),
                 time_scale: cfg.time_scale.max(1),
                 max_source_bytes: max_file_size_bytes,
+                // restore-i39: one permit per block, as a priority waiter of the budget.
+                mem_budget: Arc::clone(&mem_budget),
             },
             encoder.clone(),
         );
@@ -770,6 +799,7 @@ impl DaemonHandle {
             missing_sources: Default::default(),
             max_file_size_bytes,
             block_work_budget_bytes: mem_budget.total_bytes(),
+            dr_leases: Some(Arc::clone(&dr_leases)),
         });
 
         // Clone state for web API and metrics pusher.
