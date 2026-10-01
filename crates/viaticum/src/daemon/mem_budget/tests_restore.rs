@@ -70,30 +70,28 @@ fn estimate_restore_local_and_plaintext_follow_the_spec() {
 }
 
 /// The numbers of the spec v3.9b (W4), from the estimates themselves: a block of 16 MiB (K = 257)
-/// takes ≈ 70 MiB for the decode stage, and the plaintext stage keeps that permit (no regrant)
-/// while `E + S + 1 MiB` fits it.
+/// takes 71 MiB (70.24 unrounded) for the decode stage, and the plaintext stage keeps that permit
+/// (no regrant) while `E + S + 1 MiB` fits it: S up to 53 MiB at ×3.3 (the spec: ≈ 53). A block of
+/// 64 KiB (K = 1) takes 5 MiB (4.63): a file of up to 3.94 MiB goes without a regrant (the spec
+/// says ≈ 4.9; that is 5 MiB less the block, without the 1 MiB of the context of the one-shot
+/// call).
 #[test]
 fn restore_estimates_at_the_numbers_of_v3_9b() {
     let net = estimate_restore_network(257, T);
-    assert!(
-        (69 * MIB..=71 * MIB).contains(&net),
-        "K = 257: {} MiB",
-        net / MIB
-    );
+    assert_eq!(net, 71 * MIB, "K = 257: {} MiB", net / MIB);
     // S at the compression of ×3.3 that the spec takes (E = S / 3.3): the largest S whose
     // plaintext stage still fits the permit of the decode stage.
     let fits = |s: u64| estimate_restore_plaintext((s as f64 / 3.3) as u64, s) <= net;
     let largest = (1..200u64).rev().find(|&mib| fits(mib * MIB)).unwrap();
-    assert!(
-        (52..=54).contains(&largest),
+    assert_eq!(
+        largest, 53,
         "no regrant up to S = {largest} MiB (the spec: ≈ 53)"
     );
     // A block of 64 KiB (K = 1): the decode stage (5 MiB) holds the plaintext stage of a file of
-    // 3 MiB (the spec says up to ≈ 4.9; the sums give 5 - 1 - 0.06 = 3.9 MiB).
+    // 4 MiB less the block, and not of one byte more.
     let small = estimate_restore_network(1, T);
-    assert!(
-        estimate_restore_plaintext(T as u64, 3 * MIB) <= small,
-        "K = 1: decode stage {} MiB",
-        small / MIB
-    );
+    assert_eq!(small, 5 * MIB, "K = 1: decode stage {} MiB", small / MIB);
+    let block = T as u64;
+    assert!(estimate_restore_plaintext(block, 4 * MIB - block) <= small);
+    assert!(estimate_restore_plaintext(block, 4 * MIB - block + 1) > small);
 }
