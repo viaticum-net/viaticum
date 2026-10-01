@@ -70,6 +70,9 @@ pub enum ReleaseOutcome {
 pub struct LeaseStatus {
     pub holds_mib: u64,
     pub age_s: u64,
+    /// The node took the lease back at its ceiling, and the DR's connection is still there: the
+    /// bytes are the budget's again, but the DR still has them in its process (spec v3.9b N4).
+    pub revoked: bool,
 }
 
 struct Entry {
@@ -215,16 +218,29 @@ impl DrLeases {
         }
     }
 
-    /// The leases held now (not the revoked ones: their bytes are back).
+    /// The leases held now. A lease the ceiling took back stays here, marked `revoked`, while the
+    /// DR's connection lives (its bytes are the budget's again, but the DR's process still
+    /// has them, and the one place of the write-off is taken: spec v3.9b N4). Live leases show
+    /// first; revoked ones when there is no live one.
     pub fn status(&self) -> Option<LeaseStatus> {
         let inner = self.lock();
-        let live = || inner.leases.values().filter(|e| !e.revoked);
-        let holds: u64 = live().map(|e| e.handle.bytes()).sum();
-        let age = live().map(|e| e.since.elapsed()).max()?;
-        Some(LeaseStatus {
-            holds_mib: holds / MIB,
-            age_s: age.as_secs(),
-        })
+        for revoked in [false, true] {
+            let group: Vec<&Entry> = inner
+                .leases
+                .values()
+                .filter(|e| e.revoked == revoked)
+                .collect();
+            let Some(age) = group.iter().map(|e| e.since.elapsed()).max() else {
+                continue;
+            };
+            let holds: u64 = group.iter().map(|e| e.handle.bytes()).sum();
+            return Some(LeaseStatus {
+                holds_mib: holds / MIB,
+                age_s: age.as_secs(),
+                revoked,
+            });
+        }
+        None
     }
 
     /// At the ceiling the lease is taken back like a written-off holder; the shared counter

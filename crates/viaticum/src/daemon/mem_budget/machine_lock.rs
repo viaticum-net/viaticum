@@ -13,8 +13,15 @@
 //     `spawn_keeper`);
 //   * a `viaticum dr` that finds it held by a node leases memory from that node.
 //
-// The path depends on the uid only, never on `TMPDIR` or `XDG_RUNTIME_DIR` (a process with another
-// environment must meet the same file; M73). The directory is created 0700; a directory that is
+// The holder's record is NOT written into the locked file: it goes to a file of its own, whole
+// (a temporary file and a rename), so that a reader never meets a half-written or truncated record
+// (spec v3.9b N3) — and the locked file keeps one inode for as long as anybody holds it.
+//
+// The path depends on the uid only, never on `TMPDIR`, `XDG_RUNTIME_DIR` or `HOME` (a process with
+// another environment must meet the same file; M73). The only exception is a test's: the variable
+// `VIATICUM_TEST_MACHINE_LOCK_DIR`, read in builds with the `e2e-tools` feature only, with a WARN
+// (spec v3.9b W5: an E2E scenario must not meet the lock of a live node of the same user). The
+// directory is created 0700; a directory that is
 // not ours, or is open to others, is not trusted (`Unavailable`): the caller works without the
 // lock, as two nodes on one machine do (outside the border of the promise).
 
@@ -31,6 +38,13 @@ use super::MemBudget;
 
 /// The lock file inside [`machine_lock_dir`].
 pub const LOCK_FILE_NAME: &str = "blockwork.lock";
+
+/// The record of the holder, next to the lock file.
+pub const RECORD_FILE_NAME: &str = "blockwork.record";
+
+/// The directory of the lock set by a test (the E2E gives each scenario its own): builds with the
+/// `e2e-tools` feature only. Without it the path depends on the uid only.
+pub const TEST_LOCK_DIR_ENV: &str = "VIATICUM_TEST_MACHINE_LOCK_DIR";
 
 /// How often a node (or a waiting DR) tries the lock again.
 pub const RETRY_EVERY: Duration = Duration::from_secs(5);
@@ -99,9 +113,19 @@ fn current_uid() -> u32 {
     0
 }
 
-/// The directory of the lock for `uid`. `env` is deliberately NOT consulted: the seam is here so
-/// that a unit proves the path is the same under any environment (M73).
+/// The directory of the lock for `uid`. `env` is consulted for nothing but the test variable
+/// ([`TEST_LOCK_DIR_ENV`], `e2e-tools` builds): the seam is here so that a unit proves the path is
+/// the same under any other environment (M73).
 pub fn lock_dir_with(uid: u32, env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    #[cfg(feature = "e2e-tools")]
+    if let Some(dir) = env(TEST_LOCK_DIR_ENV).filter(|d| !d.trim().is_empty()) {
+        tracing::warn!(
+            dir = %dir,
+            "memory: the machine lock directory is set by {TEST_LOCK_DIR_ENV} (test only)"
+        );
+        return PathBuf::from(dir);
+    }
+    #[cfg(not(feature = "e2e-tools"))]
     let _ = env;
     lock_dir_of(uid)
 }
@@ -162,8 +186,8 @@ fn prepare_dir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))
 }
 
-/// The record in the lock file, read again a few times: the holder writes it right after it
-/// locks, and a reader may come in between.
+/// The record of the holder, read again a few times: the holder writes it right after it locks,
+/// and a reader may come in between (the file is not there yet, or is the last holder's).
 fn read_record(path: &Path) -> Option<LockRecord> {
     for attempt in 0..5 {
         if let Ok(text) = std::fs::read_to_string(path)
@@ -176,6 +200,28 @@ fn read_record(path: &Path) -> Option<LockRecord> {
         }
     }
     None
+}
+
+/// Write the record whole: into a temporary file of its own, then renamed over the record file.
+fn write_record(dir: &Path, record: &LockRecord) -> Result<(), String> {
+    let text = serde_json::to_string(record).map_err(|e| format!("lock record: {e}"))?;
+    let target = dir.join(RECORD_FILE_NAME);
+    let temp = dir.join(format!("{RECORD_FILE_NAME}.{}.tmp", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = options
+        .open(&temp)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .and_then(|()| std::fs::rename(&temp, &target));
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("cannot write {}: {e}", target.display())
+    })
 }
 
 /// Try the lock in `dir` once. Blocking (a file, a few milliseconds).
@@ -195,21 +241,13 @@ pub fn try_lock(dir: &Path, record: &LockRecord) -> LockOutcome {
         Ok(f) => f,
         Err(e) => return LockOutcome::Unavailable(format!("cannot open {}: {e}", path.display())),
     };
+    let record_path = dir.join(RECORD_FILE_NAME);
     match file.try_lock() {
-        Ok(()) => {
-            let text = match serde_json::to_string(record) {
-                Ok(t) => t,
-                Err(e) => return LockOutcome::Unavailable(format!("lock record: {e}")),
-            };
-            let written = file
-                .set_len(0)
-                .and_then(|()| (&file).write_all(text.as_bytes()));
-            match written {
-                Ok(()) => LockOutcome::Acquired(MachineLock { _file: file }),
-                Err(e) => LockOutcome::Unavailable(format!("cannot write {}: {e}", path.display())),
-            }
-        }
-        Err(TryLockError::WouldBlock) => LockOutcome::HeldElsewhere(read_record(&path)),
+        Ok(()) => match write_record(dir, record) {
+            Ok(()) => LockOutcome::Acquired(MachineLock { _file: file }),
+            Err(why) => LockOutcome::Unavailable(why),
+        },
+        Err(TryLockError::WouldBlock) => LockOutcome::HeldElsewhere(read_record(&record_path)),
         Err(TryLockError::Error(e)) => {
             LockOutcome::Unavailable(format!("cannot lock {}: {e}", path.display()))
         }

@@ -65,8 +65,10 @@ pub fn render_status(data: &StatusData) -> String {
     // К-b3 (spec v3.9a): a `viaticum dr` on this machine borrows this node's memory.
     if let Some(lease) = &data.dr_lease {
         out.push_str(&format!(
-            "  dr_lease:       holds_mib={} age_s={}\n",
-            lease.holds_mib, lease.age_s
+            "  dr_lease:       {}holds_mib={} age_s={}\n",
+            if lease.revoked { "revoked " } else { "" },
+            lease.holds_mib,
+            lease.age_s
         ));
     }
     out.push_str(&render_dr_readiness(data));

@@ -87,8 +87,11 @@ fn issue_budget_is_a_fifth_of_the_scaled_pos_period() {
 /// E2E's) is 800 ms. One call returns within the budget (tolerance 300 ms: the settling
 /// of the last publishes by this test-only caller, and scheduling slack) having issued
 /// part of them and deferred the rest; every later call issues more, and all 1000 are
-/// issued (nothing starves).
-#[tokio::test]
+/// issued (nothing starves). The clock is the paused one of the runtime: the publishes sleep
+/// their 20-50 ms and the tick's deadline waits run on it, so the time a call "takes" is the
+/// model's and not the load of the machine (a 2 s hiccup of a loaded CPU was a flake; the
+/// blocking preparations hold the auto-advance back while they run).
+#[tokio::test(start_paused = true)]
 async fn issue_tick_stops_at_its_budget_and_later_ticks_issue_the_rest() {
     const DUE: usize = 1000;
     let owner = owner_with_due(125, 8, 900, SlowPostman::lan());
@@ -105,7 +108,7 @@ async fn issue_tick_stops_at_its_budget_and_later_ticks_issue_the_rest() {
             .with_max_level(tracing::Level::INFO)
             .finish(),
     );
-    let t = Instant::now();
+    let t = tokio::time::Instant::now();
     tracing::instrument::WithSubscriber::with_subscriber(
         owner.scheduler.issue_due_challenges(),
         dispatch,
@@ -149,7 +152,7 @@ async fn issue_tick_stops_at_its_budget_and_later_ticks_issue_the_rest() {
         calls += 1;
         assert!(calls <= 60, "not all {DUE} issued after 60 calls");
         let before = owner.pending.lock().await.len();
-        let t = Instant::now();
+        let t = tokio::time::Instant::now();
         owner
             .scheduler
             .issue_due_challenges()

@@ -361,6 +361,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
             .map(|s| crate::cli::types::DrLeaseStatus {
                 holds_mib: s.holds_mib,
                 age_s: s.age_s,
+                revoked: s.revoked,
             }),
     }))
 }

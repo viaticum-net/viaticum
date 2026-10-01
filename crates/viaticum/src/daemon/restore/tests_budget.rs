@@ -342,14 +342,17 @@ async fn restore_releases_permit_before_writing_files() {
     }
 }
 
-/// M59 / M60: every stage of the network tier holds what its permit covers — the decode the
-/// network estimate, the plaintext `compressed + S + window`. The measured peaks are in the
-/// allocation binary (`block_prep_alloc_peak`); here the order: the symbols are in the hand of
-/// the decode only, and the permit is cut to the plaintext before the plaintext is made.
+/// M59 / M60 / M75: every stage of the network tier holds what its permit covers — the decode the
+/// network estimate (the window of zstd included: the count of the plaintext runs under it), the
+/// plaintext `compressed + S + context`. The measured peaks are in the allocation binary
+/// (`block_prep_alloc_peak`); here the order. A SMALL block keeps the permit of its decode stage
+/// for the plaintext stage: one grant, the permit cut to the plaintext, no regrant (spec v3.9b W4).
+/// The file is 1.5 MiB: with the window in the plaintext stage instead of the decode stage (M75) it
+/// would not fit the decode permit and the block would wait twice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restore_network_permit_is_cut_or_retaken_for_the_plaintext() {
+async fn small_network_block_shrinks_without_a_regrant() {
     let w = World::new();
-    let content = b"plaintext sized permit ".repeat(60);
+    let content = vec![0u8; 3 << 19];
     let holders = Arc::new(FakeHolders::default());
     let path = w.backup_placed("p.bin", &content, &holders).await;
     let (_, rec) = w.block_of(&path);
@@ -360,19 +363,46 @@ async fn restore_network_permit_is_cut_or_retaken_for_the_plaintext() {
     let (result, log) = logged(coord.restore(request(&path))).await;
     let result = result.unwrap();
 
-    assert_eq!(result.files_restored, 1);
-    // A small block: the window of zstd alone is above the decode estimate, so the plaintext
-    // permit is a second grant, of `estimate_restore_plaintext` (≥ 8 MiB).
+    assert_eq!(result.files_restored, 1, "{:?}", result.failures);
+    assert_eq!(staged(&result, &path), content);
+    let need = need_network(&rec);
+    let plain = estimate_restore_plaintext(rec.encrypted_size.unwrap(), content.len() as u64);
+    assert!(plain <= need, "fixture: {plain} must fit {need}");
+    assert_eq!(
+        granted_bytes(&log),
+        vec![need],
+        "one grant per block: {log}"
+    );
+    assert!(!log.contains("restore: regrant for plaintext"), "{log}");
+}
+
+/// A block whose plaintext does not fit its decode permit lets it go and takes a permit of
+/// `estimate_restore_plaintext` (the permit cut to it would be a growth). 6 MiB of zeros: a block
+/// of 64 KiB and a plaintext above the 5 MiB of its decode stage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_network_permit_is_retaken_when_the_plaintext_needs_more() {
+    let w = World::new();
+    let content = vec![0u8; 6 << 20];
+    let holders = Arc::new(FakeHolders::default());
+    let path = w.backup_placed("p.bin", &content, &holders).await;
+    let (_, rec) = w.block_of(&path);
+    std::fs::remove_file(&path).unwrap();
+    let budget = MemBudget::new(1 << 30);
+    let coord = w.coord(&budget, Some(&holders), raptorq());
+
+    let (result, log) = logged(coord.restore(request(&path))).await;
+    let result = result.unwrap();
+
+    assert_eq!(result.files_restored, 1, "{:?}", result.failures);
     let grants = granted_bytes(&log);
     assert_eq!(grants.len(), 2, "{log}");
     assert_eq!(grants[0], need_network(&rec));
-    assert!(grants[1] >= 8 * MIB && grants[1] < 10 * MIB, "{grants:?}");
-    assert!(log.contains("restore: regrant for plaintext"), "{log}");
     assert_eq!(
-        estimate_restore_plaintext(0, 0),
-        8 * MIB,
-        "the floor of the plaintext permit"
+        grants[1],
+        estimate_restore_plaintext(rec.encrypted_size.unwrap(), content.len() as u64),
+        "{grants:?}"
     );
+    assert!(log.contains("restore: regrant for plaintext"), "{log}");
 }
 
 /// M61: the plaintext stage lets the decode permit go BEFORE it waits for its own: with a budget
@@ -380,14 +410,14 @@ async fn restore_network_permit_is_cut_or_retaken_for_the_plaintext() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_regrant_releases_before_waiting() {
     let w = World::new();
-    let content = b"regrant content ".repeat(80);
+    let content = vec![0u8; 6 << 20];
     let holders = Arc::new(FakeHolders::default());
     let path = w.backup_placed("r.bin", &content, &holders).await;
     let (_, rec) = w.block_of(&path);
     std::fs::remove_file(&path).unwrap();
-    // The plaintext permit is 9 MiB (the window and under 1 MiB of data); the decode one is less.
-    let need2 = 9 * MIB;
-    assert!(need_network(&rec) + need2 > need2);
+    // The plaintext permit (7 MiB) is more than the decode one; the budget holds the larger only.
+    let need2 = estimate_restore_plaintext(rec.encrypted_size.unwrap(), content.len() as u64);
+    assert!(need_network(&rec) < need2 && need_network(&rec) + need2 > need2);
     let budget = MemBudget::new(need2);
     let coord = w.coord(&budget, Some(&holders), raptorq());
 
@@ -412,7 +442,7 @@ async fn worker_yields_to_a_restore_waiting_in_the_network_tier() {
     let (_, rec) = w.block_of(&path);
     std::fs::remove_file(&path).unwrap();
     let need = need_network(&rec);
-    assert_eq!(need, 3 * MIB, "fixture");
+    assert!(need > 2 * MIB && need <= 8 * MIB, "fixture: {need}");
     let budget = MemBudget::new(10 * MIB);
     let worker = budget
         .try_acquire(HolderKind::Worker, &SourceBlockId([7; 32]), 8 * MIB)
@@ -428,7 +458,7 @@ async fn worker_yields_to_a_restore_waiting_in_the_network_tier() {
     .await;
     assert!(
         budget.worker_must_yield(PriorityKind::Restore, &worker),
-        "3 MiB do not fit beside the worker's 8 of 10: it yields"
+        "{need} do not fit beside the worker's 8 of 10: it yields"
     );
 
     drop(worker);
@@ -445,15 +475,28 @@ async fn restore_waiting_logs_once_per_job_and_sets_phase() {
     let content = b"phase of a waiting job ".repeat(50);
     let holders = Arc::new(FakeHolders::default());
     let path = w.backup_placed("ph.bin", &content, &holders).await;
+    let (_, rec) = w.block_of(&path);
     std::fs::remove_file(&path).unwrap();
-    let budget = MemBudget::new(9 * MIB);
+    let need = need_network(&rec);
+    let budget = MemBudget::new(need + 2 * MIB);
+    // What is free (one MiB) is below the block's need: the restore waits.
     let hold = budget
-        .try_acquire(HolderKind::Pos, &SourceBlockId([7; 32]), 8 * MIB)
+        .try_acquire(HolderKind::Pos, &SourceBlockId([7; 32]), need + MIB)
         .unwrap();
     let coord = w.coord(&budget, Some(&holders), raptorq());
     let jobs = coord.config.jobs.clone();
     let req = request(&path);
     let job_id = req.job_id;
+    // R-b3-3: the phase is gone BEFORE the file is written, not only when the job finishes.
+    let at_write = Arc::new(Mutex::new(Vec::new()));
+    {
+        let (jobs, seen) = (jobs.clone(), Arc::clone(&at_write));
+        *coord.write_hook.lock().unwrap() = Some(Box::new(move || {
+            seen.lock()
+                .unwrap()
+                .push(jobs.get(job_id).is_some_and(|j| j.waiting_for_memory));
+        }));
+    }
     jobs.submit(job_id, &path, 1);
     let task = tokio::spawn(logged(async move { coord.restore(req).await }));
 
@@ -464,6 +507,11 @@ async fn restore_waiting_logs_once_per_job_and_sets_phase() {
     drop(hold);
     let (result, log) = task.await.unwrap();
     assert_eq!(result.unwrap().files_restored, 1);
+    assert_eq!(
+        *at_write.lock().unwrap(),
+        vec![false],
+        "the phase is off while the file is written"
+    );
 
     let line = log
         .lines()
@@ -473,7 +521,7 @@ async fn restore_waiting_logs_once_per_job_and_sets_phase() {
     for part in [
         format!("job={job_id}").as_str(),
         "tier=network",
-        "need_mib=3",
+        format!("need_mib={}", need / MIB).as_str(),
         "queued_ahead=0",
         "block=",
     ] {
@@ -482,6 +530,51 @@ async fn restore_waiting_logs_once_per_job_and_sets_phase() {
     assert!(
         !jobs.get(job_id).unwrap().waiting_for_memory,
         "ended with the job"
+    );
+}
+
+/// R-b3-2: the stop of the daemon reaches a job that waits for memory — the wait is a part of the
+/// restore, and a restore without the cancel token of the daemon would hold the shutdown behind
+/// a budget that may never free up. The job ends, restores nothing, and leaves the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_waiting_for_memory_ends_at_the_daemon_stop() {
+    let w = World::new();
+    let content = b"stopped while waiting ".repeat(50);
+    let holders = Arc::new(FakeHolders::default());
+    let path = w.backup_placed("st.bin", &content, &holders).await;
+    let (_, rec) = w.block_of(&path);
+    std::fs::remove_file(&path).unwrap();
+    let need = need_network(&rec);
+    let budget = MemBudget::new(need + 2 * MIB);
+    let _hold = budget
+        .try_acquire(HolderKind::Pos, &SourceBlockId([7; 32]), need + MIB)
+        .unwrap();
+    let coord = Arc::new(w.coord(&budget, Some(&holders), raptorq()));
+    let (jobs, cancel) = (coord.config.jobs.clone(), coord.config.cancel.clone());
+    let req = request(&path);
+    let job_id = req.job_id;
+    jobs.submit(job_id, &path, 1);
+    let job = Arc::clone(&coord);
+    let task = tokio::spawn(async move { job.restore(req).await });
+
+    until("the job waits for memory", || {
+        jobs.get(job_id).is_some_and(|j| j.waiting_for_memory)
+    })
+    .await;
+    assert!(!task.is_finished(), "the budget is busy: the job waits");
+    cancel.cancel();
+
+    let ended = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the wait for memory ends at the stop of the daemon")
+        .unwrap();
+    if let Ok(result) = ended {
+        assert_eq!(result.files_restored, 0, "{:?}", result.failures);
+    }
+    assert_eq!(budget.priority_waiters(PriorityKind::Restore), 0);
+    assert!(
+        !jobs.get(job_id).unwrap().waiting_for_memory,
+        "the phase is off"
     );
 }
 
@@ -549,8 +642,8 @@ async fn restore_blocks_of_a_job_are_sequential() {
     );
     assert_eq!(
         budget.grants(),
-        6,
-        "two grants per block, one block at a time"
+        3,
+        "one grant per small block (the permit of the decode is cut), one block at a time"
     );
     assert_eq!(budget.outstanding_bytes(), 0);
 }

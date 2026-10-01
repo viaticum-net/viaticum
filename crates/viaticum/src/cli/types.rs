@@ -234,6 +234,9 @@ pub struct StatusData {
 pub struct DrLeaseStatus {
     pub holds_mib: u64,
     pub age_s: u64,
+    /// The node took the lease back at its ceiling; the DR's connection is still open.
+    #[serde(default)]
+    pub revoked: bool,
 }
 
 /// Peer summary shown in `viaticum status`.

@@ -1,9 +1,10 @@
 //! DR's block work memory (К-b3, restore-i39; spec v3.8 §2, v3.9a).
 //!
 //! The decode of an SS block is block work and takes memory like any other: one block at a time,
-//! sized by `estimate_restore_network` of the block's parameters, from the fetch of its symbols
-//! (outside) to the decrypted plaintext (inside), released before the CBOR is parsed and before
-//! the next fetch. Whose budget it is depends on the machine's block work lock
+//! sized by `estimate_restore_network` of the block's parameters (the window of zstd included),
+//! from the fetch of its symbols (outside) through the decode, the decryption and the parse of the
+//! CBOR straight from the decompression stream (inside: there is no plaintext buffer, spec v3.9b
+//! (6)), released before the next fetch. Whose budget it is depends on the machine's block work lock
 //! (`mem_budget::machine_lock`):
 //!
 //!   * the lock is free: this DR takes it, writes `{kind: dr}`, and works on a budget of its own
@@ -14,9 +15,16 @@
 //!     it back (`POST /api/budget/release`) before the next block. The DR's decode is then a
 //!     part of the node's budget: the sum does not grow, and the node's worker and PoS checks
 //!     yield to it as to a restore;
-//!   * a node holds it and does not answer: DR waits, trying again every 30 s — and takes the
-//!     lock itself if the node has stopped; a node too old to know the request makes DR stop with
-//!     a message.
+//!   * a node holds it and does not answer (nothing for 30 s, a refused connection, a 5xx): DR
+//!     waits, trying again every 30 s — and takes the lock itself if the node has stopped. A node
+//!     too old to know the request (404/405, or its web page), a node that refuses the request
+//!     (401/403: another user), a node with its web API off, or any other status make DR stop with
+//!     a message (spec v3.9b p.5, p.7).
+//!
+//! The record of the lock is read again before EVERY lease (spec v3.9b W2): a node that stopped
+//! and another one that started on the machine (another data directory, another port) is a new
+//! client; a DR that took the lock meanwhile ends this one; a free lock gives this DR its own
+//! budget.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,7 +48,9 @@ const WAIT_SHOWN_AFTER: Duration = Duration::from_secs(5);
 /// Between two tries when the node on this machine does not answer.
 const SILENT_NODE_RETRY: Duration = Duration::from_secs(30);
 
-/// A silent node: nothing, not even a blank line of the keepalive, for this long.
+/// A silent node: nothing, not even a blank line of the keepalive, for this long. A node in
+/// SIGSTOP takes the connection in its kernel and sends nothing, so this bounds the wait for the
+/// headers of the response, for the lines of it and for the answer to `release` alike.
 const SILENCE: Duration = Duration::from_secs(30);
 
 /// The connect timeout to the node on this machine.
@@ -60,12 +70,42 @@ fn waiting_line(need_bytes: u64) -> String {
 /// Why a lease was not obtained.
 #[derive(Debug)]
 enum LeaseFailure {
-    /// The node does not answer (or answers nothing): wait and try again.
+    /// The node does not answer (nothing in time, a refused or dropped connection, a 5xx): wait
+    /// and try again.
     Silent(String),
-    /// The node does not know the request (an older version).
+    /// The node does not know the request (an older version: 404/405 or its web page).
     OldNode,
-    /// The node refused the request itself.
+    /// The node did not accept us (401/403): the user is not the node's.
+    NotAllowed(u16),
+    /// A status nobody expects (neither the stream, nor 4xx of an old node, nor 5xx).
+    UnexpectedStatus(u16),
+    /// The node has no web API (no `api-port` file): a setting, nothing to wait for.
+    WebApiOff,
+    /// The node refused the request itself (an error line of the stream).
     Refused(String),
+}
+
+impl LeaseFailure {
+    /// The error that ends DR whatever pointer is tried next, for the failures that are not
+    /// about this one lease.
+    fn fatal(&self) -> Option<DrError> {
+        match self {
+            LeaseFailure::OldNode => Some(DrError::NodeCannotShareMemory),
+            LeaseFailure::NotAllowed(status) => Some(DrError::NodeRefusedLease { status: *status }),
+            LeaseFailure::UnexpectedStatus(status) => {
+                Some(DrError::NodeUnexpectedStatus { status: *status })
+            }
+            LeaseFailure::WebApiOff => Some(DrError::NodeWebApiOff),
+            LeaseFailure::Silent(_) | LeaseFailure::Refused(_) => None,
+        }
+    }
+}
+
+fn another_dr_error() -> DrError {
+    DrError::Failed {
+        reason: "another viaticum dr is running on this machine; wait for it to finish".to_string(),
+        hint: String::new(),
+    }
 }
 
 /// Where DR's lines go (stdout; a test collects them).
@@ -85,6 +125,8 @@ pub(super) struct Memory {
     say: Say,
     /// Between two tries when the node on this machine does not answer.
     silent_retry: Duration,
+    /// How long the node may say nothing.
+    silence: Duration,
 }
 
 enum Mode {
@@ -162,16 +204,11 @@ impl Memory {
                 }
             }
             LockOutcome::HeldElsewhere(Some(held)) if held.kind == LockKind::Dr => {
-                return Err(DrError::Failed {
-                    reason: "another viaticum dr is running on this machine; wait for it to \
-                             finish"
-                        .to_string(),
-                    hint: String::new(),
-                });
+                return Err(another_dr_error());
             }
             // A node (or a holder whose record cannot be read: treated as a node).
             LockOutcome::HeldElsewhere(held) => {
-                Mode::Lease(NodeClient::new(held.and_then(|h| h.data_dir)))
+                Mode::Lease(NodeClient::new(held.and_then(|h| h.data_dir), SILENCE))
             }
         };
         Ok(Memory {
@@ -180,6 +217,7 @@ impl Memory {
             lock_dir,
             say: stdout(),
             silent_retry: SILENT_NODE_RETRY,
+            silence: SILENCE,
         })
     }
 
@@ -195,6 +233,7 @@ impl Memory {
             lock_dir: std::path::PathBuf::new(),
             say: stdout(),
             silent_retry: SILENT_NODE_RETRY,
+            silence: SILENCE,
         }
     }
 
@@ -206,6 +245,16 @@ impl Memory {
         self
     }
 
+    /// Test seam: a node that says nothing for `silence` is a silent one.
+    #[cfg(test)]
+    pub(super) fn with_silence(mut self, silence: Duration) -> Memory {
+        self.silence = silence;
+        if let Mode::Lease(client) = &mut self.mode {
+            client.silence = silence;
+        }
+        self
+    }
+
     /// The failure that must end DR, if one happened (taken once).
     pub(super) fn take_fatal(&mut self) -> Option<DrError> {
         self.fatal.take()
@@ -213,6 +262,34 @@ impl Memory {
 
     pub(super) fn is_fatal(&self) -> bool {
         self.fatal.is_some()
+    }
+
+    /// Read the record of the machine's lock again before a lease (spec v3.9b W2): who holds it
+    /// now decides whose memory DR works on. A node, even another one: a client of that node. A
+    /// DR: this one ends. Free: this DR takes it and its own budget. A lock that cannot be read or
+    /// used leaves things as they are.
+    async fn refresh_owner(&mut self) -> Result<(), DrError> {
+        let dir = self.lock_dir.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || machine_lock::try_lock(&dir, &LockRecord::dr()))
+                .await;
+        match outcome {
+            Ok(LockOutcome::Acquired(lock)) => {
+                self.mode = Mode::Own {
+                    budget: own_budget(),
+                    _lock: Some(lock),
+                };
+            }
+            Ok(LockOutcome::HeldElsewhere(Some(held))) if held.kind == LockKind::Dr => {
+                self.fatal = Some(another_dr_error());
+                return Err(another_dr_error());
+            }
+            Ok(LockOutcome::HeldElsewhere(Some(held))) => {
+                self.mode = Mode::Lease(NodeClient::new(held.data_dir, self.silence));
+            }
+            Ok(LockOutcome::HeldElsewhere(None) | LockOutcome::Unavailable(_)) | Err(_) => {}
+        }
+        Ok(())
     }
 
     /// Memory for the decode of one SS block, after its symbols are in (they are outside the
@@ -226,6 +303,9 @@ impl Memory {
         let need = estimate_restore_network(params.k, params.t);
         let mut said_silent = false;
         loop {
+            if matches!(self.mode, Mode::Lease(_)) {
+                self.refresh_owner().await?;
+            }
             match &mut self.mode {
                 Mode::Own { budget, .. } => {
                     let say = Arc::clone(&self.say);
@@ -251,11 +331,6 @@ impl Memory {
                             say: Arc::clone(&self.say),
                         });
                     }
-                    Err(LeaseFailure::OldNode) => {
-                        let e = DrError::NodeCannotShareMemory;
-                        self.fatal = Some(DrError::NodeCannotShareMemory);
-                        return Err(e);
-                    }
                     Err(LeaseFailure::Refused(why)) => {
                         return Err(DrError::Failed {
                             reason: format!("the node on this machine refused the lease: {why}"),
@@ -268,19 +343,13 @@ impl Memory {
                             (self.say)(SILENT_NODE_LINE.to_string());
                             said_silent = true;
                         }
+                        // The node may have stopped: the next turn reads the lock again.
                         tokio::time::sleep(self.silent_retry).await;
-                        // The node may have stopped: then its lock is free and DR works alone.
-                        let dir = self.lock_dir.clone();
-                        let outcome = tokio::task::spawn_blocking(move || {
-                            machine_lock::try_lock(&dir, &LockRecord::dr())
-                        })
-                        .await;
-                        if let Ok(LockOutcome::Acquired(lock)) = outcome {
-                            self.mode = Mode::Own {
-                                budget: own_budget(),
-                                _lock: Some(lock),
-                            };
-                        }
+                    }
+                    Err(other) => {
+                        let fatal = other.fatal().expect("the failure ends DR");
+                        self.fatal = other.fatal();
+                        return Err(fatal);
                     }
                 },
             }
@@ -291,9 +360,11 @@ impl Memory {
 // ─── The node on this machine ─────────────────────────────────────────────────
 
 /// The HTTP client of the node that holds the machine's lock: its `api-port` and `api-token` are
-/// in its data directory (the lock file says where).
+/// in its data directory (the lock record says where).
 struct NodeClient {
     data_dir: Option<std::path::PathBuf>,
+    /// How long the node may say nothing (the headers, a line, the answer to `release`).
+    silence: Duration,
 }
 
 /// A lease the node gave: the open response is the "connection" the node ties the lease to.
@@ -303,30 +374,44 @@ struct ActiveLease {
     base: String,
     token: String,
     http: reqwest::Client,
+    silence: Duration,
 }
 
 impl ActiveLease {
-    /// Give the lease back. `Some(true)`: the node had taken it back already.
+    /// Give the lease back. `Some(true)`: the node had taken it back already. A node that does
+    /// not answer within `silence` is given up on (`None`): dropping the response closes the
+    /// connection, and that is the node's second way to release.
     async fn release(self) -> Option<bool> {
-        let answered = self
-            .http
-            .post(format!("{}/api/budget/release", self.base))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "id": self.id }))
-            .send()
-            .await
-            .ok()?;
-        let body: serde_json::Value = answered.json().await.ok()?;
-        // Dropping the response closes the connection, the node's second way to release.
-        drop(self.response);
-        Some(body["status"] == "revoked")
+        let ActiveLease {
+            response,
+            id,
+            base,
+            token,
+            http,
+            silence,
+        } = self;
+        let answer = tokio::time::timeout(silence, async {
+            let answered = http
+                .post(format!("{base}/api/budget/release"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "id": id }))
+                .send()
+                .await
+                .ok()?;
+            let body: serde_json::Value = answered.json().await.ok()?;
+            Some(body["status"] == "revoked")
+        })
+        .await;
+        drop(response);
+        answer.ok().flatten()
     }
 }
 
 impl NodeClient {
-    fn new(data_dir: Option<String>) -> Self {
+    fn new(data_dir: Option<String>, silence: Duration) -> Self {
         NodeClient {
             data_dir: data_dir.map(std::path::PathBuf::from),
+            silence,
         }
     }
 
@@ -343,30 +428,58 @@ impl NodeClient {
         let dir = self
             .data_dir
             .as_ref()
-            .ok_or_else(|| silent("the lock file does not say where the node's API is".into()))?;
-        let (port, token) = crate::daemon::web_auth::read_port_and_token(dir)
-            .map_err(|e| silent(format!("cannot read the node's api-port or api-token: {e}")))?;
+            .ok_or_else(|| silent("the lock record does not say where the node's API is".into()))?;
+        let (port, token) = match crate::daemon::web_auth::read_port_and_token(dir) {
+            Ok(found) => found,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(LeaseFailure::WebApiOff);
+            }
+            Err(e) => {
+                return Err(silent(format!(
+                    "cannot read the node's api-port or api-token: {e}"
+                )));
+            }
+        };
         let base = format!("http://127.0.0.1:{port}");
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| silent(e.to_string()))?;
-        let mut response = http
-            .post(format!("{base}/api/budget/lease"))
-            .bearer_auth(&token)
-            .json(&serde_json::json!({
-                "block_id": viaticum_core::types::hex_encode(&block.0),
-                "encrypted_size": encrypted_size,
-            }))
-            .send()
-            .await
-            .map_err(|e| silent(e.to_string()))?;
+        // A node in SIGSTOP takes the connection in its kernel and never sends the headers: the
+        // connect timeout does not cover that.
+        let sent = tokio::time::timeout(
+            self.silence,
+            http.post(format!("{base}/api/budget/lease"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({
+                    "block_id": viaticum_core::types::hex_encode(&block.0),
+                    "encrypted_size": encrypted_size,
+                }))
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            silent(format!(
+                "the node accepted the connection and sent nothing for {} s",
+                self.silence.as_secs_f32()
+            ))
+        })?;
+        let mut response = sent.map_err(|e| silent(e.to_string()))?;
         let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(silent("the node did not accept the token".into()));
+        let is_html = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/html"));
+        match status.as_u16() {
+            401 | 403 => return Err(LeaseFailure::NotAllowed(status.as_u16())),
+            // An old node answers an unknown request with its web page or a 404/405.
+            404 | 405 => return Err(LeaseFailure::OldNode),
+            _ if is_html => return Err(LeaseFailure::OldNode),
+            500..=599 => return Err(silent(format!("the node answered {status}"))),
+            200 => {}
+            other => return Err(LeaseFailure::UnexpectedStatus(other)),
         }
-        // An old node answers an unknown request with its web page (or a 404): not a stream of
-        // lines.
         let is_lines = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -375,7 +488,7 @@ impl NodeClient {
         if !is_lines {
             return Err(LeaseFailure::OldNode);
         }
-        let id = read_grant(&mut response, need, say).await?;
+        let id = read_grant(&mut response, need, say, self.silence).await?;
         let witness = MemBudget::new(need);
         let block_id = *block;
         let permit = witness
@@ -388,6 +501,7 @@ impl NodeClient {
                 base,
                 token,
                 http,
+                silence: self.silence,
             },
             permit,
         ))
@@ -399,6 +513,7 @@ async fn read_grant(
     response: &mut reqwest::Response,
     need: u64,
     say: &Say,
+    silence: Duration,
 ) -> Result<u64, LeaseFailure> {
     let silent = |why: String| LeaseFailure::Silent(why);
     let mut pending = Vec::<u8>::new();
@@ -412,10 +527,15 @@ async fn read_grant(
                 say(waiting_line(need));
                 continue;
             }
-            chunk = tokio::time::timeout(SILENCE, response.chunk()) => chunk,
+            chunk = tokio::time::timeout(silence, response.chunk()) => chunk,
         };
         match chunk {
-            Err(_) => return Err(silent("the node sent nothing for 30 s".into())),
+            Err(_) => {
+                return Err(silent(format!(
+                    "the node sent nothing for {} s",
+                    silence.as_secs_f32()
+                )));
+            }
             Ok(Err(e)) => return Err(silent(e.to_string())),
             Ok(Ok(None)) => return Err(silent("the node ended the lease response".into())),
             Ok(Ok(Some(bytes))) => pending.extend_from_slice(&bytes),

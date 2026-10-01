@@ -210,6 +210,17 @@ pub fn plaintext_len(compressed: &[u8]) -> anyhow::Result<u64> {
         .map_err(|e| anyhow::anyhow!("zstd decompress: {e}"))
 }
 
+/// Parse a CBOR value straight out of the decompression stream of `compressed`: the plaintext is
+/// never in memory as a whole (spec v3.9b (6): the SS blocks of a DR). What zstd holds is its
+/// window; what the parser holds is the value it builds.
+pub fn parse_cbor_compressed<T: serde::de::DeserializeOwned>(
+    compressed: &[u8],
+) -> anyhow::Result<T> {
+    let decoder = zstd::stream::read::Decoder::new(compressed)
+        .map_err(|e| anyhow::anyhow!("zstd decompress: {e}"))?;
+    ciborium::de::from_reader(decoder).map_err(|e| anyhow::anyhow!("cbor decode: {e}"))
+}
+
 /// Decompress into one allocation of `capacity` bytes (`zstd::bulk`): no growth by doubling,
 /// as `zstd::decode_all` does. `capacity` is at least the plaintext length ([`plaintext_len`],
 /// or an upper bound that is close); a frame that does not fit is an error.

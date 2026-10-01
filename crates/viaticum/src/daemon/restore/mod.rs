@@ -40,7 +40,10 @@ use crate::daemon::symbol_fetch::RestoreSource;
 
 pub mod cleanup;
 mod decode;
-pub use decode::{DecryptedBlock, decode_decrypt_stage, member_bytes, plaintext_stage};
+pub use decode::{
+    DecryptedBlock, decode_decrypt_stage, decode_parse_stage, local_plaintext, member_bytes,
+    plaintext_stage,
+};
 pub mod jobs;
 mod no_answer;
 pub mod pipeline;

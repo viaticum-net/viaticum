@@ -21,16 +21,89 @@ fn acquired(outcome: LockOutcome) -> MachineLock {
     }
 }
 
-/// M73: the path depends on the uid only — never on `TMPDIR` or `XDG_RUNTIME_DIR`, so that a
-/// process with another environment meets the same file.
+/// M73: the path depends on the uid only — never on `TMPDIR`, `XDG_RUNTIME_DIR` or `HOME`, so that
+/// a process with another environment meets the same file.
 #[test]
 fn machine_lock_path_depends_only_on_uid() {
     let bare = lock_dir_with(1000, &|_| None);
-    let noisy = lock_dir_with(1000, &|k| Some(format!("/somewhere/else/{k}")));
+    let noisy = lock_dir_with(1000, &|k| match k {
+        "TMPDIR" | "XDG_RUNTIME_DIR" | "HOME" => Some(format!("/somewhere/else/{k}")),
+        _ => None,
+    });
     assert_eq!(bare, noisy);
     #[cfg(unix)]
     assert_eq!(bare, Path::new("/tmp/viaticum-1000"));
     assert_ne!(bare, lock_dir_with(1001, &|_| None));
+}
+
+/// W5 (spec v3.9b): the directory of a test, set by `VIATICUM_TEST_MACHINE_LOCK_DIR`, with a WARN
+/// `(test only)`; an empty value is no value.
+#[cfg(feature = "e2e-tools")]
+#[test]
+fn test_lock_dir_overrides_with_a_warn() {
+    #[derive(Clone, Default)]
+    struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = Buf::default();
+    let writer = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let dir = tracing::subscriber::with_default(subscriber, || {
+        let set = lock_dir_with(1000, &|k| {
+            (k == TEST_LOCK_DIR_ENV).then(|| "/run/scenario-7".to_string())
+        });
+        let empty = lock_dir_with(1000, &|k| (k == TEST_LOCK_DIR_ENV).then(String::new));
+        assert_eq!(empty, lock_dir_with(1000, &|_| None), "empty: no value");
+        set
+    });
+    assert_eq!(dir, Path::new("/run/scenario-7"));
+    let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(log.contains("WARN"), "{log}");
+    assert!(log.contains("(test only)"), "{log}");
+    assert!(log.contains(TEST_LOCK_DIR_ENV), "{log}");
+}
+
+/// Without the `e2e-tools` feature the variable is not read at all.
+#[cfg(not(feature = "e2e-tools"))]
+#[test]
+fn test_lock_dir_is_ignored_without_the_test_feature() {
+    let dir = lock_dir_with(1000, &|k| {
+        (k == TEST_LOCK_DIR_ENV).then(|| "/run/scenario-7".to_string())
+    });
+    assert_eq!(dir, lock_dir_with(1000, &|_| None));
+}
+
+/// N3 (spec v3.9b): the record is written whole into a file of its own, never into the locked
+/// file: that file stays empty, and no half-written record is there to read.
+#[test]
+fn machine_lock_record_is_written_whole_beside_the_locked_file() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("viaticum-test");
+    let _node = acquired(try_lock(&dir, &LockRecord::daemon(Path::new("/data/node"))));
+    assert_eq!(
+        std::fs::metadata(dir.join(LOCK_FILE_NAME)).unwrap().len(),
+        0,
+        "the locked file carries nothing"
+    );
+    let text = std::fs::read_to_string(dir.join(RECORD_FILE_NAME)).unwrap();
+    let record: LockRecord = serde_json::from_str(&text).unwrap();
+    assert_eq!(record.kind, LockKind::Daemon);
+    let temps: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(temps.is_empty(), "no temporary file is left: {temps:?}");
 }
 
 /// The holder writes its record; another try finds the lock held and reads who holds it.

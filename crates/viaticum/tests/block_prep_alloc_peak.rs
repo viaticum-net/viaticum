@@ -16,13 +16,17 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use viaticum::daemon::backup::pipeline::compress_and_encrypt;
+use viaticum::daemon::backup::pipeline::{
+    compress_and_encrypt, compress_block, parse_cbor_compressed, plaintext_len,
+};
 use viaticum::daemon::mem_budget::{
-    HolderKind, MemBudget, encode_block, estimate_pos_issue, estimate_restore_network,
-    estimate_restore_plaintext,
+    HolderKind, MemBudget, ZSTD_WINDOW_BYTES, encode_block, estimate_pos_issue,
+    estimate_restore_local, estimate_restore_network, estimate_restore_plaintext,
 };
 use viaticum::daemon::restore::staging::{JobId, StagingWriter};
-use viaticum::daemon::restore::{decode_decrypt_stage, member_bytes, plaintext_stage};
+use viaticum::daemon::restore::{
+    decode_decrypt_stage, local_plaintext, member_bytes, plaintext_stage,
+};
 use viaticum::daemon::scheduler::{FoldHolder, hash_holders};
 use viaticum_core::erasure::{RaptorQEncoder, pad_for_encoding};
 use viaticum_core::types::{
@@ -243,6 +247,136 @@ fn compressible_plaintext(len: usize) -> Vec<u8> {
     }
     out.truncate(len);
     out
+}
+
+/// `len` bytes of noise: zstd cannot make anything of them.
+fn noise(len: usize) -> Vec<u8> {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// W4 (spec v3.9b): the count of the plaintext (`plaintext_len`, the decoder that the decode stage
+/// runs under its permit) holds the window of zstd and nothing that grows with the block:
+/// `ZSTD_WINDOW_BYTES` (2 MiB and 128 KiB) is what the network estimate adds for it. Compressible
+/// and incompressible blocks of several windows.
+#[test]
+fn plaintext_len_alloc_peak_within_window() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    for (name, plain) in [
+        ("compressible 24 MiB", compressible_plaintext(24 << 20)),
+        ("noise 9 MiB", noise(9 << 20)),
+        ("zeros 20 MiB", vec![0u8; 20 << 20]),
+    ] {
+        let want = plain.len() as u64;
+        let compressed = compress_block(&plain).unwrap();
+        drop(plain);
+        let (counted, peak) = measure(|| plaintext_len(&compressed).unwrap());
+        println!(
+            "{name}: count peak {peak} B, window {} B ({:.3} MiB)",
+            ZSTD_WINDOW_BYTES,
+            peak as f64 / MIB as f64
+        );
+        assert_eq!(counted, want, "{name}");
+        assert!(
+            peak as u64 <= ZSTD_WINDOW_BYTES,
+            "{name}: the count held {peak} B, the estimate holds {ZSTD_WINDOW_BYTES} B"
+        );
+    }
+}
+
+/// M74 (spec v3.9b (6)): the SS block of a DR is parsed straight from the decompression stream:
+/// the plaintext is never in memory. The reference is the parse of the same CBOR from a slice that
+/// already lives (the value being built, as deep as the parser makes it); the stream adds the
+/// window of zstd and nothing else. A parse from a buffer of the plaintext (M74) adds a whole
+/// plaintext — 32 MiB here, a block that compresses more than ×10.
+#[test]
+fn dr_ss_block_is_parsed_from_the_stream_without_a_plaintext_buffer() {
+    use viaticum_core::types::{from_cbor_bytes, to_cbor_bytes};
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let value: Vec<u8> = (0..32usize << 20).map(|i| ((i / 5) % 23) as u8).collect();
+    let plaintext = to_cbor_bytes(&value);
+    let compressed = compress_block(&plaintext).unwrap();
+    assert!(
+        compressed.len() * 10 < plaintext.len(),
+        "fixture: ×10 at least ({} → {})",
+        plaintext.len(),
+        compressed.len()
+    );
+    let (reference, ref_peak) = measure(|| from_cbor_bytes::<Vec<u8>>(&plaintext).unwrap().len());
+    assert_eq!(reference, value.len());
+    drop(plaintext);
+
+    let (parsed, peak) = measure(|| {
+        let parsed: Vec<u8> = parse_cbor_compressed(&compressed).unwrap();
+        parsed.len()
+    });
+
+    assert_eq!(parsed, value.len());
+    let bar = ref_peak + ZSTD_WINDOW_BYTES as usize + MIB;
+    println!(
+        "parse from the stream: peak {:.2} MiB, the parse alone {:.2} MiB, bar {:.2} MiB",
+        peak as f64 / MIB as f64,
+        ref_peak as f64 / MIB as f64,
+        bar as f64 / MIB as f64
+    );
+    assert!(
+        peak <= bar,
+        "the parse from the stream peaked at {:.2} MiB; the parse alone {:.2} MiB + the window \
+         {:.2} MiB: a buffer of the plaintext is there",
+        peak as f64 / MIB as f64,
+        ref_peak as f64 / MIB as f64,
+        ZSTD_WINDOW_BYTES as f64 / MIB as f64
+    );
+}
+
+/// R-b3-4 (the local tier): the rebuilt blob, its decrypted compressed copy and the plaintext —
+/// `2·k·t + S + context`, the permit `estimate_restore_local` — and not the growth by doubling of
+/// `zstd::decode_all` (an 80 MiB block would make 128 MiB and a copy of 64 on the way).
+#[test]
+fn restore_local_peak_follows_the_permit() {
+    let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let key = [42u8; 32];
+    let block = SourceBlockId([6; 32]);
+
+    let base = live();
+    let (blob, params, want_hash, plain_len) = {
+        let plaintext = compressible_plaintext(80 << 20);
+        let want_hash = blake3::hash(&plaintext);
+        let plain_len = plaintext.len() as u64;
+        let blob = compress_and_encrypt(&plaintext, &key).unwrap();
+        drop(plaintext);
+        let params = ErasureParams::compute(blob.len() as u64, 1.0).unwrap();
+        (blob, params, want_hash, plain_len)
+    };
+    let e_pad = params.k as usize * params.t as usize;
+    let delta = e_pad / 50;
+    let permit = estimate_restore_local(params.k, params.t, plain_len) as usize;
+
+    reset_peak();
+    let plaintext = local_plaintext(blob, &key, plain_len, &block).expect("the local tier");
+    let peak = PEAK.load(Ordering::Relaxed) - base;
+
+    println!(
+        "local tier: permit {:.4} E_pad, measured {:.4} E_pad (delta {:.4})",
+        permit as f64 / e_pad as f64,
+        peak as f64 / e_pad as f64,
+        delta as f64 / e_pad as f64
+    );
+    assert!(
+        peak <= permit + delta,
+        "local tier: {:.4} E_pad live above the base, the permit holds {:.4} (+ delta {:.4})",
+        peak as f64 / e_pad as f64,
+        permit as f64 / e_pad as f64,
+        delta as f64 / e_pad as f64
+    );
+    assert_eq!(blake3::hash(&plaintext), want_hash, "the block's plaintext");
 }
 
 #[test]

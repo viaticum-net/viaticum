@@ -34,11 +34,10 @@ pub struct DecryptedBlock {
     pub plaintext_len: u64,
 }
 
-/// The network tier, stage one — runs under the decode permit (`estimate_restore_network`):
-/// decode the symbols, let them go, decrypt, let the padded block go, count the plaintext.
-/// Blocking. The order is the one the permits of the stages rely on (v3.9 NOTE (б)): the symbols
-/// are dropped before the decryption (M59), the padded block before the count.
-pub fn decode_decrypt_stage(
+/// The first half of stage one: decode the symbols, let them go, decrypt, let the padded block
+/// go. What is left is the decrypted compressed block. Blocking. The order is the one the permits of
+/// the stages rely on (v3.9 NOTE (б)): the symbols are dropped before the decryption (M59).
+fn decode_decrypt_compressed(
     permit: &MemPermit,
     encoder: &dyn ErasureEncoder,
     symbols: Vec<Symbol>,
@@ -46,7 +45,7 @@ pub fn decode_decrypt_stage(
     encrypted_size: u64,
     key: &[u8; 32],
     block: &SourceBlockId,
-) -> Result<DecryptedBlock, RestoreError> {
+) -> Result<Vec<u8>, RestoreError> {
     let padded = mem_budget::decode_block(permit, encoder, &symbols, params)
         .map_err(|e| RestoreError::DecodeFailed(*block, e.to_string()))?;
     drop(symbols);
@@ -67,6 +66,23 @@ pub fn decode_decrypt_stage(
             },
         )?;
     drop(padded);
+    Ok(compressed)
+}
+
+/// The network tier, stage one — runs under the decode permit (`estimate_restore_network`, the
+/// window of zstd included): decode the symbols, decrypt, count the plaintext. Blocking. The padded
+/// block is gone before the count.
+pub fn decode_decrypt_stage(
+    permit: &MemPermit,
+    encoder: &dyn ErasureEncoder,
+    symbols: Vec<Symbol>,
+    params: &ErasureParams,
+    encrypted_size: u64,
+    key: &[u8; 32],
+    block: &SourceBlockId,
+) -> Result<DecryptedBlock, RestoreError> {
+    let compressed =
+        decode_decrypt_compressed(permit, encoder, symbols, params, encrypted_size, key, block)?;
     let plaintext_len = crate::daemon::backup::pipeline::plaintext_len(&compressed)
         .map_err(|e| RestoreError::DecompressionFailed(*block, e.to_string()))?;
     Ok(DecryptedBlock {
@@ -75,9 +91,29 @@ pub fn decode_decrypt_stage(
     })
 }
 
+/// The SS block of a DR, parsed under the decode permit and nothing else (spec v3.9b (6)): the
+/// decode and the decryption of stage one, then the CBOR is read straight from the decompression
+/// stream — there is no plaintext buffer and no second permit. Under the permit: the compressed
+/// block (≤ E) and the window of zstd, both inside `estimate_restore_network`; the parsed value is
+/// outside the budget. Blocking.
+pub fn decode_parse_stage<T: serde::de::DeserializeOwned>(
+    permit: &MemPermit,
+    encoder: &dyn ErasureEncoder,
+    symbols: Vec<Symbol>,
+    params: &ErasureParams,
+    encrypted_size: u64,
+    key: &[u8; 32],
+    block: &SourceBlockId,
+) -> Result<T, RestoreError> {
+    let compressed =
+        decode_decrypt_compressed(permit, encoder, symbols, params, encrypted_size, key, block)?;
+    crate::daemon::backup::pipeline::parse_cbor_compressed(&compressed)
+        .map_err(|e| RestoreError::DecompressionFailed(*block, e.to_string()))
+}
+
 /// The network tier, stage two — runs under the permit of `estimate_restore_plaintext`:
-/// decompress into one allocation of the counted length (no doubling of `decode_all`, M60).
-/// Blocking.
+/// decompress into one allocation of the counted length (no doubling of `decode_all`, M60; the
+/// one-shot call holds no window, only its context). Blocking.
 pub fn plaintext_stage(
     _permit: &MemPermit,
     block: &SourceBlockId,
@@ -93,7 +129,7 @@ pub fn plaintext_stage(
 /// The local tier's CPU part: decrypt the rebuilt blob and decompress it, with the plaintext
 /// sized by the files' `metadata` (`size_hint`); a pack whose index outgrows the slack falls back
 /// to the exact count. Blocking; no erasure coding (T4).
-fn local_plaintext(
+pub fn local_plaintext(
     blob: Vec<u8>,
     key: &[u8; 32],
     size_hint: u64,

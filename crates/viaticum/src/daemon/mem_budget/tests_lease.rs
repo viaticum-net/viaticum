@@ -130,7 +130,7 @@ async fn dr_lease_need_is_the_ss_block_estimate() {
 }
 
 /// M70: past `max(H·P, 600 s)` of real time the node takes the lease back like a written-off
-/// holder: the bytes return, `status` no longer shows it, a WARN names it, and the DR's next call
+/// holder: the bytes return, `status` shows it as revoked, a WARN names it, and the DR's next call
 /// (`release`) answers `Revoked`.
 #[tokio::test(start_paused = true)]
 async fn dr_lease_is_revoked_after_the_ceiling_with_warn() {
@@ -149,7 +149,7 @@ async fn dr_lease_is_revoked_after_the_ceiling_with_warn() {
     assert!(leases.status().is_some());
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(budget.outstanding_bytes(), 0, "taken back at the ceiling");
-    assert!(leases.status().is_none());
+    assert!(leases.status().is_some_and(|s| s.revoked));
     let text = logs.text();
     assert!(
         text.contains("mem_budget: lease revoked held_by=dr-lease holds_mib="),
@@ -159,12 +159,34 @@ async fn dr_lease_is_revoked_after_the_ceiling_with_warn() {
 
     assert_eq!(leases.release(id), ReleaseOutcome::Revoked);
     assert_eq!(leases.release(id), ReleaseOutcome::Unknown);
+    assert!(leases.status().is_none(), "released: gone from status");
     drop(guard);
     assert_eq!(
         budget.semaphore_free_bytes(),
         1 << 30,
         "nothing is returned twice"
     );
+}
+
+/// M76 (spec v3.9b N4): a lease the node took back stays in `status`, marked revoked, while the
+/// DR's connection is open — its memory is real in the DR's process and the one place of the
+/// write-off is taken; it leaves with the connection.
+#[tokio::test(start_paused = true)]
+async fn revoked_lease_stays_in_status_until_the_connection_closes() {
+    let budget = MemBudget::new(1 << 30);
+    let leases = DrLeases::new(Arc::clone(&budget), Duration::from_secs(600));
+    let guard = leases.lease(block(1), SS_SIZE).await.unwrap();
+    assert!(leases.status().is_some_and(|s| !s.revoked));
+
+    tokio::time::sleep(Duration::from_secs(700)).await;
+    assert_eq!(budget.outstanding_bytes(), 0, "the bytes are the budget's");
+    let status = leases.status().expect("the revoked lease is still shown");
+    assert!(status.revoked);
+    assert_eq!(status.holds_mib, need_of(SS_SIZE) / MIB);
+    assert_eq!(status.age_s, 700);
+
+    drop(guard);
+    assert!(leases.status().is_none(), "the connection is closed");
 }
 
 /// The revoke is a write-off: at most one holder written off and still alive, shared with the PoS

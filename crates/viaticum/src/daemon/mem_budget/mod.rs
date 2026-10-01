@@ -807,30 +807,42 @@ pub fn estimate_pos_issue(k: u32, t: u16) -> u64 {
 // of the encoder). `dec_worst = (k_eff + L + o + K)·T + T + X`; with every source symbol present
 // there is no solution and no `rebuilt_buf`: `dec_src = (k_eff + K)·T`.
 
-/// What zstd holds besides its output while it decompresses a frame of level 3: the window and
-/// the block buffers (2 MiB + 128 KiB measured at the backup's level; the spec predicts ≤ 8 MiB).
-pub const ZSTD_WINDOW_BYTES: u64 = 8 * MIB;
+/// What zstd holds while it decompresses a frame the backup wrote, besides the compressed bytes
+/// and the output: level 3 at an unknown size gives `windowLog` 21 (a window of 2 MiB) and a block
+/// of 128 KiB (spec v3.9b W4; `backup_frames_have_window_log_at_most_21`). The streaming decoder
+/// that counts the plaintext holds it; the one-shot `bulk::decompress` into a buffer of the size of
+/// the output does not (it uses the output as the window).
+pub const ZSTD_WINDOW_BYTES: u64 = 2 * MIB + 128 * 1024;
+
+/// The decompression context of the one-shot call (about 160 KiB measured), rounded up.
+pub const DCTX_BYTES: u64 = MIB;
 
 /// Restore from the network, the decode stage: the fetched symbols the caller already holds
-/// (`k_eff·t`) and the decoder's worst case — `(2·k_eff + L(k) + o + k + 1)·t + 3277·k`. K is
+/// (`k_eff·t`), the decoder's worst case, and the window of zstd for the count of the plaintext
+/// that runs under this permit — `(2·k_eff + L(k) + o + k + 1)·t + 3277·k + window`. K is
 /// clamped like `encoder_held`: a K the decoder refuses fails before it allocates.
 pub fn estimate_restore_network(k: u32, t: u16) -> u64 {
     let k = k.min(RAPTORQ_MAX_SOURCE_SYMBOLS) as u128;
     let o = DECODE_OVERHEAD as u128;
     let k_eff = k + o;
     let l = intermediate_symbols(k as u32) as u128;
-    round_up_mib((2 * k_eff + l + o + k + 1) * t as u128 + PLAN_BYTES_PER_SOURCE_SYMBOL as u128 * k)
+    round_up_mib(
+        (2 * k_eff + l + o + k + 1) * t as u128
+            + PLAN_BYTES_PER_SOURCE_SYMBOL as u128 * k
+            + ZSTD_WINDOW_BYTES as u128,
+    )
 }
 
-/// Restore, after the decode: the decrypted compressed block, the plaintext and zstd's window.
+/// Restore, after the decode: the decrypted compressed block, the plaintext and the context of
+/// the one-shot decompression (no window: it is the stage one's, v3.9b W4).
 pub fn estimate_restore_plaintext(compressed: u64, s: u64) -> u64 {
-    round_up_mib(compressed as u128 + s as u128 + ZSTD_WINDOW_BYTES as u128)
+    round_up_mib(compressed as u128 + s as u128 + DCTX_BYTES as u128)
 }
 
 /// Restore from the local source: the rebuilt blob (`k·t`), its decrypted compressed copy (≤ `k·t`)
-/// and the plaintext `s` — `2·k·t + s + window`. `s` comes from the files' `metadata`.
+/// and the plaintext `s` — `2·k·t + s + context`. `s` comes from the files' `metadata`.
 pub fn estimate_restore_local(k: u32, t: u16, s: u64) -> u64 {
-    round_up_mib(2 * k as u128 * t as u128 + s as u128 + ZSTD_WINDOW_BYTES as u128)
+    round_up_mib(2 * k as u128 * t as u128 + s as u128 + DCTX_BYTES as u128)
 }
 
 // ─── Closed budget and the DR lease (К-b3, spec v3.9a) ────────────────────────────────────────────

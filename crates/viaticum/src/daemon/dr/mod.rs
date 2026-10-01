@@ -48,7 +48,7 @@ use viaticum_core::system_state::catalog::{
 use viaticum_core::system_state::{
     CatalogLineageId, DiffOp, SelfPointer, SystemState, apply_diffs,
 };
-use viaticum_core::types::{DeviceId, IdentityPub, Timestamp, from_cbor_bytes, hex_encode};
+use viaticum_core::types::{DeviceId, IdentityPub, Timestamp, hex_encode};
 
 use crate::daemon::handle::shutdown::ShutdownSignals;
 use crate::daemon::identity::{IdentityKeyFile, MnemonicProblem, derive_keys};
@@ -139,6 +139,24 @@ pub enum DrError {
          Nothing was changed."
     )]
     NodeCannotShareMemory,
+    /// Spec v3.9b p.5: the node answered 401/403 — DR runs as another user than the node.
+    #[error(
+        "dr: the node refused the request (status {status}); run dr as the same user as the \
+         node. Nothing was changed."
+    )]
+    NodeRefusedLease { status: u16 },
+    /// Spec v3.9b p.5: a status that is neither the lease stream, nor an old node's, nor a 5xx.
+    #[error(
+        "dr: the node on this machine answered the memory lease with status {status}. Nothing \
+         was changed."
+    )]
+    NodeUnexpectedStatus { status: u16 },
+    /// Spec v3.9b p.7: the node on this machine has no web API (a setting, nothing to wait for).
+    #[error(
+        "dr: the node on this machine has its web API off; enable it (or stop the node) and run \
+         dr again. Nothing was changed."
+    )]
+    NodeWebApiOff,
 }
 
 fn dr_failed(reason: impl std::fmt::Display) -> DrError {
@@ -665,17 +683,17 @@ async fn fetch_state(
     pointer: &SelfPointer,
 ) -> Result<SystemState, String> {
     net::dial_pointer_holders(swarm, event_rx, db, pointer).await;
-    let base_bytes = net::fetch_ss_block(swarm, encoder, &pointer.base, dr_key, memory)
-        .await
-        .map_err(|e| format!("failed to fetch SS base block: {e}"))?;
     let base_state: SystemState =
-        from_cbor_bytes(&base_bytes).map_err(|e| format!("decode base SystemState: {e}"))?;
+        net::fetch_ss_block(swarm, encoder, &pointer.base, dr_key, memory)
+            .await
+            .map_err(|e| format!("failed to fetch SS base block: {e}"))?;
     let mut diffs: Vec<Vec<DiffOp>> = Vec::with_capacity(pointer.diffs.len());
     for dref in &pointer.diffs {
-        let bytes = net::fetch_ss_block(swarm, encoder, dref, dr_key, memory)
-            .await
-            .map_err(|e| format!("failed to fetch SS diff block: {e}"))?;
-        diffs.push(from_cbor_bytes(&bytes).map_err(|e| format!("decode diff block: {e}"))?);
+        diffs.push(
+            net::fetch_ss_block(swarm, encoder, dref, dr_key, memory)
+                .await
+                .map_err(|e| format!("failed to fetch SS diff block: {e}"))?,
+        );
     }
     Ok(apply_diffs(base_state, &diffs))
 }
