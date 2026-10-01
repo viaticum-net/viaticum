@@ -19,7 +19,9 @@
 //   Our own DHT: the protocol is KAD_PROTOCOL, the only way in is the circle's
 //   `kademlia_bootstrap_peers`, and identify feeds Kademlia only peers that
 //   announce KAD_PROTOCOL — so an IPFS (or any other) Kademlia node never
-//   enters our table and is never handed out by our lookups (network-i17).
+//   enters our table and is never handed out by our lookups (network-i17). A
+//   foreign address a user put into the bootstrap list gets one dial at start
+//   and is dropped from the table after its identify.
 //   FIND_NODE only — the Kademlia bootstrap plus a periodic get_closest_peers
 //   of our own id; found peers we do not know yet are dialed, and
 //   DeviceCertExchange runs automatically after TCP+Noise connects. There is no
@@ -1500,16 +1502,25 @@ impl EventLoopState {
 
     fn handle_identify_event(&mut self, event: libp2p::identify::Event) {
         if let libp2p::identify::Event::Received { peer_id, info, .. } = event {
-            // network-i17: only a peer that announces OUR Kademlia goes into the
+            // network-i17: only a peer that announces OUR Kademlia is in the
             // table. `add_address` would put any peer there, and a protocol the
             // peer then fails to confirm only marks it, never removes it — an
             // IPFS node connecting to us would stay in the table and be handed
-            // out by our FIND_NODE answers.
+            // out by our FIND_NODE answers. A peer that got in before its
+            // identify (a foreign address in `kademlia_bootstrap_peers`: added at
+            // start, dialed once by the bootstrap) is taken out here.
             let kad_protocol = info.protocols.contains(&KAD_PROTOCOL);
             let kad_addrs = if kad_protocol {
                 self.feed_kad(peer_id, &info.listen_addrs)
             } else {
-                self.kad_addrs_of(&peer_id).len()
+                let removed = self.swarm.behaviour_mut().kad.remove_peer(&peer_id);
+                if removed.is_some() {
+                    warn!(
+                        peer_id = %peer_id,
+                        "kad peer {peer_id} does not speak {KAD_PROTOCOL} — removed from the routing table"
+                    );
+                }
+                0
             };
             // Р-7 / network-i18: how many addresses the peer announced, how many
             // its Kademlia record holds now, and whether it speaks our Kademlia.

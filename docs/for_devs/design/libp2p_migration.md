@@ -299,8 +299,11 @@ Viaticum runs its own Kademlia DHT from the first day of the network
 ([ADR-003](../decisions/ADR-003-own-kademlia.md)):
 
 - Protocol name `/viaticum/kad/1.0.0`. A node speaking another Kademlia (IPFS's
-  `/ipfs/kad/1.0.0`) cannot query us, is not answered, and never enters our routing
-  table: identify feeds Kademlia only from peers that announce our protocol.
+  `/ipfs/kad/1.0.0`) cannot query us, is not answered, and is never handed to other
+  peers: identify feeds Kademlia only from peers that announce our protocol, and
+  removes a peer whose identify does not announce it. The one boundary: a foreign
+  address a user puts into `kademlia_bootstrap_peers` gets one dial at start and is
+  dropped from the routing table after identify; it is never handed to other peers.
 - No built-in bootstrap nodes. A node enters the network through the circle's own
   bootstrap peers (`[network] kademlia_bootstrap_peers`, e.g. a friend's always-on
   node). The old `kademlia_disable_ipfs_bootstrap` switch is gone; a config that still
@@ -309,7 +312,8 @@ Viaticum runs its own Kademlia DHT from the first day of the network
   periodic `get_closest_peers` of our own id; found peers we do not know yet are
   dialed, and the DeviceCertExchange runs after TCP + Noise. Incoming PUT_VALUE /
   ADD_PROVIDER are not stored, so every answer of ours is ≤ 20 closer peers with a
-  bounded address set each and fits the default 16 KiB frame.
+  bounded address set each, so the answer is bounded and fits the default 16 KiB
+  frame with margin.
 
 An earlier plan (ε.3) started on the shared IPFS DHT with a provider record
 (`/viaticum/peers/v1`) and meant to move to an own namespace "at ~100+ nodes". It was
@@ -419,7 +423,7 @@ struct ViaticumBehaviour {
 }
 ```
 
-MemoryStore: limit 10240 records. On restart -- DHT bootstrap again. A redb-backed store can be added later.
+MemoryStore: `MemoryStore::new` with its defaults, and it stays empty — we provide nothing and incoming PUT_VALUE / ADD_PROVIDER are filtered out (`StoreInserts::FilterBoth`). Only the routing table matters; on restart it is refilled by the DHT bootstrap.
 
 ---
 

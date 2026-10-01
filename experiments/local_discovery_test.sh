@@ -323,24 +323,49 @@ log_has_since() {
 # build has no such field), KD/AD (",hex8,hex8," lists), HAS_KNOWN (Y/N).
 declare -A K A C BUSY INFRA CLOSING KD AD HAS_KNOWN WAKES
 FIELDS_NOTED=0
+sample_one() { # NODE
+    local i="$1" js row
+    js=$(api_get "$i" /api/status)
+    if [ -z "$js" ]; then K[$i]=""; return 0; fi
+    row=$(echo "$js" | jq -r '[
+        (if has("peer_count_known") then .peer_count_known else "NA" end),
+        .peer_count_authenticated, .peer_count_connected,
+        (if has("busy_peers") then .busy_peers else "NA" end),
+        (if has("infra_peers") then .infra_peers else "NA" end),
+        (if has("closing_peers") then .closing_peers else "NA" end),
+        ("," + ((.known_devices // []) | join(",")) + ","),
+        ("," + ((.authenticated_devices // []) | join(",")) + ","),
+        (if has("known_devices") then "Y" else "N" end),
+        (if has("work_wakes_suppressed") then .work_wakes_suppressed else "NA" end)
+      ] | @tsv' 2>/dev/null || true)
+    IFS=$'\t' read -r "K[$i]" "A[$i]" "C[$i]" "BUSY[$i]" "INFRA[$i]" "CLOSING[$i]" "KD[$i]" "AD[$i]" \
+        "HAS_KNOWN[$i]" "WAKES[$i]" <<< "$row"
+}
 sample_all() {
-    local i js row
-    for i in $(alive_nodes); do
-        js=$(api_get "$i" /api/status)
-        if [ -z "$js" ]; then K[$i]=""; continue; fi
-        row=$(echo "$js" | jq -r '[
-            (if has("peer_count_known") then .peer_count_known else "NA" end),
-            .peer_count_authenticated, .peer_count_connected,
-            (if has("busy_peers") then .busy_peers else "NA" end),
-            (if has("infra_peers") then .infra_peers else "NA" end),
-            (if has("closing_peers") then .closing_peers else "NA" end),
-            ("," + ((.known_devices // []) | join(",")) + ","),
-            ("," + ((.authenticated_devices // []) | join(",")) + ","),
-            (if has("known_devices") then "Y" else "N" end),
-            (if has("work_wakes_suppressed") then .work_wakes_suppressed else "NA" end)
-          ] | @tsv' 2>/dev/null || true)
-        IFS=$'\t' read -r "K[$i]" "A[$i]" "C[$i]" "BUSY[$i]" "INFRA[$i]" "CLOSING[$i]" "KD[$i]" "AD[$i]" \
-            "HAS_KNOWN[$i]" "WAKES[$i]" <<< "$row"
+    local i
+    for i in $(alive_nodes); do sample_one "$i"; done
+}
+
+# A node whose status did not answer on a sample (a loaded build host pauses every daemon
+# at once) is asked again every 5 s for up to 20 s. An answer counts as this sample's
+# value and the re-ask is listed in RESAMPLED ("node-i@Ns", for a NOTE); no answer within
+# 20 s leaves K empty and the caller fails the node as i:no-status. Used by the hold
+# checks (steps 3 and 4a), not by the convergence barrier of step 1.
+RESAMPLED=""; RESAMPLE_N=0
+resample_missing() { # NODES...
+    local i t missing
+    for t in 1 2 3 4; do
+        missing=""
+        for i in "$@"; do [ -n "${K[$i]:-}" ] || missing="$missing $i"; done
+        [ -n "$missing" ] || return 0
+        sleep 5
+        for i in $missing; do
+            sample_one "$i"
+            if [ -n "${K[$i]:-}" ]; then
+                RESAMPLE_N=$((RESAMPLE_N + 1))
+                RESAMPLED="$RESAMPLED node-$i@$(( $(date -u +%s) - T_BASE ))s"
+            fi
+        done
     done
 }
 
@@ -886,31 +911,24 @@ fi
 # ── STEP 3: HOLD ────────────────────────────────────────────────────────────
 if runs_step 3; then
     step 3 "hold ${HOLD_SECS}s, sample every ${SAMPLE_SECS}s"
-    # A status that does not answer within the API timeout on one sample (a loaded build
-    # host pauses every node at once) is a missed sample, not fallen knowledge: it goes to
-    # a NOTE (node@second) and leaves PREV_K alone, so "never down" compares with the last
-    # value received. Two or more missed samples IN A ROW of one node are a FAIL
-    # (i:no-status×N).
-    declare -A LINE3 PREV_K MISS_RUN3 MISS_MAX3
+    # A status that does not answer is asked again (resample_missing, <= 20 s); still none
+    # = FAIL i:no-status. NA (the build has no peer_count_known) = FAIL i:no-known-field.
+    declare -A LINE3 PREV_K
     for i in $(alive_nodes); do LINE3[$i]=$(log_line_count "$i"); done
     T3=$(date -u +%s)
-    KNOW_BAD=""; CAP_VIOLATIONS=""; SAMPLES=0; MISSED3=0; MISSED3_AT=""
-    sample_all
-    for i in $(alive_nodes); do PREV_K[$i]="${K[$i]:-0}"; done
+    KNOW_BAD=""; CAP_VIOLATIONS=""; SAMPLES=0; RESAMPLED=""; RESAMPLE_N=0
+    sample_all; resample_missing $(alive_nodes)
+    for i in $(alive_nodes); do
+        if [ -z "${K[$i]:-}" ]; then KNOW_BAD="$KNOW_BAD $i:no-status"; fi
+        PREV_K[$i]="${K[$i]:-0}"
+    done
     while [ $(( $(date -u +%s) - T3 )) -lt "$HOLD_SECS" ]; do
         sleep "$SAMPLE_SECS"
-        sample_all; check_cap_sample; check_sockets_sample
+        sample_all; resample_missing $(alive_nodes); check_cap_sample; check_sockets_sample
         SAMPLES=$((SAMPLES + 1))
         for i in $(alive_nodes); do
             k="${K[$i]:-}"
-            if [ -z "$k" ]; then
-                MISSED3=$((MISSED3 + 1))
-                MISSED3_AT="$MISSED3_AT node-$i@$(( $(date -u +%s) - T_BASE ))s"
-                MISS_RUN3[$i]=$(( ${MISS_RUN3[$i]:-0} + 1 ))
-                [ "${MISS_RUN3[$i]}" -gt "${MISS_MAX3[$i]:-0}" ] && MISS_MAX3[$i]="${MISS_RUN3[$i]}"
-                continue
-            fi
-            MISS_RUN3[$i]=0
+            if [ -z "$k" ]; then KNOW_BAD="$KNOW_BAD $i:no-status"; continue; fi
             if [ "$k" = NA ]; then KNOW_BAD="$KNOW_BAD $i:no-known-field"; continue; fi
             [ "$k" -lt 20 ] && KNOW_BAD="$KNOW_BAD $i:$k<20"
             [ "$k" -lt "${PREV_K[$i]:-0}" ] && KNOW_BAD="$KNOW_BAD $i:${PREV_K[$i]}->$k"
@@ -918,14 +936,11 @@ if runs_step 3; then
         done
     done
     T3_END=$(date -u +%s)
-    for i in "${!MISS_MAX3[@]}"; do
-        [ "${MISS_MAX3[$i]}" -ge 2 ] && KNOW_BAD="$KNOW_BAD $i:no-status×${MISS_MAX3[$i]}"
-    done
-    [ "$MISSED3" -gt 0 ] && note "status missed on $MISSED3 node-samples (single misses are not a fall):$(echo "$MISSED3_AT" | cut -c1-300)"
+    [ "$RESAMPLE_N" -gt 0 ] && note "status answered only when asked again (<= 20 s) $RESAMPLE_N times:$(echo "$RESAMPLED" | cut -c1-300)"
     if [ "$SAMPLES" -eq 0 ]; then
         fail "0 samples taken"
     elif [ -z "$KNOW_BAD" ]; then
-        pass "$SAMPLES samples ($MISSED3 node-samples missed): every node knows >= 20 and its known count never went down"
+        pass "$SAMPLES samples ($RESAMPLE_N status re-asks): every node knows >= 20 and its known count never went down"
     else
         fail "knowledge fell:$(echo "$KNOW_BAD" | cut -c1-300)"
     fi
@@ -1017,29 +1032,24 @@ fi
 # ── STEP 4a: SEED DOWN ──────────────────────────────────────────────────────
 if runs_step 4a; then
     step 4a "SIGKILL the seed for 90 s"
-    sample_all
+    sample_all; RESAMPLED=""; RESAMPLE_N=0; resample_missing $(alive_friends)
     declare -A K_BEFORE
-    for i in $(alive_friends); do K_BEFORE[$i]="${K[$i]:-0}"; done
+    for i in $(alive_friends); do K_BEFORE[$i]="${K[$i]:-}"; done
+    [ "$RESAMPLE_N" -gt 0 ] && note "before SIGKILL: status answered only when asked again (<= 20 s):$(echo "$RESAMPLED" | cut -c1-300)"
     kill_node "$SEED"
     T4=$(date -u +%s)
-    # As in step 3: a status missed on one check is a NOTE and keeps the comparison with the
-    # last value received; missed on both checks in a row is a FAIL (i:no-status×2).
-    declare -A MISS_RUN4
+    # A status that does not answer is asked again (resample_missing, <= 20 s); still none
+    # (here or before the kill) = FAIL i:no-status.
     check_known_kept() { # LABEL
-        local i bad="" missed=""
-        sample_all
+        local i bad=""
+        RESAMPLED=""; RESAMPLE_N=0
+        sample_all; resample_missing $(alive_friends)
         for i in $(alive_friends); do
-            if [ -z "${K[$i]:-}" ]; then
-                MISS_RUN4[$i]=$(( ${MISS_RUN4[$i]:-0} + 1 ))
-                missed="$missed node-$i@$(( $(date -u +%s) - T_BASE ))s"
-                [ "${MISS_RUN4[$i]}" -ge 2 ] && bad="$bad $i:no-status×${MISS_RUN4[$i]}"
-                continue
-            fi
-            MISS_RUN4[$i]=0
+            if [ -z "${K_BEFORE[$i]:-}" ]; then bad="$bad $i:no-status(before SIGKILL)"; continue; fi
+            if [ -z "${K[$i]:-}" ]; then bad="$bad $i:no-status"; continue; fi
             [ "${K[$i]}" -ge "${K_BEFORE[$i]}" ] 2>/dev/null || bad="$bad $i:${K_BEFORE[$i]}->${K[$i]}"
-            K_BEFORE[$i]="${K[$i]}"
         done
-        [ -n "$missed" ] && note "$1: status missed (not a fall):$(echo "$missed" | cut -c1-300)"
+        [ "$RESAMPLE_N" -gt 0 ] && note "$1: status answered only when asked again (<= 20 s):$(echo "$RESAMPLED" | cut -c1-300)"
         if [ -z "$bad" ]; then pass "$1: no friend's known count fell"; else fail "$1: known fell:$(echo "$bad" | cut -c1-300)"; fi
     }
     sleep_until $(( T4 - T_BASE + 30 ))
