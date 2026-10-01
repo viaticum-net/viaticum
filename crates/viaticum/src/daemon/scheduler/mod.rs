@@ -490,6 +490,13 @@ impl Scheduler {
             &pending.expected_chain_hash,
             first_esi,
         );
+        // The owner's verdict, for the E2E (bigfile_limit 3c reads it): log only.
+        debug!(
+            block_id = %block_id,
+            holder = %holder_id,
+            outcome = %if matches!(outcome, viaticum_core::pos::VerifyOutcome::Pass) { "pass" } else { "fail" },
+            "scheduler: PoS verdict"
+        );
 
         // Apply outcome to DB.
         let placement = match self.db.get_placement(&block_id, &holder_id)? {
