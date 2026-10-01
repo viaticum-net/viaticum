@@ -96,7 +96,16 @@ pub(super) fn budgeted_at(
         |db, dir| seed_due(db, dir, blocks, holders),
     );
     owner.scheduler.set_mem_budget(Arc::clone(&budget));
+    freeze_batch_clock(&mut owner);
     (owner, budget)
+}
+
+/// The batch's limits (half a period of work, 0.9 of a period from the tick) read a clock that
+/// does not move: a loaded machine cannot end a batch before its members are done. Tests of the
+/// limits inject a clock of their own (`FakeClock` in `issue_batch`).
+pub(super) fn freeze_batch_clock(owner: &mut Owner) {
+    let frozen = std::time::Instant::now();
+    owner.scheduler.set_batch_clock(Arc::new(move || frozen));
 }
 
 /// Take the whole budget: a busy worker.

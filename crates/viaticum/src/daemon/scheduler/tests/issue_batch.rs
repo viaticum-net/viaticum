@@ -20,9 +20,9 @@ use tokio::time::Instant;
 use viaticum_core::types::{SourceBlockId, Timestamp};
 
 use super::issue_mem::{
-    MIB, TOTAL_MIB, block_at, budgeted, budgeted_at, deferred_tick_of, hold_all, logged,
-    pending_len, permit_of_test_block, seed_sized_block, settle_until_idle, sized_block_id, tick,
-    tick_lines, until,
+    MIB, TOTAL_MIB, block_at, budgeted, budgeted_at, deferred_tick_of, freeze_batch_clock,
+    hold_all, logged, pending_len, permit_of_test_block, seed_sized_block, settle_until_idle,
+    sized_block_id, tick, tick_lines, until,
 };
 use super::issue_stall::StallingEncoder;
 use super::issue_support::{SlowPostman, owner_with_encoder};
@@ -203,6 +203,7 @@ async fn one_batch_serves_all_ripe_marks_under_one_permit_sized_by_the_largest()
         },
     );
     owner.scheduler.set_mem_budget(Arc::clone(&budget));
+    freeze_batch_clock(&mut owner);
     for (seed, t) in [(1, 65_535), (2, 64), (3, 64), (4, 64)] {
         owner
             .db
@@ -254,6 +255,7 @@ async fn batch_shrinks_to_the_largest_remaining_need_after_each_member() {
         },
     );
     owner.scheduler.set_mem_budget(Arc::clone(&budget));
+    freeze_batch_clock(&mut owner);
     let blocks = [
         sized_block_id(1, 65_535),
         sized_block_id(2, 64),
@@ -1243,12 +1245,13 @@ async fn a_failure_outside_a_member_publishes_the_ready_and_returns_the_rest() {
     let (mut owner, budget) = budgeted(3, 1, make_test_encoder());
     let calls = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&calls);
+    let frozen = StdInstant::now();
     owner.scheduler.set_batch_clock(Arc::new(move || {
         // 0, 1: the two ticks' starts; 2: the grant; 3: before member 2; 4: before member 3.
         if counted.fetch_add(1, Ordering::SeqCst) == 4 {
             panic!("the clock fails");
         }
-        StdInstant::now()
+        frozen
     }));
     let hold = hold_all(&budget);
     let mut in_flight = InFlight::default();
@@ -1264,6 +1267,71 @@ async fn a_failure_outside_a_member_publishes_the_ready_and_returns_the_rest() {
         owner.scheduler.load_failed.lock().unwrap().is_empty(),
         "nobody is punished"
     );
+    assert!(!in_flight.preparing.batch_in_flight());
+    assert!(in_flight.preparing.blocks().is_empty());
+    assert_eq!(budget.outstanding_bytes(), 0);
+}
+
+/// A panic payload whose drop panics: the batch catches the member's panic, and the failure
+/// comes later, in the handling of it — after `try_start`, before the member is staged.
+struct PanicOnDrop;
+
+impl Drop for PanicOnDrop {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            panic!("the payload of the member's panic fails to drop");
+        }
+    }
+}
+
+/// K-b2b round 3. A failure of the batch's task AFTER a member was started and BEFORE it was
+/// staged (here the handling of the member's own panic): the penalty — `load_failed` for a period,
+/// the mark cleared — falls on exactly that member (`current()`), nobody else. The member through
+/// before it is published, the one not started goes back to the marks.
+#[tokio::test]
+async fn a_failure_between_start_and_staging_penalizes_exactly_the_current_member() {
+    let encoder = plain_encoder();
+    encoder.set_hook(|call| {
+        if call == 1 {
+            std::panic::panic_any(PanicOnDrop);
+        }
+    });
+    let (owner, budget) = budgeted(3, 1, Arc::clone(&encoder) as _);
+    let (x, y, z) = (block_at(0), block_at(1), block_at(2));
+    let holder = make_identity(0x80);
+    let hold = hold_all(&budget);
+    let mut in_flight = InFlight::default();
+
+    tick(&owner, &mut in_flight).await; // X, Y, Z marked
+    {
+        // X, Y, Z in this order.
+        let mut attempted = owner.scheduler.last_attempted.lock().unwrap();
+        attempted.insert((x, holder), Timestamp(1));
+        attempted.insert((y, holder), Timestamp(2));
+        attempted.insert((z, holder), Timestamp::now());
+    }
+    tick(&owner, &mut in_flight).await; // the batch (X, Y, Z)
+    drop(hold);
+    settle_until_idle(&owner, &mut in_flight, Duration::from_secs(10)).await;
+
+    assert_eq!(encoder.calls.load(Ordering::SeqCst), 2, "Z was not started");
+    let failed: Vec<SourceBlockId> = owner
+        .scheduler
+        .load_failed
+        .lock()
+        .unwrap()
+        .keys()
+        .copied()
+        .collect();
+    assert_eq!(
+        failed,
+        vec![y],
+        "only the member the task was on is penalized"
+    );
+    assert_eq!(pending_len(&owner), 1, "X, which was through, is published");
+    assert_eq!(mark_count(&owner), 1, "only Z is marked again");
+    assert_eq!(deferred_tick_of(&owner, &y), None, "Y's mark is cleared");
+    assert!(deferred_tick_of(&owner, &z).is_some(), "Z is marked");
     assert!(!in_flight.preparing.batch_in_flight());
     assert!(in_flight.preparing.blocks().is_empty());
     assert_eq!(budget.outstanding_bytes(), 0);

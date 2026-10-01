@@ -216,15 +216,11 @@ async fn issue_tick_returns_before_its_slow_publishes_settle() {
 
 /// W-1: a placement whose challenge is still being published gets no second one. One
 /// block of 8 holders (fewer than the publish slots): the first tick starts all 8 and
-/// returns; the second finds all 8 in flight and starts none.
+/// returns; the second finds all 8 in flight and starts none. The time scale is 1: the tick's
+/// budget (720 s) cannot run out on a loaded machine before the 8 are started.
 #[tokio::test]
 async fn a_placement_being_published_gets_no_second_challenge() {
-    let owner = owner_with_due(
-        1,
-        8,
-        3600,
-        SlowPostman::acking_after(Duration::from_secs(2)),
-    );
+    let owner = owner_with_due(1, 8, 1, SlowPostman::acking_after(Duration::from_secs(2)));
     let mut in_flight = InFlight::default();
 
     owner

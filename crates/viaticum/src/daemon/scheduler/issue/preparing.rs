@@ -16,6 +16,7 @@
 // ticks while the batch holds them; the ones not started go back to the marks. The batch does not
 // count in K (`MAX_PREPARATIONS`): K bounds the preparations the ticks started.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -624,24 +625,24 @@ fn reason_to_stop(
     now: StdInstant,
     work_deadline: StdInstant,
     hard_stop: StdInstant,
-) -> Option<String> {
+) -> Option<Cow<'static, str>> {
     if batch.is_stopped() {
-        Some("written off".into())
+        Some(Cow::Borrowed("written off"))
     } else if now >= work_deadline {
-        Some("half a period of work".into())
+        Some(Cow::Borrowed("half a period of work"))
     } else if now >= hard_stop {
-        Some("nine tenths of the period".into())
+        Some(Cow::Borrowed("nine tenths of the period"))
     } else {
         // The rule counts everyone ahead of the restore (spec v3.7a: `max need(1..i)`), so what
         // does not fit may be a worker standing in front of it: the line says which.
         budget
             .batch_must_yield_to_restore(permit)
             .map(|ahead| match ahead {
-                HolderKind::Restore => "a restore does not fit beside it".to_string(),
-                other => format!(
+                HolderKind::Restore => Cow::Borrowed("a restore does not fit beside it"),
+                other => Cow::Owned(format!(
                     "a restore does not fit beside it (ahead: {})",
                     other.as_str()
-                ),
+                )),
             })
     }
 }
@@ -676,7 +677,7 @@ pub(super) fn drive_batch(
     // `left_after[i]` includes member i; the need of the ones AFTER i is `left_after[i + 1]`.
     let total = members.len();
     let mut served = 0usize;
-    let mut ended: Option<String> = None;
+    let mut ended: Option<Cow<'static, str>> = None;
     let mut rest = members.into_iter().enumerate();
     while let Some((i, (member, cpw_of))) = rest.next() {
         let block_id = member.prep.block_id();
@@ -693,7 +694,7 @@ pub(super) fn drive_batch(
             )
         };
         if stop.is_some() || !batch.try_start(&block_id) {
-            ended = Some(stop.unwrap_or_else(|| "written off".into()));
+            ended = Some(stop.unwrap_or(Cow::Borrowed("written off")));
             batch.give_back(&block_id);
             for (_, (m, _)) in rest.by_ref() {
                 batch.give_back(&m.prep.block_id());
