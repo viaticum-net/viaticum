@@ -199,6 +199,7 @@ if run_b; then
         "work_pipeline: yielding memory to overdue PoS" "work_pipeline: yielding memory to restore"
         "work_pipeline: symbols confirmed stored, placement Offered→Alive"
         "work_pipeline: iteration complete"
+        "work_pipeline: paused while a restore job runs"
         "restore: waiting for memory budget" "restore: regrant for plaintext"
         "processor: PosHashChallenge — responding with chain hash"
         "processor: sending RestoreResponse"
@@ -377,6 +378,7 @@ BUDGET_MB_0=1792               # node-00's block work budget via the test env (v
 NEAR_MB=240; RB_MB=200; B2_MB=200
 SYMBOL_BYTES=65535             # T (SYMBOL_SIZE): E = k * T
 STOPPED=0
+PROC_BOUNDS=""                 # log line counts at which node-00 was restarted (a new process starts)
 
 # stop_after STEP: true (and STOPPED=1) when STOP_AFTER names this step; the caller returns.
 stop_after() {
@@ -454,6 +456,7 @@ restart_node0() {
     else fail "node-00 did not exit 0 within 60s (rc=${EXIT_RC:-running})"; fi
     unset "DPID[0]"
     RS_L0=$(log_line_count 0)
+    PROC_BOUNDS="$PROC_BOUNDS $RS_L0"
     start_node 0
     wait_daemon 0 || { fail "node-00 did not come back after the restart"; exit 1; }
     wait_auth_peers 0 $((NUM_NODES-1)) 90 \
@@ -644,6 +647,27 @@ step3b() {
     L3B_END=$(log_line_count 0); T3B_END=$(now_f)
     info "step 3b: window and restore over: restore rc=$RST_RC after $(awk -v a="$RST_T0" -v b="$RST_TEND" 'BEGIN { printf "%.0f", b - a }') s; node-03/04 resumed at +$((T_CONT - T3B)) s"
     step3b_judge
+    b2_settle
+}
+
+# b2_settle: by the end of 3b (after the resume and the restore) B2 is Alive on node-01 and node-02
+# (symbols confirmed stored), else FAIL "B2 never completes under overdue PoS" (v3.12 §4, backup-i24-a).
+# The poll runs <= 180 s from the later of the resume and the end of the restore job (the worker is
+# paused while the job runs, v3.12a: the 180 s count from when it may work again).
+b2_settle() {
+    local d1 d2 t0 end_t ok1="" ok2=""
+    d1=$(dev_id 1); d2=$(dev_id 2)
+    t0=$T_CONT; [ "$(date +%s)" -gt "$t0" ] && t0=$(date +%s)
+    end_t=$(( t0 + 180 ))
+    while :; do
+        ok1=$(ev 0 "$((L3B + 1))" "work_pipeline: symbols confirmed stored" block_id holder | awk -v b="$B2" -v d="$d1" '$3 == b && $4 == d { print; exit }')
+        ok2=$(ev 0 "$((L3B + 1))" "work_pipeline: symbols confirmed stored" block_id holder | awk -v b="$B2" -v d="$d2" '$3 == b && $4 == d { print; exit }')
+        [ -n "$ok1" ] && [ -n "$ok2" ] && break
+        [ "$(date +%s)" -ge "$end_t" ] && break
+        sleep 3
+    done
+    if [ -n "$ok1" ] && [ -n "$ok2" ]; then pass "3b: B2 Alive on node-01 and node-02 by the end of the step"
+    else fail "3b: B2 never completes under overdue PoS: Alive on node-01: ${ok1:+yes}${ok1:-NO}, node-02: ${ok2:+yes}${ok2:-NO} (180 s after the resume and the end of the restore)"; fi
 }
 
 step3b_judge() {
@@ -760,6 +784,20 @@ step3b_judge() {
     local rr; rr=$(restore_responses_for "$RB16" 1 2)
     [ "$rr" -ge 1 ] && pass "3b (d): node-01/02 logged $rr 'sending RestoreResponse' for RB (the network was used)" \
         || fail "3b (d): no 'sending RestoreResponse' for RB at node-01/02"
+    # ---- v3.12 §4: progress between the yields of the worker for B2
+    local ys cs ws nys gap_bad
+    ys=$(ev 0 "$F" "work_pipeline: yielding memory to" block | awk -v b="$B2" '$3 == b { print $1 }' | sort -n)
+    cs=$(ev 0 "$F" "work_pipeline: chunk sent" block_id reply | awk -v b="$B2" '$3 == b && $4 == "stored" { print $1 }')
+    ws=$( { ev 0 "$F" "rejected offer for block" ; ev 0 "$F" "deliver_to_holder_worker failed"; } | awk '{ print $1 }')
+    nys=$(count_lines "$ys")
+    gap_bad=$( { echo "Y $ys"; echo "P $cs $ws"; } | awk '
+        $1 == "Y" { for (i = 2; i <= NF; i++) y[++ny] = $i }
+        $1 == "P" { for (i = 2; i <= NF; i++) p[++np] = $i }
+        END { for (i = 1; i < ny; i++) { ok = 0; for (j = 1; j <= np; j++) if (p[j] > y[i] && p[j] <= y[i + 1]) ok = 1; if (!ok) printf "%.1f-%.1f ", y[i], y[i + 1] } }')
+    if [ -n "$gap_bad" ]; then fail "3b: no stored chunk (new ESIs) and no failed-offer WARN between two yields of the worker for B2 (backup-i24-a): $gap_bad"
+    else pass "3b: $nys yield(s) for B2; every gap between two yields has a stored chunk with new ESIs or a failed-offer WARN"; fi
+    local paused; paused=$(clog 0 "$F" | grep -aF "work_pipeline: paused while a restore job runs" | head -3 | cut -c1-30 | tr '\n' ' ')
+    note "3b: INFO 'paused while a restore job runs' (once per job, Q-V9 (a)): ${paused:-none}; worker grants during the restore job: $(ev 0 "$F" "mem_budget: granted" kind block | awk -v a="$RST_T0" -v b="$RST_TEND" '$3 == "worker" && $1 >= a && $1 <= b' | wc -l)"
     # ---- memory
     local bar_kib=$((2656 * 1024))
     if [ -z "$S3B_HWMD" ]; then fail "3b: cannot read VmHWM of node-00"
@@ -835,6 +873,27 @@ final_lines_check() {
     [ "$n" -eq 0 ] && pass "no 'overdue batch ended early ... reason=written off'" || fail "$n 'pos: overdue batch ended early ... reason=written off' line(s)"
     n=$(count_lines "$(clog 0 | grep -aF 'pos: a batch member panicked' || true)")
     [ "$n" -eq 0 ] && pass "no 'pos: a batch member panicked'" || fail "$n 'pos: a batch member panicked' line(s)"
+    # v3.12 §4 (M85 guard): no (holder, ESI) pair twice in `chunk sent ... reply=stored` within one process.
+    local dup
+    dup=$(awk -v bounds="$PROC_BOUNDS" -v logf="$(node_log 0)" '
+        function kv(name) { if (match($0, "[ ]" name "=[^ ]+")) return substr($0, RSTART + 2 + length(name), RLENGTH - 2 - length(name)); return "" }
+        BEGIN { n = split(bounds, B, " "); for (i = 1; i <= n; i++) cut[B[i]] = 1 }
+        { gsub(/\033\[[0-9;]*m/, "") }
+        (FNR - 1) in cut { delete seen }
+        /work_pipeline: chunk sent/ && /reply=stored/ {
+            h = kv("holder"); b = kv("block_id"); m = split(kv("esis"), R, ",")
+            for (i = 1; i <= m; i++) {
+                if (split(R[i], ab, "\\.\\.") != 2) continue
+                for (e = ab[1] + 0; e <= ab[2] + 0; e++) {
+                    k = h "|" b "|" e
+                    if (k in seen) { dups++; if (dups <= 3) ex = ex " " h "/" b "/" e "@" FNR }
+                    seen[k] = 1
+                }
+            }
+        }
+        END { printf "%d%s\n", dups, ex }' "$(node_log 0)")
+    if [ "${dup%% *}" = "0" ]; then pass "no (holder, ESI) pair stored twice in one process (no delivery restart)"
+    else fail "delivery restarts: (holder, ESI) pair(s) sent and stored twice in one process: ${dup}"; fi
     # 'still running': NB is ROUGH only past 2 x t_encode(NB); another block is ROUGH always.
     local sr; sr=$(ev 0 1 "scheduler: PoS preparation still running" block age_s)
     if [ -z "$sr" ]; then info "no 'PoS preparation still running' on node-00"
