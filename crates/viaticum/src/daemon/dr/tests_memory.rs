@@ -720,11 +720,14 @@ async fn dr_classifies_the_answers_of_the_node_to_the_lease() {
         let dir = node_dir(serve_answering(status, content_type).await);
         let (_lock, mut memory, lines) = dr_beside_node_at(root.path(), dir.path());
 
-        let err = memory
-            .acquire(&block.id, block.encrypted_size, &block.params)
-            .await
-            .err()
-            .unwrap_or_else(|| panic!("{status} {content_type}: no lease"));
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            memory.acquire(&block.id, block.encrypted_size, &block.params),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{status} {content_type}: DR waits instead of ending"))
+        .err()
+        .unwrap_or_else(|| panic!("{status} {content_type}: no lease"));
 
         let said = err.to_string();
         match status {
@@ -807,11 +810,14 @@ async fn dr_exits_with_a_hint_when_the_node_has_its_web_api_off() {
     let (_lock, mut memory, _lines) = dr_beside_node_at(root.path(), dir.path());
     let block = ss_block(16, 80_000);
 
-    let err = memory
-        .acquire(&block.id, block.encrypted_size, &block.params)
-        .await
-        .err()
-        .expect("no API, no lease");
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        memory.acquire(&block.id, block.encrypted_size, &block.params),
+    )
+    .await
+    .expect("DR ends with the hint, it does not wait for a web API that is off")
+    .err()
+    .expect("no API, no lease");
 
     assert!(matches!(err, DrError::NodeWebApiOff), "{err}");
     assert!(
