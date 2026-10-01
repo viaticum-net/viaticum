@@ -17,6 +17,8 @@
 // count in K (`MAX_PREPARATIONS`): K bounds the preparations the ticks started.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
@@ -27,7 +29,7 @@ use tracing::{info, warn};
 use viaticum_core::types::{DeviceId, SourceBlockId};
 
 use super::prepare::{
-    BlockPrep, Hashed, Member, PrepOutcome, PrepPhase, PrepShared, with_current_dispatch,
+    BlockPrep, Computed, Hashed, Member, PrepOutcome, PrepPhase, PrepShared, with_current_dispatch,
 };
 use crate::daemon::mem_budget::{HolderKind, MemBudget, MemPermit, PriorityKind};
 use crate::daemon::scheduler::BatchClock;
@@ -418,14 +420,77 @@ impl Preparing {
     }
 }
 
-/// The results of a batch whose blocking steps failed (a panic or a cancelled task): every member
-/// is reported failed, so its mark and its place are cleared and it waits one period.
+/// The results of a batch whose first blocking step failed (a panic or a cancelled task): every
+/// member is reported failed, so its mark and its place are cleared and it waits one period.
 fn all_failed(ids: Vec<SourceBlockId>, e: &JoinError) -> Vec<PrepDone> {
     ids.into_iter()
-        .map(|block_id| PrepDone {
-            block_id,
-            cpw_of: HashMap::new(),
-            result: Err(anyhow::anyhow!("{e}")),
+        .map(|block_id| failed_done(block_id, HashMap::new(), anyhow::anyhow!("{e}")))
+        .collect()
+}
+
+fn failed_done(
+    block_id: SourceBlockId,
+    cpw_of: HashMap<DeviceId, u32>,
+    err: anyhow::Error,
+) -> PrepDone {
+    PrepDone {
+        block_id,
+        cpw_of,
+        result: Err(err),
+    }
+}
+
+/// The text of a panic.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    let text = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned());
+    format!(
+        "panicked: {}",
+        text.unwrap_or_else(|| "(no message)".into())
+    )
+}
+
+/// A member that has been through its turn under the permit: its work, or the panic it ended in.
+pub(super) struct Staged {
+    block_id: SourceBlockId,
+    cpw_of: HashMap<DeviceId, u32>,
+    outcome: Result<(BlockPrep, Computed), String>,
+}
+
+/// The members that have been through their turn, kept where the wrapper can read them even when
+/// the blocking task that filled it fails: what is ready is published all the same.
+type StagedList = Arc<Mutex<Vec<Staged>>>;
+
+/// The challenges of the staged members, their masters looked up (no permit, J12). A panic in one
+/// member's lookup fails that member only.
+fn finish_staged(staged: Vec<Staged>) -> Vec<PrepDone> {
+    staged
+        .into_iter()
+        .map(|st| {
+            let Staged {
+                block_id,
+                cpw_of,
+                outcome,
+            } = st;
+            match outcome {
+                Err(text) => failed_done(block_id, cpw_of, anyhow::anyhow!("{text}")),
+                Ok((prep, computed)) => {
+                    let finished = std::panic::catch_unwind(AssertUnwindSafe(|| match computed {
+                        Some(hashes) => Hashed { prep, hashes }.finish(),
+                        None => PrepOutcome::Unserved,
+                    }));
+                    match finished {
+                        Ok(outcome) => PrepDone {
+                            block_id,
+                            cpw_of,
+                            result: Ok(outcome),
+                        },
+                        Err(p) => failed_done(block_id, cpw_of, anyhow::anyhow!(panic_text(&*p))),
+                    }
+                }
+            }
         })
         .collect()
 }
@@ -469,18 +534,9 @@ async fn run_batch(
     else {
         return done;
     };
-    info!(
-        blocks = %ready
-            .iter()
-            .map(|(m, _)| m.prep.block_id().to_string())
-            .collect::<Vec<_>>()
-            .join(","),
-        need_mib = need_bytes >> 20,
-        "pos: overdue batch waiting for memory"
-    );
     let waited = Instant::now();
-    let permit = budget
-        .acquire_priority(
+    let permit = {
+        let mut acquire = Box::pin(budget.acquire_priority(
             PriorityKind::OverduePos,
             &biggest,
             need_bytes,
@@ -492,25 +548,72 @@ async fn run_batch(
                     "pos: overdue batch still waiting for memory"
                 );
             },
-        )
-        .await;
+        ));
+        // One look first: a grant that comes at once is not a wait and says nothing (as the
+        // worker's line comes only when its wait is not instant).
+        let look = std::future::poll_fn(|cx| std::task::Poll::Ready(acquire.as_mut().poll(cx)));
+        match look.await {
+            std::task::Poll::Ready(permit) => permit,
+            std::task::Poll::Pending => {
+                info!(
+                    blocks = %ready
+                        .iter()
+                        .map(|(m, _)| m.prep.block_id().to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    need_mib = need_bytes >> 20,
+                    "pos: overdue batch waiting for memory"
+                );
+                acquire.await
+            }
+        }
+    };
     // From here it works: its age for the stuck WARN counts from now, not from the wait.
     state.set_started(Instant::now());
     let ready_ids: Vec<SourceBlockId> = ready.iter().map(|(m, _)| m.prep.block_id()).collect();
+    let staged: StagedList = Arc::default();
+    let (task_staged, task_batch) = (Arc::clone(&staged), Arc::clone(&batch));
     let worked = tokio::task::spawn_blocking(with_current_dispatch(move || {
-        drive_batch(ready, permit, &batch, &state, &budget, &plan)
+        drive_batch(
+            ready,
+            permit,
+            &task_batch,
+            &state,
+            &budget,
+            &plan,
+            &task_staged,
+        )
     }))
     .await;
-    match worked {
-        Ok(results) => {
-            done.extend(results);
-            done
-        }
+    // What the members left, the permit gone either way (it is dropped with the task).
+    let left = std::mem::take(&mut *staged.lock().unwrap_or_else(|p| p.into_inner()));
+    let results = match worked {
+        Ok(()) => left,
         Err(e) => {
-            done.extend(all_failed(ready_ids, &e));
-            done
+            // The task itself failed outside a member's turn (a member's own panic is caught in
+            // it): only the member it was on is failed, the ones not started return to the marks
+            // (`stop`), what was ready is published.
+            batch.stop();
+            let mut results = left;
+            if let Some(current) = batch.current()
+                && !results.iter().any(|st| st.block_id == current)
+            {
+                results.push(Staged {
+                    block_id: current,
+                    cpw_of: HashMap::new(),
+                    outcome: Err(e.to_string()),
+                });
+            }
+            results
         }
+    };
+    let finished =
+        tokio::task::spawn_blocking(with_current_dispatch(move || finish_staged(results))).await;
+    match finished {
+        Ok(more) => done.extend(more),
+        Err(e) => done.extend(all_failed(ready_ids, &e)),
     }
+    done
 }
 
 /// Why a batch started no further member.
@@ -521,17 +624,25 @@ fn reason_to_stop(
     now: StdInstant,
     work_deadline: StdInstant,
     hard_stop: StdInstant,
-) -> Option<&'static str> {
+) -> Option<String> {
     if batch.is_stopped() {
-        Some("written off")
+        Some("written off".into())
     } else if now >= work_deadline {
-        Some("half a period of work")
+        Some("half a period of work".into())
     } else if now >= hard_stop {
-        Some("nine tenths of the period")
-    } else if budget.batch_must_yield_to_restore(permit) {
-        Some("a restore does not fit beside it")
+        Some("nine tenths of the period".into())
     } else {
-        None
+        // The rule counts everyone ahead of the restore (spec v3.7a: `max need(1..i)`), so what
+        // does not fit may be a worker standing in front of it: the line says which.
+        budget
+            .batch_must_yield_to_restore(permit)
+            .map(|ahead| match ahead {
+                HolderKind::Restore => "a restore does not fit beside it".to_string(),
+                other => format!(
+                    "a restore does not fit beside it (ahead: {})",
+                    other.as_str()
+                ),
+            })
     }
 }
 
@@ -540,8 +651,10 @@ fn reason_to_stop(
 /// The first member always starts. Before each further one: the batch is not written off, less
 /// than half a period of work has passed since the grant, the tick's 0.9 P has not passed, and no
 /// queued restore stands that cannot fit beside the batch (Q-V8, answer (a)). After each member the
-/// permit is shrunk to the largest need of the ones left. The permit is dropped BEFORE the
-/// holders' masters are looked up; the results are published by the run loop after that.
+/// permit is shrunk to the largest need of the ones left. A member that panics fails alone (its
+/// block waits one period, the batch goes on). Each member is put in `staged` as soon as it is
+/// through; the permit is dropped when this returns, BEFORE the holders' masters are looked up
+/// (the wrapper does it, `finish_staged`); the results are published by the run loop after that.
 pub(super) fn drive_batch(
     members: Vec<(Member, HashMap<DeviceId, u32>)>,
     mut permit: MemPermit,
@@ -549,7 +662,8 @@ pub(super) fn drive_batch(
     state: &PrepShared,
     budget: &MemBudget,
     plan: &BatchPlan,
-) -> Vec<PrepDone> {
+    staged: &Mutex<Vec<Staged>>,
+) {
     state.hold(&mut permit);
     let granted = (plan.clock)();
     let work_deadline = granted + plan.period / 2;
@@ -561,8 +675,8 @@ pub(super) fn drive_batch(
     }
     // `left_after[i]` includes member i; the need of the ones AFTER i is `left_after[i + 1]`.
     let total = members.len();
-    let mut staged = Vec::new();
-    let mut ended: Option<&'static str> = None;
+    let mut served = 0usize;
+    let mut ended: Option<String> = None;
     let mut rest = members.into_iter().enumerate();
     while let Some((i, (member, cpw_of))) = rest.next() {
         let block_id = member.prep.block_id();
@@ -579,7 +693,7 @@ pub(super) fn drive_batch(
             )
         };
         if stop.is_some() || !batch.try_start(&block_id) {
-            ended = Some(stop.unwrap_or("written off"));
+            ended = Some(stop.unwrap_or_else(|| "written off".into()));
             batch.give_back(&block_id);
             for (_, (m, _)) in rest.by_ref() {
                 batch.give_back(&m.prep.block_id());
@@ -587,8 +701,24 @@ pub(super) fn drive_batch(
             break;
         }
         state.set_started(Instant::now());
-        let (prep, computed) = BlockPrep::compute_member(member, &mut permit, state);
-        staged.push((block_id, cpw_of, prep, computed));
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            BlockPrep::compute_member(member, &mut permit, state)
+        }))
+        .map_err(|p| {
+            let text = panic_text(&*p);
+            warn!(block = %block_id, err = %text, "pos: a batch member panicked, it fails alone");
+            state.rest();
+            text
+        });
+        staged
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(Staged {
+                block_id,
+                cpw_of,
+                outcome,
+            });
+        served += 1;
         if left_after[i + 1] > 0 {
             permit.shrink_to(left_after[i + 1]);
         }
@@ -596,21 +726,10 @@ pub(super) fn drive_batch(
     drop(permit);
     if let Some(reason) = ended {
         info!(
-            reason,
-            served = staged.len(),
-            returned = total - staged.len(),
+            reason = %reason,
+            served,
+            returned = total - served,
             "pos: overdue batch ended early, the rest goes back to the marks"
         );
     }
-    staged
-        .into_iter()
-        .map(|(block_id, cpw_of, prep, computed)| PrepDone {
-            block_id,
-            cpw_of,
-            result: Ok(match computed {
-                Some(hashes) => Hashed { prep, hashes }.finish(),
-                None => PrepOutcome::Unserved,
-            }),
-        })
-        .collect()
 }

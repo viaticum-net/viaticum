@@ -813,10 +813,28 @@ impl Unblock {
     }
 }
 
+impl Unblock {
+    /// Lets go every reader that comes to the FIFO within `window`, not only the first: a test that
+    /// fails (or a mutated rule that starts one more member on the same FIFO) must end, not hang
+    /// the runtime's shutdown on a read nobody will ever answer.
+    pub(super) fn release_all(&self, window: Duration) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let deadline = std::time::Instant::now() + window;
+        while std::time::Instant::now() < deadline {
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.path);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.done.set(true);
+    }
+}
+
 impl Drop for Unblock {
     fn drop(&mut self) {
         if !self.done.get() {
-            self.now();
+            self.release_all(Duration::from_secs(2));
         }
     }
 }

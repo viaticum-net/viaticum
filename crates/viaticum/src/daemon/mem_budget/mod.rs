@@ -441,20 +441,30 @@ impl MemBudget {
     /// Whether the batch of overdue PoS checks, holding `permit` (after its shrink), must end
     /// between two members for a restore (Q-V8, answer (a): restore first; spec v3.7a WARN-B):
     /// the rule (Б′) of the worker, `max need(1..i) > total − W` for some queued restore `i`, read
-    /// for the batch's permit. Kept apart from `worker_must_yield`: a worker may wait in the queue
-    /// behind the batch, which is not the worker's A4 case.
-    pub fn batch_must_yield_to_restore(&self, permit: &MemPermit) -> bool {
+    /// for the batch's permit. The prefix counts everyone ahead of the restore, so the need that
+    /// does not fit may be a worker's, standing in front of it: the kind of the waiter with the
+    /// largest need in that prefix is returned (the reason of the log line names it). Kept apart
+    /// from `worker_must_yield`: a worker may wait in the queue behind the batch, which is not the
+    /// worker's A4 case.
+    pub fn batch_must_yield_to_restore(&self, permit: &MemPermit) -> Option<HolderKind> {
         let fits_beside_batch = self.total_mib.saturating_sub(permit.mib);
         let w = self.lock_waiters();
         let mut prefix_max = 0u32;
+        let mut biggest = HolderKind::Restore;
         for x in &w.queued {
-            prefix_max = prefix_max.max(x.need_mib);
+            if x.need_mib > prefix_max {
+                prefix_max = x.need_mib;
+                biggest = match x.kind {
+                    WaitKind::Plain(k) => k,
+                    WaitKind::Priority(p) => p.holder_kind(),
+                };
+            }
             if x.kind == WaitKind::Priority(PriorityKind::Restore) && prefix_max > fits_beside_batch
             {
-                return true;
+                return Some(biggest);
             }
         }
-        false
+        None
     }
 
     /// Write a stuck holder's permit off (pos-i7-d-d, variant (a)): its bytes go back to the budget

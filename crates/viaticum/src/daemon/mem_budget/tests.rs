@@ -1235,7 +1235,10 @@ async fn batch_yields_to_a_restore_that_does_not_fit_beside_it() {
     let other = third_holder(&budget, 4);
     let waiters = queue_up(&budget, &[(None, 3), (Some(PriorityKind::Restore), 5)]).await;
     // The plain waiter stands for the worker's `acquire` shape; restore needs 5 > 10 - 6.
-    assert!(budget.batch_must_yield_to_restore(&batch));
+    assert_eq!(
+        budget.batch_must_yield_to_restore(&batch),
+        Some(HolderKind::Restore)
+    );
     drop((batch, other, waiters));
 
     let budget = MemBudget::new(10 * MIB);
@@ -1244,9 +1247,35 @@ async fn batch_yields_to_a_restore_that_does_not_fit_beside_it() {
         .unwrap();
     let other = third_holder(&budget, 6);
     let waiters = queue_up(&budget, &[(Some(PriorityKind::Restore), 5)]).await;
-    assert!(
-        !budget.batch_must_yield_to_restore(&batch),
+    assert_eq!(
+        budget.batch_must_yield_to_restore(&batch),
+        None,
         "5 <= 10 - 4: it is served when the others' units come back, no yield needed"
+    );
+    drop((batch, other, waiters));
+
+    // Only a worker is queued, however big: the batch yields to restores alone (MR-R3).
+    let budget = MemBudget::new(10 * MIB);
+    let batch = budget
+        .try_acquire(HolderKind::Pos, &block(1), 6 * MIB)
+        .unwrap();
+    let other = third_holder(&budget, 4);
+    let waiters = queue_up(&budget, &[(None, 9)]).await;
+    assert_eq!(budget.batch_must_yield_to_restore(&batch), None);
+    drop((batch, other, waiters));
+
+    // A worker stands AHEAD of a restore that would fit by itself: the prefix maximum counts
+    // the worker (spec v3.7a), and the answer names it.
+    let budget = MemBudget::new(10 * MIB);
+    let batch = budget
+        .try_acquire(HolderKind::Pos, &block(1), 6 * MIB)
+        .unwrap();
+    let other = third_holder(&budget, 4);
+    let waiters = queue_up(&budget, &[(None, 9), (Some(PriorityKind::Restore), 1)]).await;
+    // (`queue_up`'s plain waiter is a `Pos` acquire: not a restore, the rule's point.)
+    assert_eq!(
+        budget.batch_must_yield_to_restore(&batch),
+        Some(HolderKind::Pos)
     );
     drop((batch, other, waiters));
 }

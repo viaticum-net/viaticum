@@ -111,7 +111,8 @@ pub(crate) enum PrepOutcome {
 pub(crate) enum PrepPhase {
     /// No permit yet (the record read, the precheck, the `try_acquire`).
     Start = 0,
-    /// Holding the permit; loading the source block (database, source files, seal).
+    /// Holding the permit; the sources' `metadata` (a batch member) and loading the source block
+    /// (database, source files, seal).
     Load = 1,
     /// Holding the permit; padding and encoding, hashing while it goes.
     Encode = 2,
@@ -258,6 +259,9 @@ pub(super) struct BlockPrep {
     /// Runs just before a holder's master is looked up (tests: the permit must be gone).
     #[cfg(test)]
     master_lookup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Runs at the start of a batch member's sources check (tests: a `metadata` that hangs).
+    #[cfg(test)]
+    precheck_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Scheduler {
@@ -298,6 +302,12 @@ impl Scheduler {
             #[cfg(test)]
             master_lookup_hook: self
                 .master_lookup_hook
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
+            #[cfg(test)]
+            precheck_hook: self
+                .precheck_hook
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clone(),
@@ -454,6 +464,12 @@ impl BlockPrep {
     /// files; a catalog read that fails is left to the load, which reports it.
     fn sources_are_readable(&self, record: &viaticum_core::types::SourceBlockRecord) -> bool {
         use crate::daemon::backup::rebuild::{SourceCheck, precheck_sources};
+        #[cfg(test)]
+        {
+            if let Some(hook) = &self.precheck_hook {
+                hook();
+            }
+        }
         if crate::daemon::system_state::block::retained_block_path(&self.data_dir, &self.block_id)
             .exists()
         {
@@ -542,6 +558,9 @@ impl BlockPrep {
         state: &PrepShared,
     ) -> (BlockPrep, Computed) {
         let Member { prep, record, .. } = member;
+        // `metadata` of the sources is a read of the disk like the load: a dead NAS hangs it in
+        // the same way, so it is the LOAD phase, which the write-off watches (spec v3.7 WARN-4).
+        state.set_phase(PrepPhase::Load);
         let hashes = if prep.sources_are_readable(&record) {
             prep.compute(&record.erasure_params(), permit, state)
         } else {

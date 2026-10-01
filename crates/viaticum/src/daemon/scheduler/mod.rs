@@ -140,6 +140,9 @@ pub struct Scheduler {
     /// Runs before a holder's master is looked up in a preparation (tests: no permit is held).
     #[cfg(test)]
     master_lookup_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs at the start of a batch member's sources check (tests: a hung `metadata`).
+    #[cfg(test)]
+    precheck_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// A source of "now" for the batch of overdue PoS checks.
@@ -183,6 +186,8 @@ impl Scheduler {
             batch_clock: Arc::new(std::time::Instant::now),
             #[cfg(test)]
             master_lookup_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            precheck_hook: std::sync::Mutex::new(None),
         }
     }
 
