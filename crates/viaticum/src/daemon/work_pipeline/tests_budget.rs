@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -394,7 +394,7 @@ struct Rig {
     budget: Arc<MemBudget>,
     config: WorkPipelineConfig,
     /// What the pipeline keeps between the turns of one block (`last_attempt`, RAM only).
-    last_attempt: tokio::sync::Mutex<HashMap<DeviceId, u32>>,
+    last_attempt: tokio::sync::Mutex<worker::TurnMemory>,
 }
 
 impl Rig {
@@ -410,7 +410,7 @@ impl Rig {
             data_dir,
             budget,
             config,
-            last_attempt: tokio::sync::Mutex::new(HashMap::new()),
+            last_attempt: tokio::sync::Mutex::new(worker::TurnMemory::default()),
         }
     }
 
@@ -683,7 +683,7 @@ async fn worker_waits_for_the_budget_before_reading_the_source() {
                 &rec,
                 &pool,
                 0,
-                &mut HashMap::new(),
+                &mut worker::TurnMemory::default(),
             )
             .await
         })
@@ -1040,7 +1040,7 @@ async fn worker_does_not_yield_to_a_waiter_granted_by_its_shrink() {
                 &rec,
                 &pool,
                 0,
-                &mut HashMap::new(),
+                &mut worker::TurnMemory::default(),
             )
             .await
         })
@@ -1204,10 +1204,14 @@ fn yield_counter_counts_per_block_and_resets_on_full_delivery() {
     };
     let (a, b) = (SourceBlockId([1; 32]), SourceBlockId([2; 32]));
     let holder = DeviceId([9; 32]);
+    let marked = |holder, turn| worker::TurnMemory {
+        turns: turn + 1,
+        marks: HashMap::from([(holder, turn)]),
+    };
     let mut yields = HashMap::new();
     let mut last = HashMap::new();
     for id in [a, b] {
-        last.insert(id, HashMap::from([(holder, 0u32)]));
+        last.insert(id, marked(holder, 0));
     }
 
     super::count_yields(&mut yields, &mut last, a, &outcome(0, 0, 2, true, false));
@@ -1229,11 +1233,11 @@ fn yield_counter_counts_per_block_and_resets_on_full_delivery() {
     assert!(!yields.contains_key(&b) && !last.contains_key(&b));
     // Parked (nobody to offer to): both go too.
     yields.insert(a, 3);
-    last.insert(a, HashMap::from([(holder, 2u32)]));
+    last.insert(a, marked(holder, 2));
     super::count_yields(&mut yields, &mut last, a, &outcome(0, 0, 0, false, false));
     assert!(!yields.contains_key(&a) && !last.contains_key(&a));
     // A turn that entered an empty map leaves none behind.
-    last.insert(b, HashMap::new());
+    last.insert(b, worker::TurnMemory::default());
     super::count_yields(&mut yields, &mut last, b, &outcome(1, 1, 2, false, false));
     assert!(!last.contains_key(&b));
 }
@@ -1623,6 +1627,136 @@ async fn a_dead_first_holder_does_not_stall_live_holders_when_a_holder_completes
     );
 }
 
+/// M36 (16', WARN-1 b): the marks of the rotation follow a counter of ALL turns of the block, not
+/// the yield count. Holders [B, C], both dead. Turn 0 (no waiter, no yield) tries both; turn 1
+/// (yield) tries the one the plan puts first, P; turn 2 must start with the other one, Q, which
+/// was tried longest ago. Marks equal to the yield count make turn 0 and turn 1 the same
+/// "turn 0": P and Q tie and the plan puts P first again.
+#[tokio::test]
+async fn the_rotation_counts_turns_without_a_yield_too() {
+    let rig = Rig::new(YIELD_BUDGET_MIB, BIG_CHUNK);
+    let rec = retained(rig.data_dir.path(), 0x21, BIG_K, BIG_T);
+    rig.db.upsert_source_block(&rec).unwrap();
+    let (armed, slot) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)));
+    let waiter = register_waiter_once(
+        &rig.budget,
+        PriorityKind::OverduePos,
+        YIELD_WAITER_MIB,
+        &armed,
+        &slot,
+    );
+    let flag = Arc::new(AtomicBool::new(true));
+    let mut net = Net::new(0x50).await;
+    let holders = [
+        net.holder(0x6b, &rig.budget, dead_holder_hooks(&flag, waiter.clone()))
+            .await,
+        net.holder(0x6c, &rig.budget, dead_holder_hooks(&flag, waiter))
+            .await,
+    ];
+    let swarm = net.ready();
+    let devices: Vec<DeviceId> = holders.iter().map(|h| h.device_id).collect();
+    let pool = pool_of(&devices);
+
+    // Turn 0: no yield; both are tried and fail.
+    let outcome = rig
+        .turn(&plain_encoder(), &swarm, &rec, &pool, 0)
+        .await
+        .unwrap();
+    assert!(!outcome.yielded, "{outcome:?}");
+    assert_eq!(offers_total(&holders), 2);
+
+    // Turn 1: the first yield; the plan's first holder P is tried.
+    constant_pos_turn(&rig, &swarm, &rec, &pool, 0, &armed, &slot).await;
+    assert_eq!(offers_total(&holders), 3);
+    let first = holders.iter().position(|h| h.offers() == 2).unwrap();
+
+    // Turn 2: the other holder is first.
+    constant_pos_turn(&rig, &swarm, &rec, &pool, 1, &armed, &slot).await;
+    assert_eq!(
+        holders[1 - first].offers(),
+        2,
+        "the holder tried longest ago goes first (offers: {} and {})",
+        holders[0].offers(),
+        holders[1].offers()
+    );
+    assert_eq!(holders[first].offers(), 2, "P was not first again");
+}
+
+/// M37 (16', WARN-1 a): a holder is marked when it was put through an attempt, not when the turn
+/// reached it. Holders [X, Y]: X rejects (an attempt); Y accepts, and the overdue PoS that came
+/// during its offer takes the budget before its first chunk — Y had no attempt. The next turn
+/// starts with Y (never attempted), not with X (plan order). Marking at the start would tie them.
+#[tokio::test]
+async fn a_holder_the_turn_yielded_before_its_first_attempt_is_not_marked() {
+    let rig = Rig::new(YIELD_BUDGET_MIB, BIG_CHUNK);
+    let rec = retained(rig.data_dir.path(), 0x22, BIG_K, BIG_T);
+    rig.db.upsert_source_block(&rec).unwrap();
+    let (armed, slot) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)));
+    let waiter = register_waiter_once(
+        &rig.budget,
+        PriorityKind::OverduePos,
+        YIELD_WAITER_MIB,
+        &armed,
+        &slot,
+    );
+    // Offer 0 (X): reject. Offer 1 (Y): accept, and the waiter comes. Offer 2: the waiter again.
+    let flag = Arc::new(AtomicBool::new(true));
+    let seen = Arc::new(AtomicUsize::new(0));
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let mut net = Net::new(0x51).await;
+    let mut holders = Vec::new();
+    for i in 0..2usize {
+        let reject = Arc::clone(&flag);
+        let (flag, seen, order, waiter) = (
+            Arc::clone(&flag),
+            Arc::clone(&seen),
+            Arc::clone(&order),
+            waiter.clone(),
+        );
+        let on_offer = hook(move || {
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            order.lock().unwrap().push(i);
+            if n == 1 {
+                flag.store(false, Ordering::SeqCst);
+            }
+            let waiter = waiter.clone();
+            async move {
+                if n >= 1 {
+                    waiter().await;
+                }
+            }
+        });
+        let hooks = Hooks {
+            on_offer: Some(on_offer),
+            reject_offers: Some(reject),
+            ..Hooks::default()
+        };
+        holders.push(net.holder(0x6d + i as u8, &rig.budget, hooks).await);
+    }
+    let swarm = net.ready();
+    let devices: Vec<DeviceId> = holders.iter().map(|h| h.device_id).collect();
+    let pool = pool_of(&devices);
+
+    // Turn 1: X fails, Y accepts and the turn yields before Y's first chunk.
+    constant_pos_turn(&rig, &swarm, &rec, &pool, 0, &armed, &slot).await;
+    let (x, y) = {
+        let order = order.lock().unwrap();
+        assert_eq!(order.len(), 2, "both were offered: {order:?}");
+        (order[0], order[1])
+    };
+    assert_ne!(x, y);
+    assert_eq!(transfers_total(&holders), 0, "Y got no chunk");
+
+    // Turn 2: Y, never attempted, is first (and gets its first chunk).
+    constant_pos_turn(&rig, &swarm, &rec, &pool, 1, &armed, &slot).await;
+    assert_eq!(
+        order.lock().unwrap().as_slice(),
+        &[x, y, y],
+        "the second turn starts with the holder that was not attempted"
+    );
+    assert_eq!(holders[y].transfers(), 1);
+}
+
 // ─── N4: the wait for the budget is visible ──────────────────────────────────
 
 /// A worker that waits for the budget says so once, after `WAIT_LOG_AFTER`, with the numbers; the
@@ -1668,7 +1802,7 @@ async fn worker_wait_logs_once_after_slow_after() {
                 &rec,
                 &pool,
                 0,
-                &mut HashMap::new(),
+                &mut worker::TurnMemory::default(),
             )
             .await
         })

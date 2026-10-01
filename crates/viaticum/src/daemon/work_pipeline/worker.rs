@@ -92,6 +92,15 @@ pub(super) enum YieldTo {
 /// How long the worker waits for the budget before the INFO line says so (N4).
 const WAIT_LOG_AFTER: Duration = Duration::from_secs(5);
 
+/// What the worker keeps between the turns of one block (RAM only, cleared with the yield count,
+/// backup-i24-a): how many turns the block has had (any turn, yielded or not) and, per holder,
+/// the number of the turn in which it was last attempted.
+#[derive(Debug, Default)]
+pub(crate) struct TurnMemory {
+    pub(crate) turns: u32,
+    pub(crate) marks: HashMap<DeviceId, u32>,
+}
+
 /// Progress of one turn (one `run_block_iteration`) — the yield rules need it: a turn always
 /// makes at least one attempt before it yields to an overdue PoS, and at least one holder before
 /// it yields to a restore (J13, backup-i24-a).
@@ -204,10 +213,11 @@ pub(crate) struct ExcludedHolders {
 ///  7. Drop raw symbols (no disk spill), release the permit.
 ///
 /// `yields_before` is the number of turns on this block that ended in a yield since it was last
-/// delivered in full (the number of THIS turn); `last_attempt` (RAM, per block, cleared with the
-/// yield count) holds, per holder, the number of the turn in which it was last tried: the turn
-/// goes through the holders in that order, never-tried first, then the longest ago (LRU, spec
-/// v3.5 WARN-4), and records the holders it tries.
+/// delivered in full (for the yield line); `memory` (RAM, per block, cleared with the yield
+/// count) counts every turn of the block and holds, per holder, the number of the turn in which
+/// it was last ATTEMPTED (`turn.attempts` grew while it was served): the turn goes through the
+/// holders in that order, never-attempted first, then the longest ago (LRU, spec v3.5a 16',
+/// backup-i24-a), and marks the holders it attempts.
 ///
 /// The caller records the attempt after this returns (`last_attempted_at`,
 /// `last_pool_signature`): an ordinary cooldown when `offered > 0`, otherwise (or on
@@ -224,7 +234,7 @@ pub(crate) async fn run_block_iteration(
     block: &SourceBlockRecord,
     pool: &PoolSnapshot,
     yields_before: u32,
-    last_attempt: &mut HashMap<DeviceId, u32>,
+    memory: &mut TurnMemory,
 ) -> anyhow::Result<WorkOutcome> {
     // 1. Compute ErasureParams.
     let k = block.k;
@@ -301,9 +311,12 @@ pub(crate) async fn run_block_iteration(
     // The order of the turn: holders never tried first (plan order), then those tried longest ago
     // (stable sort). Every yielded turn tries at least its first holder, so within h yielded
     // turns every live holder is first once, however the list shrinks or grows.
+    memory.turns += 1;
+    let this_turn = memory.turns;
     let mut offers = offers;
     offers.sort_by_key(|o| {
-        last_attempt
+        memory
+            .marks
             .get(&o.device_id)
             .map_or((0u8, 0u32), |&turn| (1u8, turn))
     });
@@ -441,8 +454,8 @@ pub(crate) async fn run_block_iteration(
         };
 
         turn.holders_started += 1;
-        last_attempt.insert(offer.device_id, yields_before);
-        match deliver_to_holder_worker(
+        let attempts_before = turn.attempts;
+        let delivery = deliver_to_holder_worker(
             db,
             encoder,
             swarm,
@@ -454,8 +467,13 @@ pub(crate) async fn run_block_iteration(
             block.importance,
             &mut turn,
         )
-        .await
-        {
+        .await;
+        // Marked by what the holder was put through, not by being reached: a turn that gave
+        // the budget away before its first attempt leaves it unmarked (16').
+        if turn.attempts > attempts_before {
+            memory.marks.insert(offer.device_id, this_turn);
+        }
+        match delivery {
             Ok(DeliveryOutcome::Stored) => {
                 acked += 1;
             }

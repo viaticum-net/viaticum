@@ -159,6 +159,16 @@ enum BlockAttempt {
     LeftService,
 }
 
+/// Forget a block's turn memory: the yield count and the holders' marks (v3.5a NOTE 3).
+fn clear_turn_memory(
+    yields: &mut std::collections::HashMap<SourceBlockId, u32>,
+    last_attempt: &mut std::collections::HashMap<SourceBlockId, TurnMemory>,
+    block_id: SourceBlockId,
+) {
+    yields.remove(&block_id);
+    last_attempt.remove(&block_id);
+}
+
 /// The yield counter of one block after a turn, and with it the turn memory of its holders
 /// (`last_attempt`; both RAM only, backup-i24-a): a yield counts; a delivery in full starts the
 /// count afresh; a block that left service (or was parked: nobody to offer to) without a full
@@ -166,7 +176,7 @@ enum BlockAttempt {
 /// (spec v3.5a NOTE 3); anything else leaves them.
 fn count_yields(
     yields: &mut std::collections::HashMap<SourceBlockId, u32>,
-    last_attempt: &mut std::collections::HashMap<SourceBlockId, HolderTurns>,
+    last_attempt: &mut std::collections::HashMap<SourceBlockId, TurnMemory>,
     block_id: SourceBlockId,
     outcome: &worker::WorkOutcome,
 ) {
@@ -175,20 +185,18 @@ fn count_yields(
     if outcome.yielded {
         *yields.entry(block_id).or_insert(0) += 1;
     } else if delivered_in_full || outcome.left_service || outcome.offered == 0 {
-        yields.remove(&block_id);
-        last_attempt.remove(&block_id);
+        clear_turn_memory(yields, last_attempt, block_id);
     }
-    // The turn entered an empty map for the block; do not keep it.
+    // The turn marked nobody: nothing to keep.
     if last_attempt
         .get(&block_id)
-        .is_some_and(HolderTurns::is_empty)
+        .is_some_and(|m| m.marks.is_empty())
     {
         last_attempt.remove(&block_id);
     }
 }
 
-/// Per holder of one block: the number of the yielded turn in which it was last tried.
-type HolderTurns = std::collections::HashMap<DeviceId, u32>;
+use worker::TurnMemory;
 
 // ─── WorkPipeline ─────────────────────────────────────────────────────────────
 
@@ -208,10 +216,10 @@ pub struct WorkPipeline {
     /// How many times the worker gave the budget away on each block since it last delivered the
     /// block in full (RAM only; the `yields_for_block` of the yield line, backup-i24-a).
     yields: std::collections::HashMap<SourceBlockId, u32>,
-    /// Per block, per holder: the number of the yielded turn in which the holder was last tried
-    /// (RAM only; cleared together with `yields`). The next turn goes through the holders by
-    /// it, the longest ago first (LRU, backup-i24-a).
-    last_attempt: std::collections::HashMap<SourceBlockId, HolderTurns>,
+    /// Per block: the turns it has had and, per holder, the turn in which the holder was last
+    /// attempted (RAM only; cleared together with `yields`). The next turn goes through the
+    /// holders by it, the longest ago first (LRU, backup-i24-a).
+    last_attempt: std::collections::HashMap<SourceBlockId, TurnMemory>,
 }
 
 impl WorkPipeline {
@@ -391,7 +399,7 @@ impl WorkPipeline {
                 min = self.config.min_pool_size,
                 "work_pipeline: pool_too_small — parking block, no encode"
             );
-            self.update_block_cooldown(block, pool, now, Some(ParkReason::PoolTooSmall));
+            self.park_clearing_memory(block, pool, now, ParkReason::PoolTooSmall);
             return Ok(BlockAttempt::PoolUnusable);
         }
 
@@ -400,7 +408,7 @@ impl WorkPipeline {
             Some(s) => s,
             None => {
                 tracing::debug!("work_pipeline: no swarm, parking block");
-                self.update_block_cooldown(block, pool, now, Some(ParkReason::NoSwarm));
+                self.park_clearing_memory(block, pool, now, ParkReason::NoSwarm);
                 return Ok(BlockAttempt::PoolUnusable);
             }
         };
@@ -459,17 +467,22 @@ impl WorkPipeline {
                     error = %e,
                     "work_pipeline: iteration error — parking block"
                 );
-                if self
-                    .last_attempt
-                    .get(&block.block_id)
-                    .is_some_and(HolderTurns::is_empty)
-                {
-                    self.last_attempt.remove(&block.block_id);
-                }
-                self.update_block_cooldown(block, pool, now, Some(ParkReason::IterationError));
+                self.park_clearing_memory(block, pool, now, ParkReason::IterationError);
                 Ok(BlockAttempt::Error)
             }
         }
+    }
+
+    /// Park a block and forget its turn memory with it (v3.5a NOTE 3).
+    fn park_clearing_memory(
+        &mut self,
+        block: &SourceBlockRecord,
+        pool: &PoolSnapshot,
+        now: Timestamp,
+        reason: ParkReason,
+    ) {
+        clear_turn_memory(&mut self.yields, &mut self.last_attempt, block.block_id);
+        self.update_block_cooldown(block, pool, now, Some(reason));
     }
 
     /// Reset cooldowns on all blocks. Called on `PeerAuthenticated` to force
