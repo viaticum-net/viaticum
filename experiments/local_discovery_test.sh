@@ -455,15 +455,32 @@ known_auth_verdict() {
     fi
 }
 
-# redial_carousel_split NODE LINE0 : "counted excused" — re-dials of evicted peers with
-# origin=redial after LINE0. Excused (i43's exception "auth fell below the floor") when
-# the node's latest `auto-dial pass` before the re-dial line says below_floor=true;
-# those go to a NOTE, not to the carousel bar (fix round 1, N-2).
+# redial_carousel_split NODE LINE0 : "counted excused floor_none" — re-dials of evicted
+# peers with origin=redial after LINE0, attributed to the redial pass that DIALED that
+# peer (fix round 2, N-d): the `auto-dial: dialing peer … peer_id=X` line before the
+# re-dial and the `auto-dial pass` summary that closes that pass (printed after its dial
+# lines; a re-dial logged before the summary waits for it). Excused (i43's exception
+# "auth fell below the floor") when that pass says below_floor=true — a NOTE, not the
+# bar. floor_none = such passes with floor=none (no cache floor: wrong on a friend in the
+# CAP modes).
 redial_carousel_split() {
     tail -n +$(( $2 + 1 )) "$(node_log "$1")" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk '
-        /auto-dial pass/ { below = ($0 ~ /below_floor=true/) ? 1 : 0; next }
-        /lru: re-dial of evicted peer/ && /origin=redial( |$)/ { if (below) e++; else c++ }
-        END { printf "%d %d\n", c + 0, e + 0 }' || echo "0 0"
+        function field(k,   i, n, a) { n = split($0, a, " "); for (i = 1; i <= n; i++) if (index(a[i], k "=") == 1) return substr(a[i], length(k) + 2); return "" }
+        function judge(below, fl) { if (fl == "none") fn++; if (below == "true") e++; else c++ }
+        /auto-dial: dialing peer/ { p = field("peer_id"); pend[p] = 1; next }
+        /auto-dial pass/ {
+            b = field("below_floor"); fl = field("floor")
+            for (p in pend) { attr_b[p] = b; attr_f[p] = fl }
+            for (p in wait) { for (k = 0; k < wait[p]; k++) judge(b, fl); delete wait[p] }
+            delete pend; next
+        }
+        /lru: re-dial of evicted peer/ && /origin=redial( |$)/ {
+            p = field("peer_id")
+            if (p in pend) wait[p]++
+            else if (p in attr_b) judge(attr_b[p], attr_f[p])
+            else c++
+        }
+        END { for (p in wait) c += wait[p]; printf "%d %d %d\n", c + 0, e + 0, fn + 0 }' || echo "0 0 0"
 }
 
 # Р-17 v3.3 NOTE: the swarm settles its lookup cadence on ITS known set (peers without an
@@ -1074,7 +1091,7 @@ if runs_step 3; then
     fi
     known_auth_verdict
     # Log bars (spec v3.2 BL-2). Lines of a build without the cache are simply absent.
-    EVICT=0; SLOW_EVICT=""; SLOW_EVICT_LATE=""; REDIAL_CAR=0; REDIAL_EXCUSED=0; DISC_CAR=0; KAD_CAR=0; OND_CAR=0
+    EVICT=0; SLOW_EVICT=""; SLOW_EVICT_LATE=""; REDIAL_CAR=0; REDIAL_EXCUSED=0; REDIAL_FLOOR_NONE=""; DISC_CAR=0; KAD_CAR=0; OND_CAR=0
     LOOKUPS_MAX=0; BOOTS_MAX=0; AUTO_BOOTS=0; OVER_MS=0; KEEPALIVE=0; TICK_LATE=0
     for i in $(alive_nodes); do
         L="$(plain_log_since "$i" "${LINE3[$i]}")"
@@ -1093,8 +1110,9 @@ if runs_step 3; then
         done < <(events "$(node_log "$i")" "lru: evicted peer" evictable_for_ms | awk -v l0="${LINE3[$i]}" '$2 > l0')
         n=$(grep -a "kademlia bootstrap started" <<< "$L" | grep -acE "origin=auto( |$)" || true); AUTO_BOOTS=$((AUTO_BOOTS + n))
         LF=$(node_log "$i"); L0I="${LINE3[$i]}"
-        read -r RC_N RC_EX <<< "$(redial_carousel_split "$i" "$L0I")"
+        read -r RC_N RC_EX RC_FN <<< "$(redial_carousel_split "$i" "$L0I")"
         REDIAL_CAR=$((REDIAL_CAR + RC_N)); REDIAL_EXCUSED=$((REDIAL_EXCUSED + RC_EX))
+        [ "$i" != "$SEED" ] && [ "${RC_FN:-0}" -gt 0 ] && REDIAL_FLOOR_NONE="$REDIAL_FLOOR_NONE node-$i:$RC_FN"
         DISC_CAR=$((DISC_CAR + $(carousel_count "$LF" discovery "$L0I")))
         KAD_CAR=$((KAD_CAR + $(carousel_count "$LF" kad "$L0I")))
         OND_CAR=$((OND_CAR + $(carousel_count "$LF" on_demand "$L0I")))
@@ -1113,6 +1131,9 @@ if runs_step 3; then
         fail "victims closed later than 11 s after they became evictable (no 'lru: tick late' before them):$(echo "$SLOW_EVICT" | cut -c1-200)"
     elif [ "$EVICT" -gt 0 ]; then
         pass "$EVICT evictions, each within 11 s of becoming evictable (or right after a stalled loop)"
+    fi
+    if [ -n "$CAP" ] && [ -n "$REDIAL_FLOOR_NONE" ]; then
+        fail "redial passes of friends with floor=none under cap $CAP (no cache floor on a friend):$REDIAL_FLOOR_NONE"
     fi
     if [ $((REDIAL_CAR + DISC_CAR)) -gt 0 ]; then
         fail "carousel: re-dials of evicted peers origin=redial $REDIAL_CAR, origin=discovery $DISC_CAR"

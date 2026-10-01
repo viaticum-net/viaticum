@@ -433,10 +433,11 @@ fn seed_infra_rule_counts_up_to_the_limit() {
     assert!(c.is_infra(&peers[0]) && c.is_infra(&peers[1]));
 }
 
-/// Fix round 1: after our answer the peer lingers — closing it in the same
-/// turn cut the answer off — and goes at the first pass after the linger.
+/// Fix round 2 (WARN-C): an answer does not keep the peer out of the cap — it
+/// is a victim at once — but its connection is closed only after the linger
+/// (`close_at`), so the answer is not cut off.
 #[test]
-fn answered_peer_lingers_before_eviction() {
+fn answered_peer_is_evicted_at_once_and_closed_after_the_linger() {
     let t0 = Instant::now();
     let mut c = lru(0);
     let p = PeerId::random();
@@ -444,12 +445,18 @@ fn answered_peer_lingers_before_eviction() {
     let _ = c.on_authenticated(&p, t0);
     c.begin(&p); // an inbound request
     c.touch(&p, at(t0, 20));
-    assert!(
-        c.end_inbound(&p, at(t0, 20)).is_empty(),
-        "answered just now: lingers"
+    let v = c.end_inbound(&p, at(t0, 20));
+    assert_eq!(v.len(), 1, "not busy: evicted in the same pass");
+    assert_eq!(
+        v[0].close_at,
+        at(t0, 20) + super::ANSWER_LINGER,
+        "closed after the linger"
     );
-    assert!(c.victims(at(t0, 21)).is_empty());
-    let v = c.victims(at(t0, 23));
-    assert_eq!(v.len(), 1, "gone after the linger");
-    assert!(v[0].evictable_for <= Duration::from_secs(2));
+    // Without an answer the close is immediate.
+    let q = PeerId::random();
+    c.on_connected(q, t0);
+    let _ = c.on_authenticated(&q, t0);
+    let v = c.victims(at(t0, 30));
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].close_at, at(t0, 30));
 }

@@ -437,3 +437,52 @@ async fn listener_answers_cert_before_its_cache_closes_the_peer() {
     assert!(b.conn_stats().await.unwrap().evictions_total >= 1);
     wait_auth(&b, a.device_id, false).await;
 }
+
+/// Fix round 2 (WARN-C): a peer that asks again before the linger of our last
+/// answer runs out is NOT kept out of the cap by its own answers — at cap 1 it
+/// is evicted (closing, not authenticated) when another peer is more recent,
+/// and its connection is closed after the linger of the last answer.
+#[tokio::test]
+async fn frequent_asker_is_evicted_and_closed_after_the_linger() {
+    let (b, addr_b) = acking_peer_cfg(cached_config(227, 1, 20_000), Duration::ZERO).await;
+    let (c, _evc) = SwarmHandle::start(make_swarm_config(228)).await.expect("C");
+    let (d, _evd) = SwarmHandle::start(make_swarm_config(229)).await.expect("D");
+    let c = Arc::new(c);
+    connect(&c, &b, addr_b.clone()).await;
+    connect(&d, &b, addr_b).await;
+    wait_auth(&b, c.device_id, true).await;
+    wait_auth(&b, d.device_id, true).await;
+    // C asks every second (< ANSWER_LINGER), for good.
+    let (c2, dev_b) = (c.clone(), b.device_id);
+    let pinger = tokio::spawn(async move {
+        loop {
+            let _ = c2.send_to_device(dev_b, app_message()).await;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    ack(&d, &b).await; // D is now the most recent: C goes
+    let s = b.conn_stats().await.unwrap();
+    let (auth, _) = b.peer_sets().await.unwrap();
+    assert!(
+        !auth.contains(&c.device_id),
+        "C evicted despite its fresh answers ({s:?})"
+    );
+    assert_eq!(s.closing, 1, "C waits in closing ({s:?})");
+    assert_eq!(
+        s.connected, 2,
+        "its connection is not closed yet: the linger ({s:?})"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let s = b.conn_stats().await.unwrap();
+            if s.connected == 1 && s.closing == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("C's connection closed after the linger; closing does not leak");
+    pinger.abort();
+}

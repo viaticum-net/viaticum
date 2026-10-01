@@ -4595,3 +4595,26 @@ fn update_peer_none_leaves_the_table_and_returns_current() {
     let kept = db.update_peer(&d, |_| None).unwrap().expect("current");
     assert_eq!(kept.device_id, d);
 }
+
+/// Fix round 2 (WARN-A): `update_peer` that changes nothing does not commit —
+/// no storage write and no fsync. Observable through the write-switch backend:
+/// with storage writes failing, the no-op update still succeeds, while an
+/// update that changes the record fails.
+#[test]
+fn update_peer_without_change_writes_nothing() {
+    let (db, fail) = crate::db::testutil::test_db_with_write_switch();
+    let d = DeviceId([9u8; 32]);
+    db.upsert_peer(&make_peer(d)).unwrap();
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let kept = db
+        .update_peer(&d, |_| None)
+        .expect("a no-op update touches no storage")
+        .expect("current record");
+    assert_eq!(kept.device_id, d);
+    assert!(
+        db.update_peer(&d, |rec| rec).is_err(),
+        "control: a real update does write (and fails with writes switched off)"
+    );
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(db.get_peer(&d).unwrap().unwrap().addrs, make_peer(d).addrs);
+}

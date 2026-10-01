@@ -275,6 +275,7 @@ impl EventLoopState {
         dialer: bool,
         now: Instant,
     ) {
+        self.pending_close.remove(&peer);
         if self.closing.remove(&peer).is_some() {
             // A new connection of a peer the cache just evicted: it is alive
             // again and re-authenticates on this connection.
@@ -307,6 +308,7 @@ impl EventLoopState {
 
     /// The last connection of `peer` closed.
     pub(super) fn conn_closed(&mut self, peer: PeerId, now: Instant) {
+        self.pending_close.remove(&peer);
         if let Some(lru) = self.lru.as_mut() {
             lru.on_disconnected(&peer);
         }
@@ -401,7 +403,12 @@ impl EventLoopState {
             }
             self.pending_cert.remove(&v.peer);
             self.evicted_at.insert(v.peer, now);
-            if self.swarm.disconnect_peer_id(v.peer).is_ok() {
+            if v.close_at > now && self.swarm.is_connected(&v.peer) {
+                // Deferred close (fix round 2): we answered it just now; the
+                // connection goes at `close_at` (`close_due`, 1-second tick).
+                self.closing.insert(v.peer, device);
+                self.pending_close.insert(v.peer, v.close_at);
+            } else if self.swarm.disconnect_peer_id(v.peer).is_ok() {
                 self.closing.insert(v.peer, device);
             } else {
                 // Not connected after all: nothing will close; tell the processor now.
@@ -419,6 +426,7 @@ impl EventLoopState {
                 reason = %v.reason.as_str(),
                 trigger = %trigger,
                 evictable_for_ms = v.evictable_for.as_millis() as u64,
+                close_in_ms = v.close_at.saturating_duration_since(now).as_millis() as u64,
                 idle_secs = v.idle.as_secs(),
                 connected,
                 busy,
@@ -427,6 +435,34 @@ impl EventLoopState {
             );
         }
         self.check_over_cap(now);
+    }
+
+    /// Close the evicted peers whose linger is over (deferred close; the
+    /// 1-second tick). A peer that is gone by then is reported closed here.
+    pub(super) fn close_due(&mut self) {
+        let now = Instant::now();
+        let due: Vec<PeerId> = self
+            .pending_close
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(p, _)| *p)
+            .collect();
+        for peer in due {
+            self.pending_close.remove(&peer);
+            if !self.closing.contains_key(&peer) {
+                continue; // connected again meanwhile, or already closed
+            }
+            if self.swarm.disconnect_peer_id(peer).is_err() {
+                let device = self.closing.remove(&peer).flatten();
+                emit_event(
+                    &self.event_tx,
+                    ProtocolEvent::ConnectionClosed {
+                        peer_id: peer,
+                        device_id: device,
+                    },
+                );
+            }
+        }
     }
 
     fn lru_log_counts(&self, now: Instant) -> (usize, usize, usize) {
@@ -561,6 +597,7 @@ impl EventLoopState {
             reason: VictimReason::Idle,
             evictable_for: Duration::ZERO,
             idle: Duration::ZERO,
+            close_at: now,
         };
         self.evict(vec![victim], "test", now);
         true

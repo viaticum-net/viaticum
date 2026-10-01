@@ -331,9 +331,9 @@ impl Processor {
                             // that follows (C-DK C4 fix round 1). The rest (cluster
                             // add, PeerAnnounce, wake) may wait on the network: spawned.
                             let _ = peer_id;
-                            if let Some(is_new_peer) = this.record_peer_authenticated(
+                            if let Some(is_new_peer) = off_runtime(|| this.record_peer_authenticated(
                                 device_id, identity_pub, &device_cert, x25519_pub, &listen_addrs,
-                            ) {
+                            )) {
                                 let this2 = this.clone();
                                 tokio::spawn(async move {
                                     this2.after_peer_authenticated(
@@ -402,7 +402,7 @@ impl Processor {
                         }
                         Some(ProtocolEvent::PeerIdentified { device_id, listen_addrs }) => {
                             // Inline, after the authentication that created the record.
-                            this.on_peer_identified(device_id, listen_addrs);
+                            off_runtime(|| this.on_peer_identified(device_id, listen_addrs));
                         }
                     }
                 }
@@ -972,6 +972,18 @@ pub(crate) use viaticum_core::trust::recalculate_trust;
 
 /// Approximate protocol week number from the current unix timestamp (1-indexed).
 ///
+/// Run a synchronous redb write from the processor loop without holding an async
+/// worker (C-DK C4 fix round 2, as `fanout.rs::record_contact_off_runtime`): on the
+/// daemon's multi-thread runtime in `block_in_place`, which hands the worker's other
+/// tasks to a fresh one first. A current-thread runtime (tests) cannot hand off —
+/// `block_in_place` panics there — so it is a plain call.
+fn off_runtime<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 /// When `time_scale` > 1, simulated time advances faster: each real second
 /// counts as `time_scale` simulated seconds. This ensures the trust P-window
 /// slides during accelerated experiments.

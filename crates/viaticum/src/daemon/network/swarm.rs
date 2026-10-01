@@ -940,6 +940,7 @@ impl SwarmHandle {
             known,
             lru,
             closing: HashMap::new(),
+            pending_close: HashMap::new(),
             on_demand,
             dial_on_demand: config.conn_policy.dial_on_demand,
             dial_origin: HashMap::new(),
@@ -1575,6 +1576,9 @@ struct EventLoopState {
     /// device (for the processor's ConnectionClosed). Not authenticated any
     /// more; a send to one dials after the close.
     closing: HashMap<PeerId, Option<DeviceId>>,
+    /// Evicted peers whose connection is closed only after the linger of our
+    /// last answer → when (deferred close, fix round 2). A subset of `closing`.
+    pending_close: HashMap<PeerId, Instant>,
     /// Waiters of `send_to_device` for peers being dialed on demand (network-i42).
     on_demand: OnDemand,
     /// The policy dials on demand.
@@ -1670,6 +1674,7 @@ impl EventLoopState {
                 _ = cert_check.tick() => {
                     self.check_cert_timeouts().await;
                     self.on_demand_expire();
+                    self.close_due();
                 }
                 _ = cert_sweep.tick() => {
                     self.sweep_unauthenticated_connected().await;
@@ -2207,6 +2212,9 @@ impl EventLoopState {
                         response_channel: channel,
                     };
                     emit_event(&self.event_tx, ev);
+                } else if self.closing.contains_key(&peer) {
+                    // Evicted, its close deferred: not answered (fix round 2).
+                    debug!(peer_id = %peer, "dropping inbound request from a closing peer");
                 } else {
                     warn!(
                         peer_id = %peer,

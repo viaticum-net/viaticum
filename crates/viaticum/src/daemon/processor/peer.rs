@@ -388,6 +388,8 @@ impl Processor {
             // the addresses is never overwritten (C-DK C4 fix round 1).
             self.db.update_peer(did, |current| {
                 let mut existing = current?;
+                #[cfg(test)]
+                announce_rmw_test_delay();
                 existing.last_seen = now;
                 if msg.x25519_pub.is_some() {
                     existing.x25519_pub = msg.x25519_pub;
@@ -407,5 +409,21 @@ impl Processor {
         );
 
         Ok(())
+    }
+}
+
+/// Tests only: how long a PeerAnnounce update holds between reading the record
+/// and writing it back (ms). Makes the read-modify-write window wide enough that
+/// a concurrent identify write would be lost if the two were not one
+/// transaction (C-DK C4 fix round 2, WARN-B). 0 = off.
+#[cfg(test)]
+pub(crate) static ANNOUNCE_RMW_DELAY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn announce_rmw_test_delay() {
+    let ms = ANNOUNCE_RMW_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
     }
 }

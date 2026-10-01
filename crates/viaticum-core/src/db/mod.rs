@@ -1671,7 +1671,8 @@ impl Db {
 
     /// Read-modify-write of one PeerRecord in ONE write transaction: `f` gets
     /// the stored record (None when there is none) and returns what to store
-    /// (None = leave the table as it is). Returns the record as stored now.
+    /// (None = leave the table as it is: the transaction is aborted, nothing is
+    /// written or synced). Returns the record as stored now.
     /// redb serializes write transactions, so two updates of the same peer never
     /// lose each other's change — the lost update of separate `get_peer` +
     /// `upsert_peer` calls (C-DK C4 fix round 1: identify addresses wiped by a
@@ -1681,7 +1682,7 @@ impl Db {
         F: FnOnce(Option<PeerRecord>) -> Option<PeerRecord>,
     {
         let tx = self.inner.begin_write()?;
-        let stored = {
+        let (stored, changed) = {
             let mut peers = tx.open_table(PEERS)?;
             let current: Option<PeerRecord> = match peers.get(&device_id.0)? {
                 Some(v) => Some(from_cbor_bytes(v.value())?),
@@ -1692,12 +1693,17 @@ impl Db {
                     debug_assert_eq!(next.device_id, *device_id, "update_peer keeps the key");
                     let bytes = to_cbor_bytes(&next);
                     peers.insert(&device_id.0, bytes.as_slice())?;
-                    Some(next)
+                    (Some(next), true)
                 }
-                None => current,
+                None => (current, false),
             }
         };
-        tx.commit()?;
+        if changed {
+            tx.commit()?;
+        } else {
+            // Nothing to write: no commit (each redb commit is a durable fsync).
+            tx.abort()?;
+        }
         Ok(stored)
     }
 

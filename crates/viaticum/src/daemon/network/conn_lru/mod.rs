@@ -23,7 +23,10 @@
 //   0. connections without a cert past the cert timeout, oldest first;
 //   1. handshake-only peers (cert done, no activity), oldest establishment first;
 //   2. peers with activity, least recent activity first (tie: PeerId order).
-// A victim's entry is REMOVED here; the swarm moves it to `closing` and closes it.
+// A victim's entry is REMOVED here; the swarm moves it to `closing` and closes it —
+// at once, or, when we answered it less than ANSWER_LINGER ago, at `close_at`
+// (deferred close, fix round 2: an answer is not cut off, and a peer that keeps
+// asking is not kept out of the cap by its own answers).
 //
 // Pure: no swarm, no clock of its own — every call takes `now`.
 
@@ -40,10 +43,12 @@ use libp2p::PeerId;
 /// stand from a tick that does not run its pass.
 pub(crate) const LRU_TICK_LATE_MS: u64 = 12_000;
 
-/// After we ANSWERED a peer (a /viaticum/1 response, our cert answer) it stays
-/// busy this long: `ResponseSent` means the stream is closed on our side, not
-/// that yamux has flushed it — closing the connection in the same turn lost the
-/// answer (fix round 1). The next pass (an event, or the tick ≤ 10 s) closes it.
+/// After we ANSWERED a peer (a /viaticum/1 response, our cert answer) its
+/// connection is not closed for this long: `ResponseSent` means the stream is
+/// closed on our side, not that yamux has flushed it — closing the connection in
+/// the same turn lost the answer (fix round 1). The peer is still evicted at once
+/// (out of the cache and `authenticated`, into `closing`); only the close waits
+/// (fix round 2).
 pub(crate) const ANSWER_LINGER: Duration = Duration::from_secs(2);
 
 /// Who is infrastructure: outside the cap, never evicted (network-i41). The
@@ -95,6 +100,9 @@ pub(crate) struct Victim {
     pub evictable_for: Duration,
     /// now − last activity (or establishment for a handshake-only peer).
     pub idle: Duration,
+    /// When to close its connection: now, or the end of the linger after our
+    /// last answer (deferred close).
+    pub close_at: Instant,
 }
 
 /// The cache's view for `ConnStats` (network-i41). `busy` counts connected
@@ -153,9 +161,10 @@ struct Entry {
     /// Decided once by `is_infra` in `on_connected`.
     infra: bool,
     /// When the entry last stopped being busy (cert done, in_flight → 0, the
-    /// last waiter gone, an answer's linger over).
+    /// last waiter gone).
     evictable_since: Option<Instant>,
-    /// Busy until then: an answer of ours may still be on its way out.
+    /// Not closed before then: an answer of ours may still be on its way out.
+    /// Does NOT make the peer busy (fix round 2).
     linger_until: Option<Instant>,
 }
 
@@ -260,7 +269,7 @@ impl ConnLru {
         {
             e.cert_done = true;
             if e.in_flight == 0 {
-                e.evictable_since = Some(e.linger_until.map_or(now, |t| t.max(now)));
+                e.evictable_since = Some(now);
             }
             // (waiters keep it busy all the same: see `is_busy`)
         }
@@ -288,28 +297,20 @@ impl ConnLru {
         }
     }
 
-    /// We answered `peer` (a response, our cert answer): busy for ANSWER_LINGER.
+    /// We answered `peer` (a response, our cert answer): its connection is not
+    /// closed before ANSWER_LINGER from now.
     pub(crate) fn linger(&mut self, peer: &PeerId, now: Instant) {
         if let Some(e) = self.entries.get_mut(peer) {
-            let until = now + ANSWER_LINGER;
-            e.linger_until = Some(until);
-            e.evictable_since = Some(until);
+            e.linger_until = Some(now + ANSWER_LINGER);
         }
     }
 
-    /// An inbound request of `peer` ended with our answer: like `end`, but the
-    /// peer lingers (ANSWER_LINGER) before it can be closed.
+    /// An inbound request of `peer` ended with our answer: `end`, with the
+    /// linger set first (a victim of this very pass is closed after it).
     #[must_use]
     pub(crate) fn end_inbound(&mut self, peer: &PeerId, now: Instant) -> Vec<Victim> {
-        let Some(e) = self.entries.get_mut(peer) else {
-            return Vec::new();
-        };
-        e.in_flight = e.in_flight.saturating_sub(1);
-        let until = now + ANSWER_LINGER;
-        e.linger_until = Some(until);
-        e.evictable_since = Some(until);
-        // The pass may close OTHER peers; this one lingers.
-        self.victims(now)
+        self.linger(peer, now);
+        self.end(peer, now)
     }
 
     /// An on-demand waiter for `peer` arrived (network-i42).
@@ -391,7 +392,6 @@ impl ConnLru {
     fn is_busy(&self, e: &Entry, peer: &PeerId, protected: &[PeerId], now: Instant) -> bool {
         !e.infra
             && (self.cert_pending(e, now)
-                || e.linger_until.is_some_and(|t| now < t)
                 || e.in_flight > 0
                 || self.has_waiters(peer)
                 || protected.contains(peer))
@@ -451,6 +451,7 @@ impl ConnLru {
                     reason,
                     evictable_for: now.saturating_duration_since(since),
                     idle: now.saturating_duration_since(e.last_activity.unwrap_or(e.established)),
+                    close_at: e.linger_until.map_or(now, |t| t.max(now)),
                 }
             })
             .collect();

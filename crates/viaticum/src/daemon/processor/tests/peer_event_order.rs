@@ -89,3 +89,73 @@ async fn identify_right_after_auth_keeps_the_addresses_of_every_peer() {
         unknown.len()
     );
 }
+
+/// Fix round 2 (WARN-B): a PeerAnnounce (handled in a spawned task) that read
+/// the record before the inline identify wrote the addresses does not write the
+/// record back without them. The announce update holds its read-modify-write
+/// open for 20 ms (test hook), the identify arrives inside that window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_announce_racing_identify_keeps_the_addresses() {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let processor = Arc::new(super::make_processor(db.clone(), &dir).await);
+    let own_master = processor.own_identity;
+    super::super::peer::ANNOUNCE_RMW_DELAY_MS.store(20, Ordering::Relaxed);
+
+    let mut devices = Vec::new();
+    let mut announces = Vec::new();
+    for n in 0..50u8 {
+        // One master per device: each announce updates exactly its device.
+        let master = ed25519_dalek::SigningKey::from_bytes(&[n.wrapping_add(100); 32]);
+        let identity = IdentityPub(master.verifying_key().to_bytes());
+        let key = ed25519_dalek::SigningKey::from_bytes(&[n.wrapping_add(1); 32]);
+        let device_id = DeviceId(key.verifying_key().to_bytes());
+        let peer_id = device_id_to_peer_id(&device_id).unwrap();
+        let cert =
+            viaticum_core::cluster::issue_device_certificate(&master, device_id, Timestamp::now());
+        let addr: libp2p::Multiaddr =
+            format!("/ip4/127.0.0.1/tcp/{}/p2p/{peer_id}", 21000 + n as u16)
+                .parse()
+                .unwrap();
+        // Processor::run: the record steps inline …
+        assert!(
+            processor
+                .record_peer_authenticated(device_id, identity, &cert, None, &[])
+                .is_some()
+        );
+        // … the announce spawned (dispatch_libp2p) …
+        let pa =
+            viaticum_core::messages::build_peer_announce(identity, Timestamp::now(), &master, None);
+        let p = processor.clone();
+        announces.push(tokio::spawn(
+            async move { p.handle_peer_announce(pa).await },
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await; // it has read
+        // … and the identify inline, inside the announce's window.
+        processor.on_peer_identified(device_id, vec![addr]);
+        devices.push(device_id);
+    }
+    for a in announces {
+        a.await.expect("join").expect("announce handled");
+    }
+    super::super::peer::ANNOUNCE_RMW_DELAY_MS.store(0, Ordering::Relaxed);
+
+    let own_device = DeviceId([0u8; 32]);
+    let unknown: Vec<String> = devices
+        .iter()
+        .filter(|d| {
+            !db.get_peer(d)
+                .unwrap()
+                .is_some_and(|r| is_known(&r, &own_master, &own_device))
+        })
+        .map(|d| d.to_string())
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "{} of 50 peers lost their address to an announce: {unknown:?}",
+        unknown.len()
+    );
+}
