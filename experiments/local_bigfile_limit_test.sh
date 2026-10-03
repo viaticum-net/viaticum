@@ -756,9 +756,14 @@ step3b_judge() {
     rel=$(ev 0 "$F" "mem_budget: released kind=" kind block | awk -v b="$RB16" '$3 == "restore" && $4 == b { t = $1 } END { print t }')
     tres=$(ev 0 "$F" "restored path=" path | awk '$3 ~ /r\.bin$/ { if (!_d++) print $1 }')
     info "3b (d): waiting line: ${tW:-none} (t need_mib queued_ahead tier); granted restore RB: $(count_lines "$G1")x; shrunk: ${shr:-none}; regrant: ${reg:-none}; last release: ${rel:-none}; restored line: ${tres:-none}"
-    if [ -z "$tW" ]; then
-        fail "3b (d): no INFO 'restore: waiting for memory budget ... block=RB' (the restore did not wait for the budget)"
+    # v3.12a/b + Q-V9 (a): a running restore job pauses the backup (the worker yields at a portion
+    # boundary and the gate holds it), and the restore asks for memory only after it fetched the
+    # symbols. So the INFO 'waiting' line is not guaranteed any more: without it the worker must have
+    # given way to the restore before the grant (checked below), otherwise FAIL.
+    if [ -z "$tW" ] && [ -z "$(ev 0 "$F" "work_pipeline: yielding memory to restore" block | awk -v b="$B2" '$3 == b { print $1; exit }')" ]; then
+        fail "3b (d): no INFO 'restore: waiting for memory budget ... block=RB' and no 'yielding memory to restore' by the worker (the restore neither waited nor was given the budget)"
     else
+        [ -n "$tW" ] || note "3b (d): no 'waiting for memory budget' line: the worker paused the backup for the restore first (Q-V9 (a)), the grant came without a wait"
         local tw_t; tw_t=${tW%% *}
         [ -n "$tG" ] || fail "3b (d): no DEBUG 'mem_budget: granted kind=restore block=RB'"
         if [ -n "$tG" ]; then
@@ -776,7 +781,8 @@ step3b_judge() {
             else fail "3b (d): no 'yielding memory to restore' / 'released kind=worker block=B2' before 'granted kind=restore block=RB'"; fi
             local wt; wt=$(awk -v a="$tw_t" -v b="$tG" 'BEGIN { printf "%.1f", b - a }')
             local lim2; lim2=$(awk -v t="${S3_TENC:-0}" 'BEGIN { printf "%.1f", t + 90 }')
-            if fle "$wt" "$lim2"; then pass "3b (d): the restore waited ${wt} s for memory (limit t_encode ${S3_TENC}s + 90 = ${lim2} s)"
+            if [ -z "$tW" ]; then :
+            elif fle "$wt" "$lim2"; then pass "3b (d): the restore waited ${wt} s for memory (limit t_encode ${S3_TENC}s + 90 = ${lim2} s)"
             else rough "3b (d): restore waited past one holder attempt: ${wt} s > t_encode + 90 = ${lim2} s"; fi
         fi
     fi
