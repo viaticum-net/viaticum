@@ -57,6 +57,10 @@ pub enum CliResponse {
     DeviceAdded(DeviceEntry),
     DeviceRevoked {
         device_id_hex: String,
+        /// Holder devices of our placements whose master is unknown (not in PEERS nor in
+        /// `device_to_master`): the revocation did not reach them (dr-i8). Printed only > 0.
+        #[serde(default)]
+        holders_skipped: u32,
     },
     Files(Vec<FileEntry>),
     Versions(Vec<VersionEntry>),

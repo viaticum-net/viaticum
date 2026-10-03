@@ -364,6 +364,7 @@ fn send_command_http(conn: &Connection, cmd: &Command) -> Result<CliResponse, Cl
         {
             return Ok(CliResponse::DeviceRevoked {
                 device_id_hex: device_id.clone(),
+                holders_skipped: 0,
             });
         }
         return Err(CliError::Decode("unexpected 204 from daemon".into()));
@@ -460,7 +461,10 @@ fn response_from_http(
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
-                Ok(CliResponse::DeviceRevoked { device_id_hex })
+                Ok(CliResponse::DeviceRevoked {
+                    device_id_hex,
+                    holders_skipped: 0,
+                })
             }
         },
         Command::Connect { .. } => {
@@ -499,9 +503,10 @@ fn handle_response(response: CliResponse, json_output: bool) {
         }
         CliResponse::DeviceList(devices) => output::format_device_list(&devices),
         CliResponse::DeviceAdded(device) => output::format_device_added(&device),
-        CliResponse::DeviceRevoked { device_id_hex } => {
-            output::format_device_revoked(&device_id_hex)
-        }
+        CliResponse::DeviceRevoked {
+            device_id_hex,
+            holders_skipped,
+        } => output::format_device_revoked(&device_id_hex, holders_skipped),
         CliResponse::Files(files) => output::format_files(&files),
         CliResponse::Versions(versions) => {
             // We don't have the path here, use empty string as placeholder.

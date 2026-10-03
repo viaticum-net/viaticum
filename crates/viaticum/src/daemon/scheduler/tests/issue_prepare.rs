@@ -242,7 +242,14 @@ async fn a_holder_that_stopped_being_challengeable_during_preparation_gets_no_ch
         [9; 16],
         "B keeps its own"
     );
-    assert_eq!(postman.store_count(), 1, "only D's challenge was published");
+    // One publish is a store per candidate postman (the seeded holder peers are candidates too):
+    // count the distinct challenges, not the stores.
+    let published: std::collections::HashSet<_> = postman
+        .stores()
+        .iter()
+        .map(|(_, r)| r.entry.msg_id)
+        .collect();
+    assert_eq!(published.len(), 1, "only D's challenge was published");
 }
 
 /// Four holders of one block; the 4th is not due when the block is cut (verified just

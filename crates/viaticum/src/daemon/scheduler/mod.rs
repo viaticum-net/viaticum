@@ -122,6 +122,9 @@ pub struct Scheduler {
     /// block whose source outgrew the size limit fails every tick; the log must not.
     /// Shared with the preparation task, which runs on the blocking pool.
     pos_load_warned: Arc<std::sync::Mutex<HashMap<SourceBlockId, std::time::Instant>>>,
+    /// When the WARN "holder master unknown" was last written per (holder, "pos" | "delete")
+    /// (dr-i8): once per PoS period, not on every tick.
+    master_warned: std::sync::Mutex<HashMap<(DeviceId, &'static str), std::time::Instant>>,
     /// The block work memory budget (backup-i24): PoS preparations take their permits from it.
     /// The daemon sets the real one (`set_mem_budget`); the default is effectively unbounded.
     mem_budget: Arc<crate::daemon::mem_budget::MemBudget>,
@@ -179,6 +182,7 @@ impl Scheduler {
             last_attempted: std::sync::Mutex::new(HashMap::new()),
             rebuild_scope: Default::default(),
             pos_load_warned: Arc::default(),
+            master_warned: std::sync::Mutex::new(HashMap::new()),
             mem_budget: crate::daemon::mem_budget::MemBudget::new(1 << 50),
             issue_seq: std::sync::atomic::AtomicU64::new(0),
             mem_deferred_at: std::sync::Mutex::new(HashMap::new()),
@@ -605,6 +609,27 @@ impl Scheduler {
         Ok(())
     }
 
+    /// WARN that the master of `holder` is known nowhere (not in PEERS, not in
+    /// `device_to_master`), so no `kind` ("pos" | "delete") mail is sent to it; at most once
+    /// per PoS period per holder and kind (dr-i8).
+    fn warn_holder_master_unknown(&self, holder: &DeviceId, kind: &'static str) {
+        let period = Duration::from_secs(scaled_timer_secs(
+            self.config.pos_interval_secs,
+            self.config.time_scale,
+        ));
+        let loud = {
+            let mut map = self.master_warned.lock().unwrap_or_else(|p| p.into_inner());
+            issue::should_warn_every(&mut map, (*holder, kind), std::time::Instant::now(), period)
+        };
+        if loud {
+            warn!(
+                holder = %holder,
+                kind,
+                "{kind}: holder master unknown, mail to this holder not sent"
+            );
+        }
+    }
+
     /// Trust of one holder for its challenge rate: the two-level trust (device and
     /// master) when there is any, else the legacy combined score; times its clamped
     /// `trust_s`. An unknown peer gets medium trust (0.5). Three redb reads.
@@ -803,12 +828,24 @@ impl Scheduler {
                         now,
                         &self.signing_key,
                     );
-                    let holder_master = self
-                        .db
-                        .get_master_for_device(&holder_id)
-                        .ok()
-                        .flatten()
-                        .unwrap_or(IdentityPub(holder_id.0));
+                    // dr-i8: PEERS first, device_to_master as fallback. Unknown anywhere (or a
+                    // db error): nothing is published and the placement stays as it is, the
+                    // engine emits the notice again on the next deletion tick.
+                    let holder_master = match self.db.master_for_holder(&holder_id) {
+                        Ok(Some(m)) => m,
+                        Ok(None) => {
+                            self.warn_holder_master_unknown(&holder_id, "delete");
+                            continue;
+                        }
+                        Err(e) => {
+                            error!(
+                                block_id = %source_block_id,
+                                holder_id = %holder_id,
+                                "deletion: holder master lookup failed, will retry next tick: {e}"
+                            );
+                            continue;
+                        }
+                    };
                     let delete_payload = DeleteRequestPayload::Delete(delete_msg);
                     // Publish FIRST, then gate the per-holder state-change txn on delivery
                     // success. mailbox publish is REMOTE (unlike the relay-era guaranteed

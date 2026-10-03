@@ -521,18 +521,24 @@ pub fn format_device_added(device: &DeviceEntry) {
 }
 
 /// Render a device revocation confirmation to a String.
-pub fn render_device_revoked(device_id_hex: &str) -> String {
+pub fn render_device_revoked(device_id_hex: &str, holders_skipped: u32) -> String {
     let short = if device_id_hex.len() > 16 {
         format!("{}...", &device_id_hex[..16])
     } else {
         device_id_hex.to_string()
     };
-    format!("device revoked: {short}\n")
+    let mut out = format!("device revoked: {short}\n");
+    if holders_skipped > 0 {
+        out.push_str(&format!(
+            "revocation not sent to {holders_skipped} holder device(s): master unknown until they reconnect\n"
+        ));
+    }
+    out
 }
 
 /// Format and print a device revocation confirmation to stdout.
-pub fn format_device_revoked(device_id_hex: &str) {
-    print!("{}", render_device_revoked(device_id_hex));
+pub fn format_device_revoked(device_id_hex: &str, holders_skipped: u32) {
+    print!("{}", render_device_revoked(device_id_hex, holders_skipped));
 }
 
 /// Render a list of FileEntry to a String.

@@ -995,6 +995,129 @@ async fn revocation_published_only_to_storage_relationship_peers() {
     }
 }
 
+/// dr-i8: after a DR `device_to_master` is empty. The revocation still reaches the holder whose
+/// master is in PEERS; a holder known nowhere is not addressed (no device-id box) and is counted
+/// in the response.
+#[tokio::test]
+async fn revoke_after_dr_reaches_holder_master_from_peers() {
+    use std::sync::{Arc as StdArc, Mutex};
+    use viaticum_core::cluster::{ClusterState, issue_device_certificate, master_identity};
+
+    let seed = [0xE5u8; 32];
+    let master_key = viaticum_core::cluster::derive_master_key(&seed).unwrap();
+    let our_master = master_identity(&master_key);
+    let our_device_id = DeviceId([0xE5u8; 32]);
+    let revoked_device_id = DeviceId([0xE6u8; 32]);
+    let now = Timestamp(1_000_000);
+    let cert_a = issue_device_certificate(&master_key, our_device_id, now);
+    let cert_r = issue_device_certificate(&master_key, revoked_device_id, now);
+    let db = Db::open_in_memory().expect("db");
+    let mut cs = ClusterState::init(db.clone(), our_master, cert_a.clone(), now, now).unwrap();
+    cs.add_device(cert_r.clone(), now).unwrap();
+    let cluster_state = StdArc::new(Mutex::new(cs));
+
+    // H1: a PeerRecord with a master, device_to_master empty. H2: unknown anywhere.
+    let h1_master = IdentityPub([0xB7u8; 32]);
+    let h1_device = gen_libp2p_device_id();
+    let h2_device = gen_libp2p_device_id();
+    db.upsert_peer(&PeerRecord {
+        device_id: h1_device,
+        master_identity: h1_master,
+        trust_p: 0.5,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp(0),
+        last_seen: Timestamp(0),
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma: 0.5,
+        last_avail_sample: 0,
+    })
+    .unwrap();
+    assert_eq!(db.get_master_for_device(&h1_device).unwrap(), None);
+    for (i, holder) in [h1_device, h2_device].into_iter().enumerate() {
+        db.upsert_placement(&SymbolPlacement {
+            source_block_id: SourceBlockId([0x30 + i as u8; 32]),
+            holder_id: holder,
+            file_id: viaticum_core::types::FileId(1),
+            esi_ranges: vec![(0, 5)],
+            binding_seed: [0u8; 32],
+            status: viaticum_core::types::PlacementStatus::Alive,
+            last_verified: None,
+            placed_at: now,
+            consecutive_misses: 0,
+        })
+        .unwrap();
+    }
+
+    let (restore_tx, _restore_rx) = mpsc::channel::<crate::daemon::restore::RestoreRequest>(4);
+    let (router, sender) = make_router_for_revocation(&db);
+    let state = Arc::new(DaemonState {
+        db,
+        identity_pub: our_master,
+        device_id: our_device_id,
+        restore_tx,
+        restore_jobs: test_jobs(),
+        restore_staging: Default::default(),
+        cluster_state: Some(cluster_state),
+        master_key,
+        seed: seed.to_vec(),
+        data_dir: std::path::PathBuf::from("/tmp"),
+        soft_quota_bytes: 0,
+        disk_reserve_bytes: 0,
+        hard_quota_bytes: 0,
+        time_scale: 1,
+        swarm_handle: None,
+        watch_admin: None,
+        config_admin: None,
+        restart_gate: None,
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
+        peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
+        mailbox_router: Some(router),
+        missing_sources: Default::default(),
+        max_file_size_bytes: 0,
+        block_work_budget_bytes: 0,
+        dr_leases: None,
+    });
+
+    let revoked_hex: String = revoked_device_id
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let response = dispatch(
+        CliRequest::DeviceRevoke {
+            device_id_hex: revoked_hex,
+        },
+        &state,
+    )
+    .await;
+    match response {
+        CliResponse::DeviceRevoked {
+            holders_skipped, ..
+        } => {
+            assert_eq!(holders_skipped, 1, "H2 is unknown anywhere");
+        }
+        other => panic!("expected DeviceRevoked, got {other:?}"),
+    }
+    let stored = sender.stored.lock().await;
+    let targets: Vec<_> = stored
+        .iter()
+        .map(|r| IdentityPub(r.entry.target.0))
+        .collect();
+    assert!(
+        targets.contains(&h1_master),
+        "H1's master from PEERS: {targets:?}"
+    );
+    assert!(
+        !targets.contains(&IdentityPub(h2_device.0)),
+        "never a device-id box"
+    );
+}
+
 /// revocation_dedup_peer_is_holder_and_owner:
 /// A peer that is BOTH a holder (we have a placement) AND an owner-we-hold-for
 /// must result in exactly one Revocation publish, not two.

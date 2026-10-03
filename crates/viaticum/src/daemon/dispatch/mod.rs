@@ -1048,6 +1048,9 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
         "device revoked, epoch rotated"
     );
 
+    // dr-i8: holder devices whose master is unknown anywhere; the CLI is told how many.
+    let mut skipped_holders: std::collections::HashSet<DeviceId> = std::collections::HashSet::new();
+
     // T-13b-2: Publish directed Revocation entries to storage-relationship peers only.
     //
     // Target-master set = { get_master_for_device(p.holder_id) ∀ our placements }
@@ -1071,17 +1074,20 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
                 match state.db.list_all_placements() {
                     Ok(placements) => {
                         for placement in &placements {
-                            match state.db.get_master_for_device(&placement.holder_id) {
+                            // dr-i8: PEERS first (they survive DR), device_to_master as fallback.
+                            match state.db.master_for_holder(&placement.holder_id) {
                                 Ok(Some(master)) => {
                                     if master != my_master {
                                         target_masters.insert(master);
                                     }
                                 }
                                 Ok(None) => {
-                                    tracing::debug!(
-                                        holder = %placement.holder_id,
-                                        "dispatch_device_revoke: no master for holder device, skipping"
-                                    );
+                                    if skipped_holders.insert(placement.holder_id) {
+                                        tracing::warn!(
+                                            holder = %placement.holder_id,
+                                            "dispatch_device_revoke: holder master unknown, revocation not sent to this holder"
+                                        );
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -1197,7 +1203,10 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
         }
     }
 
-    CliResponse::DeviceRevoked { device_id_hex }
+    CliResponse::DeviceRevoked {
+        device_id_hex,
+        holders_skipped: skipped_holders.len() as u32,
+    }
 }
 
 // ── Connect ───────────────────────────────────────────────────────────────────
