@@ -163,6 +163,11 @@ pub struct StatusData {
     /// sorted, uncapped. Shown only in --json.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub known_devices: Option<Vec<String>>,
+    /// PeerRecords of another master WITHOUT a dialable address (the ones
+    /// `known_devices` leaves out; C-DK C4 fix round 3): DeviceId, first 8 bytes
+    /// hex, sorted, uncapped. Shown only in --json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unaddressed_devices: Option<Vec<String>>,
     /// The devices this node is authenticated with right now: DeviceId, first 8
     /// bytes hex, sorted, uncapped; `None` when the swarm is down. Shown only in
     /// --json.

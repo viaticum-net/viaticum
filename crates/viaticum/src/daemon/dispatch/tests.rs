@@ -2450,6 +2450,11 @@ async fn dispatch_status_reports_known_devices_from_peer_records() {
         Some(vec![viaticum_core::types::hex_encode(&known.0[..8])])
     );
     assert_eq!(
+        data.unaddressed_devices,
+        Some(vec![viaticum_core::types::hex_encode(&key(52).0[..8])]),
+        "C-DK C4 fix round 3: the stranger's record without an address"
+    );
+    assert_eq!(
         data.authenticated_devices, None,
         "no swarm: no list, not an empty one"
     );

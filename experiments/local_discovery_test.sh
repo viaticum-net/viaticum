@@ -48,7 +48,10 @@
 #                  node known >= 20, seed known = 39; symmetry on the other side (100 % PASS,
 #                  >= 95 % ROUGH, else FAIL); every sample: friends connected - busy - infra
 #                  - closing <= CAP_eff and protected_peers <= 16; seed connected = its
-#                  authenticated (CAP modes: 39);
+#                  authenticated (CAP modes: 39); known ⊇ authenticated: (a) authenticated
+#                  > 30 s and in unaddressed_devices = FAIL, (b) no PeerRecord yet = NOTE
+#                  with the max lag <= 150 s, FAIL beyond, (c) any `event_tx full or
+#                  closed` line in a daemon log = FAIL (also step 3);
 #                  H1..H4 signature printed (spec §2.4) (i14, i18, i41) — status, logs
 #               2. each friend adds a 64 KB .jpg -> <= 180 s (lru*: 300, ROUGH > 180)
 #                  restorable and on >= 2 holders other than the seed (i14) — holder disks
@@ -343,8 +346,9 @@ on_demand_dial_since() {
 
 # ── One status sample of every live node ────────────────────────────────────
 # Fills K (known), A (authenticated), C (connected), BUSY/INFRA/CLOSING/PROT ("NA" when
-# the build has no such field), KD/AD (",hex8,hex8," lists), HAS_KNOWN (Y/N).
-declare -A K A C BUSY INFRA CLOSING PROT KD AD HAS_KNOWN WAKES
+# the build has no such field), KD/AD/UD (",hex8,hex8," lists; UD = unaddressed_devices,
+# "NA" on a build before C4 fix round 3), HAS_KNOWN (Y/N).
+declare -A K A C BUSY INFRA CLOSING PROT KD AD UD HAS_KNOWN WAKES
 FIELDS_NOTED=0
 sample_one() { # NODE
     local i="$1" js row
@@ -360,10 +364,11 @@ sample_one() { # NODE
         ("," + ((.authenticated_devices // []) | join(",")) + ","),
         (if has("known_devices") then "Y" else "N" end),
         (if has("work_wakes_suppressed") then .work_wakes_suppressed else "NA" end),
-        (if has("protected_peers") then .protected_peers else "NA" end)
+        (if has("protected_peers") then .protected_peers else "NA" end),
+        (if has("unaddressed_devices") then ("," + (.unaddressed_devices | join(",")) + ",") else "NA" end)
       ] | @tsv' 2>/dev/null || true)
     IFS=$'\t' read -r "K[$i]" "A[$i]" "C[$i]" "BUSY[$i]" "INFRA[$i]" "CLOSING[$i]" "KD[$i]" "AD[$i]" \
-        "HAS_KNOWN[$i]" "WAKES[$i]" "PROT[$i]" <<< "$row"
+        "HAS_KNOWN[$i]" "WAKES[$i]" "PROT[$i]" "UD[$i]" <<< "$row"
 }
 sample_all() {
     local i
@@ -420,39 +425,114 @@ check_cap_sample() {
     return 0
 }
 
-# known ⊇ authenticated (fix round 1, network-i14): every peer a node has been
-# authenticated with for more than 30 s is in its known_devices. All owners of this run
-# are different masters (no siblings), so every authenticated peer must become known; a
-# miss is the PeerRecord-without-address race (authentication and identify written by
-# racing tasks). Independent of TIME_SCALE. AUTH_SINCE[i:hex8] = first sample time.
-declare -A AUTH_SINCE
-KNOWN_AUTH_BAD=""
+# known ⊇ authenticated (fix rounds 1 and 3, network-i14). All owners of this run are
+# different masters (no siblings), so every peer a node is authenticated with must get a
+# PeerRecord with an address. AUTH_SINCE[i:hex8] = the first sample that showed the pair
+# authenticated (the real authentication is up to one sample earlier). Three bars:
+#  (a) authenticated > 30 s and listed in unaddressed_devices -> FAIL "PeerRecord without
+#      an address" (the identify addresses lost: fix round 1's race);
+#  (b) authenticated but in neither known_devices nor unaddressed_devices = no PeerRecord
+#      yet: the writer's lag. It is clocked until the record shows up (also after the pair
+#      left the authenticated list: records are never deleted); NOTE with the max lag per
+#      node when <= 150 s, FAIL beyond (the writer is not keeping up);
+#  (c) event_drop_verdict below.
+# A build without unaddressed_devices (UD = NA) cannot tell (a) from (b): the old bar,
+# "not in known_devices after 30 s" = FAIL. Independent of TIME_SCALE.
+declare -A AUTH_SINCE NOREC_SINCE MAX_REC_LAG
+KNOWN_AUTH_BAD=""; REC_LAG_BAD=""; UD_NA_NODES=""
+REC_LAG_BAR=150
 check_known_covers_auth() {
-    local i h now key seen
+    local i h now key seen lag
     now=$(date -u +%s)
     for i in $(alive_nodes); do
         [ -n "${K[$i]:-}" ] || continue
+        for key in "${!NOREC_SINCE[@]}"; do   # a record showed up: its lag
+            [ "${key%%:*}" = "$i" ] || continue
+            h="${key#*:}"
+            if in_list "$h" "${KD[$i]:-,}" || in_list "$h" "${UD[$i]:-,}"; then
+                lag=$(( now - ${NOREC_SINCE[$key]} ))
+                [ "$lag" -gt "${MAX_REC_LAG[$i]:-0}" ] && MAX_REC_LAG[$i]=$lag
+                [ "$lag" -gt "$REC_LAG_BAR" ] && REC_LAG_BAD="$REC_LAG_BAD node-$i>$h:${lag}s"
+                unset "NOREC_SINCE[$key]"
+            fi
+        done
         for key in "${!AUTH_SINCE[@]}"; do   # left authenticated: forget the start
             [ "${key%%:*}" = "$i" ] || continue
             in_list "${key#*:}" "${AD[$i]:-,}" || unset "AUTH_SINCE[$key]"
         done
+        if [ "${UD[$i]:-NA}" = NA ]; then
+            [[ "$UD_NA_NODES" == *" $i "* ]] || UD_NA_NODES="$UD_NA_NODES $i "
+        fi
         for h in $(echo "${AD[$i]:-}" | tr ',' ' '); do
             key="$i:$h"
             seen="${AUTH_SINCE[$key]:-}"
-            if [ -z "$seen" ]; then AUTH_SINCE[$key]=$now; continue; fi
-            if [ $(( now - seen )) -gt 30 ] && ! in_list "$h" "${KD[$i]:-,}"; then
-                [[ "$KNOWN_AUTH_BAD" == *" node-$i>$h"* ]] || KNOWN_AUTH_BAD="$KNOWN_AUTH_BAD node-$i>$h"
+            [ -n "$seen" ] || { seen=$now; AUTH_SINCE[$key]=$now; }
+            in_list "$h" "${KD[$i]:-,}" && continue
+            if [ "${UD[$i]:-NA}" = NA ]; then
+                if [ $(( now - seen )) -gt 30 ]; then
+                    [[ "$KNOWN_AUTH_BAD" == *" node-$i>$h"* ]] || KNOWN_AUTH_BAD="$KNOWN_AUTH_BAD node-$i>$h"
+                fi
+                continue
             fi
+            if in_list "$h" "${UD[$i]}"; then
+                if [ $(( now - seen )) -gt 30 ]; then
+                    [[ "$KNOWN_AUTH_BAD" == *" node-$i>$h"* ]] || KNOWN_AUTH_BAD="$KNOWN_AUTH_BAD node-$i>$h"
+                fi
+                continue
+            fi
+            [ -n "${NOREC_SINCE[$key]:-}" ] || NOREC_SINCE[$key]=$seen
         done
     done
     return 0
 }
 known_auth_verdict() {
-    if [ -z "$KNOWN_AUTH_BAD" ]; then
-        pass "every peer authenticated for > 30 s is in the node's known_devices (known ⊇ authenticated)"
-    else
-        fail "authenticated > 30 s but not known (PeerRecord without an address) — node>peer:$(echo "$KNOWN_AUTH_BAD" | cut -c1-400)"
+    local key i lag now open="" lags=""
+    now=$(date -u +%s)
+    if [ -n "$UD_NA_NODES" ]; then
+        note "status has no unaddressed_devices on nodes$UD_NA_NODES(build before C4 fix round 3): there 'not known after 30 s' is the bar, a missing record and a record without an address are not told apart"
     fi
+    if [ -z "$KNOWN_AUTH_BAD" ]; then
+        pass "no peer authenticated for > 30 s has a PeerRecord without an address (known ⊇ authenticated, bar a)"
+    else
+        fail "PeerRecord without an address: authenticated > 30 s, listed in unaddressed_devices (no build field: not in known_devices) — node>peer:$(echo "$KNOWN_AUTH_BAD" | cut -c1-400)"
+    fi
+    for key in "${!NOREC_SINCE[@]}"; do   # still no record: the lag so far
+        i="${key%%:*}"; lag=$(( now - ${NOREC_SINCE[$key]} ))
+        [ "$lag" -gt "${MAX_REC_LAG[$i]:-0}" ] && MAX_REC_LAG[$i]=$lag
+        [ "$lag" -gt "$REC_LAG_BAR" ] && open="$open node-$i>${key#*:}:${lag}s+"
+    done
+    for i in $(printf '%s\n' "${!MAX_REC_LAG[@]}" | sort -n); do
+        lags="$lags node-$i:${MAX_REC_LAG[$i]}s"
+    done
+    if [ -n "$REC_LAG_BAD$open" ]; then
+        fail "PeerRecord written > ${REC_LAG_BAR}s after the authentication was first seen (+ = still none; bar b) — node>peer:$(echo "$REC_LAG_BAD$open" | cut -c1-400)"
+    elif [ -n "$lags" ]; then
+        note "PeerRecord write lag (authenticated, record in neither list yet), max per node, <= ${REC_LAG_BAR}s:$(echo "$lags" | cut -c1-400)"
+    else
+        pass "every authenticated peer had a PeerRecord at its first sample (bar b)"
+    fi
+}
+# (c) The swarm drops a protocol event only when the processor's channel is full: the loop
+# fell behind (fix round 1 wrote PeerRecords inline and stalled it). Any such line in a
+# daemon log since LINE0 (0 = the daemon's start; "3" = LINE3[i] of step 3) is a FAIL with
+# the signature; lines after the daemon's own "shutting down" are a stop, not counted.
+EVENT_DROP_SIG="event_tx full or closed, dropping protocol event"
+event_drop_verdict() { # 0|3
+    local i from n first bad=""
+    for i in $(alive_nodes); do
+        if [ "$1" = 0 ]; then from=0; else from="${LINE3[$i]:-0}"; fi
+        read -r n first <<< "$(log_since "$i" "$from" | event_drop_count)"
+        [ "${n:-0}" -gt 0 ] && bad="$bad node-$i:${n}x@$first"
+    done
+    if [ -z "$bad" ]; then
+        pass "0 '$EVENT_DROP_SIG' in the daemon logs (the processor loop kept up, bar c)"
+    else
+        fail "the swarm dropped protocol events, the processor loop fell behind ('$EVENT_DROP_SIG'; bar c) — node:count@first:$(echo "$bad" | cut -c1-300)"
+    fi
+}
+# stdin = log lines -> "COUNT FIRST_TIMESTAMP" of EVENT_DROP_SIG before a "shutting down".
+event_drop_count() {
+    awk -v sig="$EVENT_DROP_SIG" '/shutting down/ { exit } index($0, sig) { n++; if (f == "") f = $1 } END { printf "%d %s\n", n, (f == "" ? "-" : f) }'
 }
 
 # redial_carousel_split NODE LINE0 : "counted excused floor_none" — re-dials of evicted
@@ -969,6 +1049,7 @@ else
     fail "cap invariant broken:$(echo "$CAP_VIOLATIONS" | cut -c1-300)"
 fi
 known_auth_verdict
+event_drop_verdict 0
 SEED_OK=""
 for t in $(seq 1 12); do
     sample_all
@@ -1070,7 +1151,7 @@ if runs_step 3; then
     declare -A LINE3 PREV_K
     for i in $(alive_nodes); do LINE3[$i]=$(log_line_count "$i"); done
     T3=$(date -u +%s)
-    KNOW_BAD=""; CAP_VIOLATIONS=""; KNOWN_AUTH_BAD=""; MAX_BUSY_NOT_PROT=0; SAMPLES=0; RESAMPLED=""; RESAMPLE_N=0
+    KNOW_BAD=""; CAP_VIOLATIONS=""; KNOWN_AUTH_BAD=""; REC_LAG_BAD=""; MAX_REC_LAG=(); MAX_BUSY_NOT_PROT=0; SAMPLES=0; RESAMPLED=""; RESAMPLE_N=0
     sample_all; resample_missing $(alive_nodes)
     for i in $(alive_nodes); do
         if [ -z "${K[$i]:-}" ]; then KNOW_BAD="$KNOW_BAD $i:no-status"; fi
@@ -1105,6 +1186,7 @@ if runs_step 3; then
         fail "cap invariant broken:$(echo "$CAP_VIOLATIONS" | cut -c1-300)"
     fi
     known_auth_verdict
+    event_drop_verdict 3
     # Log bars (spec v3.2 BL-2). Lines of a build without the cache are simply absent.
     EVICT=0; SLOW_EVICT=""; SLOW_EVICT_LATE=""; REDIAL_CAR=0; REDIAL_EXCUSED=0; REDIAL_FLOOR_NONE=""; DISC_CAR=0; KAD_CAR=0; OND_CAR=0
     LOOKUPS_MAX=0; BOOTS_MAX=0; AUTO_BOOTS=0; OVER_MS=0; KEEPALIVE=0; TICK_LATE=0

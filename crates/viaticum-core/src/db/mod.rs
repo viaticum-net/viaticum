@@ -3352,15 +3352,19 @@ pub mod testutil {
         Timestamp(n as u64 * crate::constants::SECS_PER_WEEK)
     }
 
-    /// An in-memory storage whose writes fail while `fail` is set: a full disk or a
-    /// redb I/O error on demand. Reads keep working.
+    /// An in-memory storage for probing tests: its writes fail while `fail` is set (a full
+    /// disk or a redb I/O error on demand; reads keep working), it counts its syncs (every
+    /// durable redb commit syncs; a read or an aborted write transaction does not), and each
+    /// sync sleeps `sync_delay_ms` (a slow disk under load).
     #[derive(Debug)]
-    struct WriteSwitchBackend {
+    struct ProbeBackend {
         inner: redb::backends::InMemoryBackend,
         fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        syncs: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        sync_delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
 
-    impl WriteSwitchBackend {
+    impl ProbeBackend {
         fn check(&self) -> std::io::Result<()> {
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
                 Err(std::io::Error::other("test: storage writes switched off"))
@@ -3370,7 +3374,7 @@ pub mod testutil {
         }
     }
 
-    impl StorageBackend for WriteSwitchBackend {
+    impl StorageBackend for ProbeBackend {
         fn len(&self) -> std::io::Result<u64> {
             self.inner.len()
         }
@@ -3383,6 +3387,11 @@ pub mod testutil {
         }
         fn sync_data(&self) -> std::io::Result<()> {
             self.check()?;
+            let ms = self.sync_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+            if ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+            self.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.sync_data()
         }
         fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
@@ -3391,13 +3400,35 @@ pub mod testutil {
         }
     }
 
-    /// A test db whose writes fail while the returned switch is `true` (mailbox-i59:
-    /// "META not written → nothing sent").
-    pub fn test_db_with_write_switch() -> (Db, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    /// The handles of a [`test_db_with_sync_probe`] db.
+    #[derive(Debug, Clone)]
+    pub struct SyncProbe {
+        /// Storage syncs so far (durable commits; compare deltas, a commit may sync more
+        /// than once).
+        pub syncs: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        /// Each sync sleeps this long (ms); 0 = no delay.
+        pub sync_delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl SyncProbe {
+        pub fn syncs(&self) -> u64 {
+            self.syncs.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        pub fn set_sync_delay_ms(&self, ms: u64) {
+            self.sync_delay_ms
+                .store(ms, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn probe_db() -> (Db, ProbeBackendHandles) {
         let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let backend = WriteSwitchBackend {
+        let syncs = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sync_delay_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let backend = ProbeBackend {
             inner: redb::backends::InMemoryBackend::new(),
             fail: std::sync::Arc::clone(&fail),
+            syncs: std::sync::Arc::clone(&syncs),
+            sync_delay_ms: std::sync::Arc::clone(&sync_delay_ms),
         };
         let db = redb::Database::builder()
             .create_with_backend(backend)
@@ -3409,8 +3440,34 @@ pub mod testutil {
                 inner: std::sync::Arc::new(db),
                 hot: std::sync::Arc::new(std::sync::RwLock::new(hot)),
             },
-            fail,
+            ProbeBackendHandles {
+                fail,
+                probe: SyncProbe {
+                    syncs,
+                    sync_delay_ms,
+                },
+            },
         )
+    }
+
+    struct ProbeBackendHandles {
+        fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        probe: SyncProbe,
+    }
+
+    /// A test db that counts its durable commits and can make them slow (C-DK C4 fix round
+    /// 3: "a batch of authentications is one commit", "the processor does not wait for a
+    /// slow disk").
+    pub fn test_db_with_sync_probe() -> (Db, SyncProbe) {
+        let (db, handles) = probe_db();
+        (db, handles.probe)
+    }
+
+    /// A test db whose writes fail while the returned switch is `true` (mailbox-i59:
+    /// "META not written → nothing sent").
+    pub fn test_db_with_write_switch() -> (Db, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let (db, handles) = probe_db();
+        (db, handles.fail)
     }
 }
 
@@ -3425,6 +3482,10 @@ mod four_r_state;
 
 /// backup-i4: too-large source marks (`too_large_sources`), node-local.
 mod too_large;
+
+/// C-DK C4 fix round 3: a batch of peer updates in one write transaction.
+mod peer_batch;
+pub use peer_batch::PeerBatch;
 
 #[cfg(test)]
 mod tests;

@@ -126,11 +126,10 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
     let auth_devices = auth_snapshot.unwrap_or_default();
     // network-i14: knowledge, from the PeerRecords (another master + a dialable
     // address). "Another" = not the cluster's master, as in the swarm's known set.
-    let known_devices = net_status::known_devices_hex8(
-        &peers,
-        &net_status::status_cluster_master(state),
-        &state.device_id,
-    );
+    let status_master = net_status::status_cluster_master(state);
+    let known_devices = net_status::known_devices_hex8(&peers, &status_master, &state.device_id);
+    let unaddressed_devices =
+        net_status::unaddressed_devices_hex8(&peers, &status_master, &state.device_id);
 
     // Compute peer summaries, sorted by combined trust descending (top 20).
     let mut peer_summaries: Vec<PeerSummary> = peers
@@ -350,6 +349,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         peer_count_authenticated,
         peer_count_known: known_devices.len() as u32,
         known_devices: Some(known_devices),
+        unaddressed_devices: Some(unaddressed_devices),
         authenticated_devices,
         conn_cache,
         avg_trust,

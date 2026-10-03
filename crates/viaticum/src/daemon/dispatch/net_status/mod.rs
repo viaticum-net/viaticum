@@ -55,6 +55,25 @@ pub(crate) fn known_devices_hex8(
     )
 }
 
+/// C-DK C4 fix round 3: PeerRecords of another master WITHOUT a dialable
+/// address (first 8 bytes hex, sorted) — the records `known_devices` leaves
+/// out. Own device and siblings (the cluster's master) are in neither list. A
+/// peer authenticated for long but listed here is a PeerRecord that lost (or
+/// never got) its addresses; one in neither list has no record yet.
+pub(crate) fn unaddressed_devices_hex8(
+    peers: &[PeerRecord],
+    own_master: &IdentityPub,
+    own_device: &DeviceId,
+) -> Vec<String> {
+    devices_hex8_sorted(
+        peers
+            .iter()
+            .filter(|p| p.device_id != *own_device && p.master_identity != *own_master)
+            .filter(|p| !is_known(p, own_master, own_device))
+            .map(|p| &p.device_id),
+    )
+}
+
 #[cfg(feature = "e2e-tools")]
 pub(crate) use e2e::{dispatch_e2e_disconnect, dispatch_e2e_reach};
 

@@ -11,6 +11,7 @@ fn make_status(peers: Vec<PeerSummary>) -> StatusData {
         peer_count_authenticated: peers.len() as u32,
         peer_count_known: 0,
         known_devices: None,
+        unaddressed_devices: None,
         authenticated_devices: None,
         conn_cache: Default::default(),
         avg_trust: 0.75,

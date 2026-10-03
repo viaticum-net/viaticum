@@ -4,7 +4,7 @@
 use viaticum_core::constants::{AVAIL_EWMA_INITIAL, INITIAL_TRUST_P};
 use viaticum_core::types::{DeviceId, IdentityPub, PeerRecord, Timestamp};
 
-use super::{devices_hex8_sorted, known_devices_hex8};
+use super::{devices_hex8_sorted, known_devices_hex8, unaddressed_devices_hex8};
 use crate::daemon::network::swarm_test_helpers::make_signing_key;
 
 fn device(seed: u8) -> DeviceId {
@@ -62,6 +62,34 @@ fn known_devices_lists_only_other_masters_with_a_dialable_addr() {
     ];
     let got = known_devices_hex8(&peers, &own_master, &own_device);
     assert_eq!(got, devices_hex8_sorted([&known_a, &known_b]));
+}
+
+#[test]
+fn unaddressed_devices_are_other_masters_without_a_dialable_addr() {
+    let own_device = device(40);
+    let own_master = IdentityPub([0x11; 32]);
+    let other = IdentityPub([0x22; 32]);
+    let addr = vec!["/ip4/127.0.0.1/tcp/4001".to_string()];
+    let bare_a = device(41);
+    let bare_b = device(42);
+    let peers = vec![
+        record(device(43), other, addr), // known
+        record(bare_a, other, vec![]),   // no address
+        record(
+            bare_b,
+            IdentityPub([0x33; 32]),
+            vec!["not a multiaddr".to_string()],
+        ),
+        record(own_device, other, vec![]),      // own device
+        record(device(44), own_master, vec![]), // a sibling
+    ];
+    let got = unaddressed_devices_hex8(&peers, &own_master, &own_device);
+    assert_eq!(got, devices_hex8_sorted([&bare_a, &bare_b]));
+    let known = known_devices_hex8(&peers, &own_master, &own_device);
+    assert!(
+        got.iter().all(|h| !known.contains(h)),
+        "known and unaddressed never overlap"
+    );
 }
 
 #[cfg(feature = "e2e-tools")]
