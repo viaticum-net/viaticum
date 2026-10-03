@@ -618,8 +618,18 @@ step3b() {
         [ -n "$B2" ] && break
         sleep 0.5
     done
+    # The offer order is random: if a holder to be stopped is first, stopping right at the grant makes
+    # the first offer time out and the worker yields to PoS and never returns to B2 in the window
+    # (repair-i5 hole, v3.12c). So the stop waits for the first chunk of B2 that reached a holder.
+    if [ -n "$B2" ]; then
+        local cend=$(( $(date +%s) + 90 ))
+        while [ "$(date +%s)" -lt "$cend" ]; do
+            clog 0 "$L3B" | grep -aF "work_pipeline: chunk sent" | grep -aqF "block_id=$B2" && break
+            sleep 0.5
+        done
+    fi
     kill -STOP "${DPID[3]}" "${DPID[4]}"
-    if [ -n "$B2" ]; then info "step 3b: worker granted for B2 = $B2 at +$(( $(date +%s) - T3B )) s: node-03/04 stopped"
+    if [ -n "$B2" ]; then info "step 3b: worker granted for B2 = $B2, first chunk delivered; at +$(( $(date +%s) - T3B )) s node-03/04 stopped"
     else
         rough "3b: B2 never picked within 120 s of big2.bin (node-03/04 stopped anyway); picks in the window: $(clog 0 "$((L3B + 1))" | grep -aF 'picked block for work' | grep -ao 'block_id=[0-9a-f]*' | sort | uniq -c | tr '\n' ' ')"
     fi
