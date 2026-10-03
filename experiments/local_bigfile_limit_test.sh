@@ -770,7 +770,12 @@ step3b_judge() {
     # boundary and the gate holds it), and the restore asks for memory only after it fetched the
     # symbols. So the INFO 'waiting' line is not guaranteed any more: without it the worker must have
     # given way to the restore before the grant (checked below), otherwise FAIL.
-    if [ -z "$tW" ] && [ -z "$(ev 0 "$F" "work_pipeline: yielding memory to restore" block | awk -v b="$B2" '$3 == b { print $1; exit }')" ]; then
+    # The worker gives way in one of three logged forms (portion boundary, gate after the permit
+    # (K-b2a^5 step 5b), pause line); all are grep'd by prefix "restore gate is up" / "yielding memory to restore".
+    local gave_way
+    gave_way=$({ ev 0 "$F" "work_pipeline: yielding memory to restore" block | awk -v b="$B2" '$3 == b { print $1 }'; \
+                 ev 0 "$F" "restore gate is up after the permit was granted" block | awk -v b="$B2" '$3 == b { print $1 }'; } | head -1)
+    if [ -z "$tW" ] && [ -z "$gave_way" ]; then
         fail "3b (d): no INFO 'restore: waiting for memory budget ... block=RB' and no 'yielding memory to restore' by the worker (the restore neither waited nor was given the budget)"
     else
         [ -n "$tW" ] || note "3b (d): no 'waiting for memory budget' line: the worker paused the backup for the restore first (Q-V9 (a)), the grant came without a wait"
