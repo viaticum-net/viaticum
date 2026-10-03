@@ -92,10 +92,7 @@ pub fn ledger_master_for_device(
     db: &Db,
     device: &DeviceId,
 ) -> Result<Option<IdentityPub>, DbError> {
-    Ok(db
-        .get_peer(device)?
-        .map(|peer| peer.master_identity)
-        .filter(|master| master.0 != [0u8; 32]))
+    db.master_for_peer_device(device)
 }
 
 /// Д-K: add the folded events on top of a row whose interval has ALREADY been decayed
