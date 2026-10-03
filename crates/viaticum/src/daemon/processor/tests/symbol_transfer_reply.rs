@@ -234,7 +234,7 @@ async fn resent_chunk_already_on_disk_replies_stored_without_rewrite() {
     assert_stored(&first, blk, vec![(0, 2)]);
 
     // The reply to the first send was lost; the owner resends the same chunk.
-    let resent = reply_to(&p, owner, chunk(blk, &[0, 1], 0xBB)).await;
+    let resent = reply_to(&p, owner, chunk(blk, &[0, 1], 0xAA)).await;
 
     assert_stored(&resent, blk, vec![(0, 2)]);
     assert_eq!(bins_on_disk(&dir, blk), vec![0, 1]);
@@ -415,4 +415,68 @@ async fn truncated_held_file_is_not_already_held() {
     let rec = db.get_holding(&blk, &owner).unwrap().unwrap();
     assert_eq!(rec.esi_ranges, vec![(0, 2)]);
     assert_eq!(rec.total_bytes, 2 * 64);
+}
+
+/// Same length, other bytes: not "already held". Matching bytes: `Stored` with no offer. Mismatch:
+/// without an offer nothing is rewritten; with one the file is rewritten (no `.tmp` left),
+/// `Stored`, the record's size unchanged. Mutation: compare off -> this reddens.
+#[tokio::test]
+async fn held_file_with_other_bytes_is_rewritten_and_matching_one_is_not() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let p = make_processor(db.clone(), &dir).await;
+    let owner = make_identity(0x1F);
+    let blk = make_block_id(0x1F);
+    insert_accepted_offer(&p, owner, blk, vec![(0, 2)], 0.5);
+    assert_stored(
+        &reply_to(&p, owner, chunk(blk, &[0, 1], 0xAA)).await,
+        blk,
+        vec![(0, 2)],
+    );
+    assert_stored(
+        &reply_to(&p, owner, chunk(blk, &[0, 1], 0xAA)).await,
+        blk,
+        vec![(0, 2)],
+    );
+    let block_hex: String = blk.0.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(dir.path().join(&block_hex).join("1.bin"), [0x55; 64]).unwrap();
+
+    let no_offer = reply_to(&p, owner, chunk(blk, &[0, 1], 0xAA)).await;
+    assert_ack(&no_offer);
+    assert_eq!(read_bin(&dir, blk, 1), vec![0x55; 64]);
+
+    insert_accepted_offer(&p, owner, blk, vec![(0, 2)], 0.5);
+    let with_offer = reply_to(&p, owner, chunk(blk, &[0, 1], 0xAA)).await;
+    assert_stored(&with_offer, blk, vec![(0, 2)]);
+    assert_eq!(read_bin(&dir, blk, 1), vec![0xAA; 64]);
+    assert_eq!(bins_on_disk(&dir, blk), vec![0, 1]);
+    // A mismatching held ESI outside the offer's remaining range is still rewritten.
+    std::fs::write(dir.path().join(&block_hex).join("0.bin"), [0x55; 64]).unwrap();
+    insert_accepted_offer(&p, owner, blk, vec![(2, 2)], 0.5);
+    let outside = reply_to(&p, owner, chunk(blk, &[0], 0xAA)).await;
+    assert_stored(&outside, blk, vec![(0, 1)]);
+    assert_eq!(read_bin(&dir, blk, 0), vec![0xAA; 64]);
+    assert!(!dir.path().join(&block_hex).join("1.bin.tmp").exists());
+    let rec = db.get_holding(&blk, &owner).unwrap().unwrap();
+    assert_eq!(rec.esi_ranges, vec![(0, 2)]);
+    assert_eq!(rec.total_bytes, 2 * 64);
+}
+
+/// The file is gone while the DB still holds the ESI: rewritten through the offer.
+#[tokio::test]
+async fn held_esi_with_missing_file_is_rewritten() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let p = make_processor(db.clone(), &dir).await;
+    let owner = make_identity(0x20);
+    let blk = make_block_id(0x20);
+    insert_accepted_offer(&p, owner, blk, vec![(0, 2)], 0.5);
+    reply_to(&p, owner, chunk(blk, &[0, 1], 0xAA)).await;
+    let block_hex: String = blk.0.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::remove_file(dir.path().join(block_hex).join("0.bin")).unwrap();
+
+    insert_accepted_offer(&p, owner, blk, vec![(0, 2)], 0.5);
+    let reply = reply_to(&p, owner, chunk(blk, &[0, 1], 0xAA)).await;
+    assert_stored(&reply, blk, vec![(0, 2)]);
+    assert_eq!(read_bin(&dir, blk, 0), vec![0xAA; 64]);
 }

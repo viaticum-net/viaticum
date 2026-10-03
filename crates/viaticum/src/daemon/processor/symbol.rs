@@ -915,7 +915,7 @@ impl Processor {
     ///
     /// Returns `Stored` only if EVERY ESI of the chunk is on disk afterwards: written now, or
     /// already held (in the owner's Active `HoldingRecord` for this block AND `{esi}.bin` exists
-    /// with the chunk symbol's length) — a resend of a chunk whose reply was lost is answered
+    /// with the chunk symbol's bytes) — a resend of a chunk whose reply was lost is answered
     /// truthfully (backup-i19).
     ///
     /// ESIs not already held require an accepted offer for `(from_device, block_id)`. The
@@ -966,7 +966,7 @@ impl Processor {
         let block_dir = self.holdings_dir.join(&block_hex);
 
         // ── Already held: in the owner's ACTIVE record AND the file exists with the chunk's
-        // length (a truncated file is rewritten through the offer) ───────────────────────────
+        // bytes (a truncated or different file is rewritten through the offer) ───────────────────────────
         // A record in any other status is on its way out (MarkedForDelete is swept after the
         // cooldown; Silent is never set by the daemon): its symbols are not "held", the chunk
         // goes through the offer path and the merge below makes the record Active again.
@@ -979,12 +979,16 @@ impl Processor {
             if !held_esis.contains(&symbol.esi) {
                 continue;
             }
-            let on_disk =
-                match tokio::fs::metadata(block_dir.join(format!("{}.bin", symbol.esi))).await {
-                    Ok(m) => m.len() == symbol.data.len() as u64,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(e) => return Err(e.into()),
-                };
+            // Length AND bytes: a same-length file with other bytes (bit rot, a PoS `Fail` that
+            // left bad bytes) is not held — the chunk goes through the offer path and the file
+            // is rewritten. One read of <= SYMBOL_SIZE per held symbol of a resend: off the
+            // fresh-write path, resends are rare.
+            let on_disk = match tokio::fs::read(block_dir.join(format!("{}.bin", symbol.esi))).await
+            {
+                Ok(bytes) => bytes == symbol.data,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e.into()),
+            };
             if on_disk {
                 already_held.push(symbol.esi);
             }
@@ -1047,7 +1051,9 @@ impl Processor {
         // transfer and drop the offer.
         for symbol in &transfer.symbols {
             let esi = symbol.esi;
-            let in_range = already_held.contains(&esi)
+            // A held ESI (owner's Active record) is in range even when its bytes differ and it
+            // is rewritten: the rewrite adds no new symbol, the offer need not cover it.
+            let in_range = held_esis.contains(&esi)
                 || accepted_esi_ranges
                     .iter()
                     .any(|&(start, count)| esi >= start && esi < start + count);
@@ -1076,7 +1082,15 @@ impl Processor {
                 continue;
             }
             let sym_path = block_dir.join(format!("{}.bin", symbol.esi));
-            tokio::fs::write(&sym_path, &symbol.data).await?;
+            if held_esis.contains(&symbol.esi) {
+                // Rewrite of a held file (truncated or other bytes): a PoS read in between must
+                // see the old or the new file, never half of one — write aside, then rename.
+                let tmp_path = block_dir.join(format!("{}.bin.tmp", symbol.esi));
+                tokio::fs::write(&tmp_path, &symbol.data).await?;
+                tokio::fs::rename(&tmp_path, &sym_path).await?;
+            } else {
+                tokio::fs::write(&sym_path, &symbol.data).await?;
+            }
             received_esis.push(symbol.esi);
             total_bytes += symbol.data.len() as u64;
         }
