@@ -35,6 +35,8 @@ pub struct RestoreJobs {
     /// Wakes the backup worker's loop when the set of unfinished jobs changes (Q-V9, spec
     /// v3.12b). Only a wake: the gate itself is computed from the registry (`has_unfinished`).
     gate_wake: Option<crate::daemon::work_pipeline::GateWake>,
+    /// How long the backup has been paused (the gate's reading; `status` asks it).
+    pause_watch: Arc<crate::daemon::work_pipeline::PauseWatch>,
 }
 
 #[derive(Debug, Default)]
@@ -115,7 +117,18 @@ impl RestoreJobs {
             inner: Arc::new(Mutex::new(JobsInner::default())),
             staging_root,
             gate_wake: None,
+            pause_watch: crate::daemon::work_pipeline::PauseWatch::new(),
         }
+    }
+
+    /// The watch of the backup pause: the gate built over this registry shares it.
+    pub fn pause_watch(&self) -> Arc<crate::daemon::work_pipeline::PauseWatch> {
+        Arc::clone(&self.pause_watch)
+    }
+
+    /// The pause has lasted longer than `BACKUP_PAUSE_WARN_AFTER` (`status`).
+    pub fn backup_pause_overlong(&self) -> bool {
+        crate::daemon::work_pipeline::RESTORE_PAUSES_BACKUP && self.pause_watch.overlong()
     }
 
     /// The notifier of the backup worker's gate: bumped at every change of the set of jobs.

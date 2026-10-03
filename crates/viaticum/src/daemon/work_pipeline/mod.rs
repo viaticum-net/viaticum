@@ -34,7 +34,10 @@ mod tests;
 #[cfg(test)]
 mod tests_budget;
 
-pub use gate::{GateWake, RestoreGate, new_gate_wake, notify_gate};
+pub use gate::{
+    BACKUP_PAUSE_WARN_AFTER, GateWake, PauseWatch, RestoreGate, new_gate_wake, notify_gate,
+    restore_gate,
+};
 pub use pool::{PoolSnapshot, pool_signature, snapshot_pool};
 
 // ─── Q-V9: restore or backup first ────────────────────────────────────────────
@@ -181,8 +184,8 @@ enum BlockAttempt {
     /// The block left service before its offers were written (repair-i16); parked; the
     /// next block may do better.
     LeftService,
-    /// The turn stopped before it encoded anything: the restore gate went up while it waited for
-    /// its permit (spec v3.12b WARN-1). Not parked, no cooldown: the block is picked again when
+    /// The turn stopped before it offered anything: the restore gate went up while it waited for
+    /// its permit or while it encoded (spec v3.12b WARN-1). Not parked, no cooldown: the block is picked again when
     /// the gate comes down; the iteration ends.
     Paused,
 }
@@ -318,9 +321,18 @@ impl WorkPipeline {
     /// Q-V9 (a): the gate is up and the constant says restore comes first — no new iteration.
     /// One INFO line per pause.
     fn paused_for_restore(&mut self) -> bool {
-        if !self.turn_gate().is_some_and(RestoreGate::is_up) {
+        let Some(gate) = self.turn_gate().filter(|g| g.is_up()) else {
             self.pause_announced = false;
             return false;
+        };
+        if let Some(held) = gate.take_overlong_warning() {
+            tracing::warn!(
+                paused_for_h = held.as_secs() / 3600,
+                "work_pipeline: the backup has been paused for over {} h — a restore job or a DR \
+                 session still holds the gate (a restore job whose coordinator died holds it \
+                 until the node restarts)",
+                BACKUP_PAUSE_WARN_AFTER.as_secs() / 3600
+            );
         }
         if !self.pause_announced {
             self.pause_announced = true;
@@ -567,8 +579,9 @@ impl WorkPipeline {
                 if wo.left_service {
                     self.update_block_cooldown(block, pool, now, Some(ParkReason::LeftService));
                     Ok(BlockAttempt::LeftService)
-                } else if wo.yielded && !wo.encoded {
-                    // Stopped by the gate before the encode: nothing was tried, nothing parked.
+                } else if wo.yielded && wo.offered == 0 {
+                    // Stopped by the gate before any offer (before the encode, or after it: the
+                    // job started while the encoder ran): nothing was tried, nothing parked.
                     Ok(BlockAttempt::Paused)
                 } else if wo.offered > 0 {
                     // Offers went out (accepted or not): retry after the normal

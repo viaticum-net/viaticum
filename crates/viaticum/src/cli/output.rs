@@ -75,6 +75,12 @@ pub fn render_status(data: &StatusData) -> String {
     if data.backup_paused_while_restoring {
         out.push_str("  backup:         paused while restoring\n");
     }
+    if data.backup_pause_overlong {
+        out.push_str(&format!(
+            "  backup:         paused for over {} h: a restore job may be stuck\n",
+            crate::daemon::work_pipeline::BACKUP_PAUSE_WARN_AFTER.as_secs() / 3600
+        ));
+    }
     out.push_str(&render_dr_readiness(data));
     // holder-i1/i2: 0 is "no room", never "unlimited"; an unread disk says so.
     let quota_str = match data.quota_state.as_str() {

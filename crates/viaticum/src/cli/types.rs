@@ -231,6 +231,10 @@ pub struct StatusData {
     /// «backup paused while restoring». Absent when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub backup_paused_while_restoring: bool,
+    /// The pause has lasted longer than `BACKUP_PAUSE_WARN_AFTER` (6 h): a restore job may be
+    /// stuck (spec v3.12b NOTE 2). Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backup_pause_overlong: bool,
 }
 
 /// The lease a `viaticum dr` holds on this node's block work budget (`status`).

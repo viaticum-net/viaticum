@@ -303,6 +303,7 @@ fn make_status_zero_peers() -> StatusData {
         block_work_budget_bytes: 0,
         dr_lease: None,
         backup_paused_while_restoring: false,
+        backup_pause_overlong: false,
     }
 }
 
@@ -526,6 +527,7 @@ fn format_status_top_peers_printed() {
         block_work_budget_bytes: 0,
         dr_lease: None,
         backup_paused_while_restoring: false,
+        backup_pause_overlong: false,
     };
     let rendered = output::render_status(&data);
     assert!(rendered.contains("a1b2c3d4"), "got: {rendered}");
@@ -993,6 +995,7 @@ fn cli_response_roundtrips_cbor() {
             block_work_budget_bytes: 0,
             dr_lease: None,
             backup_paused_while_restoring: false,
+            backup_pause_overlong: false,
         })),
         CliResponse::DeviceList(vec![]),
         CliResponse::Error("oops".into()),

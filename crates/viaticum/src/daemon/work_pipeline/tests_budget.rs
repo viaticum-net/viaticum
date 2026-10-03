@@ -2757,10 +2757,12 @@ async fn backup_resumes_when_the_last_restore_job_finishes_or_is_removed() {
     let staging = tempfile::tempdir().unwrap();
     let wake = super::new_gate_wake();
     let jobs = RestoreJobs::new(staging.path().to_path_buf()).with_gate_wake(Arc::clone(&wake));
-    let gate = {
-        let jobs = jobs.clone();
-        super::RestoreGate::new(&wake, move || jobs.has_unfinished())
-    };
+    let leases = crate::daemon::mem_budget::DrLeases::with_gate_wake(
+        MemBudget::new(MIB),
+        Duration::from_secs(3600),
+        Arc::clone(&wake),
+    );
+    let gate = super::restore_gate(&jobs, &leases, &wake);
 
     let data_dir = tempfile::tempdir().unwrap();
     let db = db();
@@ -2990,5 +2992,229 @@ async fn acked_takes_only_this_block_and_the_chunk_esis() {
             .map(|p| p.status),
         Some(PlacementStatus::Alive),
         "{outcome:?}"
+    );
+}
+
+// ─── К-b2a⁵ ───────────────────────────────────────────────────────────────────────────────────
+
+/// WARN-1 (K-b2a^5). A restore job starts WHILE THE ENCODER RUNS (up to minutes on 1 GiB): the
+/// gate is read once more after the encode, before the first holder. No offer, no chunk, no
+/// placement is written; the permit is back; the turn ends as a pause (`yielded`, nothing
+/// offered). Mutation: without the check after the encode the first holder gets its offer and
+/// first chunk (the attempt counter is 0, so neither boundary rule fires) — `offers_total` is 1+.
+#[tokio::test]
+async fn job_started_during_the_encode_stops_the_turn_before_the_first_offer() {
+    let (flag, gate, _wake) = flag_gate();
+    let mut rig = Rig::new(YIELD_BUDGET_MIB, BIG_CHUNK);
+    rig.gate = Some(gate);
+    let rec = retained(rig.data_dir.path(), 0x3a, BIG_K, BIG_T);
+    rig.db.upsert_source_block(&rec).unwrap();
+    let mut net = Net::new(0x6e).await;
+    let holders = [
+        net.holder(0x84, &rig.budget, Hooks::default()).await,
+        net.holder(0x85, &rig.budget, Hooks::default()).await,
+    ];
+    let swarm = net.ready();
+    let devices: Vec<DeviceId> = holders.iter().map(|h| h.device_id).collect();
+    // The job starts at the moment the encoder is called (the gate was down before it).
+    let raised = Arc::clone(&flag);
+    let encoder = SpyEncoder::spying(move |_| raised.store(true, Ordering::SeqCst));
+
+    let outcome = rig
+        .turn(&encoder, &swarm, &rec, &pool_of(&devices), 0)
+        .await
+        .unwrap();
+
+    assert!(
+        outcome.yielded && outcome.encoded && outcome.offered == 0,
+        "{outcome:?}"
+    );
+    assert_eq!(offers_total(&holders), 0, "nobody was asked");
+    assert_eq!(transfers_total(&holders), 0, "no chunk went out");
+    assert!(placement_statuses(&rig.db, &rec.block_id).is_empty());
+    assert_eq!(rig.budget.outstanding_bytes(), 0, "the permit is back");
+}
+
+/// R-a4-3 (K-b2a^5). A turn that ended as `Paused` leaves the block as it was: no cooldown, not
+/// parked. After the restore the SAME block is picked at once (the cooldown is 30 s here and not
+/// reset), and the encode is the one re-encode of the job. Mutation `Paused` -> park as
+/// `NoCandidates` (or the condition of `Paused` without the pause after the encode): the cooldown
+/// is set after the first iteration, and the second one picks nothing.
+#[tokio::test]
+async fn paused_block_has_no_cooldown_and_is_picked_first_after_the_pause() {
+    use super::tests::{add_pool_peers, device_id, lonely_swarm, retained_block};
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let db = db();
+    add_pool_peers(&db, &[device_id(0xC7), device_id(0xC8)]);
+    let rec = retained_block(data_dir.path(), 0xC9, 1.0);
+    db.upsert_source_block(&rec).unwrap();
+    let mut config = super::tests::make_config();
+    config.data_dir = data_dir.path().to_path_buf();
+    let (flag, gate, _wake) = flag_gate();
+    let encodes = Arc::new(AtomicUsize::new(0));
+    let (counted, raised) = (Arc::clone(&encodes), Arc::clone(&flag));
+    let encoder = SpyEncoder::spying(move |_| {
+        // The first encode is the one the job starts during.
+        if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+            raised.store(true, Ordering::SeqCst);
+        }
+    });
+    let (_events_tx, events_rx) = tokio::sync::mpsc::channel(4);
+    let mut pipeline = super::WorkPipeline::new(
+        db.clone(),
+        config,
+        encoder,
+        Some(lonely_swarm(0x43).await),
+        None,
+        None,
+        None,
+        events_rx,
+    )
+    .with_restore_gate(gate);
+    let cooldown = || db.block_cooldown(&rec.block_id);
+
+    assert!(
+        pipeline.run_iteration().await.unwrap(),
+        "the block was picked"
+    );
+    assert_eq!(encodes.load(Ordering::SeqCst), 1, "stand: the turn encoded");
+    assert!(
+        cooldown().last_attempted_at.is_none(),
+        "paused: no cooldown, not parked"
+    );
+    // The job is still on: nothing is picked.
+    assert!(!pipeline.run_iteration().await.unwrap());
+
+    // The job is over: the same block, at once.
+    flag.store(false, Ordering::SeqCst);
+    assert!(
+        pipeline.run_iteration().await.unwrap(),
+        "the paused block is picked first, without waiting out a cooldown"
+    );
+    assert!(
+        encodes.load(Ordering::SeqCst) >= 2,
+        "the block is encoded again"
+    );
+    assert!(cooldown().last_attempted_at.is_some(), "now it was worked");
+}
+
+/// WARN-2 (K-b2a^5). The gate of the DAEMON is `restore_gate(jobs, leases, wake)` — the daemon
+/// builds it with this very function — and it is up for an unfinished job AND for a DR session
+/// (a lease held; then the 30 s window). Mutation: remove `|| leases.session_active()` from the
+/// function — the unit fails at the first lease assertion; remove `has_unfinished` — at the job.
+#[tokio::test(start_paused = true)]
+async fn the_daemons_gate_is_up_for_a_restore_job_and_for_a_dr_session() {
+    use crate::daemon::mem_budget::DrLeases;
+    use crate::daemon::restore::{jobs::RestoreJobs, staging::JobId};
+
+    let staging = tempfile::tempdir().unwrap();
+    let wake = super::new_gate_wake();
+    let jobs = RestoreJobs::new(staging.path().to_path_buf()).with_gate_wake(Arc::clone(&wake));
+    let leases = DrLeases::with_gate_wake(
+        MemBudget::new(1 << 30),
+        Duration::from_secs(3600),
+        Arc::clone(&wake),
+    );
+    let gate = super::restore_gate(&jobs, &leases, &wake);
+    assert!(!gate.is_up(), "nothing runs: down");
+
+    // A job alone.
+    let id = JobId::new();
+    jobs.submit(id, "a", 1);
+    assert!(gate.is_up(), "a queued job raises the gate");
+    jobs.finish(id, false);
+    assert!(!gate.is_up(), "the job is finished: down");
+
+    // A DR session alone.
+    let lease = leases
+        .lease(SourceBlockId([9; 32]), 16 * MIB)
+        .await
+        .unwrap();
+    assert!(gate.is_up(), "a lease held raises the gate");
+    drop(lease);
+    assert!(gate.is_up(), "the 30 s window of the session");
+    tokio::time::advance(Duration::from_secs(31)).await;
+    assert!(!gate.is_up(), "the session is over: down");
+}
+
+/// A clock the unit moves by hand (the real `Instant` plus an offset).
+fn hand_clock() -> (
+    Arc<Mutex<Duration>>,
+    impl Fn() -> std::time::Instant + Send + Sync,
+) {
+    let base = std::time::Instant::now();
+    let shift = Arc::new(Mutex::new(Duration::ZERO));
+    let read = Arc::clone(&shift);
+    (shift, move || base + *read.lock().unwrap())
+}
+
+/// NOTE-2 (K-b2a^5). A pause longer than `BACKUP_PAUSE_WARN_AFTER` (6 h) is one WARN per pause and
+/// a flag for `status`; a shorter one is neither; a gate that went down and up again starts a new
+/// pause with its own warning. The clock is injected. Mutation: no warning in
+/// `paused_for_restore` — the count of lines stays 0; the warning on every reading — it grows
+/// with the readings.
+#[tokio::test]
+async fn a_pause_over_six_hours_warns_once_and_shows_in_status() {
+    use super::tests::{add_pool_peers, device_id, lonely_swarm, pipeline_with};
+
+    let (logs, _guard) = capture_logs();
+    let (shift, clock) = hand_clock();
+    let watch = super::PauseWatch::with_clock(clock);
+    let (flag, gate, _wake) = flag_gate();
+    let gate = gate.with_pause_watch(Arc::clone(&watch));
+    let db = db();
+    add_pool_peers(&db, &[device_id(0xCA), device_id(0xCB)]);
+    let mut pipeline = pipeline_with(
+        &db,
+        super::tests::make_config(),
+        Some(lonely_swarm(0x44).await),
+    )
+    .with_restore_gate(gate);
+    let warned = || {
+        logs.text()
+            .lines()
+            .filter(|l| l.contains("WARN") && l.contains("the backup has been paused for over 6 h"))
+            .count()
+    };
+    let step = |by: Duration| *shift.lock().unwrap() += by;
+    let hour = Duration::from_secs(3600);
+
+    flag.store(true, Ordering::SeqCst);
+    for _ in 0..3 {
+        assert!(!pipeline.run_iteration().await.unwrap());
+    }
+    step(5 * hour + Duration::from_secs(3000));
+    assert!(!pipeline.run_iteration().await.unwrap());
+    assert_eq!(warned(), 0, "under 6 h: silent");
+    assert!(!watch.overlong());
+
+    step(Duration::from_secs(700));
+    for _ in 0..3 {
+        assert!(!pipeline.run_iteration().await.unwrap());
+    }
+    assert_eq!(
+        warned(),
+        1,
+        "over 6 h: one WARN for the pause\n{}",
+        logs.text()
+    );
+    assert!(watch.overlong(), "and the flag for status");
+
+    // The gate comes down: the pause is over, the flag with it.
+    flag.store(false, Ordering::SeqCst);
+    pipeline.run_iteration().await.unwrap();
+    assert!(!watch.overlong());
+    // A new pause has its own count.
+    flag.store(true, Ordering::SeqCst);
+    assert!(!pipeline.run_iteration().await.unwrap());
+    step(7 * hour);
+    assert!(!pipeline.run_iteration().await.unwrap());
+    assert!(!pipeline.run_iteration().await.unwrap());
+    assert_eq!(
+        warned(),
+        2,
+        "the second pause warns once more\n{}",
+        logs.text()
     );
 }
