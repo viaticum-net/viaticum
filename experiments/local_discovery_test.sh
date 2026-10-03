@@ -49,7 +49,8 @@
 #                  >= 95 % ROUGH, else FAIL); every sample: friends connected - busy - infra
 #                  - closing <= CAP_eff and protected_peers <= 16; seed connected = its
 #                  authenticated (CAP modes: 39); known ⊇ authenticated: (a) authenticated
-#                  > 30 s and in unaddressed_devices = FAIL, (b) no PeerRecord yet = NOTE
+#                  and in unaddressed_devices > 30 s (clocked from its first sample
+#                  there) = FAIL, (b) no PeerRecord yet = NOTE
 #                  with the max lag <= 150 s, FAIL beyond, (c) any `event_tx full or
 #                  closed` line in a daemon log = FAIL (also step 3);
 #                  H1..H4 signature printed (spec §2.4) (i14, i18, i41) — status, logs
@@ -428,9 +429,14 @@ check_cap_sample() {
 # known ⊇ authenticated (fix rounds 1 and 3, network-i14). All owners of this run are
 # different masters (no siblings), so every peer a node is authenticated with must get a
 # PeerRecord with an address. AUTH_SINCE[i:hex8] = the first sample that showed the pair
-# authenticated (the real authentication is up to one sample earlier). Three bars:
-#  (a) authenticated > 30 s and listed in unaddressed_devices -> FAIL "PeerRecord without
-#      an address" (the identify addresses lost: fix round 1's race);
+# authenticated (the real authentication is up to one sample earlier); UD_SINCE[i:hex8] =
+# the first sample that listed the peer in node i's unaddressed_devices (forgotten when it
+# leaves the list). Three bars:
+#  (a) authenticated and listed in unaddressed_devices for > 30 s, clocked from UD_SINCE
+#      -> FAIL "PeerRecord without an address" (the identify addresses lost: fix round 1's
+#      race). Not from AUTH_SINCE (fix round 4): a record the writer is late with (bar b)
+#      shows up without an address first and gets it from identify a batch later — that
+#      lag is bar b's, it must not count against bar a;
 #  (b) authenticated but in neither known_devices nor unaddressed_devices = no PeerRecord
 #      yet: the writer's lag. It is clocked until the record shows up (also after the pair
 #      left the authenticated list: records are never deleted); NOTE with the max lag per
@@ -438,7 +444,7 @@ check_cap_sample() {
 #  (c) event_drop_verdict below.
 # A build without unaddressed_devices (UD = NA) cannot tell (a) from (b): the old bar,
 # "not in known_devices after 30 s" = FAIL. Independent of TIME_SCALE.
-declare -A AUTH_SINCE NOREC_SINCE MAX_REC_LAG
+declare -A AUTH_SINCE UD_SINCE NOREC_SINCE MAX_REC_LAG
 KNOWN_AUTH_BAD=""; REC_LAG_BAD=""; UD_NA_NODES=""
 REC_LAG_BAR=150
 check_known_covers_auth() {
@@ -462,6 +468,14 @@ check_known_covers_auth() {
         done
         if [ "${UD[$i]:-NA}" = NA ]; then
             [[ "$UD_NA_NODES" == *" $i "* ]] || UD_NA_NODES="$UD_NA_NODES $i "
+        else
+            for key in "${!UD_SINCE[@]}"; do   # left unaddressed: forget the start
+                [ "${key%%:*}" = "$i" ] || continue
+                in_list "${key#*:}" "${UD[$i]}" || unset "UD_SINCE[$key]"
+            done
+            for h in $(echo "${UD[$i]}" | tr ',' ' '); do
+                [ -n "${UD_SINCE[$i:$h]:-}" ] || UD_SINCE[$i:$h]=$now
+            done
         fi
         for h in $(echo "${AD[$i]:-}" | tr ',' ' '); do
             key="$i:$h"
@@ -475,7 +489,7 @@ check_known_covers_auth() {
                 continue
             fi
             if in_list "$h" "${UD[$i]}"; then
-                if [ $(( now - seen )) -gt 30 ]; then
+                if [ $(( now - ${UD_SINCE[$key]:-$now} )) -gt 30 ]; then
                     [[ "$KNOWN_AUTH_BAD" == *" node-$i>$h"* ]] || KNOWN_AUTH_BAD="$KNOWN_AUTH_BAD node-$i>$h"
                 fi
                 continue
@@ -492,9 +506,9 @@ known_auth_verdict() {
         note "status has no unaddressed_devices on nodes$UD_NA_NODES(build before C4 fix round 3): there 'not known after 30 s' is the bar, a missing record and a record without an address are not told apart"
     fi
     if [ -z "$KNOWN_AUTH_BAD" ]; then
-        pass "no peer authenticated for > 30 s has a PeerRecord without an address (known ⊇ authenticated, bar a)"
+        pass "no authenticated peer stayed in unaddressed_devices for > 30 s (known ⊇ authenticated, bar a)"
     else
-        fail "PeerRecord without an address: authenticated > 30 s, listed in unaddressed_devices (no build field: not in known_devices) — node>peer:$(echo "$KNOWN_AUTH_BAD" | cut -c1-400)"
+        fail "PeerRecord without an address: authenticated and listed in unaddressed_devices for > 30 s (no build field: authenticated > 30 s, not in known_devices) — node>peer:$(echo "$KNOWN_AUTH_BAD" | cut -c1-400)"
     fi
     for key in "${!NOREC_SINCE[@]}"; do   # still no record: the lag so far
         i="${key%%:*}"; lag=$(( now - ${NOREC_SINCE[$key]} ))

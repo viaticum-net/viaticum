@@ -350,6 +350,21 @@ fn status_data_without_staging_fields_deserializes_with_zero() {
     assert!(!back.restore_staging_squeezes_holdings);
 }
 
+/// C-DK C4 fix round 4 (N8): `peer_record_dropped` is a top-level status field (the
+/// connection-cache block is flattened); a daemon without it reads as 0.
+#[test]
+fn status_peer_record_dropped_is_top_level_and_defaults_to_zero() {
+    let mut data = make_status_zero_peers();
+    data.conn_cache.peer_record_dropped = 7;
+    let mut v = serde_json::to_value(&data).unwrap();
+    assert_eq!(v["peer_record_dropped"], 7, "flattened into the top level");
+    let back: StatusData = serde_json::from_value(v.clone()).unwrap();
+    assert_eq!(back.conn_cache.peer_record_dropped, 7);
+    v.as_object_mut().unwrap().remove("peer_record_dropped");
+    let old: StatusData = serde_json::from_value(v).unwrap();
+    assert_eq!(old.conn_cache.peer_record_dropped, 0);
+}
+
 /// W3: right after start the byte count is not known yet: say so, never "0 B".
 #[test]
 fn render_status_says_counting_before_bytes_are_known() {

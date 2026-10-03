@@ -316,8 +316,12 @@ impl Processor {
     ) -> anyhow::Result<()> {
         let this = Arc::new(self);
         // The PeerRecord writer: stopped (after writing what is queued) when
-        // this loop ends, whichever way.
-        let writer_cancel = cancel.child_token();
+        // this loop ends, whichever way. Its own token, NOT a child of `cancel`:
+        // a child would stop the writer at the same moment as the loop, and the
+        // loop's `select!` may still take one more event and push it after the
+        // writer has written its last batch — that event would be lost (fix
+        // round 4, N2). Cancelled below, after the loop has ended.
+        let writer_cancel = CancellationToken::new();
         let writer = tokio::spawn(peer_record_writer::run_writer(
             this.clone(),
             writer_cancel.clone(),
@@ -352,14 +356,16 @@ impl Processor {
                             // writer spawns the after-steps once the record is
                             // committed.
                             let _ = peer_id;
-                            if this.admit_authenticated(device_id, identity_pub, &device_cert) {
-                                this.peer_records.push(PeerRecordEvent::Authenticated {
+                            if this.admit_authenticated(device_id, identity_pub, &device_cert)
+                                && !this.peer_records.push(PeerRecordEvent::Authenticated {
                                     device_id,
                                     identity_pub,
                                     device_cert: Box::new(device_cert),
                                     x25519_pub,
                                     listen_addrs: peer::addr_strings(&listen_addrs),
-                                });
+                                })
+                            {
+                                this.swarm.note_peer_record_dropped();
                             }
                         }
                         Some(ProtocolEvent::InboundRequest {
@@ -422,16 +428,19 @@ impl Processor {
                         }
                         Some(ProtocolEvent::PeerIdentified { device_id, listen_addrs }) => {
                             // To the writer, behind the authentication it follows.
-                            this.peer_records.push(PeerRecordEvent::Identified {
+                            if !this.peer_records.push(PeerRecordEvent::Identified {
                                 device_id,
                                 listen_addrs: peer::addr_strings(&listen_addrs),
-                            });
+                            }) {
+                                this.swarm.note_peer_record_dropped();
+                            }
                         }
                     }
                 }
             }
         }
 
+        // Every push of this loop is done: now the writer may write the rest and stop.
         writer_cancel.cancel();
         if let Err(e) = writer.await {
             error!(err = %e, "processor: PeerRecord writer task failed");

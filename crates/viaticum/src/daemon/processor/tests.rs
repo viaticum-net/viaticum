@@ -128,7 +128,11 @@ async fn make_swarm() -> Arc<SwarmHandle> {
     Arc::new(handle)
 }
 
-async fn make_processor(db: Db, holdings_dir: &TempDir) -> Processor {
+/// Also used by the PeerRecord writer's tests (`peer_record_writer/tests.rs`).
+pub(in crate::daemon::processor) async fn make_processor(
+    db: Db,
+    holdings_dir: &TempDir,
+) -> Processor {
     make_processor_with_quota(db, holdings_dir, u64::MAX, u64::MAX).await
 }
 

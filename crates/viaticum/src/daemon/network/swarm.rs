@@ -644,6 +644,8 @@ pub struct SwarmHandle {
     /// C-DK Р-18: work-pipeline wakes the processor suppressed. Kept here
     /// because the handle is the one object both the processor and status share.
     work_wakes_suppressed: std::sync::atomic::AtomicU64,
+    /// PeerRecord events dropped at the writer's queue cap (C-DK C4 fix round 4, N8).
+    peer_record_dropped: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for SwarmHandle {
@@ -978,6 +980,7 @@ impl SwarmHandle {
             address_book: config.conn_policy.address_book,
             time_scale: config.conn_policy.time_scale,
             work_wakes_suppressed: std::sync::atomic::AtomicU64::new(0),
+            peer_record_dropped: std::sync::atomic::AtomicU64::new(0),
         };
         Ok((handle, event_rx))
     }
@@ -1066,6 +1069,19 @@ impl SwarmHandle {
     /// C-DK Р-18: work-pipeline wakes suppressed so far (status).
     pub fn work_wakes_suppressed(&self) -> u64 {
         self.work_wakes_suppressed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The processor dropped one PeerRecord event at the writer's queue cap
+    /// (C-DK C4 fix round 4, N8).
+    pub(crate) fn note_peer_record_dropped(&self) {
+        self.peer_record_dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// PeerRecord events dropped at the writer's queue cap so far (status).
+    pub fn peer_record_dropped(&self) -> u64 {
+        self.peer_record_dropped
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

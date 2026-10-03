@@ -25,8 +25,10 @@
 //
 // Bounded, lossless, never waiting. The queue holds at most one entry per device; a
 // repeated event of a queued device folds into its entry and costs no memory. The number of
-// distinct devices is capped at `PENDING_MAX` (an ERROR drops a NEW device beyond it —
-// that many distinct peers authenticated within one commit is a flood, not a network). A
+// distinct devices is capped at `PENDING_MAX` (a NEW device beyond it is dropped — that many
+// distinct peers authenticated within one commit is a flood, not a network; an ERROR at
+// most once per `DROP_LOG_EVERY` names how many were dropped since the last one, and the
+// daemon counts every drop in `status` as `peer_record_dropped`). A
 // WARN marks the queue growing past `PENDING_WARN` (the disk is far behind). `push` takes
 // a std mutex for a map insert and returns; the loop never awaits the writer. Hence no
 // bounded mpsc: a full mpsc forces the producer to wait (the loop must not) or to drop
@@ -38,17 +40,34 @@
 // dedicated OS thread would do the same but needs its own wake-up and shutdown plumbing;
 // the async task gets both from `Notify` and the cancellation token.
 //
+// Revocation. `Processor::run` admits an authentication (revocation check) before it
+// pushes it; a revocation committed between the push and the batch is seen inside the
+// batch's transaction (`PeerBatch::is_device_revoked`, the same two lists): the entry is
+// not written and its after-steps do not run (C-DK C4 fix round 4, N1).
+//
 // After the commit. For every authentication written the writer spawns
 // `Processor::after_peer_authenticated` (cluster auto-add, PeerAnnounce, work wake) — the
 // steps that may wait on the network, as before, now strictly after the record exists.
 //
+// Shutdown. The writer has its own token, cancelled by `Processor::run` only after its
+// loop has ended: every push happens before the cancel, and the writer writes what is
+// queued once it sees it (fix round 4, N2).
+//
 // No deadlock: the loop holds the queue mutex only for a map operation and never waits on
 // the writer; the writer holds it only to take a batch and never while writing; the write
-// transaction holds redb's single writer lock and nothing else, and a concurrent
-// `update_peer` (PeerAnnounce) just waits for it — each sees the other's commit whole.
+// transaction holds redb's single writer lock and nothing else (the cluster state is read
+// from its table, not through the in-memory `ClusterState` mutex, which is taken BEFORE
+// redb's writer lock elsewhere), and a concurrent `update_peer` (PeerAnnounce) just waits
+// for it.
+//
+// Lost updates. Against `update_peer` each sees the other's commit whole. Not against the
+// writers that read with `get_peer` and write back with `upsert_peer` in two transactions:
+// a batch committed between the two is overwritten. The list and why it is left as it is:
+// `Db::update_peers` in viaticum-core (`db/peer_batch`).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -67,8 +86,10 @@ mod tests;
 pub(crate) const BATCH_MAX: usize = 256;
 /// A WARN when this many devices wait for the writer (once per backlog).
 pub(crate) const PENDING_WARN: usize = 1024;
-/// Most distinct devices waiting; a new device beyond it is dropped with an ERROR.
+/// Most distinct devices waiting; a new device beyond it is dropped.
 pub(crate) const PENDING_MAX: usize = 16_384;
+/// The ERROR about devices dropped at the cap: at most once per this.
+pub(crate) const DROP_LOG_EVERY: Duration = Duration::from_secs(10);
 
 /// One PeerRecord event, in the swarm's order.
 #[derive(Debug, Clone)]
@@ -174,6 +195,44 @@ struct PendingState {
     by_device: HashMap<DeviceId, PendingPeer>,
     /// The PENDING_WARN line was printed for the current backlog.
     warned: bool,
+    /// Drops at the cap not yet reported by an ERROR.
+    dropped_unreported: u64,
+    /// When the last drop ERROR was printed.
+    last_drop_log: Option<Instant>,
+}
+
+impl PendingState {
+    /// One drop at the cap at `now`: `Some(n)` = print the ERROR now, `n` dropped since the
+    /// last one (this one included); `None` = within `DROP_LOG_EVERY` of the last line.
+    fn note_drop(&mut self, now: Instant) -> Option<u64> {
+        self.dropped_unreported += 1;
+        self.drop_report_due(now)
+    }
+
+    /// The drops not yet reported, when the last report is `DROP_LOG_EVERY` old (or none
+    /// was printed yet); the count is reset then.
+    fn drop_report_due(&mut self, now: Instant) -> Option<u64> {
+        if self.dropped_unreported == 0 {
+            return None;
+        }
+        if self
+            .last_drop_log
+            .is_some_and(|t| now.saturating_duration_since(t) < DROP_LOG_EVERY)
+        {
+            return None;
+        }
+        self.last_drop_log = Some(now);
+        Some(std::mem::take(&mut self.dropped_unreported))
+    }
+}
+
+fn log_drops(dropped: u64, pending: usize) {
+    error!(
+        dropped,
+        pending,
+        every_secs = DROP_LOG_EVERY.as_secs(),
+        "peer-record writer: queue at its cap of distinct devices, events of new devices dropped since the last such line"
+    );
 }
 
 /// The writer's queue: one folded entry per device (see the module comment).
@@ -193,7 +252,8 @@ impl PeerRecordQueue {
     }
 
     /// Queue `event` behind everything pushed before it and wake the writer. Never waits
-    /// for the writer. Returns false only when a NEW device is refused at the cap.
+    /// for the writer. Returns false only when a NEW device is refused at the cap (the
+    /// caller counts it for `status`; the ERROR is rate-limited here).
     pub(crate) fn push(&self, event: PeerRecordEvent) -> bool {
         if event.is_noop() {
             return true;
@@ -205,8 +265,11 @@ impl PeerRecordQueue {
                 entry.fold(event);
             } else {
                 if st.by_device.len() >= self.max_devices {
-                    error!(device = %device_id, pending = st.by_device.len(),
-                        "peer-record writer: queue at its cap of distinct devices, event of a new device dropped");
+                    let pending = st.by_device.len();
+                    if let Some(dropped) = st.note_drop(Instant::now()) {
+                        log_drops(dropped, pending);
+                    }
+                    debug!(device = %device_id, "peer-record writer: event of a new device dropped at the cap");
                     return false;
                 }
                 let mut entry = PendingPeer::new(device_id);
@@ -241,6 +304,11 @@ impl PeerRecordQueue {
         }
         if st.by_device.is_empty() {
             st.warned = false;
+        }
+        // Drops after the last ERROR line are reported once its window has passed, even
+        // when no further drop comes.
+        if let Some(dropped) = st.drop_report_due(Instant::now()) {
+            log_drops(dropped, st.by_device.len());
         }
         batch
     }
@@ -321,6 +389,8 @@ fn write_entry(
 ) -> Result<Option<WrittenAuth>, DbError> {
     let current = b.get(&device_id)?;
     let Some(auth) = auth else {
+        // An identify alone: as before, the addresses of whatever record exists (a revoked
+        // device's record included — admission never gated identify).
         if let (Some(mut record), Some(addrs)) = (current, addrs)
             && record.addrs != addrs
         {
@@ -329,6 +399,12 @@ fn write_entry(
         }
         return Ok(None);
     };
+    // N1: revoked after admission, before this commit — not written, no after-steps.
+    if b.is_device_revoked(&device_id)? {
+        warn!(device = %device_id, master = %auth.identity_pub,
+            "peer-record writer: device revoked after its authentication was admitted — record not written");
+        return Ok(None);
+    }
     let is_new_peer = current.is_none();
     let mut record = match current {
         Some(mut existing) => {
@@ -383,9 +459,12 @@ fn write_entry(
 /// network-i2) and stops; the after-steps are skipped then.
 pub(crate) async fn run_writer(processor: Arc<Processor>, cancel: CancellationToken) {
     loop {
+        // Cancellation first: once the token is cancelled every later round writes as a
+        // stopping one (no after-steps), whatever wake permit is stored.
         let stopping = tokio::select! {
-            _ = processor.peer_records.wake.notified() => false,
+            biased;
             _ = cancel.cancelled() => true,
+            _ = processor.peer_records.wake.notified() => false,
         };
         loop {
             let batch = processor.peer_records.take_batch(BATCH_MAX);

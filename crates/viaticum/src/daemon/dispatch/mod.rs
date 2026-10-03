@@ -273,9 +273,13 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
 
     // network-i41: the cache fields and the connected / authenticated counts
     // come from ONE ConnStats snapshot (taken after an eviction pass).
-    let (conn, work_wakes_suppressed) = match state.swarm_handle.as_ref() {
-        Some(s) => (s.conn_stats().await.ok(), s.work_wakes_suppressed()),
-        None => (None, 0),
+    let (conn, work_wakes_suppressed, peer_record_dropped) = match state.swarm_handle.as_ref() {
+        Some(s) => (
+            s.conn_stats().await.ok(),
+            s.work_wakes_suppressed(),
+            s.peer_record_dropped(),
+        ),
+        None => (None, 0, 0),
     };
     let conn = conn.unwrap_or_default();
     let (peer_count_connected, peer_count_authenticated) = (conn.connected, conn.authenticated);
@@ -290,6 +294,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         on_demand_dials_failed: conn.on_demand_failed,
         on_demand_neg_cached: conn.on_demand_neg_cached,
         work_wakes_suppressed,
+        peer_record_dropped,
     };
 
     let by_importance = compute_importance_buckets(&source_blocks);

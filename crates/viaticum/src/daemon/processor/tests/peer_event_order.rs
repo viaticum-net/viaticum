@@ -298,3 +298,64 @@ async fn slow_disk_does_not_hold_the_processor_loop() {
     );
     assert_eq!(woken, 50, "every new peer is woken once, after its commit");
 }
+
+/// Fix round 4 (N8): an event the PeerRecord writer's queue refuses at its cap is
+/// counted on the swarm handle (`status` `peer_record_dropped`): an authentication and an
+/// identify of new devices alike. Cap 0 here: every new device is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_refused_at_the_queue_cap_are_counted_for_status() {
+    use std::time::{Duration, Instant};
+
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let mut processor = super::make_processor(db.clone(), &dir).await;
+    processor.peer_records = crate::daemon::processor::peer_record_writer::PeerRecordQueue::new(0);
+    let swarm = processor.swarm.clone();
+    assert_eq!(swarm.peer_record_dropped(), 0);
+    let (tx, rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+    let run = tokio::spawn(processor.run(rx, cancel.clone()));
+
+    let other_master = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]);
+    let other = IdentityPub(other_master.verifying_key().to_bytes());
+    for n in 0..3u8 {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[n.wrapping_add(60); 32]);
+        let device_id = DeviceId(key.verifying_key().to_bytes());
+        let peer_id = device_id_to_peer_id(&device_id).unwrap();
+        tx.send(ProtocolEvent::PeerAuthenticated {
+            peer_id,
+            device_id,
+            identity_pub: other,
+            device_cert: viaticum_core::cluster::issue_device_certificate(
+                &other_master,
+                device_id,
+                Timestamp::now(),
+            ),
+            x25519_pub: None,
+            listen_addrs: vec![],
+        })
+        .await
+        .unwrap();
+        tx.send(ProtocolEvent::PeerIdentified {
+            device_id,
+            listen_addrs: vec![
+                format!("/ip4/127.0.0.1/tcp/{}/p2p/{peer_id}", 23000 + n as u16)
+                    .parse()
+                    .unwrap(),
+            ],
+        })
+        .await
+        .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while swarm.peer_record_dropped() < 6 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cancel.cancel();
+    let _ = run.await;
+    assert_eq!(
+        swarm.peer_record_dropped(),
+        6,
+        "3 authentications + 3 identifies refused"
+    );
+}

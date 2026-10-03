@@ -120,3 +120,62 @@ fn update_peers_reads_its_own_writes() {
         1
     );
 }
+
+fn cluster_state_revoking(revoked: Vec<DeviceId>) -> crate::cluster::StoredClusterState {
+    crate::cluster::StoredClusterState {
+        master_pub: IdentityPub([0x33; 32]),
+        devices: vec![],
+        current_epoch: crate::cluster::EpochCounter(1),
+        epoch_history: vec![],
+        revoked_devices: revoked,
+        peer_affinity: vec![],
+        last_applied_seq: 0,
+        sync_cursors: std::collections::HashMap::new(),
+        cluster_addrs: std::collections::HashMap::new(),
+    }
+}
+
+/// C-DK C4 fix round 4 (N1): the batch sees a revocation in the cluster state committed
+/// before it began, as admission does.
+#[test]
+fn update_peers_sees_cluster_revocation_committed_before_it() {
+    let (db, _probe) = test_db_with_sync_probe();
+    let revoked = DeviceId([4; 32]);
+    let ((), _) = db
+        .update_peers(|b| {
+            assert!(!b.is_device_revoked(&revoked)?, "no cluster state yet");
+            Ok(())
+        })
+        .unwrap();
+    db.set_cluster_state(&cluster_state_revoking(vec![revoked]))
+        .unwrap();
+    let ((), committed) = db
+        .update_peers(|b| {
+            assert!(b.is_device_revoked(&revoked)?);
+            assert!(!b.is_device_revoked(&DeviceId([5; 32]))?);
+            Ok(())
+        })
+        .unwrap();
+    assert!(!committed, "a check writes nothing");
+}
+
+/// N1: a revocation of the device's key on its own PeerRecord (a signed revocation of its
+/// master) is seen too; a key revoked on another record is not this device's.
+#[test]
+fn update_peers_sees_record_revocation_of_the_device_itself() {
+    let (db, _probe) = test_db_with_sync_probe();
+    let mut r = record(6, vec![]);
+    r.revoked_device_pub_keys = vec![[6; 32]];
+    db.upsert_peer(&r).unwrap();
+    let mut other = record(7, vec![]);
+    other.revoked_device_pub_keys = vec![[8; 32]];
+    db.upsert_peer(&other).unwrap();
+    let ((), _) = db
+        .update_peers(|b| {
+            assert!(b.is_device_revoked(&DeviceId([6; 32]))?);
+            assert!(!b.is_device_revoked(&DeviceId([7; 32]))?);
+            assert!(!b.is_device_revoked(&DeviceId([8; 32]))?, "no record of 8");
+            Ok(())
+        })
+        .unwrap();
+}

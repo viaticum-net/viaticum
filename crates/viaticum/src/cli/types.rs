@@ -126,6 +126,11 @@ pub struct ConnCacheStatus {
     /// Work-pipeline wakes suppressed by the per-device rate (C-DK Р-18).
     #[serde(default)]
     pub work_wakes_suppressed: u64,
+    /// PeerRecord events (authentication / identify of a new device) dropped at the
+    /// PeerRecord writer's queue cap since start (C-DK C4 fix round 4, N8). Non-zero =
+    /// records or addresses lost to a flood; the daemon's ERROR log says when.
+    #[serde(default)]
+    pub peer_record_dropped: u64,
 }
 
 /// Data for the `status` subcommand.

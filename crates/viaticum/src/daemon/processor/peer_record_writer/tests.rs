@@ -2,14 +2,20 @@
 // batch (record + device-to-master together), no write for an identify that changes
 // nothing, events of one device folded in arrival order, the queue bounded by devices.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 use viaticum_core::constants::{AVAIL_EWMA_ALPHA, AVAIL_EWMA_INITIAL};
 use viaticum_core::db::Db;
 use viaticum_core::db::testutil::{SyncProbe, test_db_with_sync_probe};
 use viaticum_core::types::{DeviceId, IdentityPub, Timestamp, ewma_contact_observed};
 
-use super::{BATCH_MAX, PeerRecordEvent, PeerRecordQueue, apply_batch};
+use super::{
+    BATCH_MAX, DROP_LOG_EVERY, PeerRecordEvent, PeerRecordQueue, PendingState, apply_batch,
+    run_writer,
+};
 
 fn other_master() -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&[0x77; 32])
@@ -219,4 +225,188 @@ fn queue_at_its_device_cap_refuses_only_new_devices() {
         "a queued device still folds in"
     );
     assert_eq!(q.len(), 2);
+}
+
+// ── C-DK C4 fix round 4 ──────────────────────────────────────────────────────
+
+/// Poll `cond` every 20 ms for up to `secs`.
+async fn wait_until(secs: u64, cond: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while !cond() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    true
+}
+
+/// WARN-2 (i), network-i2: an authentication pushed right before the shutdown is written
+/// before the writer returns — the cancelled writer writes what is queued, it does not
+/// just stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_writer_writes_what_is_queued_before_it_returns() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let processor =
+        Arc::new(crate::daemon::processor::tests::make_processor(db.clone(), &dir).await);
+    let a = addr(20);
+    assert!(processor.peer_records.push(auth(20, &[a.as_str()])));
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_writer(processor.clone(), cancel),
+    )
+    .await
+    .expect("the cancelled writer returns");
+    let r = db
+        .get_peer(&device(20))
+        .unwrap()
+        .expect("queued at the cancel: written before run_writer returned");
+    assert_eq!(r.addrs, vec![a]);
+    assert_eq!(processor.peer_records.len(), 0);
+}
+
+/// WARN-2 (ii): a batch whose write fails costs that batch only; the writer goes on and
+/// writes the next one. The failure is a row that does not decode (the batch reads it):
+/// a storage I/O error cannot serve here — redb marks the database failed after one
+/// (`PreviousIo` on every later transaction), so nothing could be written afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writer_goes_on_after_a_failed_batch() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let processor =
+        Arc::new(crate::daemon::processor::tests::make_processor(db.clone(), &dir).await);
+    db.corrupt_peer_row_for_test(&device(21)).unwrap();
+    let cancel = CancellationToken::new();
+    let writer = tokio::spawn(run_writer(processor.clone(), cancel.clone()));
+
+    assert!(processor.peer_records.push(auth(21, &[])));
+    // Taken: the failing batch is in flight (one batch at a time), a later push is the
+    // next batch.
+    let q = processor.clone();
+    assert!(wait_until(5, move || q.peer_records.len() == 0).await);
+    let a = addr(22);
+    assert!(processor.peer_records.push(auth(22, &[a.as_str()])));
+    let db2 = db.clone();
+    let written = wait_until(5, move || db2.get_peer(&device(22)).unwrap().is_some()).await;
+    cancel.cancel();
+    let _ = writer.await;
+    assert!(
+        written,
+        "the batch after a failed one was never written: the writer stopped"
+    );
+    assert!(
+        db.get_peer(&device(21)).is_err(),
+        "control: the failed batch's row is still the undecodable one"
+    );
+}
+
+/// N1: a revocation on the device's own PeerRecord committed between the push (admitted)
+/// and the batch: the authentication is not written (no `last_seen` / contact update) and
+/// nothing comes back for the after-steps.
+#[test]
+fn record_revoked_after_the_push_is_not_written() {
+    let (db, _probe) = test_db_with_sync_probe();
+    let q = PeerRecordQueue::new(1000);
+    q.push(auth(23, &[]));
+    assert_eq!(drain(&db, &q), 1);
+    let mut revoked = db.get_peer(&device(23)).unwrap().unwrap();
+
+    q.push(auth(23, &["/ip4/127.0.0.1/tcp/9"])); // admitted: not revoked yet
+    revoked.revoked_device_pub_keys.push(device(23).0);
+    db.upsert_peer(&revoked).unwrap(); // the signed revocation lands
+    let batch = q.take_batch(BATCH_MAX);
+    let written = apply_batch(&db, batch).unwrap();
+    assert!(written.is_empty(), "no after-steps for a revoked device");
+    let stored = db.get_peer(&device(23)).unwrap().unwrap();
+    assert_eq!(stored.last_seen, revoked.last_seen);
+    assert_eq!(stored.avail_ewma, revoked.avail_ewma);
+    assert!(
+        stored.addrs.is_empty(),
+        "the revoked authentication wrote nothing"
+    );
+}
+
+/// N1 through the writer task: a cluster revocation committed after the push — no
+/// PeerRecord, no device-to-master mapping, no after-step (the work wake of the revoked
+/// device never comes; the one of the other device in the same batch does).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cluster_revoked_after_the_push_gets_no_record_and_no_after_steps() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let mut processor = crate::daemon::processor::tests::make_processor(db.clone(), &dir).await;
+    let (work_tx, mut work_rx) = tokio::sync::mpsc::channel(16);
+    processor.set_work_event_tx(work_tx);
+    let processor = Arc::new(processor);
+
+    assert!(processor.peer_records.push(auth(24, &[]))); // admitted
+    assert!(processor.peer_records.push(auth(25, &[]))); // control
+    let mut cs = db
+        .get_cluster_state()
+        .unwrap()
+        .expect("make_processor inits a cluster");
+    cs.revoked_devices.push(device(24));
+    db.set_cluster_state(&cs).unwrap(); // the revocation lands before the batch
+
+    let cancel = CancellationToken::new();
+    let writer = tokio::spawn(run_writer(processor.clone(), cancel.clone()));
+    let mut woken = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !woken.contains(&device(25)) && Instant::now() < deadline {
+        if let Ok(Some(crate::daemon::work_pipeline::WorkEvent::PeerAuthenticated { device_id })) =
+            tokio::time::timeout(Duration::from_millis(100), work_rx.recv()).await
+        {
+            woken.push(device_id);
+        }
+    }
+    // The after-steps of one batch are spawned together: give a stray one time to show.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while let Ok(crate::daemon::work_pipeline::WorkEvent::PeerAuthenticated { device_id }) =
+        work_rx.try_recv()
+    {
+        woken.push(device_id);
+    }
+    cancel.cancel();
+    let _ = writer.await;
+    assert!(
+        woken.contains(&device(25)),
+        "control: the other device's after-steps ran"
+    );
+    assert!(
+        !woken.contains(&device(24)),
+        "after-steps ran for a revoked device"
+    );
+    assert!(db.get_peer(&device(24)).unwrap().is_none());
+    assert_eq!(db.get_master_for_device(&device(24)).unwrap(), None);
+    assert!(db.get_peer(&device(25)).unwrap().is_some());
+}
+
+/// N8: the ERROR about drops at the cap is printed at most once per `DROP_LOG_EVERY` and
+/// carries the number dropped since the last one; drops after it are reported once the
+/// window has passed, also without a further drop.
+#[test]
+fn drop_error_is_rate_limited_and_counts_the_window() {
+    let mut st = PendingState::default();
+    let t0 = Instant::now();
+    assert_eq!(
+        st.note_drop(t0),
+        Some(1),
+        "the first drop is reported at once"
+    );
+    assert_eq!(st.note_drop(t0 + Duration::from_secs(1)), None);
+    assert_eq!(st.note_drop(t0 + Duration::from_secs(2)), None);
+    assert_eq!(st.drop_report_due(t0 + Duration::from_secs(5)), None);
+    assert_eq!(
+        st.drop_report_due(t0 + DROP_LOG_EVERY),
+        Some(2),
+        "the two drops of the window, without a further drop"
+    );
+    assert_eq!(
+        st.drop_report_due(t0 + DROP_LOG_EVERY * 3),
+        None,
+        "nothing unreported"
+    );
+    assert_eq!(st.note_drop(t0 + DROP_LOG_EVERY * 3), Some(1));
 }
