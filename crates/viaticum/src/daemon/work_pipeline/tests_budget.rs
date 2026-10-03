@@ -3092,7 +3092,10 @@ async fn paused_block_has_no_cooldown_and_is_picked_first_after_the_pause() {
         pipeline.run_iteration().await.unwrap(),
         "the paused block is picked first, without waiting out a cooldown"
     );
-    assert!(encodes.load(Ordering::SeqCst) >= 2, "the block is encoded again");
+    assert!(
+        encodes.load(Ordering::SeqCst) >= 2,
+        "the block is encoded again"
+    );
     assert!(cooldown().last_attempted_at.is_some(), "now it was worked");
 }
 
@@ -3171,9 +3174,7 @@ async fn a_pause_over_six_hours_warns_once_and_shows_in_status() {
     let warned = || {
         logs.text()
             .lines()
-            .filter(|l| {
-                l.contains("WARN") && l.contains("the backup has been paused for over 6 h")
-            })
+            .filter(|l| l.contains("WARN") && l.contains("the backup has been paused for over 6 h"))
             .count()
     };
     let step = |by: Duration| *shift.lock().unwrap() += by;

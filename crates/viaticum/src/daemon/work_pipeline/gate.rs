@@ -66,13 +66,15 @@ impl PauseWatch {
     }
 
     fn elapsed(&self, st: &PauseState) -> Option<Duration> {
-        st.since.map(|t| (self.clock)().saturating_duration_since(t))
+        st.since
+            .map(|t| (self.clock)().saturating_duration_since(t))
     }
 
     /// The pause that is on has lasted longer than `BACKUP_PAUSE_WARN_AFTER`.
     pub fn overlong(&self) -> bool {
         let st = self.lock();
-        self.elapsed(&st).is_some_and(|d| d > BACKUP_PAUSE_WARN_AFTER)
+        self.elapsed(&st)
+            .is_some_and(|d| d > BACKUP_PAUSE_WARN_AFTER)
     }
 
     /// The length of the pause when it is overlong and nobody was told yet; once per pause.
