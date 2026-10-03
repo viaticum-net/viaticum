@@ -962,6 +962,7 @@ phase_b() {
     stop_after 3b && return 0
     step3c
     stop_after 3c && return 0
+    return 0   # the last stop_after returns 1 when no STOP_AFTER is set: under set -e that killed the run before step 9
 }
 
 echo "============================================================"
