@@ -336,9 +336,16 @@ async fn handle_device_add(
 async fn handle_device_revoke(
     State(state): State<Arc<DaemonState>>,
     axum::extract::Path(device_id_hex): axum::extract::Path<String>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match dispatch(CliRequest::DeviceRevoke { device_id_hex }, &state).await {
-        CliResponse::DeviceRevoked { .. } => Ok(StatusCode::NO_CONTENT),
+        // 200 + JSON (not 204): the CLI must learn `holders_skipped` (dr-i8).
+        CliResponse::DeviceRevoked {
+            device_id_hex,
+            holders_skipped,
+        } => Ok(Json(serde_json::json!({
+            "device_id_hex": device_id_hex,
+            "holders_skipped": holders_skipped,
+        }))),
         CliResponse::Error(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
         _ => Err((
             StatusCode::INTERNAL_SERVER_ERROR,

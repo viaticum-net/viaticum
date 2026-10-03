@@ -21,7 +21,7 @@ use crate::daemon::restore::{RestoreCoordinator, RestoreRequest, VersionSelector
 pub mod missing_sources;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 // ============================================================
 // Dispatch — wired to real DaemonState
@@ -1053,7 +1053,7 @@ async fn dispatch_device_revoke(state: &DaemonState, device_id_hex: String) -> C
 
     // T-13b-2: Publish directed Revocation entries to storage-relationship peers only.
     //
-    // Target-master set = { get_master_for_device(p.holder_id) ∀ our placements }
+    // Target-master set = { master_for_holder(p.holder_id) ∀ our placements }   (PEERS first, then device_to_master)
     //                   ∪ { h.owner_id ∀ our holdings }
     // deduplicated, excluding our own master (cluster siblings learn via cluster_sync epoch path).
     if let (Some(cert), Some(mailbox_router)) = (device_cert, state.mailbox_router.as_ref()) {

@@ -605,3 +605,24 @@ async fn budget_lease_needs_the_token_and_a_block_id() {
         StatusCode::BAD_REQUEST
     );
 }
+
+// ─── Device revoke (dr-i8) ────────────────────────────────────────────────────
+
+/// DELETE /api/devices/{id} answers 200 + JSON carrying `holders_skipped`, so the CLI can warn
+/// about holders whose master is unknown (not 204, which would drop the count).
+#[tokio::test]
+async fn device_revoke_returns_holders_skipped() {
+    let (state, revoked_hex, _h1_master, _h2, _sender) =
+        crate::daemon::dispatch::tests::after_dr_revoke_fixture();
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/devices/{revoked_hex}"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_of(response).await;
+    assert_eq!(body["device_id_hex"], revoked_hex);
+    assert_eq!(body["holders_skipped"], 1, "H2 is unknown anywhere: {body}");
+}

@@ -630,6 +630,39 @@ impl Scheduler {
         }
     }
 
+    /// A db error on the holder-master lookup: one ERROR per holder and `kind` per PoS period
+    /// (the same limiter as [`Self::warn_holder_master_unknown`], its own key space), the rest
+    /// DEBUG.
+    fn error_holder_master_lookup(
+        &self,
+        holder: &DeviceId,
+        kind: &'static str,
+        err: &dyn std::fmt::Display,
+    ) {
+        let period = Duration::from_secs(scaled_timer_secs(
+            self.config.pos_interval_secs,
+            self.config.time_scale,
+        ));
+        let loud = {
+            let mut map = self.master_warned.lock().unwrap_or_else(|p| p.into_inner());
+            issue::should_warn_every(
+                &mut map,
+                (*holder, if kind == "pos" { "pos-db" } else { "delete-db" }),
+                std::time::Instant::now(),
+                period,
+            )
+        };
+        if loud {
+            error!(
+                holder = %holder,
+                kind,
+                "{kind}: holder master lookup failed, holder skipped: {err}"
+            );
+        } else {
+            debug!(holder = %holder, kind, "{kind}: holder master lookup failed again: {err}");
+        }
+    }
+
     /// Trust of one holder for its challenge rate: the two-level trust (device and
     /// master) when there is any, else the legacy combined score; times its clamped
     /// `trust_s`. An unknown peer gets medium trust (0.5). Three redb reads.
@@ -838,11 +871,8 @@ impl Scheduler {
                             continue;
                         }
                         Err(e) => {
-                            error!(
-                                block_id = %source_block_id,
-                                holder_id = %holder_id,
-                                "deletion: holder master lookup failed, will retry next tick: {e}"
-                            );
+                            // Retried on the next deletion tick; the log is rate-limited.
+                            self.error_holder_master_lookup(&holder_id, "delete", &e);
                             continue;
                         }
                     };

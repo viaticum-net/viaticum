@@ -729,8 +729,8 @@ use viaticum_core::types::{HoldingRecord, HoldingStatus, PeerRecord, SymbolPlace
 
 use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter};
 
-struct RecordingMailboxSenderD {
-    stored: tokio::sync::Mutex<Vec<MailboxStoreRequest>>,
+pub(crate) struct RecordingMailboxSenderD {
+    pub(crate) stored: tokio::sync::Mutex<Vec<MailboxStoreRequest>>,
 }
 
 impl RecordingMailboxSenderD {
@@ -998,8 +998,15 @@ async fn revocation_published_only_to_storage_relationship_peers() {
 /// dr-i8: after a DR `device_to_master` is empty. The revocation still reaches the holder whose
 /// master is in PEERS; a holder known nowhere is not addressed (no device-id box) and is counted
 /// in the response.
-#[tokio::test]
-async fn revoke_after_dr_reaches_holder_master_from_peers() {
+/// dr-i8 fixture: daemon state after a DR (`device_to_master` empty), a revoked device, holder H1
+/// (master in PEERS) and holder H2 (unknown anywhere). Returns (state, revoked hex, H1 master, H2 device, sender).
+pub(crate) fn after_dr_revoke_fixture() -> (
+    Arc<DaemonState>,
+    String,
+    IdentityPub,
+    DeviceId,
+    Arc<RecordingMailboxSenderD>,
+) {
     use std::sync::{Arc as StdArc, Mutex};
     use viaticum_core::cluster::{ClusterState, issue_device_certificate, master_identity};
 
@@ -1088,6 +1095,12 @@ async fn revoke_after_dr_reaches_holder_master_from_peers() {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
+    (state, revoked_hex, h1_master, h2_device, sender)
+}
+
+#[tokio::test]
+async fn revoke_after_dr_reaches_holder_master_from_peers() {
+    let (state, revoked_hex, h1_master, h2_device, sender) = after_dr_revoke_fixture();
     let response = dispatch(
         CliRequest::DeviceRevoke {
             device_id_hex: revoked_hex,

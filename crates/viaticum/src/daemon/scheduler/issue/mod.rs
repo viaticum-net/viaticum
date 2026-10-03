@@ -415,28 +415,27 @@ impl Scheduler {
         // the trust). `Hashed::finish` stays authoritative and skips on `None` as well.
         let mut no_master = 0usize;
         if !due.is_empty() {
-            let mut known: HashMap<DeviceId, bool> = HashMap::new();
+            // Per holder: Some(true) known, Some(false) master unknown, None db error (a db
+            // error is not "no master": it is logged, rate-limited, and not counted).
+            let mut known: HashMap<DeviceId, Option<bool>> = HashMap::new();
             due.retain(|e| {
-                let ok = *known.entry(e.holder_id).or_insert_with(|| {
+                let state = *known.entry(e.holder_id).or_insert_with(|| {
                     match self.db.master_for_holder(&e.holder_id) {
-                        Ok(Some(_)) => true,
+                        Ok(Some(_)) => Some(true),
                         Ok(None) => {
                             self.warn_holder_master_unknown(&e.holder_id, "pos");
-                            false
+                            Some(false)
                         }
                         Err(err) => {
-                            error!(
-                                holder = %e.holder_id,
-                                "pos: holder master lookup failed, holder skipped this tick: {err}"
-                            );
-                            false
+                            self.error_holder_master_lookup(&e.holder_id, "pos", &err);
+                            None
                         }
                     }
                 });
-                if !ok {
+                if state == Some(false) {
                     no_master += 1;
                 }
-                ok
+                state == Some(true)
             });
         }
 

@@ -357,7 +357,7 @@ fn send_command_http(conn: &Connection, cmd: &Command) -> Result<CliResponse, Cl
     }
     let status = resp.status();
     if status == reqwest::StatusCode::NO_CONTENT {
-        // Used by DELETE /api/devices/{id}; synthesize a response so the handler can format it.
+        // Used by DELETE /api/devices/{id} on an older daemon (no body, so holders_skipped = 0); synthesize a response so the handler can format it.
         if let Command::Device {
             action: DeviceAction::Revoke { device_id },
         } = cmd
@@ -454,16 +454,20 @@ fn response_from_http(
                 Ok(CliResponse::DeviceAdded(data))
             }
             DeviceAction::Revoke { .. } => {
-                // 204 path already handled in send_command_http
+                // Old-daemon 204 path is handled in send_command_http.
                 let data: serde_json::Value = resp.json().unwrap_or(serde_json::Value::Null);
                 let device_id_hex = data
                     .get("device_id_hex")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
+                let holders_skipped = data
+                    .get("holders_skipped")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
                 Ok(CliResponse::DeviceRevoked {
                     device_id_hex,
-                    holders_skipped: 0,
+                    holders_skipped,
                 })
             }
         },
