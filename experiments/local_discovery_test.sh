@@ -677,7 +677,16 @@ print_lookup_signature() {
     note "lookups (friends): total=$total empty=$empty (successes=0,failures>=1: $s0f1; requests=0: $r0); median duration of the failed empty ones=${med}ms; lines without statistics=$nostats"
     note "kad 'Request to peer in query failed … exceeds maximum of 16384b': $ex on $ex_nodes friends${sample:+ — e.g. $sample}"
     note "WARN 'kademlia lookup found no peers': $warn; seed hit the inbound substream limit ${h3:-0} times; friends' kad requests cut off (UnexpectedEof): $eof; distinct peers in 'routing table updated' per friend (median): $rt_med"
-    [ "$total" -gt 0 ] || setup_fail "no lookup statistics ('dht: get_closest_peers complete' with requests=) in any friend's log: DEBUG filter or a build without Р-7"
+    # The statistics explain a RED knowledge bar. A bar already green before the first
+    # lookup (TIME_SCALE=1: convergence in ~10 s, first discovery lookup at 15 s) has
+    # nothing to explain: a NOTE, not a setup failure.
+    if [ "$total" -eq 0 ]; then
+        if [ "${KNOW_BAR:-RED}" = GREEN ]; then
+            note "no lookup statistics yet (the knowledge bar went green before the first lookup)"
+        else
+            setup_fail "no lookup statistics ('dht: get_closest_peers complete' with requests=) in any friend's log: DEBUG filter or a build without Р-7"
+        fi
+    fi
     # H1 condition by condition, so a miss says which one failed.
     local h1_fail=""
     [ "$KNOW_BAR" = RED ] || h1_fail="$h1_fail knowledge-bar-green"
