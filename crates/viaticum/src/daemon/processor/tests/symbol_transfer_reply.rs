@@ -14,7 +14,7 @@ use viaticum_core::types::{
 
 use super::{
     AcceptedOffer, Processor, insert_accepted_offer, make_block_id, make_identity, make_processor,
-    sender_device,
+    make_processor_with_quota, sender_device,
 };
 
 fn chunk(block_id: SourceBlockId, esis: &[u32], byte: u8) -> SymbolTransferMsg {
@@ -479,4 +479,106 @@ async fn held_esi_with_missing_file_is_rewritten() {
     let reply = reply_to(&p, owner, chunk(blk, &[0, 1], 0xAA)).await;
     assert_stored(&reply, blk, vec![(0, 2)]);
     assert_eq!(read_bin(&dir, blk, 0), vec![0xAA; 64]);
+}
+
+fn sized_chunk(block_id: SourceBlockId, esis: &[u32], byte: u8, len: usize) -> SymbolTransferMsg {
+    SymbolTransferMsg {
+        v: 1,
+        source_block_id: block_id,
+        symbols: esis
+            .iter()
+            .map(|&esi| Symbol {
+                esi,
+                data: vec![byte; len],
+            })
+            .collect(),
+        timestamp: Timestamp::now(),
+    }
+}
+
+/// W1 (cross review): 1-byte symbols, then the same ESIs at full size. The record's total follows
+/// the files (it grows), and the growth is asked of the quota.
+#[tokio::test]
+async fn one_byte_symbols_then_full_size_overwrite_grows_total_bytes() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let p = make_processor(db.clone(), &dir).await;
+    let owner = make_identity(0x21);
+    let blk = make_block_id(0x21);
+    insert_accepted_offer(&p, owner, blk, vec![(0, 2)], 0.5);
+    reply_to(&p, owner, sized_chunk(blk, &[0, 1], 0xAA, 1)).await;
+    assert_eq!(
+        db.get_holding(&blk, &owner).unwrap().unwrap().total_bytes,
+        2
+    );
+
+    insert_accepted_offer(&p, owner, blk, vec![(0, 2)], 0.5);
+    let reply = reply_to(&p, owner, sized_chunk(blk, &[0, 1], 0xBB, 2000)).await;
+
+    assert_stored(&reply, blk, vec![(0, 2)]);
+    assert_eq!(
+        db.get_holding(&blk, &owner).unwrap().unwrap().total_bytes,
+        4000
+    );
+}
+
+#[tokio::test]
+async fn one_byte_symbols_then_full_size_overwrite_is_held_by_the_quota() {
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let p = make_processor_with_quota(db.clone(), &dir, 1000, u64::MAX).await;
+    let owner = make_identity(0x22);
+    let blk = make_block_id(0x22);
+    insert_accepted_offer(&p, owner, blk, vec![(0, 2)], 0.5);
+    reply_to(&p, owner, sized_chunk(blk, &[0, 1], 0xAA, 1)).await;
+
+    insert_accepted_offer(&p, owner, blk, vec![(0, 2)], 0.5);
+    let reply = reply_to(&p, owner, sized_chunk(blk, &[0, 1], 0xBB, 2000)).await;
+
+    assert_ack(&reply);
+    assert_eq!(read_bin(&dir, blk, 0), vec![0xAA; 1]);
+    assert_eq!(
+        db.get_holding(&blk, &owner).unwrap().unwrap().total_bytes,
+        2
+    );
+}
+
+/// W2: every write replaces the file through a temp name — the old file (inode) stays whole until
+/// the rename, also when the holding is on its way out (MarkedForDelete) and the chunk comes
+/// through the offer. Mutation M2 "direct write" keeps the inode and reddens this.
+#[cfg(unix)]
+#[tokio::test]
+async fn every_write_replaces_the_file_through_rename_and_leaves_no_tmp() {
+    use std::os::unix::fs::MetadataExt;
+    let db = Db::open_in_memory().unwrap();
+    let dir = TempDir::new().unwrap();
+    let p = make_processor(db.clone(), &dir).await;
+    let owner = make_identity(0x23);
+    let blk = make_block_id(0x23);
+    let block_hex: String = blk.0.iter().map(|b| format!("{b:02x}")).collect();
+    let file = dir.path().join(&block_hex).join("0.bin");
+    insert_accepted_offer(&p, owner, blk, vec![(0, 1)], 0.5);
+    reply_to(&p, owner, chunk(blk, &[0], 0xAA)).await;
+    let ino_first = std::fs::metadata(&file).unwrap().ino();
+    // Hold the old file by a hard link so a freed inode number cannot be reused by the rename.
+    std::fs::hard_link(&file, dir.path().join(&block_hex).join("keep.lnk")).unwrap();
+
+    let mut rec = db.get_holding(&blk, &owner).unwrap().unwrap();
+    rec.status = HoldingStatus::MarkedForDelete;
+    db.upsert_holding(&rec).unwrap();
+    insert_accepted_offer(&p, owner, blk, vec![(0, 1)], 0.5);
+    let reply = reply_to(&p, owner, chunk(blk, &[0], 0xCC)).await;
+
+    assert_stored(&reply, blk, vec![(0, 1)]);
+    assert_ne!(std::fs::metadata(&file).unwrap().ino(), ino_first);
+    assert_eq!(
+        std::fs::read(dir.path().join(&block_hex).join("keep.lnk")).unwrap(),
+        vec![0xAA; 64],
+        "the old file stays whole"
+    );
+    let names: Vec<String> = std::fs::read_dir(dir.path().join(&block_hex))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(names.iter().all(|n| !n.contains(".tmp")), "{names:?}");
 }
