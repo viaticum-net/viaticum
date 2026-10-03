@@ -505,7 +505,11 @@ scan_cadence_settled() {
 }
 
 # Step 6 on every sample: non-local sockets of every live daemon (any TCP state).
+# network-i17 is about what a daemon OPENS: a socket whose local port is one of the
+# daemon's own LISTEN ports was accepted from outside (a LAN host dialing an announced
+# address) — recorded as a NOTE, not counted against the bar.
 NONLOCAL_HITS=""
+NONLOCAL_INBOUND=""
 MAX_DUP_SOCKETS=0
 check_sockets_sample() {
     local snap i pid hits est dup
@@ -513,8 +517,16 @@ check_sockets_sample() {
     for i in $(alive_nodes); do
         pid="${NODE_PID[$i]:-}"; [ -n "$pid" ] || continue
         hits=$(nonlocal_sockets_of_pid "$pid" "$snap")
-        [ -n "$hits" ] && NONLOCAL_HITS="$NONLOCAL_HITS
-node-$i @$(( $(date -u +%s) - T_BASE ))s: $(echo "$hits" | head -3 | tr '\n' ';')"
+        if [ -n "$hits" ]; then
+            local lports inb outb
+            lports=" $(grep -F "pid=$pid," <<< "$snap" | awk '$1 == "LISTEN" { a = $4; sub(/.*:/, "", a); print a }' | sort -u | tr '\n' ' ') "
+            inb=$(awk -v lp="$lports" '{ a = $2; sub(/.*:/, "", a); if ($1 != "SYN-SENT" && index(lp, " " a " ") > 0) print }' <<< "$hits")
+            outb=$(awk -v lp="$lports" '{ a = $2; sub(/.*:/, "", a); if ($1 == "SYN-SENT" || index(lp, " " a " ") == 0) print }' <<< "$hits")
+            [ -n "$outb" ] && NONLOCAL_HITS="$NONLOCAL_HITS
+node-$i @$(( $(date -u +%s) - T_BASE ))s: $(echo "$outb" | head -3 | tr '\n' ';')"
+            [ -n "$inb" ] && NONLOCAL_INBOUND="$NONLOCAL_INBOUND
+node-$i @$(( $(date -u +%s) - T_BASE ))s: $(echo "$inb" | head -3 | tr '\n' ';')"
+        fi
         est=$(established_sockets_of_pid "$pid" "$snap")
         dup=$(( est - ${C[$i]:-0} ))
         [ "$dup" -gt "$MAX_DUP_SOCKETS" ] && MAX_DUP_SOCKETS=$dup
@@ -644,10 +656,13 @@ run_step6() {
     STEP6_RUNS=$((STEP6_RUNS + 1))
     step 6 "the whole run so far (evaluation $STEP6_RUNS): no socket to a non-local address, no IPFS bootstrap"
     sample_all; check_sockets_sample
+    if [ -n "$NONLOCAL_INBOUND" ]; then
+        note "inbound connections from non-local hosts to the daemons' listen ports (not opened by a daemon, not counted): $(echo "$NONLOCAL_INBOUND" | head -8 | tr '\n' ' ' | cut -c1-500)"
+    fi
     if [ -z "$NONLOCAL_HITS" ]; then
-        pass "no daemon held a TCP socket (any state) to a non-local address on any sample"
+        pass "no daemon opened a TCP socket (any state) to a non-local address on any sample"
     else
-        fail "sockets to non-local addresses:$(echo "$NONLOCAL_HITS" | head -8 | tr '\n' ' ' | cut -c1-500)"
+        fail "sockets to non-local addresses opened by a daemon:$(echo "$NONLOCAL_HITS" | head -8 | tr '\n' ' ' | cut -c1-500)"
     fi
     local ipfs_err=""
     for i in $(seq 0 $LATE); do
