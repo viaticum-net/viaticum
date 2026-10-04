@@ -358,7 +358,7 @@ async fn dispatch_pos_challenge(
     now_secs: u64,
 ) {
     // CS-ID-6 / SM-8 (defense-in-depth): we only ever poll our own mailbox
-    // (`router.poll(&my_master_pub, ...)`), so a PosChallenge that reaches dispatch
+    // (`router.poll_stream(&my_master_pub, ...)`), so a PosChallenge that reaches dispatch
     // must be addressed to us. Effects are already gated by signature verification
     // (the holding lookup keys on owner_master from `entry.sender`), but this guard
     // documents and enforces the routing invariant: a buggy or hostile postman that

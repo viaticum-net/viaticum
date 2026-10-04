@@ -172,21 +172,6 @@ async fn poll_late_answer_updates_contact() {
     assert!(rec.last_avail_sample >= before_secs);
 }
 
-/// `poll` still returns once every postman answered: all answers, merged by bytes.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn poll_collects_every_answer_and_merges_identical_bytes() {
-    let (router, _db, _) = router_over(&[
-        Reply::Answer(0, vec![entry(1, b"a")]),
-        Reply::Answer(3, vec![entry(1, b"a"), entry(1, b"forged")]),
-        Reply::Asleep,
-    ]);
-    let start = Instant::now();
-    let mut got = router.poll(&my_box(), None, None).await.unwrap();
-    assert_eq!(start.elapsed(), PEER_REQUEST_TIMEOUT);
-    got.sort_by(|a, b| a.payload.cmp(&b.payload));
-    assert_eq!(got, vec![entry(1, b"a"), entry(1, b"forged")]);
-}
-
 #[test]
 fn poll_seen_skips_records_seen_earlier_in_the_poll_and_expired_ones() {
     let now = Timestamp::now().0;

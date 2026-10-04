@@ -1,7 +1,8 @@
 // T-4 test scenarios (spec §2.5).
 //
 // Test strategy:
-//   - Pure functions (select_write_peers ranking, merge_poll_answers): unit tests, no network.
+//   - Pure functions (select_write_peers ranking, the poll merge `PollSeen`): unit tests,
+//     no network.
 //   - Integration scenarios (publish, poll, dr_walk): inject MockSender to stub network.
 //     No real SwarmHandle needed — all I/O goes through the MailboxNetworkSender trait.
 //
@@ -12,7 +13,8 @@
 //
 // Additional unit tests:
 //   select_write_peers_orders_by_combined_trust_times_avail_ewma
-//   merge_* / forged_record_with_honest_msg_id_does_not_hide_the_honest_one (mailbox-i69)
+//   merge_* / forged_record_with_honest_msg_id_does_not_hide_the_honest_one (mailbox-i69),
+//   on `PollSeen` (the poll's one merge rule)
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -33,9 +35,7 @@ use viaticum_core::types::{
     DeviceId, IdentityPub, PeerRecord, SourceBlockId, Timestamp, ewma_contact_observed,
 };
 
-use super::{
-    MailboxNetworkSender, MailboxRouter, PublishOutcome, PublishVerdict, merge_poll_answers,
-};
+use super::{MailboxNetworkSender, MailboxRouter, PollSeen, PublishOutcome, PublishVerdict};
 use crate::daemon::network::swarm::device_id_to_peer_id;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
@@ -226,8 +226,34 @@ fn with_payload(mut e: MailboxEntry, payload: &[u8]) -> MailboxEntry {
     e
 }
 
+/// The postmen's answers of one poll, in arrival order, merged as `poll_once` merges
+/// them (`PollSeen`): what reaches the handlers.
+fn merge_poll_answers(answers: Vec<Vec<MailboxEntry>>, now_secs: u64) -> Vec<MailboxEntry> {
+    let mut seen = PollSeen::new(now_secs);
+    answers
+        .into_iter()
+        .flat_map(|answer| seen.admit(answer))
+        .collect()
+}
+
+/// Drain one whole poll of `target` through `PollSeen` (what `poll_once` reads, without
+/// its deadline).
+async fn poll_all(
+    router: &MailboxRouter,
+    target: &MailboxAddress,
+    proof: Option<[u8; 64]>,
+) -> Vec<MailboxEntry> {
+    let mut rx = router.poll_stream(target, proof, None);
+    let mut seen = PollSeen::new(Timestamp::now().0);
+    let mut out = vec![];
+    while let Some((_, answer)) = rx.recv().await {
+        out.extend(seen.admit(answer));
+    }
+    out
+}
+
 #[test]
-fn merge_keeps_highest_stored_at_of_identical_bytes() {
+fn merge_keeps_one_record_of_identical_bytes_whatever_the_stored_at() {
     let target = make_identity(1);
     let msg_id = make_msg_id(1);
     let older = make_entry(target, msg_id, 1000, MailboxClass::PosChallenge);
@@ -240,7 +266,10 @@ fn merge_keeps_highest_stored_at_of_identical_bytes() {
         1,
         "same bytes from two postmen are one record"
     );
-    assert_eq!(merged[0].stored_at, 2000);
+    assert_eq!(
+        merged[0].stored_at, 1000,
+        "the first copy to arrive is handled"
+    );
 }
 
 #[test]
@@ -559,10 +588,7 @@ async fn poll_returns_deduplicated_entries_from_read_fanout() {
     let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
     let router = MailboxRouter::with_sender(sender, db);
 
-    let entries = router
-        .poll(&MailboxAddress::for_master(&my_master), None, None)
-        .await
-        .unwrap();
+    let entries = poll_all(&router, &MailboxAddress::for_master(&my_master), None).await;
 
     assert_eq!(
         entries.len(),
@@ -630,10 +656,7 @@ async fn poll_records_avail_on_successful_fetch() {
     let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
     let router = MailboxRouter::with_sender(sender, db.clone());
 
-    let _entries = router
-        .poll(&MailboxAddress::for_master(&my_master), None, None)
-        .await
-        .unwrap();
+    let _entries = poll_all(&router, &MailboxAddress::for_master(&my_master), None).await;
 
     // Check avail_ewma was updated.
     let updated = db.get_peer(&device_id).unwrap().unwrap();
@@ -649,7 +672,7 @@ async fn poll_records_avail_on_successful_fetch() {
 
 #[tokio::test]
 async fn poll_filters_expired_entries_from_response() {
-    // poll() must drop entries where expires_at <= now_secs, even when the postman
+    // The poll must drop entries where expires_at <= now_secs, even when the postman
     // returns them (defensive against clock skew).
     //
     // Setup: one peer returns two entries — one expired (expires_at in the past),
@@ -690,10 +713,7 @@ async fn poll_filters_expired_entries_from_response() {
     let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
     let router = MailboxRouter::with_sender(sender, db);
 
-    let entries = router
-        .poll(&MailboxAddress::for_master(&my_master), None, None)
-        .await
-        .unwrap();
+    let entries = poll_all(&router, &MailboxAddress::for_master(&my_master), None).await;
 
     assert_eq!(
         entries.len(),
@@ -773,8 +793,7 @@ async fn contact_on_ack_refreshes_last_seen() {
 }
 
 /// dr-i50 / pos-i8: a postman's answer to our poll's fetch is a contact too — its
-/// `last_seen` moves to now inside `MailboxRouter::poll`, before the entries are
-/// returned, whatever the poll loop then does with them (the PoS memory of pos-i5
+/// `last_seen` moves to now in the fetch task, before the entries are handed over, whatever the poll loop then does with them (the PoS memory of pos-i5
 /// skips most of them).
 #[tokio::test]
 async fn poll_fetch_contact_refreshes_last_seen() {
@@ -798,10 +817,7 @@ async fn poll_fetch_contact_refreshes_last_seen() {
     let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
     let router = MailboxRouter::with_sender(sender, db.clone());
 
-    let entries = router
-        .poll(&MailboxAddress::for_master(&my_master), None, None)
-        .await
-        .unwrap();
+    let entries = poll_all(&router, &MailboxAddress::for_master(&my_master), None).await;
 
     assert_eq!(entries.len(), 1);
     assert!(
@@ -1472,14 +1488,14 @@ async fn rendezvous_poll_through_real_postmen_needs_proof_and_returns_only_point
         );
     }
 
-    let without = router.poll(&rv.address, None, None).await.unwrap();
+    let without = poll_all(&router, &rv.address, None).await;
     assert!(
         without.is_empty(),
         "no proof, not the master of the box: nothing"
     );
 
     let proof = rv.fetch_proof(&requester_device);
-    let with = router.poll(&rv.address, Some(proof), None).await.unwrap();
+    let with = poll_all(&router, &rv.address, Some(proof)).await;
     assert_eq!(
         with.len(),
         1,

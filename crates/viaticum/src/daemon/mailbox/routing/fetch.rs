@@ -30,12 +30,12 @@ use super::{MailboxNetworkSender, PEER_REQUEST_TIMEOUT};
 /// unsigned `sender` header. `sender` is in the key because a PosChallenge's holder
 /// answers to the `sender` box: a copy with the honest payload under another `sender`,
 /// arriving first, must not hide the honest copy (mailbox-i69).
-pub type PollEntryKey = ([u8; 16], MailboxClass, [u8; 32], Option<IdentityPub>);
+pub(crate) type PollEntryKey = ([u8; 16], MailboxClass, [u8; 32], Option<IdentityPub>);
 
 /// The merge key of `entry` (mailbox-i69). A postman stores per `(target, msg_id, class)`,
 /// so one `msg_id` may legitimately carry records of several classes; records sharing a
 /// `msg_id` but differing in class or payload are different records.
-pub fn poll_entry_key(entry: &MailboxEntry) -> PollEntryKey {
+pub(crate) fn poll_entry_key(entry: &MailboxEntry) -> PollEntryKey {
     (
         entry.msg_id,
         entry.class,

@@ -19,7 +19,8 @@
 // number of acks, not after the slowest postman (mailbox-i60, submodule `fanout`).
 //
 // poll_stream: each postman's answer reaches the caller as it arrives, not after the
-// slowest postman (mailbox-i63, submodule `fetch`); `poll` collects them all.
+// slowest postman (mailbox-i63, submodule `fetch`); the reader merges them with `PollSeen`
+// (identical bytes only, mailbox-i69).
 //
 // Avail observation wiring (T-4a §5):
 // Successful MailboxStoreAck / MailboxFetchResponse → positive observation:
@@ -61,7 +62,7 @@ use fanout::{record_avail_contact, store_fanout, unix_now};
 use fetch::fetch_fanout;
 
 pub use dr_walk::DrWalk;
-pub use fetch::{PollEntryKey, PollSeen, poll_entry_key};
+pub use fetch::PollSeen;
 pub use verdict::{PublishOutcome, PublishVerdict};
 
 // ─── Per-request network timeout ─────────────────────────────────────────────
@@ -344,31 +345,6 @@ impl MailboxRouter {
         fetch_fanout(&self.sender, &self.db, read_peers, req)
     }
 
-    /// Poll the box `target` and return once every postman answered or timed out:
-    /// the non-expired entries merged by `merge_poll_answers` (identical bytes only).
-    /// See `poll_stream`.
-    pub async fn poll(
-        &self,
-        target: &MailboxAddress,
-        proof: Option<[u8; 64]>,
-        since_stored_at: Option<u64>,
-    ) -> anyhow::Result<Vec<MailboxEntry>> {
-        let mut rx = self.poll_stream(target, proof, since_stored_at);
-        let mut answers: Vec<Vec<MailboxEntry>> = Vec::new();
-        while let Some((_, entries)) = rx.recv().await {
-            answers.push(entries);
-        }
-        let answered = answers.len();
-        let entries = merge_poll_answers(answers, unix_now());
-        debug!(
-            target = %target,
-            entry_count = entries.len(),
-            answered,
-            "mailbox poll: collected entries"
-        );
-        Ok(entries)
-    }
-
     // ─── Peer selection ───────────────────────────────────────────────────────
 
     /// Select write-fanout: top `write_fanout` peers from `candidates` by
@@ -475,36 +451,6 @@ fn peer_id_to_device_id_best_effort(peer_id: &PeerId) -> Option<DeviceId> {
     let pub_key = PublicKey::try_decode_protobuf(multihash.digest()).ok()?;
     let ed_key = pub_key.try_into_ed25519().ok()?;
     Some(DeviceId(ed_key.to_bytes()))
-}
-
-// ─── Pure helper: merge the postmen's answers ─────────────────────────────────
-
-/// Merge the answers of several postmen to one poll (mailbox-i69).
-///
-/// Records merge only when they are the same bytes: same `msg_id`, class and blake3 of
-/// the payload (a postman stores per `(target, msg_id, class)`, so one `msg_id` may
-/// legitimately carry records of several classes). Records that share a `msg_id` but
-/// differ in class or payload go to the handlers side by side: a forgery a postman
-/// stores under an honest `msg_id`, in any class and with any `stored_at`, must not
-/// replace the honest record (last-writer-wins by `msg_id` did), and the handlers tell
-/// them apart by the signature. Expired records are dropped (the postman filters them;
-/// clock skew).
-pub fn merge_poll_answers(answers: Vec<Vec<MailboxEntry>>, now_secs: u64) -> Vec<MailboxEntry> {
-    let mut merged: HashMap<PollEntryKey, MailboxEntry> = HashMap::new();
-    for entry in answers.into_iter().flatten() {
-        if entry.expires_at <= now_secs {
-            continue;
-        }
-        merged
-            .entry(poll_entry_key(&entry))
-            .and_modify(|existing| {
-                if entry.stored_at > existing.stored_at {
-                    *existing = entry.clone();
-                }
-            })
-            .or_insert(entry);
-    }
-    merged.into_values().collect()
 }
 
 #[cfg(test)]
