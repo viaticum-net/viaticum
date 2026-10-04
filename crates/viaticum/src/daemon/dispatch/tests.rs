@@ -1881,7 +1881,11 @@ async fn status_shows_last_refusal_reason() {
             1_790_000_000,
             0,
         );
-        rec.last_refusal = Some(PointerRefusal { at: 1, kind });
+        rec.last_refusal = Some(PointerRefusal {
+            at: 1,
+            kind,
+            expired: false,
+        });
         meta.current = Some(rec);
         state.db.put_pointer_publications(&meta).unwrap();
         let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {

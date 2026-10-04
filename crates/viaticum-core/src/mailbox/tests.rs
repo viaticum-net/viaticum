@@ -1,8 +1,8 @@
 use crate::db::testutil::test_db;
 use crate::mailbox::{
-    MailboxAddress, MailboxClass, MailboxEngine, MailboxEntry, MailboxError,
-    SELF_POINTER_MAX_FUTURE_SKEW_SECS, Stored, check_entry_clock, check_pointer_sealed,
-    class_config, seal,
+    MAILBOX_TRANSIT_GRACE_SECS, MailboxAddress, MailboxClass, MailboxEngine, MailboxEntry,
+    MailboxError, SELF_POINTER_MAX_FUTURE_SKEW_SECS, Stored, check_entry_clock,
+    check_pointer_sealed, class_config, seal, transit_grace_secs,
 };
 
 // ============================================================
@@ -1164,6 +1164,108 @@ fn check_entry_clock_accepts_old_unexpired_self_pointer() {
     let mut e = pointer(make_target(49), 1, now - four_years);
     e.expires_at = now + 365 * 24 * 3600;
     assert!(check_entry_clock(&e, now).is_ok());
+}
+
+/// A PoS response with the production TTL (7 days) sent at `stored_at`.
+fn pos_response(stored_at: u64) -> MailboxEntry {
+    make_entry(
+        make_target(51),
+        make_msg_id(1),
+        MailboxClass::PosResponse,
+        vec![],
+        stored_at,
+        7 * 24 * 3600,
+    )
+}
+
+/// mailbox-i61: an entry whose TTL ran out on the way (expired up to a minute ago by
+/// the postman's clock, sealed in the postman's past) is `Expired`, not a clock fault.
+#[test]
+fn entry_expired_within_grace_is_expired_not_clock_skew() {
+    let now = 1_800_000_000;
+    let mut e = pos_response(now - 7 * 24 * 3600);
+    assert_eq!(transit_grace_secs(&e), MAILBOX_TRANSIT_GRACE_SECS);
+    for expired_ago in [0, 1, MAILBOX_TRANSIT_GRACE_SECS - 1] {
+        e.expires_at = now - expired_ago;
+        assert!(
+            matches!(
+                check_entry_clock(&e, now),
+                Err(MailboxError::Expired { expires_at, now: n }) if expires_at == now - expired_ago && n == now
+            ),
+            "expired {expired_ago} s ago"
+        );
+    }
+    // A pointer is judged the same way.
+    let mut p = pointer(make_target(52), 1, now - 1_000);
+    p.expires_at = now - 1;
+    assert!(matches!(
+        check_entry_clock(&p, now),
+        Err(MailboxError::Expired { .. })
+    ));
+}
+
+/// mailbox-i61: past the window, or an entry "sealed" in the postman's future, is
+/// still `ClockSkew` (the sender's clock is off by about the whole TTL or more).
+#[test]
+fn entry_expired_long_ago_is_clock_skew() {
+    let now = 1_800_000_000;
+    let mut e = pos_response(now - 30 * 24 * 3600);
+    for expired_ago in [
+        MAILBOX_TRANSIT_GRACE_SECS,
+        MAILBOX_TRANSIT_GRACE_SECS + 1,
+        3600,
+    ] {
+        e.expires_at = now - expired_ago;
+        assert!(
+            matches!(
+                check_entry_clock(&e, now),
+                Err(MailboxError::ClockSkew { .. })
+            ),
+            "expired {expired_ago} s ago"
+        );
+    }
+    // stored_at ahead of the postman: not "in transit", whatever the expiry.
+    let mut ahead = pos_response(now + 10);
+    ahead.expires_at = now;
+    assert!(matches!(
+        check_entry_clock(&ahead, now),
+        Err(MailboxError::ClockSkew { .. })
+    ));
+}
+
+/// Р.3: the window is a quarter of the entry's own lifetime when that is under four
+/// minutes (a PoS TTL scaled by time_scale 20000 lives ~30 s → ~7 s of grace), so a
+/// scaled entry is not read as "in transit" for most of its life.
+#[test]
+fn grace_shrinks_with_a_short_lived_entry() {
+    let now = 1_800_000_000;
+    let ttl = 7 * 24 * 3600 / 20_000; // 30 s
+    let mut e = pos_response(0);
+    e.stored_at = now - 100;
+    e.expires_at = e.stored_at + ttl;
+    let grace = transit_grace_secs(&e);
+    assert_eq!(grace, ttl / 4);
+    assert!(grace < MAILBOX_TRANSIT_GRACE_SECS);
+    e.stored_at = now - ttl - grace + 1;
+    e.expires_at = e.stored_at + ttl; // expired grace − 1 s ago
+    assert!(matches!(
+        check_entry_clock(&e, now),
+        Err(MailboxError::Expired { .. })
+    ));
+    e.stored_at -= 1;
+    e.expires_at -= 1; // expired exactly `grace` ago: out of the window
+    assert!(matches!(
+        check_entry_clock(&e, now),
+        Err(MailboxError::ClockSkew { .. })
+    ));
+    // Zero lifetime: no window at all.
+    e.stored_at = now;
+    e.expires_at = now;
+    assert_eq!(transit_grace_secs(&e), 0);
+    assert!(matches!(
+        check_entry_clock(&e, now),
+        Err(MailboxError::ClockSkew { .. })
+    ));
 }
 
 #[test]

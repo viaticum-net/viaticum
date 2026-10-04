@@ -1285,6 +1285,29 @@ fn publish_verdict_mixed_refusal() {
     );
 }
 
+/// mailbox-i61: "expired in transit" is no clock verdict — all of them is `NoAck`,
+/// among other refusals it counts as `other`; `RefusalKind` is not extended.
+#[test]
+fn publish_verdict_expired_is_no_ack_or_other_never_clock() {
+    use MailboxRejectReason::{ClockSkew, Expired};
+    let all = outcome(0, &[Expired, Expired], 1);
+    assert_eq!(all.verdict(), PublishVerdict::NoAck);
+    assert!(all.all_expired());
+    let mixed = outcome(0, &[Expired, ClockSkew], 0);
+    assert_eq!(
+        mixed.verdict(),
+        PublishVerdict::MixedRefusal {
+            clock: 1,
+            superseded: 0,
+            slots_full: 0,
+            other: 1
+        }
+    );
+    assert!(!mixed.all_expired());
+    assert!(!outcome(1, &[Expired], 0).all_expired(), "an ack stores it");
+    assert!(!outcome(0, &[], 2).all_expired(), "nobody answered");
+}
+
 #[test]
 fn publish_verdict_one_reject_among_acks_is_stored() {
     assert_eq!(

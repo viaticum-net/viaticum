@@ -197,6 +197,11 @@ pub struct PointerRefusal {
     /// Unix secs of the refused attempt.
     pub at: u64,
     pub kind: RefusalKind,
+    /// mailbox-i61: every refusal was "expired in transit" (`kind` is then `NoAck`, no
+    /// clock verdict). Nobody holds the envelope: the publisher seals a new one, as
+    /// after an all-`ClockSkew` refusal.
+    #[serde(default)]
+    pub expired: bool,
 }
 
 /// Why the newest catalog state is not in any accepted pointer (mailbox-i54).

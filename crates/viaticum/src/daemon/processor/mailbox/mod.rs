@@ -50,7 +50,9 @@ use crate::daemon::mailbox::candidate::{KademliaRoutingView, should_store};
 /// 3. `SelfPointer`: `req.target_sig` must verify against `req.entry.target`
 ///    (`verify_store_sig`, before the `expires_at` clamp) → else `Reject { Unauthorized }`.
 ///    Other classes: `target_sig` ignored (a sender never holds the recipient's key).
-/// 4. Clock: `expires_at <= now`, or a SelfPointer `stored_at` more than
+/// 4. Clock: an entry that expired in transit (mailbox-i61: within the last
+///    `transit_grace_secs`, `stored_at` not ahead) → `Reject { Expired }`; any other
+///    `expires_at <= now`, or a SelfPointer `stored_at` more than
 ///    `SELF_POINTER_MAX_FUTURE_SKEW_SECS` ahead of `now_secs` → `Reject { ClockSkew }`.
 /// 5. MailboxEngine::store:
 ///    - Ok / Err(Duplicate) → `Ack { msg_id }` (duplicate: idempotent, already present;
@@ -124,6 +126,17 @@ pub fn handle_mailbox_store(
 
     // 4. Postman clock rule (before the expires_at clamp inside the engine).
     if let Err(e) = check_entry_clock(entry, now_secs) {
+        if let MailboxError::Expired { .. } = e {
+            // mailbox-i61: died on the way, nobody's clock is at fault.
+            debug!(
+                target = %target,
+                msg_id = %hex_encode(&msg_id),
+                class = ?entry.class,
+                err = %e,
+                "mailbox: store rejected — expired in transit"
+            );
+            return reject(MailboxRejectReason::Expired);
+        }
         warn!(
             target = %target,
             msg_id = %hex_encode(&msg_id),
