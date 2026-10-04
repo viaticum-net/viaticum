@@ -55,3 +55,71 @@ fn inject_without_replace_refuses_an_occupied_slot() {
     assert!(store_injected(&db, &sp(1, 0x99, 1_001), false).is_err());
     assert_eq!(held(&db)[0].payload, vec![0x11; 64]);
 }
+
+// ─── --pos-response: the forged PoS responses of C-SP step 4 (pos-i16) ─────────
+
+use viaticum_core::messages::{MessageError, verify_pos_hash_response};
+use viaticum_core::types::{DeviceId, SourceBlockId, Timestamp};
+
+#[test]
+fn pos_response_spec_parses_cid_block_device() {
+    let spec = format!(
+        "{}:{}:{}",
+        "11".repeat(16),
+        "22".repeat(32),
+        "33".repeat(32)
+    );
+    let (cid, block, device) = parse_pos_response_spec(&spec).expect("parses");
+    assert_eq!(cid, [0x11; 16]);
+    assert_eq!(block, SourceBlockId([0x22; 32]));
+    assert_eq!(device, DeviceId([0x33; 32]));
+    for bad in [
+        format!("{}:{}", "11".repeat(16), "22".repeat(32)),
+        format!(
+            "{}:{}:{}",
+            "11".repeat(15),
+            "22".repeat(32),
+            "33".repeat(32)
+        ),
+        format!(
+            "{}:{}:{}",
+            "11".repeat(16),
+            "22".repeat(32),
+            "33".repeat(16)
+        ),
+        format!("{spec}:44"),
+    ] {
+        assert!(parse_pos_response_spec(&bad).is_none(), "{bad}");
+    }
+    assert_eq!(parse_forge_key("device"), Some(ForgeKey::Device));
+    assert_eq!(parse_forge_key("master"), Some(ForgeKey::Master));
+    assert_eq!(parse_forge_key("other"), None);
+}
+
+#[test]
+fn forged_pos_response_names_the_given_device_and_verifies_only_for_its_signer() {
+    let sibling_key = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+    let sibling = DeviceId(sibling_key.verifying_key().to_bytes());
+    let master_key = ed25519_dalek::SigningKey::from_bytes(&[0x52; 32]);
+    let addressed = DeviceId([0x53; 32]);
+    let block = SourceBlockId([0x54; 32]);
+
+    // F1: the sibling's device key, naming itself → the owner sees WrongDevice.
+    let f1 = forged_pos_response([0x55; 16], block, sibling, &sibling_key, Timestamp(7));
+    assert_eq!(f1.device_id, sibling);
+    assert_eq!(f1.chain_hash, FORGED_CHAIN_HASH);
+    assert_eq!((f1.challenge_id, f1.source_block_id), ([0x55; 16], block));
+    verify_pos_hash_response(&f1, &sibling).expect("a valid device signature");
+    assert!(matches!(
+        verify_pos_hash_response(&f1, &addressed),
+        Err(MessageError::WrongDevice { .. })
+    ));
+
+    // F2: the master key, naming the addressed device → BadSignature for that device.
+    let f2 = forged_pos_response([0x55; 16], block, addressed, &master_key, Timestamp(7));
+    assert_eq!(f2.device_id, addressed);
+    assert!(matches!(
+        verify_pos_hash_response(&f2, &addressed),
+        Err(MessageError::BadSignature)
+    ));
+}
