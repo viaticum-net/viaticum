@@ -328,8 +328,11 @@ pending.holder_id` and the signature verifies under `holder_id`
 (`verify_pos_hash_response(msg, &holder_id)` → `WrongDevice` / `BadSignature`). A response from
 a sibling device, a forgery, or one signed with the master key is ignored and the pending
 challenge is left intact for the addressed device's own answer. Siblings share the master and
-epoch keys (they are not cryptographically isolated from each other), but one device cannot
-pass or fail a PoS challenge for another.
+epoch keys (they are not cryptographically isolated from each other), so the guarantee is
+narrower: a sibling running honest software, and anyone who holds only the master key, cannot
+pass or fail a PoS challenge for another device. It does not hold for a device whose key is
+derived from the phrase (`init --mnemonic` without `--new-device`, `device add`): anyone who
+holds the phrase can compute that key and sign for it.
 
 `PosHashNack` means: "I am not storing (some of) these symbols" (evicted under disk pressure, or never received). A holder must send `PosHashNack` instead of staying silent if it knows it does not hold them.
 
