@@ -37,7 +37,7 @@ use viaticum_core::constants::{
     AVAIL_EWMA_INITIAL, MAILBOX_CANDIDATES_N, MAILBOX_READ_FANOUT, MAILBOX_WRITE_FANOUT,
 };
 use viaticum_core::db::Db;
-use viaticum_core::mailbox::{MailboxAddress, MailboxEntry};
+use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
 use viaticum_core::messages::{
     MAILBOX_WIRE_VERSION, MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest,
     MailboxStoreResponse, Message,
@@ -339,30 +339,14 @@ impl MailboxRouter {
             }));
         }
 
-        // Collect all responses; dedup by msg_id.
-        // Last writer (by stored_at) wins on duplicate msg_id from different peers.
-        let mut by_msg_id: HashMap<[u8; 16], MailboxEntry> = HashMap::new();
+        // Collect every postman's answer; merge them in `merge_poll_answers`.
+        let mut answers: Vec<Vec<MailboxEntry>> = Vec::with_capacity(handles.len());
 
         for handle in handles {
             match handle.await {
                 Ok((device_id, Ok(resp))) => {
                     record_contact_off_runtime(&self.db, device_id, now_secs);
-                    for entry in resp.entries {
-                        // Skip expired entries (should not happen; postman filters them,
-                        // but be defensive against clock skew).
-                        if entry.expires_at <= now_secs {
-                            continue;
-                        }
-                        // Dedup: keep highest stored_at per msg_id.
-                        by_msg_id
-                            .entry(entry.msg_id)
-                            .and_modify(|existing| {
-                                if entry.stored_at > existing.stored_at {
-                                    *existing = entry.clone();
-                                }
-                            })
-                            .or_insert(entry);
-                    }
+                    answers.push(resp.entries);
                 }
                 Ok((device_id, Err(e))) => {
                     debug!(device = %device_id, err = %e, "mailbox poll: fetch failed");
@@ -373,7 +357,7 @@ impl MailboxRouter {
             }
         }
 
-        let entries: Vec<_> = by_msg_id.into_values().collect();
+        let entries = merge_poll_answers(answers, now_secs);
         debug!(
             target = %target,
             entry_count = entries.len(),
@@ -496,19 +480,49 @@ fn peer_id_to_device_id_best_effort(peer_id: &PeerId) -> Option<DeviceId> {
 
 /// Deduplicate a slice of entries by msg_id, keeping the one with highest stored_at.
 /// Exposed for unit testing.
-pub fn dedup_entries(entries: Vec<MailboxEntry>) -> Vec<MailboxEntry> {
-    let mut by_msg_id: HashMap<[u8; 16], MailboxEntry> = HashMap::new();
-    for entry in entries {
-        by_msg_id
-            .entry(entry.msg_id)
-            .and_modify(|existing| {
-                if entry.stored_at > existing.stored_at {
-                    *existing = entry.clone();
-                }
-            })
-            .or_insert(entry);
+/// Merge the answers of several postmen to one poll (mailbox-i69).
+///
+/// A postman keeps one record per `msg_id`, so from one answer only the record with the
+/// highest `stored_at` per `msg_id` is taken: a single postman cannot multiply variants.
+/// Across postmen, records merge only when they are the same bytes — same `msg_id`,
+/// class and blake3 of the payload. Records that share a `msg_id` but differ go to the
+/// handlers side by side: a postman's forgery under an honest `msg_id` must not replace
+/// the honest record (last-writer-wins did), and the handlers tell them apart by the
+/// signature. Expired records are dropped (the postman filters them; clock skew).
+pub fn merge_poll_answers(answers: Vec<Vec<MailboxEntry>>, now_secs: u64) -> Vec<MailboxEntry> {
+    let mut merged: HashMap<([u8; 16], MailboxClass, [u8; 32]), MailboxEntry> = HashMap::new();
+    for answer in answers {
+        let mut per_msg_id: HashMap<[u8; 16], MailboxEntry> = HashMap::new();
+        for entry in answer {
+            if entry.expires_at <= now_secs {
+                continue;
+            }
+            per_msg_id
+                .entry(entry.msg_id)
+                .and_modify(|existing| {
+                    if entry.stored_at > existing.stored_at {
+                        *existing = entry.clone();
+                    }
+                })
+                .or_insert(entry);
+        }
+        for entry in per_msg_id.into_values() {
+            let key = (
+                entry.msg_id,
+                entry.class,
+                *blake3::hash(&entry.payload).as_bytes(),
+            );
+            merged
+                .entry(key)
+                .and_modify(|existing| {
+                    if entry.stored_at > existing.stored_at {
+                        *existing = entry.clone();
+                    }
+                })
+                .or_insert(entry);
+        }
     }
-    by_msg_id.into_values().collect()
+    merged.into_values().collect()
 }
 
 #[cfg(test)]

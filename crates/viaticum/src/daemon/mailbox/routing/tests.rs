@@ -1,7 +1,7 @@
 // T-4 test scenarios (spec §2.5).
 //
 // Test strategy:
-//   - Pure functions (select_write_peers ranking, dedup_entries): unit tests, no network.
+//   - Pure functions (select_write_peers ranking, merge_poll_answers): unit tests, no network.
 //   - Integration scenarios (publish, poll, dr_walk): inject MockSender to stub network.
 //     No real SwarmHandle needed — all I/O goes through the MailboxNetworkSender trait.
 //
@@ -12,9 +12,7 @@
 //
 // Additional unit tests:
 //   select_write_peers_orders_by_combined_trust_times_avail_ewma
-//   dedup_entries_keeps_highest_stored_at
-//   dedup_entries_single_entry_unchanged
-//   dedup_entries_empty_is_empty
+//   merge_* / forged_record_with_honest_msg_id_does_not_hide_the_honest_one (mailbox-i69)
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -35,7 +33,9 @@ use viaticum_core::types::{
     DeviceId, IdentityPub, PeerRecord, SourceBlockId, Timestamp, ewma_contact_observed,
 };
 
-use super::{MailboxNetworkSender, MailboxRouter, PublishOutcome, PublishVerdict, dedup_entries};
+use super::{
+    MailboxNetworkSender, MailboxRouter, PublishOutcome, PublishVerdict, merge_poll_answers,
+};
 use crate::daemon::network::swarm::device_id_to_peer_id;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
@@ -217,45 +217,53 @@ fn build_router_with_peers(n: usize, sender: Arc<MockSender>) -> (MailboxRouter,
 // Pure unit tests
 // ============================================================
 
+/// `make_entry` sets `expires_at` from `stored_at` + the class TTL; every entry below is
+/// live at this moment.
+const MERGE_NOW: u64 = 1;
+
+fn with_payload(mut e: MailboxEntry, payload: &[u8]) -> MailboxEntry {
+    e.payload = payload.to_vec();
+    e
+}
+
 #[test]
-fn dedup_entries_keeps_highest_stored_at() {
+fn merge_keeps_highest_stored_at_of_identical_bytes() {
     let target = make_identity(1);
     let msg_id = make_msg_id(1);
+    let older = make_entry(target, msg_id, 1000, MailboxClass::PosChallenge);
+    let newer = make_entry(target, msg_id, 2000, MailboxClass::PosChallenge);
+    assert_eq!(older.payload, newer.payload);
 
-    // Same msg_id, different stored_at.
-    let older = {
-        let mut e = make_entry(target, msg_id, 1000, MailboxClass::PosChallenge);
-        e.stored_at = 1000;
-        e
-    };
-    let newer = {
-        let mut e = make_entry(target, msg_id, 2000, MailboxClass::PosChallenge);
-        e.stored_at = 2000;
-        e
-    };
-
-    let deduped = dedup_entries(vec![older, newer]);
-    assert_eq!(deduped.len(), 1);
-    assert_eq!(deduped[0].stored_at, 2000, "must keep highest stored_at");
+    let merged = merge_poll_answers(vec![vec![older], vec![newer]], MERGE_NOW);
+    assert_eq!(
+        merged.len(),
+        1,
+        "same bytes from two postmen are one record"
+    );
+    assert_eq!(merged[0].stored_at, 2000);
 }
 
 #[test]
-fn dedup_entries_single_entry_unchanged() {
-    let target = make_identity(2);
-    let entry = make_entry(target, make_msg_id(2), 1000, MailboxClass::PosChallenge);
-    let deduped = dedup_entries(vec![entry.clone()]);
-    assert_eq!(deduped.len(), 1);
-    assert_eq!(deduped[0].msg_id, entry.msg_id);
+fn merge_single_entry_unchanged() {
+    let entry = make_entry(
+        make_identity(2),
+        make_msg_id(2),
+        1000,
+        MailboxClass::PosChallenge,
+    );
+    let merged = merge_poll_answers(vec![vec![entry.clone()]], MERGE_NOW);
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].msg_id, entry.msg_id);
 }
 
 #[test]
-fn dedup_entries_empty_is_empty() {
-    let deduped = dedup_entries(vec![]);
-    assert!(deduped.is_empty());
+fn merge_of_no_answers_is_empty() {
+    assert!(merge_poll_answers(vec![], MERGE_NOW).is_empty());
+    assert!(merge_poll_answers(vec![vec![], vec![]], MERGE_NOW).is_empty());
 }
 
 #[test]
-fn dedup_entries_distinct_msg_ids_all_kept() {
+fn merge_keeps_all_distinct_msg_ids() {
     let target = make_identity(3);
     let entries: Vec<_> = (0..5u8)
         .map(|i| {
@@ -267,8 +275,82 @@ fn dedup_entries_distinct_msg_ids_all_kept() {
             )
         })
         .collect();
-    let deduped = dedup_entries(entries);
-    assert_eq!(deduped.len(), 5, "all distinct msg_ids must be kept");
+    assert_eq!(merge_poll_answers(vec![entries], MERGE_NOW).len(), 5);
+}
+
+/// mailbox-i69: a postman's forgery under the honest msg_id, stored later, does not
+/// replace the honest record from another postman — both reach the handlers.
+#[test]
+fn forged_record_with_honest_msg_id_does_not_hide_the_honest_one() {
+    let target = make_identity(4);
+    let msg_id = make_msg_id(4);
+    let honest = with_payload(
+        make_entry(target, msg_id, 1000, MailboxClass::PosResponse),
+        b"honest signed response",
+    );
+    let forged = with_payload(
+        make_entry(target, msg_id, 9000, MailboxClass::PosResponse),
+        b"forged response",
+    );
+
+    let merged = merge_poll_answers(vec![vec![honest.clone()], vec![forged.clone()]], MERGE_NOW);
+    assert_eq!(merged.len(), 2, "both variants go to the handlers");
+    assert!(merged.iter().any(|e| e.payload == honest.payload));
+    assert!(merged.iter().any(|e| e.payload == forged.payload));
+}
+
+/// A single postman answers with one record per msg_id (the one it keeps); extra
+/// variants in its answer do not multiply the work of the handlers.
+#[test]
+fn one_postman_contributes_one_variant_per_msg_id() {
+    let target = make_identity(5);
+    let msg_id = make_msg_id(5);
+    let answer: Vec<_> = (0..10u8)
+        .map(|i| {
+            with_payload(
+                make_entry(target, msg_id, 1000 + i as u64, MailboxClass::PosResponse),
+                &[i; 8],
+            )
+        })
+        .collect();
+
+    let merged = merge_poll_answers(vec![answer], MERGE_NOW);
+    assert_eq!(merged.len(), 1);
+    assert_eq!(
+        merged[0].payload,
+        vec![9u8; 8],
+        "the postman's newest record"
+    );
+}
+
+#[test]
+fn same_msg_id_in_another_class_is_another_record() {
+    let target = make_identity(6);
+    let msg_id = make_msg_id(6);
+    let a = with_payload(
+        make_entry(target, msg_id, 1000, MailboxClass::PosChallenge),
+        b"x",
+    );
+    let b = with_payload(
+        make_entry(target, msg_id, 1000, MailboxClass::DropNotice),
+        b"x",
+    );
+    assert_eq!(
+        merge_poll_answers(vec![vec![a], vec![b]], MERGE_NOW).len(),
+        2
+    );
+}
+
+#[test]
+fn merge_drops_expired_records() {
+    let mut e = make_entry(
+        make_identity(7),
+        make_msg_id(7),
+        1000,
+        MailboxClass::PosChallenge,
+    );
+    e.expires_at = 500;
+    assert!(merge_poll_answers(vec![vec![e]], 500).is_empty());
 }
 
 #[test]
