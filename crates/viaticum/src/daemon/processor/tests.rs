@@ -4668,6 +4668,7 @@ async fn a_notice_inside_the_owners_delete_cooldown_is_still_the_friends_drop() 
 
 // DN-1: one notice — one application (spec f1_stale_drop_notice.md, DN1-1..DN1-18).
 mod drop_notice_dedup;
+mod drop_notice_device;
 
 // В-0b: the offer path refactor and the 4R offer shadow (D-3a, D-3b, D-5).
 mod four_r_shadow;
