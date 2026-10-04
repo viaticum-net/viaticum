@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use viaticum_core::db::Db;
-use viaticum_core::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp, hex_encode};
+use viaticum_core::types::{DeviceId, SourceBlockId, Timestamp, hex_encode};
 
 use super::{
     RecordingMailboxSender, TEST_EPOCH_KEY, dummy_master_pub, make_identity, make_peer_record,
@@ -27,7 +27,6 @@ fn challenge(block: SourceBlockId, holder: DeviceId, cid: [u8; 16]) -> PendingHa
         expected_chain_hash: [0u8; 32],
         issued_at: Timestamp::now(),
         challenge_id: cid,
-        holder_master: IdentityPub(holder.0),
     }
 }
 
@@ -131,7 +130,7 @@ async fn pending_lookup_by_challenge_id_is_indexed() {
             source_block_id: block_of(i),
             chain_hash: [0u8; 32],
             timestamp: Timestamp::now(),
-            device_id: None,
+            device_id: DeviceId([0u8; 32]),
             sig: [0u8; 64],
         };
         scheduler

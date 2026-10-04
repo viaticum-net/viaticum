@@ -1,37 +1,48 @@
 // PoS handlers: holder responds to hash challenge, owner verifies hash response or receives nack.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use tracing::{debug, info, warn};
+use viaticum_core::cluster::ClusterState;
 use viaticum_core::db::Db;
 use viaticum_core::messages::{
-    Message, PosHashChallengeMsg, PosHashResponseMsg, build_pos_hash_nack, build_pos_hash_response,
+    Message, PosHashChallengeMsg, build_pos_hash_nack, build_pos_hash_response,
     verify_pos_hash_challenge,
 };
 use viaticum_core::pos::compute_chain_hash;
 use viaticum_core::types::from_cbor_bytes;
-use viaticum_core::types::{IdentityPub, Timestamp, hex_encode};
+use viaticum_core::types::{DeviceId, IdentityPub, Timestamp, hex_encode};
 
-use crate::daemon::mailbox::poll::PosMailboxChallengeHandler;
+use crate::daemon::mailbox::poll::{PosChallengeAnswer, PosMailboxChallengeHandler};
 
 use super::{Processor, ProcessorError};
 
 // ─── PosResponder: standalone holder-side challenge-response compute ─────────
 
-/// Lightweight struct that owns only the three fields needed to compute a
-/// PosHashResponse (or PosHashNack) for an inbound PosHashChallengeMsg.
+/// Lightweight struct that owns only the fields needed to compute a PosHashResponse (or
+/// PosHashNack) for an inbound PosHashChallengeMsg.
 ///
 /// Decoupled from the full Processor so it can be cloned into the mailbox poll
 /// task without requiring Processor to be Arc-wrapped.
 ///
-/// Fields mirror the corresponding fields of `Processor`:
-/// - `db`: used to verify we hold symbols for the given owner+block.
+/// - `db`: used to verify we hold symbols for the given owner+block, and to know the
+///   devices of our own master (sibling check, pos-i15).
 /// - `holdings_dir`: root directory for stored symbol files (`{block_hex}/{esi}.bin`).
-/// - `master_signing_key`: signs PosHashNackMsg so the owner can verify authenticity.
+/// - `device_signing_key`: this device's key; signs the response and the Nack so the
+///   owner accepts them only for a placement on this device (pos-i16).
+/// - `device_id`: derived from `device_signing_key`; a challenge addressed to another
+///   device is not served (pos-i15).
+/// - `own_master`: our master identity; its devices are our siblings.
+/// - `cluster_state`: the devices this node's cluster knows (siblings not yet in the
+///   device→master table).
 pub struct PosResponder {
     db: Db,
     holdings_dir: PathBuf,
-    master_signing_key: ed25519_dalek::SigningKey,
+    device_signing_key: ed25519_dalek::SigningKey,
+    device_id: DeviceId,
+    own_master: IdentityPub,
+    cluster_state: Option<Arc<Mutex<ClusterState>>>,
     /// Scales the freshness window (`challenge_max_age_secs`); 1 = production.
     time_scale: u64,
 }
@@ -58,12 +69,18 @@ impl PosResponder {
     pub fn new(
         db: Db,
         holdings_dir: PathBuf,
-        master_signing_key: ed25519_dalek::SigningKey,
+        device_signing_key: ed25519_dalek::SigningKey,
+        own_master: IdentityPub,
+        cluster_state: Option<Arc<Mutex<ClusterState>>>,
     ) -> Self {
+        let device_id = DeviceId(device_signing_key.verifying_key().to_bytes());
         PosResponder {
             db,
             holdings_dir,
-            master_signing_key,
+            device_signing_key,
+            device_id,
+            own_master,
+            cluster_state,
             time_scale: 1,
         }
     }
@@ -72,6 +89,23 @@ impl PosResponder {
     pub fn with_time_scale(mut self, time_scale: u64) -> Self {
         self.time_scale = time_scale.max(1);
         self
+    }
+
+    /// Whether `device` is another device of our own master: in the device→master table
+    /// or in the cluster state.
+    fn is_sibling(&self, device: &DeviceId) -> Result<bool, ProcessorError> {
+        if self
+            .db
+            .get_devices_for_master(&self.own_master)?
+            .contains(device)
+        {
+            return Ok(true);
+        }
+        Ok(self.cluster_state.as_ref().is_some_and(|cs| {
+            cs.lock()
+                .map(|g| g.get_device(device).is_some())
+                .unwrap_or(false)
+        }))
     }
 }
 
@@ -123,6 +157,31 @@ impl PosResponder {
             return Err(ProcessorError::StaleChallenge { age_secs: age });
         }
 
+        // pos-i15: the challenge goes to our MASTER box, which every device of our master
+        // reads; `device_id` (signed by the owner) names the one device whose placement is
+        // challenged. Another device's challenge is not served: no Nack, no response, no
+        // disk read — before the holding lookup, so even a sibling holding stale symbols
+        // at the same ESIs cannot speak for the addressed device. A sibling's challenge is
+        // `NotAddressedToThisDevice` (remembered until forgotten); a device we do not know
+        // as a sibling is `NotAddressedToThisMaster` (junk, re-checked like a no-answer).
+        if challenge.device_id != self.device_id {
+            let sibling = self.is_sibling(&challenge.device_id)?;
+            debug!(
+                block_id = %block_id,
+                challenger = %owner_id,
+                challenge_id = %hex_encode(&challenge.challenge_id),
+                addressed_device = %challenge.device_id,
+                own_device = %self.device_id,
+                sibling,
+                "processor: PosHashChallenge addressed to another device — not answering"
+            );
+            return Err(if sibling {
+                ProcessorError::NotAddressedToThisDevice
+            } else {
+                ProcessorError::NotAddressedToThisMaster
+            });
+        }
+
         // Verify we hold symbols for this owner+block. Capture the holding — its
         // `symbol_count()` bounds the legitimate challenge size (SM-1 guard below).
         let holding = match self.db.get_holding(&block_id, &owner_id)? {
@@ -139,8 +198,7 @@ impl PosResponder {
                     block_id,
                     0,
                     Timestamp::now(),
-                    challenge.device_id,
-                    &self.master_signing_key,
+                    &self.device_signing_key,
                 )));
             }
         };
@@ -244,8 +302,7 @@ impl PosResponder {
                         block_id,
                         esi,
                         Timestamp::now(),
-                        challenge.device_id,
-                        &self.master_signing_key,
+                        &self.device_signing_key,
                     )));
                 }
                 Err(e) => return Err(ProcessorError::Io(e)),
@@ -268,15 +325,15 @@ impl PosResponder {
             owner = %owner_id,
             "processor: PosHashChallenge — responding with chain hash"
         );
-        // CS-ID-1 / P1-1: sign the response with our master key so the owner can verify it
-        // came from the challenged holder (not a positioned postman forging a wrong hash).
+        // CS-ID-1 / pos-i16: sign the response with our DEVICE key so the owner accepts it
+        // only for the placement on this device (not a postman's forgery, not a sibling's
+        // answer, not anything signed with the master key alone).
         Ok(Message::PosHashResponse(build_pos_hash_response(
             challenge.challenge_id,
             block_id,
             chain_hash,
             Timestamp::now(),
-            challenge.device_id,
-            &self.master_signing_key,
+            &self.device_signing_key,
         )))
     }
 }
@@ -288,8 +345,8 @@ impl Processor {
     /// chain hash, return PosHashResponse (or PosHashNack on missing symbols).
     ///
     /// Delegates to `PosResponder::compute_response` — the responder owns only
-    /// the three fields needed (db, holdings_dir, master_signing_key), keeping
-    /// the compute logic decoupled from the full Processor lifetime.
+    /// the fields it needs, keeping the compute logic decoupled from the full
+    /// Processor lifetime.
     pub(crate) async fn handle_pos_hash_challenge_inner(
         &self,
         owner_id: IdentityPub,
@@ -298,7 +355,9 @@ impl Processor {
         let responder = PosResponder::new(
             self.db.clone(),
             self.holdings_dir.clone(),
-            self.master_signing_key.clone(),
+            self.device_signing_key.clone(),
+            self.own_identity,
+            self.cluster_state.clone(),
         );
         responder.compute_response(owner_id, challenge).await
     }
@@ -312,8 +371,8 @@ impl Processor {
 /// The handler decodes the challenge, calls `PosResponder::compute_response`, and
 /// returns the response (if any). The poll loop then publishes the response via mailbox.
 ///
-/// `PosResponder` is constructed from the same db / holdings_dir / master_signing_key
-/// clones that are passed into Processor — no Arc<Processor> wrapping is needed.
+/// `PosResponder` is constructed from the same db / holdings_dir / device key / master /
+/// cluster state clones that are passed into Processor — no Arc<Processor> wrapping.
 ///
 /// Note: owner_id here is the sender field from the MailboxEntry (the owner's master_pub
 /// who published the challenge). We pass it as `owner_id` to `compute_response` which uses
@@ -338,50 +397,11 @@ impl PosMailboxChallengeHandler for ProcessorPosHandler {
         &self,
         owner_master_pub: IdentityPub,
         payload: Vec<u8>,
-    ) -> anyhow::Result<Option<PosHashResponseMsg>> {
+    ) -> anyhow::Result<PosChallengeAnswer> {
         // owner_master_pub = MailboxEntry.sender (the owner who sent the challenge).
         // Passed as owner_id to compute_response which uses it to look up our HoldingRecord.
-        match from_cbor_bytes::<PosHashChallengeMsg>(&payload) {
-            Ok(challenge) => {
-                match self
-                    .responder
-                    .compute_response(owner_master_pub, challenge)
-                    .await
-                {
-                    Ok(Message::PosHashResponse(response)) => Ok(Some(response)),
-                    Ok(Message::PosHashNack(_)) => {
-                        // Nack-over-mailbox delivery is a documented A2 follow-up (needs a new
-                        // MailboxClass). The owner's pending challenge timeout (14d2h) is the
-                        // correct backstop for cold backup — this is a conscious limitation, not
-                        // a silent drop.
-                        info!(
-                            "mailbox PoS: holder cannot serve challenge (nack); \
-                             owner will detect via pending timeout — \
-                             nack-over-mailbox delivery is a documented A2 follow-up"
-                        );
-                        Ok(None)
-                    }
-                    Ok(other) => {
-                        warn!(
-                            msg_variant = ?std::mem::discriminant(&other),
-                            "mailbox PoS: unexpected Message variant from compute_response"
-                        );
-                        Ok(None)
-                    }
-                    // CS-ID-5 / P1-2: an unauthenticated (forged/unsigned) challenge was already
-                    // logged inside compute_response. Treat it as a clean drop — no response is
-                    // published and the poll loop must NOT surface it as a handler error.
-                    Err(ProcessorError::UnauthenticatedChallenge) => Ok(None),
-                    // SM-1: an oversized/malformed challenge (sum of counts > what we hold, or a
-                    // range overflowing u32) was already warn-logged inside compute_response.
-                    // Same clean-drop treatment as UnauthenticatedChallenge — no Nack, no
-                    // response, not surfaced as a handler error.
-                    Err(ProcessorError::OversizedChallenge { .. }) => Ok(None),
-                    // pos-i5-a: a replay older than TTL + skew, already warn-logged.
-                    Err(ProcessorError::StaleChallenge { .. }) => Ok(None),
-                    Err(e) => Err(anyhow::anyhow!("pos challenge handler error: {e}")),
-                }
-            }
+        let challenge = match from_cbor_bytes::<PosHashChallengeMsg>(&payload) {
+            Ok(c) => c,
             // An undecodable payload is junk (a postman's plant or a broken peer): a clean
             // drop like an unauthenticated challenge, so the poll remembers it as a
             // no-answer and re-checks it once per quarter TTL instead of logging an
@@ -392,8 +412,51 @@ impl PosMailboxChallengeHandler for ProcessorPosHandler {
                     err = %e,
                     "mailbox PoS: undecodable PosHashChallengeMsg — dropping"
                 );
-                Ok(None)
+                return Ok(PosChallengeAnswer::NoAnswer);
             }
+        };
+        match self
+            .responder
+            .compute_response(owner_master_pub, challenge)
+            .await
+        {
+            Ok(Message::PosHashResponse(response)) => Ok(PosChallengeAnswer::Respond(response)),
+            Ok(Message::PosHashNack(_)) => {
+                // Nack-over-mailbox delivery is a documented A2 follow-up (needs a new
+                // MailboxClass). The owner's pending challenge timeout (14d2h) is the
+                // correct backstop for cold backup — this is a conscious limitation, not
+                // a silent drop.
+                info!(
+                    "mailbox PoS: holder cannot serve challenge (nack); \
+                     owner will detect via pending timeout — \
+                     nack-over-mailbox delivery is a documented A2 follow-up"
+                );
+                Ok(PosChallengeAnswer::NoAnswer)
+            }
+            Ok(other) => {
+                warn!(
+                    msg_variant = ?std::mem::discriminant(&other),
+                    "mailbox PoS: unexpected Message variant from compute_response"
+                );
+                Ok(PosChallengeAnswer::NoAnswer)
+            }
+            // pos-i15: a sibling device's challenge, already debug-logged. Not ours to
+            // answer, and the addressee is signed: remembered until forgotten, no re-check.
+            Err(ProcessorError::NotAddressedToThisDevice) => Ok(PosChallengeAnswer::NotMine),
+            // A device we do not know as a sibling: may be a postman replaying someone
+            // else's signed challenge into our box. A plain no-answer (junk cap, re-check).
+            Err(ProcessorError::NotAddressedToThisMaster) => Ok(PosChallengeAnswer::NoAnswer),
+            // CS-ID-5 / P1-2: an unauthenticated (forged/unsigned) challenge was already
+            // logged inside compute_response. Treat it as a clean drop — no response is
+            // published and the poll loop must NOT surface it as a handler error.
+            Err(ProcessorError::UnauthenticatedChallenge) => Ok(PosChallengeAnswer::NoAnswer),
+            // SM-1: an oversized/malformed challenge (sum of counts > what we hold, or a
+            // range overflowing u32) was already warn-logged inside compute_response.
+            // Same clean-drop treatment as UnauthenticatedChallenge.
+            Err(ProcessorError::OversizedChallenge { .. }) => Ok(PosChallengeAnswer::NoAnswer),
+            // pos-i5-a: a replay older than TTL + skew, already warn-logged.
+            Err(ProcessorError::StaleChallenge { .. }) => Ok(PosChallengeAnswer::NoAnswer),
+            Err(e) => Err(anyhow::anyhow!("pos challenge handler error: {e}")),
         }
     }
 }

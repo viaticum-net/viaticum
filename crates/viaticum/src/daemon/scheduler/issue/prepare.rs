@@ -80,8 +80,8 @@ pub(crate) struct PreparedChallenge {
     /// The ranges the expected hash covers: a publish is valid only for a placement that
     /// still holds exactly these.
     pub(super) esi_ranges: Vec<(u32, u32)>,
-    /// The key the challenge is addressed to, resolved during the preparation (CS-POS-3:
-    /// the response is verified against this same key).
+    /// The master box the challenge is published to (every device of that master reads
+    /// it; `holder_id` inside the signed challenge names the addressee).
     holder_master: IdentityPub,
 }
 
@@ -149,12 +149,14 @@ impl Scheduler {
         let now = Timestamp::now();
         // CS-ID-5 / P1-2: sign the challenge with our master key so the holder can
         // authenticate it against MailboxEntry.sender before doing any disk work.
+        // pos-i15: addressed to the placement's device; the holder's siblings reading
+        // the same master box do not answer it.
         let challenge_msg = viaticum_core::messages::build_pos_hash_challenge(
             c.challenge_id,
             block_id,
             c.esi_ranges.clone(),
             now,
-            Some(c.holder_id),
+            c.holder_id,
             &self.signing_key,
         );
         let payload = match to_cbor(&challenge_msg) {
@@ -185,9 +187,8 @@ impl Scheduler {
             // W-3: sender is our master_pub so holder knows where to publish the response.
             sender: Some(self.my_master_pub),
         };
-        // CS-POS-3: the pending record keeps the holder_master the challenge was addressed
-        // to, so the response is verified against the SAME key — not a re-resolve that may
-        // have degraded to device-pub by then.
+        // pos-i16: the response is verified against `holder_id` (the device key), so the
+        // pending record does not need the master the mailbox entry was addressed to.
         let challenge = PendingHashChallenge {
             source_block_id: block_id,
             holder_id: c.holder_id,
@@ -195,7 +196,6 @@ impl Scheduler {
             expected_chain_hash: c.expected_chain_hash,
             issued_at: now,
             challenge_id: c.challenge_id,
-            holder_master: c.holder_master,
         };
         Some((entry, challenge))
     }

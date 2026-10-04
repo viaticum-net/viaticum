@@ -63,7 +63,7 @@ pub(crate) fn poll_interval_secs(time_scale: u64) -> u64 {
 /// - `pending`: the owner's in-flight challenges, written by the scheduler; only responses
 ///   to these are forwarded (pos-i6)
 /// - `challenge_handler`: called with (owner_master, challenge_payload_bytes) to process a
-///   PosChallenge and return an optional PosHashResponseMsg + owner_master for publishing
+///   PosChallenge: a response to publish, no answer, or not mine (pos-i15)
 /// - `drop_handler`: called for each DropNotice decoded from a SymbolDropNoticeBatchMsg entry
 /// - `delete_handler`: called for each DeleteRequest entry (T-13b-1)
 /// - `revocation_handler`: called for each Revocation entry (T-13b-2)
@@ -188,6 +188,7 @@ pub(crate) async fn poll_once(
             entries = entry_count,
             computed = counts.computed,
             no_answer = counts.no_answer,
+            not_mine = counts.not_mine,
             handler_error = counts.handler_error,
             republished = counts.republished,
             skipped = counts.skipped,
@@ -304,8 +305,9 @@ pub(crate) async fn dispatch_entry(
 /// on the next poll after a 0-ack publish, otherwise once per quarter TTL while the
 /// challenge and the response entry live. That re-publish is the retry (trap W-1: a
 /// postman that lost the entry after acking it). A no-answer (Nack, unauthenticated,
-/// oversized) is remembered too and re-checked once per quarter TTL; a handler error
-/// is not remembered and is retried on the next poll.
+/// oversized) is remembered too and re-checked once per quarter TTL; a challenge
+/// addressed to a sibling device (pos-i15) is remembered as not-mine until forgotten;
+/// a handler error is not remembered and is retried on the next poll.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_pos_challenge(
     router: &Arc<MailboxRouter>,
@@ -391,7 +393,7 @@ async fn dispatch_pos_challenge(
         .handle_pos_challenge(owner_master, entry.payload.clone())
         .await
     {
-        Ok(Some(response)) => {
+        Ok(PosChallengeAnswer::Respond(response)) => {
             counts.computed += 1;
             // Publish PosResponse back to the owner via mailbox.
             let response_payload = match to_cbor(&response) {
@@ -480,11 +482,17 @@ async fn dispatch_pos_challenge(
             }
             answered.remember_response(key, response_entry, response.challenge_id, acks, now_secs);
         }
-        Ok(None) => {
+        Ok(PosChallengeAnswer::NoAnswer) => {
             // Nack or CannotCompute — challenge_handler already logged
             counts.no_answer += 1;
             answered.remember_no_answer(key, now_secs);
             debug!(msg_id = %hex_encode(&entry.msg_id), "mailbox_poll: PosChallenge handler returned no response (nack)");
+        }
+        Ok(PosChallengeAnswer::NotMine) => {
+            // pos-i15: addressed to a sibling device of our master — nothing to publish.
+            // The addressee is signed and in the key, so it stays not-mine until forgotten.
+            counts.not_mine += 1;
+            answered.remember_not_mine(key, now_secs);
         }
         Err(e) => {
             counts.handler_error += 1;
@@ -806,16 +814,28 @@ pub trait DropNoticeHandler: Send + Sync {
 
 // ─── PosMailboxChallengeHandler trait ────────────────────────────────────────
 
+/// What the holder does with one PoS challenge from its master box.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PosChallengeAnswer {
+    /// A computed response to publish back to the owner.
+    Respond(PosHashResponseMsg),
+    /// Nothing to publish: a Nack (not delivered by mail), an unauthenticated, oversized,
+    /// stale or undecodable challenge, or one addressed to a device we do not know as
+    /// ours. Remembered as a no-answer (junk cap, re-checked once per quarter TTL).
+    NoAnswer,
+    /// pos-i15: addressed to another device of our own master. Nothing to publish;
+    /// remembered until forgotten, never re-checked (the addressee is signed and in the
+    /// memory key).
+    NotMine,
+}
+
 /// Abstraction for handling a PosChallenge from the mailbox.
 ///
 /// Exists as a trait seam so the poll loop can be tested without a full Processor.
-/// Production impl: `ProcessorPosHandler` wraps `Processor::handle_pos_hash_challenge_inner`.
+/// Production impl: `ProcessorPosHandler` wraps `PosResponder::compute_response`.
 ///
-/// Returns:
-///   Ok(Some(response)) — computed PosHashResponseMsg to publish back to owner
-///   Ok(None)           — nack (missing symbols etc.); handler already logged
-///   Err(e)             — unexpected error
-/// Handler trait for PoS challenges received from the mailbox.
+/// Returns `Ok(answer)` (see `PosChallengeAnswer`; the handler already logged) or
+/// `Err(e)` for an unexpected error (not remembered, retried on the next poll).
 ///
 /// Parameters to `handle_pos_challenge`:
 /// - `owner_master_pub`: owner's master_pub from `MailboxEntry.sender` (the identity who sent the
@@ -828,7 +848,7 @@ pub trait PosMailboxChallengeHandler: Send + Sync {
         &self,
         owner_master_pub: IdentityPub,
         payload: Vec<u8>,
-    ) -> anyhow::Result<Option<PosHashResponseMsg>>;
+    ) -> anyhow::Result<PosChallengeAnswer>;
 }
 
 #[cfg(test)]

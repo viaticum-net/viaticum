@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use viaticum_core::messages::{PosHashChallengeMsg, PosHashResponseMsg};
-use viaticum_core::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp, from_cbor_bytes};
+use viaticum_core::types::{DeviceId, SourceBlockId, Timestamp, from_cbor_bytes};
 
 use super::issue_support::{Owner, SlowPostman, owner_with_due};
 use super::pos_scale::{LogBuf, field};
@@ -31,7 +31,6 @@ async fn pending_with_response(owner: &Owner) -> ([u8; 16], PosHashResponseMsg) 
             expected_chain_hash: [0u8; 32],
             issued_at: Timestamp::now(),
             challenge_id: cid,
-            holder_master: IdentityPub(holder.0),
         },
     );
     let response = viaticum_core::messages::build_pos_hash_response(
@@ -39,7 +38,6 @@ async fn pending_with_response(owner: &Owner) -> ([u8; 16], PosHashResponseMsg) 
         block,
         [0u8; 32],
         Timestamp::now(),
-        None,
         &holder_key,
     );
     (cid, response)

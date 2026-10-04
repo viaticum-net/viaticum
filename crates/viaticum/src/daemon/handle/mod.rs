@@ -1010,7 +1010,7 @@ impl DaemonHandle {
                 backup_event_tx,
                 Some(cluster_state.clone()),
                 accepted_offers.clone(),
-                master_key.clone(),
+                device_key.clone(),
             );
             // Wire WorkPipeline event channel to Processor so on_peer_authenticated
             // sends WorkEvent::PeerAuthenticated to wake the worker.
@@ -1193,9 +1193,18 @@ impl DaemonHandle {
             };
 
             // pos-i5-a: the freshness window of an answered challenge scales with the run.
+            // pos-i15/i16: the responder answers only challenges addressed to this device
+            // and signs with the device key; siblings come from the device→master table
+            // and the cluster state.
             let pos_handler = ProcessorPosHandler::new(
-                PosResponder::new(db.clone(), holdings_dir.clone(), master_key.clone())
-                    .with_time_scale(time_scale),
+                PosResponder::new(
+                    db.clone(),
+                    holdings_dir.clone(),
+                    device_key.clone(),
+                    identity_pub,
+                    Some(cluster_state.clone()),
+                )
+                .with_time_scale(time_scale),
             );
 
             // T-13a: pass repair_tx so ProcessorDropHandler can wake the repair worker

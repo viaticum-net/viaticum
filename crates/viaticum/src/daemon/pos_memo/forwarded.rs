@@ -44,13 +44,17 @@ pub struct ResponseKey([u8; 32]);
 
 impl ResponseKey {
     /// blake3 over the fields the holder signs (challenge_id, source_block_id,
-    /// chain_hash, timestamp — decoded values in one fixed layout) and the signature.
-    /// `v`, `device_id` and the entry's `sender` are not signed and not in the key.
+    /// device_id, chain_hash, timestamp — decoded values in one fixed layout) and the
+    /// signature. `v` and the entry's `sender` are not signed and not in the key. The
+    /// responding `device_id` is signed and in the key: a sibling's response under the
+    /// same challenge_id is another envelope, so it cannot lock out the addressed device's
+    /// response (pos-i16).
     pub fn signed(r: &PosHashResponseMsg) -> Self {
         let mut h = blake3::Hasher::new();
-        h.update(b"viaticum-pos-memo-signed-response-v1");
+        h.update(b"viaticum-pos-memo-signed-response-v2");
         h.update(&r.challenge_id);
         h.update(&r.source_block_id.0);
+        h.update(&r.device_id.0);
         h.update(&r.chain_hash);
         h.update(&r.timestamp.0.to_le_bytes());
         h.update(&r.sig);

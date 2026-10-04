@@ -47,7 +47,6 @@ impl PosDropFixture {
             self.block,
             expected,
             Timestamp::now(),
-            Some(self.holder),
             &self.holder_key,
         );
         self.scheduler
@@ -71,7 +70,7 @@ impl std::io::Write for LogBuf {
 }
 
 /// Run `fut` with an INFO log capture; returns its log.
-async fn logged<F: std::future::Future>(fut: F) -> (F::Output, String) {
+pub(super) async fn logged<F: std::future::Future>(fut: F) -> (F::Output, String) {
     let buf = LogBuf::default();
     let writer = buf.clone();
     let dispatch = tracing::Dispatch::new(

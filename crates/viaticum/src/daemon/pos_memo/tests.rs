@@ -9,7 +9,7 @@ use viaticum_core::types::{SourceBlockId, Timestamp, from_cbor_bytes};
 
 use super::{
     AnsweredChallenges, ChallengeKey, ChallengeStep, MAX_REMEMBERED_NO_ANSWERS,
-    MAX_REMEMBERED_RESPONSES, PollCounts, PosPollState,
+    MAX_REMEMBERED_NOT_MINE, MAX_REMEMBERED_RESPONSES, PollCounts, PosPollState,
 };
 
 /// The key the poll uses for `e`: signed content when the payload decodes as a
@@ -452,6 +452,7 @@ fn no_answer_turning_into_response_at_a_full_cap_is_dropped_not_kept_stale() {
 fn production_caps_are_the_documented_ones() {
     assert_eq!(MAX_REMEMBERED_RESPONSES, 200_000);
     assert_eq!(MAX_REMEMBERED_NO_ANSWERS, 10_000);
+    assert_eq!(MAX_REMEMBERED_NOT_MINE, 200_000);
     let mut memo = AnsweredChallenges::new(TS);
     let ttl = memo.ttl_secs();
     for i in 0..(MAX_REMEMBERED_NO_ANSWERS as u32 + 100) {
@@ -499,7 +500,7 @@ fn signed() -> PosHashChallengeMsg {
         SourceBlockId([8; 32]),
         vec![(0, 3), (10, 2)],
         Timestamp(1_700_000_000),
-        None,
+        viaticum_core::types::DeviceId([7; 32]),
         &owner_key(),
     )
 }
@@ -529,14 +530,6 @@ fn postman_variants() -> Vec<(&'static str, Vec<u8>)> {
     let mut with_tail = honest.clone();
     with_tail.push(0x00);
     vec![
-        (
-            "device_id",
-            to_cbor(&PosHashChallengeMsg {
-                device_id: Some(viaticum_core::types::DeviceId([7; 32])),
-                ..c.clone()
-            })
-            .unwrap(),
-        ),
         (
             "v",
             to_cbor(&PosHashChallengeMsg { v: 9, ..c.clone() }).unwrap(),
@@ -634,6 +627,10 @@ fn signed_fields_are_all_in_the_key() {
             timestamp: Timestamp(1),
             ..c.clone()
         },
+        PosHashChallengeMsg {
+            device_id: viaticum_core::types::DeviceId([8; 32]),
+            ..c.clone()
+        },
     ];
     for e in edits {
         assert_ne!(k(&entry_with(to_cbor(&e).unwrap())), base);
@@ -643,4 +640,79 @@ fn signed_fields_are_all_in_the_key() {
         ..entry_with(to_cbor(&c).unwrap())
     };
     assert_ne!(k(&other_sender), base);
+}
+
+// ─── pos-i15: a challenge addressed to a sibling device ───────────────────────
+
+// M5: a not-mine entry is skipped until forgotten — never re-checked at TTL/4 like a
+// no-answer (the addressee is signed and in the key).
+#[test]
+fn not_mine_is_skipped_until_forget_without_recheck() {
+    let mut memo = AnsweredChallenges::new(TS);
+    let ttl = memo.ttl_secs();
+    let retry = memo.retry_secs();
+    let c = entry_with(to_cbor(&signed()).unwrap());
+    memo.remember_not_mine(k(&c), T0);
+    for t in [T0 + 1, T0 + retry, T0 + 2 * retry + 1, T0 + ttl - 1] {
+        assert_eq!(memo.step(k(&c), t), ChallengeStep::Skip, "at +{}", t - T0);
+    }
+    // After forget_at the challenge is a new sight (computed once more).
+    assert_eq!(memo.step(k(&c), T0 + ttl), ChallengeStep::Compute);
+    assert_eq!(memo.forget_expired(T0 + ttl), 1);
+    assert!(memo.is_empty());
+
+    // Control: a no-answer of the same age is re-checked at TTL/4.
+    let mut junk = AnsweredChallenges::new(TS);
+    junk.remember_no_answer(k(&c), T0);
+    assert_eq!(junk.step(k(&c), T0 + retry), ChallengeStep::Compute);
+}
+
+// A6: the not-mine room is its own — junk no-answers do not take it and it does not take
+// the junk's or the responses' room.
+#[test]
+fn not_mine_cap_is_separate_from_no_answers() {
+    let mut memo = AnsweredChallenges::with_all_caps(TS, 2, 2, 3);
+    let ttl = memo.ttl_secs();
+    for id in 0..20u8 {
+        memo.remember_no_answer(k(&challenge(id, vec![0xEE, id], T0, ttl)), T0);
+    }
+    assert_eq!(memo.len(), 2, "the junk room is full");
+    for id in 0..3u8 {
+        memo.remember_not_mine(k(&challenge(id, vec![0x51, id], T0, ttl)), T0);
+    }
+    assert_eq!(
+        memo.len(),
+        5,
+        "not-mine entries are stored past the full junk room"
+    );
+    let refused = memo.refused();
+    let over = challenge(9, vec![0x51, 9], T0, ttl);
+    memo.remember_not_mine(k(&over), T0);
+    assert_eq!(memo.refused(), refused + 1, "the not-mine cap holds");
+    assert_eq!(memo.step(k(&over), T0 + 4), ChallengeStep::Compute);
+    let honest = challenge(200, vec![1, 2, 3], T0, ttl);
+    memo.remember_response(k(&honest), response(9, T0, ttl), [1; 16], 1, T0);
+    assert_eq!(memo.step(k(&honest), T0 + 4), ChallengeStep::Skip);
+    assert_eq!(memo.len(), 6);
+    // Forgetting frees each room by its kind.
+    assert_eq!(memo.forget_expired(T0 + ttl), 6);
+    memo.remember_not_mine(k(&over), T0 + ttl);
+    assert_eq!(memo.step(k(&over), T0 + ttl + 4), ChallengeStep::Skip);
+}
+
+// M4: two challenges that differ only in the addressed device never share an entry.
+#[test]
+fn challenge_key_differs_when_device_id_differs() {
+    let c = signed();
+    let to_other = PosHashChallengeMsg {
+        device_id: viaticum_core::types::DeviceId([8; 32]),
+        ..c.clone()
+    };
+    let a = k(&entry_with(to_cbor(&c).unwrap()));
+    let b = k(&entry_with(to_cbor(&to_other).unwrap()));
+    assert_ne!(a, b);
+    // A not-mine entry for the sibling's challenge does not skip ours.
+    let mut memo = AnsweredChallenges::new(TS);
+    memo.remember_not_mine(a, T0);
+    assert_eq!(memo.step(b, T0 + 4), ChallengeStep::Compute);
 }
