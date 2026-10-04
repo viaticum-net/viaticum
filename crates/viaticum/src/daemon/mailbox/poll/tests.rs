@@ -2339,8 +2339,7 @@ async fn poll_forgets_an_answered_challenge_one_ttl_later() {
             900,
             at,
         )
-        .await
-        .expect("poll");
+        .await;
         assert_eq!(
             pos.answered.len(),
             want,
@@ -2688,8 +2687,7 @@ async fn poll_forwards_only_pending_responses_once() {
             900,
             now + 4 * poll,
         )
-        .await
-        .expect("poll");
+        .await;
         total.forwarded += counts.forwarded;
         total.not_pending += counts.not_pending;
         total.in_flight += counts.in_flight;
@@ -2770,3 +2768,5 @@ async fn production_channel_forwards_a_3000_response_poll_without_deferring() {
     }
     assert_eq!(received.len(), usize::from(BURST));
 }
+
+mod stream;

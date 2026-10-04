@@ -18,6 +18,9 @@
 // pointer publisher can name a refusal (CROWN-1 V.3, V.15.3). It returns at the needed
 // number of acks, not after the slowest postman (mailbox-i60, submodule `fanout`).
 //
+// poll_stream: each postman's answer reaches the caller as it arrives, not after the
+// slowest postman (mailbox-i63, submodule `fetch`); `poll` collects them all.
+//
 // Avail observation wiring (T-4a §5):
 // Successful MailboxStoreAck / MailboxFetchResponse → positive observation:
 //   record.avail_ewma = ewma_contact_observed(record.avail_ewma, AVAIL_EWMA_ALPHA)
@@ -31,13 +34,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use libp2p::PeerId;
+use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
 use viaticum_core::constants::{
     AVAIL_EWMA_INITIAL, MAILBOX_CANDIDATES_N, MAILBOX_READ_FANOUT, MAILBOX_WRITE_FANOUT,
 };
 use viaticum_core::db::Db;
-use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
+use viaticum_core::mailbox::{MailboxAddress, MailboxEntry};
 use viaticum_core::messages::{
     MAILBOX_WIRE_VERSION, MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest,
     MailboxStoreResponse, Message,
@@ -50,11 +54,14 @@ use crate::daemon::network::swarm::{SwarmHandle, device_id_to_peer_id};
 
 mod dr_walk;
 mod fanout;
+mod fetch;
 mod verdict;
 
-use fanout::{record_avail_contact, record_contact_off_runtime, store_fanout, unix_now};
+use fanout::{record_avail_contact, store_fanout, unix_now};
+use fetch::fetch_fanout;
 
 pub use dr_walk::DrWalk;
+pub use fetch::{PollEntryKey, PollSeen, poll_entry_key};
 pub use verdict::{PublishOutcome, PublishVerdict};
 
 // ─── Per-request network timeout ─────────────────────────────────────────────
@@ -297,74 +304,68 @@ impl MailboxRouter {
         Ok(self.publish_detailed(entry, target_sig, 1).await.acks.len())
     }
 
-    /// Poll the box `target` from read-fanout (300) candidates.
+    /// Poll the box `target` from read-fanout (300) candidates, answer by answer
+    /// (mailbox-i63).
     ///
     /// `proof` is `None` for our own master box (the postman checks the transport
     /// identity); a pointer box needs a fetch proof bound to our device, and then the
     /// postman serves only SelfPointer entries.
     ///
-    /// Returns the non-expired entries merged by `merge_poll_answers` (identical bytes only).
-    /// Avail observation: on successful FetchResponse, updates avail_ewma for the responding peer.
-    pub async fn poll(
+    /// Every postman's answer `(postman, entries)` comes out of the channel as soon as it
+    /// arrives, raw: the reader drops expired records and merges by `poll_entry_key`
+    /// (`PollSeen`). A sleeping postman holds only its own answer (≤ 15 s), not the
+    /// others'. The channel closes when every postman answered or timed out.
+    /// Avail observation: every successful FetchResponse, a late one included, updates
+    /// avail_ewma and `last_seen` of the responding peer.
+    pub fn poll_stream(
         &self,
         target: &MailboxAddress,
         proof: Option<[u8; 64]>,
         since_stored_at: Option<u64>,
-    ) -> anyhow::Result<Vec<MailboxEntry>> {
-        let now_secs = unix_now();
+    ) -> mpsc::Receiver<(DeviceId, Vec<MailboxEntry>)> {
         let ranked = self.build_ranked_candidates(target);
-
         // Read-fanout: top-300 closest peers.
         let read_peers: Vec<DeviceId> = ranked
             .iter()
             .take(self.read_fanout)
             .map(|(d, _)| *d)
             .collect();
-
         let req = MailboxFetchRequest {
             v: MAILBOX_WIRE_VERSION,
             target: *target,
             since_stored_at,
             target_proof: proof,
         };
+        debug!(
+            target = %target,
+            peers_tried = read_peers.len(),
+            "mailbox poll: fetching"
+        );
+        fetch_fanout(&self.sender, &self.db, read_peers, req)
+    }
 
-        // Send in parallel to all read-fanout peers.
-        let mut handles = Vec::with_capacity(read_peers.len());
-        for device_id in &read_peers {
-            let sender = Arc::clone(&self.sender);
-            let req_clone = req.clone();
-            let dev = *device_id;
-            handles.push(tokio::spawn(async move {
-                (dev, sender.send_fetch(dev, req_clone).await)
-            }));
+    /// Poll the box `target` and return once every postman answered or timed out:
+    /// the non-expired entries merged by `merge_poll_answers` (identical bytes only).
+    /// See `poll_stream`.
+    pub async fn poll(
+        &self,
+        target: &MailboxAddress,
+        proof: Option<[u8; 64]>,
+        since_stored_at: Option<u64>,
+    ) -> anyhow::Result<Vec<MailboxEntry>> {
+        let mut rx = self.poll_stream(target, proof, since_stored_at);
+        let mut answers: Vec<Vec<MailboxEntry>> = Vec::new();
+        while let Some((_, entries)) = rx.recv().await {
+            answers.push(entries);
         }
-
-        // Collect every postman's answer; merge them in `merge_poll_answers`.
-        let mut answers: Vec<Vec<MailboxEntry>> = Vec::with_capacity(handles.len());
-
-        for handle in handles {
-            match handle.await {
-                Ok((device_id, Ok(resp))) => {
-                    record_contact_off_runtime(&self.db, device_id, now_secs);
-                    answers.push(resp.entries);
-                }
-                Ok((device_id, Err(e))) => {
-                    debug!(device = %device_id, err = %e, "mailbox poll: fetch failed");
-                }
-                Err(join_err) => {
-                    warn!("mailbox poll: task panicked: {join_err}");
-                }
-            }
-        }
-
-        let entries = merge_poll_answers(answers, now_secs);
+        let answered = answers.len();
+        let entries = merge_poll_answers(answers, unix_now());
         debug!(
             target = %target,
             entry_count = entries.len(),
-            peers_tried = read_peers.len(),
+            answered,
             "mailbox poll: collected entries"
         );
-
         Ok(entries)
     }
 
@@ -489,18 +490,13 @@ fn peer_id_to_device_id_best_effort(peer_id: &PeerId) -> Option<DeviceId> {
 /// them apart by the signature. Expired records are dropped (the postman filters them;
 /// clock skew).
 pub fn merge_poll_answers(answers: Vec<Vec<MailboxEntry>>, now_secs: u64) -> Vec<MailboxEntry> {
-    let mut merged: HashMap<([u8; 16], MailboxClass, [u8; 32]), MailboxEntry> = HashMap::new();
+    let mut merged: HashMap<PollEntryKey, MailboxEntry> = HashMap::new();
     for entry in answers.into_iter().flatten() {
         if entry.expires_at <= now_secs {
             continue;
         }
-        let key = (
-            entry.msg_id,
-            entry.class,
-            *blake3::hash(&entry.payload).as_bytes(),
-        );
         merged
-            .entry(key)
+            .entry(poll_entry_key(&entry))
             .and_modify(|existing| {
                 if entry.stored_at > existing.stored_at {
                     *existing = entry.clone();

@@ -428,7 +428,7 @@ pub struct PollCounts {
     /// ours): dropped without a WARN (pos-i6).
     pub not_pending: u32,
     /// PosResponse entries already handed over and still pending, or a second envelope
-    /// of one challenge in this poll (pos-i6).
+    /// of one challenge in the same postman's answer (pos-i6, mailbox-i63).
     pub in_flight: u32,
 }
 

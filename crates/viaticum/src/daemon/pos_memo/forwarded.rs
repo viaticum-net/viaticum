@@ -32,8 +32,8 @@ use crate::daemon::scheduler::PendingIndex;
 /// Honest bound: one pending challenge per placement, one honest envelope per challenge
 /// (two after a holder restart), released as soon as the challenge leaves pending. A
 /// postman can add one forged envelope per pending challenge per poll (one envelope per
-/// challenge_id per poll is selected), each kept until its challenge resolves or one TTL
-/// passes. ~100 B per entry ≈ 20 MB at the cap. Above the cap an envelope is not marked:
+/// challenge_id per postman's answer is selected, mailbox-i63), each kept until its
+/// challenge resolves or one TTL passes. ~100 B per entry ≈ 20 MB at the cap. Above the cap an envelope is not marked:
 /// it is forwarded again on the next poll while its challenge is pending (the pre-pos-i6
 /// behaviour, bounded by the channel).
 pub const MAX_FORWARDED_RESPONSES: usize = 200_000;
@@ -77,7 +77,7 @@ pub struct ForwardCounts {
     /// owner restarted): dropped without a WARN.
     pub not_pending: u32,
     /// Already sent and still pending, or a second envelope of a challenge already
-    /// selected in this poll.
+    /// selected in this postman's answer.
     pub in_flight: u32,
     /// Did not decode as a PosHashResponseMsg.
     pub undecodable: u32,
