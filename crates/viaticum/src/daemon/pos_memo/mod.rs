@@ -405,6 +405,8 @@ impl AnsweredChallenges {
 /// Counters of one poll, printed by `mailbox_poll: poll done`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PollCounts {
+    /// Postmen whose answer the poll read before its deadline (mailbox-i63).
+    pub responders: u32,
     /// Challenges the handler answered with a response this poll (symbols read).
     pub computed: u32,
     /// Challenges the handler gave no answer to (Nack, unauthenticated, oversized).

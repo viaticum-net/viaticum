@@ -119,16 +119,20 @@ struct Fixture {
     router: Arc<MailboxRouter>,
     delete: Arc<RecordingDelete>,
     my_master: IdentityPub,
+    /// The postmen, in the order of `replies`.
+    postmen: Vec<DeviceId>,
 }
 
 impl Fixture {
     fn new(replies: &[Reply]) -> Self {
         let db = Db::open_in_memory().expect("db");
         let sender = Arc::new(Planned::default());
+        let mut postmen = vec![];
         for r in replies {
             let d = gen_device_id();
             db.upsert_peer(&peer(d)).expect("upsert peer");
             sender.plan.lock().unwrap().insert(d, r.clone());
+            postmen.push(d);
         }
         let router = Arc::new(MailboxRouter::with_sender(
             sender as Arc<dyn MailboxNetworkSender>,
@@ -139,14 +143,25 @@ impl Fixture {
             router,
             delete: Arc::new(RecordingDelete::default()),
             my_master: my_master(),
+            postmen,
         }
     }
 
-    /// One `poll_once` at wall-clock now.
+    /// One `poll_once` at wall-clock now, time_scale 1 (read budget 15 s).
     async fn poll(
         &self,
         pos: &mut PosPollState,
         pos_tx: &mpsc::Sender<PosHashResponseMsg>,
+    ) -> PollCounts {
+        self.poll_scaled(pos, pos_tx, 1).await
+    }
+
+    /// One `poll_once` at wall-clock now with `time_scale`.
+    async fn poll_scaled(
+        &self,
+        pos: &mut PosPollState,
+        pos_tx: &mpsc::Sender<PosHashResponseMsg>,
+        time_scale: u64,
     ) -> PollCounts {
         let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
         let challenge_handler: Arc<dyn super::super::PosMailboxChallengeHandler> =
@@ -166,7 +181,7 @@ impl Fixture {
             &delete_handler,
             &revocation_handler,
             &self.my_master,
-            1,
+            time_scale,
             Timestamp::now().0,
         )
         .await
@@ -222,8 +237,64 @@ async fn poll_dispatches_entries_before_a_sleeping_postman_answers() {
     );
     assert!(
         start.elapsed() >= Duration::from_secs(15),
-        "the sleeper was really asked (the poll ends when it times out)"
+        "the sleeper was really asked (the poll reads for its 15 s budget)"
     );
+}
+
+/// mailbox-i63 (review B1): the poll reads answers for min(15 s, poll period) — 5 s at
+/// time_scale 720 — and then stops. A postman answering at 10 s is not waited for: its
+/// record is not handled in this poll (the next poll fetches it again), and its answer
+/// still records the contact (avail, `last_seen`) from its own task.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn poll_stops_reading_at_its_deadline_and_late_answer_still_updates_contact() {
+    let f = Fixture::new(&[
+        Reply::Answer(0, vec![delete_entry(1, b"quick")]),
+        Reply::Answer(10, vec![delete_entry(2, b"late")]),
+    ]);
+    let late = f.postmen[1];
+    let (pos_tx, _pos_rx) = mpsc::channel::<PosHashResponseMsg>(8);
+    let mut pos = PosPollState::new(pending_for(&[]), 720);
+    let before_secs = Timestamp::now().0;
+
+    let start = Instant::now();
+    let counts = f.poll_scaled(&mut pos, &pos_tx, 720).await;
+
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_secs(5),
+        "the poll ends at its read budget, not at the late postman's answer"
+    );
+    assert_eq!(super::super::poll_read_budget(720), Duration::from_secs(5));
+    assert_eq!(counts.responders, 1, "only the quick postman was read");
+    assert_eq!(f.delete_payloads(), vec![b"quick".to_vec()]);
+    assert_eq!(
+        f.db.get_peer(&late).unwrap().unwrap().last_seen,
+        Timestamp(0),
+        "the late postman has not answered yet"
+    );
+
+    sleep(Duration::from_secs(6)).await;
+    let rec = f.db.get_peer(&late).unwrap().unwrap();
+    assert!(
+        rec.last_seen.0 >= before_secs,
+        "the late answer moves last_seen"
+    );
+    assert!(rec.avail_ewma > 0.5, "the late answer raises avail");
+    assert_eq!(
+        f.delete_payloads(),
+        vec![b"quick".to_vec()],
+        "the late record waits for the next poll"
+    );
+}
+
+/// The read budget is one postman's request timeout, capped by the poll period.
+#[test]
+fn poll_read_budget_is_the_request_timeout_capped_by_the_poll_period() {
+    use super::super::poll_read_budget;
+    assert_eq!(poll_read_budget(1), Duration::from_secs(15));
+    assert_eq!(poll_read_budget(240), Duration::from_secs(15));
+    assert_eq!(poll_read_budget(900), Duration::from_secs(4));
+    assert_eq!(poll_read_budget(100_000), Duration::from_secs(1));
 }
 
 /// mailbox-i69 under streaming: two postmen bring the same msg_id with different payloads

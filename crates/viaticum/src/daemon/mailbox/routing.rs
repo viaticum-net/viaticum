@@ -68,7 +68,7 @@ pub use verdict::{PublishOutcome, PublishVerdict};
 
 /// Per-peer request timeout. Mailbox operations are best-effort and parallelized;
 /// a slow peer must not stall the whole fanout.
-const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ============================================================
 // MailboxNetworkSender — test seam

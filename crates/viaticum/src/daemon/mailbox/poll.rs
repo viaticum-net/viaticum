@@ -19,7 +19,7 @@
 //   Generic/other  → ignore
 
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -31,7 +31,7 @@ use viaticum_core::messages::{
 };
 use viaticum_core::types::{IdentityPub, from_cbor_bytes, hex_encode};
 
-use super::routing::{MailboxRouter, PollSeen};
+use super::routing::{MailboxRouter, PEER_REQUEST_TIMEOUT, PollSeen};
 use crate::daemon::pos_memo::{
     AnsweredChallenges, ChallengeKey, ChallengeStep, PollCounts, PosPollState,
 };
@@ -50,6 +50,16 @@ use crate::daemon::scheduler::PendingChallenges;
 /// never busy-spins on a 0s interval; `time_scale = 0` is treated as 1.
 pub(crate) fn poll_interval_secs(time_scale: u64) -> u64 {
     (MAILBOX_POLL_INTERVAL_SECS / time_scale.max(1)).max(1)
+}
+
+/// How long one poll reads the postmen's answers (mailbox-i63): one postman's request
+/// timeout (`PEER_REQUEST_TIMEOUT`, 15 s), never longer than the poll period
+/// (`poll_interval_secs`), so a sleeping postman cannot stretch a poll into the next one.
+/// An answer that comes later still records its contact (avail, `last_seen`) in its own
+/// fetch task (`routing::fetch`); its records stay at the postman until their TTL and come
+/// back on the next poll.
+pub(crate) fn poll_read_budget(time_scale: u64) -> Duration {
+    PEER_REQUEST_TIMEOUT.min(Duration::from_secs(poll_interval_secs(time_scale)))
 }
 
 /// Run the periodic mailbox poll loop.
@@ -123,8 +133,10 @@ pub async fn run_mailbox_poll(
 /// postman's answer as it arrives (mailbox-i63): drop the records already seen in this
 /// poll (same bytes, `PollSeen`, mailbox-i69) or expired, forward the answer's
 /// PosResponse entries as one batch (pos-i6), dispatch its other entries one by one.
-/// A sleeping postman delays only its own records. At the end print
-/// `mailbox_poll: poll done` (INFO when the poll had entries, DEBUG when it was empty).
+/// A sleeping postman delays only its own records. The poll stops reading at its
+/// deadline (`poll_read_budget`): a late answer records its contact in its own task and
+/// its records come on the next poll. Then print `mailbox_poll: poll done` (INFO when the
+/// poll had entries, DEBUG when it was empty; `responders` = postmen read in time).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn poll_once(
     router: &Arc<MailboxRouter>,
@@ -145,13 +157,22 @@ pub(crate) async fn poll_once(
     // None): a holder's re-published PoS response keeps its first `stored_at` and must
     // still come back (mailbox-i63, `pos_memo`).
     let mut answers = router.poll_stream(&MailboxAddress::for_master(my_master_pub), None, None);
+    let deadline = tokio::time::Instant::now() + poll_read_budget(time_scale);
     let mut seen = PollSeen::new(now_secs);
     let mut entry_count = 0usize;
     let mut first_entry_ms: Option<u64> = None;
     let mut counts = PollCounts::default();
     let mut responses_forwarded = false;
 
-    while let Some((_postman, answer)) = answers.recv().await {
+    loop {
+        let answer = match tokio::time::timeout_at(deadline, answers.recv()).await {
+            Ok(Some((_postman, answer))) => answer,
+            // Every postman answered or timed out.
+            Ok(None) => break,
+            // The read budget is spent: stop reading (mailbox-i63).
+            Err(_) => break,
+        };
+        counts.responders += 1;
         let entries = seen.admit(answer);
         if entries.is_empty() {
             continue;
@@ -186,6 +207,8 @@ pub(crate) async fn poll_once(
             .await;
         }
     }
+    // Late answers find the channel closed; their tasks have recorded the contact.
+    drop(answers);
     if !responses_forwarded {
         // Release the sent marks of resolved challenges even when no response came.
         forward_pos_responses(pos, pos_response_tx, vec![], now_secs, &mut counts).await;
@@ -200,6 +223,7 @@ pub(crate) async fn poll_once(
         info!(
             elapsed_ms,
             first_entry_ms,
+            responders = counts.responders,
             entries = entry_count,
             computed = counts.computed,
             no_answer = counts.no_answer,
@@ -221,6 +245,7 @@ pub(crate) async fn poll_once(
     } else {
         debug!(
             elapsed_ms,
+            responders = counts.responders,
             entries = 0,
             memo_answered,
             memo_forwarded,
