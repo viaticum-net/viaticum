@@ -338,12 +338,20 @@ pub struct SourceBlockRecord {
     /// (INV-G0).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub seal_generation: u32,
+    /// repair-i8: monotonic ESI cursor of this block — the end of the highest range ever
+    /// offered for it. Never decreases (`Db::upsert_source_block` keeps the larger value);
+    /// written in the transaction that writes the `Offered` rows; rides SystemState with the
+    /// record. 0 for records written before this field (and not serialized when 0, so such
+    /// records stay byte-identical, as INV-G0 for `seal_generation`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub esi_high_water: u32,
     // B-4: worker cooldown (last_attempted_at / last_pool_signature) moved to the
     // RAM-only HotCache::block_cooldown — never persisted, resets on restart.
     // Old records may still carry these CBOR map keys; serde ignores them.
 }
 
-/// `skip_serializing_if` for [`SourceBlockRecord::seal_generation`] (INV-G0).
+/// `skip_serializing_if` for [`SourceBlockRecord::seal_generation`] (INV-G0) and
+/// [`SourceBlockRecord::esi_high_water`].
 fn is_zero(v: &u32) -> bool {
     *v == 0
 }

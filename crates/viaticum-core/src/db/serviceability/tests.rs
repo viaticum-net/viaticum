@@ -12,6 +12,7 @@ use super::Serviceability;
 fn block(seed: u8, status: SourceBlockStatus) -> SourceBlockRecord {
     SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: SourceBlockId([seed; 32]),
         k: 4,
         t: 1024,

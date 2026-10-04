@@ -220,6 +220,16 @@ Triggered by PoS state machine (PresumedLost or Lost).
 
 Graduated response: PresumedLost triggers repair but doesn't zero trust (holder may come back). Lost = permanent, trust penalized via PoS outcome recording.
 
+### ESI numbering (repair-i8, repair-i9, repair-i10)
+
+An ESI number of a block is given to one placement row only and is never given out again while the block lives:
+
+- **Cursor.** Fresh numbers start at `max(esi_high_water, end of every placement row of the block, cluster namespace start)`. Rows of every status count: a `Lost` or `Deleting` holder may still have its symbols on disk (an advance DropNotice holds until its deadline; a PoS `Fail` leaves bad bytes). `esi_high_water` is a field of `SourceBlockRecord`, raised in the same transaction that writes the `Offered` rows, never lowered (the DB keeps the larger value on every write) and carried in SystemState with the record — so an overwritten or deleted top row does not move the cursor back.
+- **Re-offer.** A device with an `Offered` row (a `SymbolReject`, an unfinished delivery) gets its own range again — the only repeat of numbers (repair-i9). Every other device gets fresh numbers, including a device whose row is `Lost`: its old files may be bad, and the holder treats a symbol file of the right length as "already held" (repair-i10).
+- **Ceiling.** raptorq accepts ESIs below 2^24 (`MAX_ESI_EXCLUSIVE`), for every device whatever its cluster namespace. Fresh numbers stop there: the plan offers only what is left, and the block is reported as not repairable (`blocks_esi_exhausted` in `status --json`, a line on the Dashboard, a WARN once a day per block; another WARN once per block when the cursor passes 2^23). Old numbers are not reused.
+
+Consequence for DropNotice and PoS: the ranges of different rows of a block never overlap, so a notice or a challenge names one placement.
+
 ## Deletion
 
 Double cooldown protects against ransomware and accidental deletion.

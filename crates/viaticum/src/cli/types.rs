@@ -312,6 +312,11 @@ pub struct StatusData {
     /// backup-i24: this machine's block work budget in bytes; 0 until R1-d-b sets one.
     #[serde(default)]
     pub block_work_budget_bytes: u64,
+    /// repair-i8 ceiling (C-SP §2.6): blocks in service the worker cannot repair because
+    /// their ESI numbers are used up (2^24, raptorq); none until the worker plans a block
+    /// after a start.
+    #[serde(default)]
+    pub blocks_esi_exhausted: u32,
 }
 
 /// Peer summary shown in `viaticum status`.

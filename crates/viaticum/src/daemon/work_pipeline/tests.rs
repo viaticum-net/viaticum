@@ -111,6 +111,7 @@ fn make_block_record(
 ) -> SourceBlockRecord {
     SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: bid,
         k: 5,
         t: 1024,
@@ -140,6 +141,7 @@ fn make_config() -> WorkPipelineConfig {
         min_pool_size: 2,
         recheck_tx: None,
         max_source_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
+        esi_space: Arc::default(),
     }
 }
 

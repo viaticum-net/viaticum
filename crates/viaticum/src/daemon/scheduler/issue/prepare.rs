@@ -271,10 +271,8 @@ impl BlockPrep {
         } in self.holders
         {
             // Expand the holder's OWN ranges to a sorted ESI list.
-            let mut esis: Vec<u32> = esi_ranges
-                .iter()
-                .flat_map(|&(start, count)| start..start + count)
-                .collect();
+            // Saturating end (CS-ERA-6): the worker keeps every range below 2^24.
+            let mut esis: Vec<u32> = viaticum_core::types::ranges_to_esi_list(&esi_ranges);
             esis.sort_unstable();
 
             // Apply binding keystream and collect bound symbols.

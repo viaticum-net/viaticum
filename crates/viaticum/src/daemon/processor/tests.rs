@@ -1679,6 +1679,7 @@ async fn handle_symbol_drop_notice_does_not_panic() {
 fn make_source_block(block_id: SourceBlockId) -> SourceBlockRecord {
     SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 10,
         t: 1,
@@ -3689,6 +3690,7 @@ async fn cluster_sync_response_from_non_cluster_peer_is_rejected() {
 fn make_source_block_for_hook(block_id: SourceBlockId, importance: f64) -> SourceBlockRecord {
     SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 5,
         t: 1,

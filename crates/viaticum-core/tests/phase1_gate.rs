@@ -276,6 +276,7 @@ fn db_stores_and_retrieves_full_records() {
     // Insert SourceBlockRecord.
     let sbr = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: bid,
         k: 1,
         t: 65_535,
@@ -519,6 +520,7 @@ fn full_owner_flow() {
 
     let sbr = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: bid,
         k: params.k,
         t: params.t,

@@ -963,13 +963,36 @@ impl Db {
 // Source blocks table
 // ============================================================
 
+/// Write `record` into the source-blocks table, never lowering the stored
+/// `esi_high_water` (repair-i8): a writer holding an older snapshot of the record (cached
+/// fields, the deletion executor, an SS restore) must not move the ESI cursor back.
+fn insert_source_block_keeping_high_water(
+    table: &mut redb::Table<'_, &'static [u8; 32], &'static [u8]>,
+    record: &SourceBlockRecord,
+) -> Result<(), DbError> {
+    let stored_high_water = match table.get(&record.block_id.0)? {
+        Some(v) => from_cbor_bytes::<SourceBlockRecord>(v.value())?.esi_high_water,
+        None => 0,
+    };
+    let bytes = if stored_high_water > record.esi_high_water {
+        let mut kept = record.clone();
+        kept.esi_high_water = stored_high_water;
+        to_cbor_bytes(&kept)
+    } else {
+        to_cbor_bytes(record)
+    };
+    table.insert(&record.block_id.0, bytes.as_slice())?;
+    Ok(())
+}
+
 impl Db {
+    /// Insert or replace a SourceBlockRecord. `esi_high_water` never decreases: the larger of
+    /// the stored and the given value is written (repair-i8).
     pub fn upsert_source_block(&self, record: &SourceBlockRecord) -> Result<(), DbError> {
-        let bytes = to_cbor_bytes(record);
         let tx = self.inner.begin_write()?;
         {
             let mut table = tx.open_table(SOURCE_BLOCKS)?;
-            table.insert(&record.block_id.0, bytes.as_slice())?;
+            insert_source_block_keeping_high_water(&mut table, record)?;
         }
         tx.commit()?;
         Ok(())
@@ -1410,6 +1433,10 @@ impl Db {
 
     /// Delete placement. Also cleans up indices and HOT cache.
     /// Returns the deleted placement, or None if it did not exist.
+    ///
+    /// Only when the block is retired or being released (`Deleting`): rows go only with the
+    /// block. The ESI cursor of a live block is `esi_high_water` (repair-i8), so a deleted
+    /// top row would not move it back — but nothing should delete a live block's row.
     pub fn delete_placement(
         &self,
         block_id: &SourceBlockId,
@@ -2904,14 +2931,11 @@ pub struct DbWriteTxn<'db> {
 
 impl<'db> DbWriteTxn<'db> {
     /// Insert or replace a SourceBlockRecord. No hot cache entry (blocks agg
-    /// is derived from placements, not source block records).
+    /// is derived from placements, not source block records). `esi_high_water` never
+    /// decreases: the larger of the stored and the given value is written (repair-i8).
     pub fn upsert_source_block(&mut self, record: &SourceBlockRecord) -> Result<(), DbError> {
-        let bytes = to_cbor_bytes(record);
-        {
-            let mut table = self.txn.open_table(SOURCE_BLOCKS)?;
-            table.insert(&record.block_id.0, bytes.as_slice())?;
-        }
-        Ok(())
+        let mut table = self.txn.open_table(SOURCE_BLOCKS)?;
+        insert_source_block_keeping_high_water(&mut table, record)
     }
 
     /// Delete a SourceBlockRecord. No hot cache entry.
@@ -2987,6 +3011,9 @@ impl<'db> DbWriteTxn<'db> {
 
     /// Delete a SymbolPlacement. Queues a hot cache delta.
     /// Returns the deleted placement, or None if it did not exist.
+    ///
+    /// Only when the block is retired or being released (`Deleting`): rows go only with the
+    /// block; the ESI cursor of a live block is `esi_high_water` (repair-i8).
     pub fn delete_placement(
         &mut self,
         block_id: &SourceBlockId,

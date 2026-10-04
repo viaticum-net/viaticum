@@ -19,12 +19,20 @@
 // planned all shares from the cursor again and a block every peer refused ran into raptorq's
 // `assert!(esi < 2^24)` within hours.
 //
-// Out of scope (slice C-SP K1b): the same rule for every row status (`Lost`, `Deleting`), a
-// persistent `esi_high_water`, and the path at the ESI ceiling.
+// Fresh numbers (repair-i8, repair-i10; C-SP K1b): the cursor is max(the block's persistent
+// `esi_high_water`, the end of every row of the block whatever its status, the namespace
+// start). A device with a `Lost` row gets fresh numbers like any other; only an `Offered` row
+// is reused. `esi_high_water` is written in the transaction that writes the `Offered` rows and
+// never decreases, so neither an overwritten nor a deleted top row moves the cursor back.
+//
+// Ceiling: 2^24 (raptorq), whatever the cluster namespace. Fresh numbers stop there; the plan
+// offers what is left (a smaller share, or nothing) and the worker reports the block "not
+// repairable" (`esi_space`). No reuse of old numbers (repair-i11, future).
 
 use std::sync::{Arc, Mutex};
 
 use viaticum_core::cluster::{ClusterState, esi_namespace_start};
+use viaticum_core::constants::MAX_ESI_EXCLUSIVE;
 use viaticum_core::db::Db;
 use viaticum_core::erasure::binding_seed;
 use viaticum_core::placement::{
@@ -59,11 +67,15 @@ pub(crate) enum OfferPlan {
     EmptyAllocation,
     /// The allocation failed.
     AllocationFailed(PlacementError),
-    /// Offers to send; `cursor` is where fresh numbers started.
+    /// Offers to send; `cursor` is where fresh numbers started. `esi_cut`: fresh numbers ran
+    /// into 2^24 and some offer got less than its share (C-SP §2.6).
     Planned {
         cursor: u32,
         offers: Vec<PlannedOffer>,
+        esi_cut: bool,
     },
+    /// The plan needed fresh numbers and none are left below 2^24: nothing to offer.
+    EsiExhausted { cursor: u32 },
 }
 
 /// Start of this device's ESI namespace: `device_index · 2^20` in a cluster, else 0.
@@ -81,28 +93,43 @@ pub(crate) fn namespace_start(
         .unwrap_or(0)
 }
 
-/// Next fresh ESI: max end over EVERY row of the block, whatever its status, never below the
-/// namespace (repair-i8). A `Lost`/`Deleting` row counts too: its holder may still have those
-/// ESIs on disk (a PoS `Fail` leaves the bad bytes there, a DropNotice holds until its
-/// deadline), so its numbers must not come back as "fresh" — to another device, or to the same
-/// one (repair-i10: a device with a `Lost` row gets fresh numbers only; `reusable_own_ranges`
-/// reuses `Offered` rows alone). Before, a `Fail` on the TOP range dropped the cursor onto it,
-/// repair re-offered the same ESIs to the same holder, the holder answered "already held" by
-/// file length and the placement went back to `Alive` with the bad symbol: a Fail→Lost→Alive
-/// loop, never healed. Residual (C-SP K1b): a removed row takes its range out of the cursor —
-/// a persistent `esi_high_water` closes that.
-pub(crate) fn esi_cursor(placements: &[SymbolPlacement], namespace_start: u32) -> u32 {
+/// Next fresh ESI (repair-i8): max of the block's `esi_high_water`, the end of EVERY row of
+/// the block whatever its status, and the namespace start. A `Lost`/`Deleting` row counts: its
+/// holder may still have those ESIs on disk (a PoS `Fail` leaves the bad bytes there, a
+/// DropNotice holds until its deadline), so its numbers must not come back as "fresh" — to
+/// another device, or to the same one (repair-i10: a device with a `Lost` row gets fresh
+/// numbers only; `reusable_own_ranges` reuses `Offered` rows alone). Before, a `Fail` on the
+/// TOP range dropped the cursor onto it, repair re-offered the same ESIs to the same holder,
+/// the holder answered "already held" by file length and the placement went back to `Alive`
+/// with the bad symbol: a Fail→Lost→Alive loop, never healed. `high_water` covers a top row
+/// that was overwritten or deleted since its range was given out.
+pub(crate) fn esi_cursor(
+    placements: &[SymbolPlacement],
+    high_water: u32,
+    namespace_start: u32,
+) -> u32 {
     placements
         .iter()
         .flat_map(|p| p.esi_ranges.iter())
         .map(|(start, count)| start.saturating_add(*count))
         .max()
         .unwrap_or(0)
+        .max(high_water)
         .max(namespace_start)
 }
 
+/// The block's cursor after `offers` (from `cursor`): the end of the highest range offered.
+pub(crate) fn high_water_after(offers: &[PlannedOffer], cursor: u32) -> u32 {
+    offers
+        .iter()
+        .flat_map(|o| o.esi_ranges.iter())
+        .map(|(start, count)| start.saturating_add(*count))
+        .fold(cursor, u32::max)
+}
+
 /// Plan the offers of one block for this pool: exclude holders that hold or may hold it
-/// (repair-i2), allocate, assign ESI ranges (repair-i9). Reads the DB, writes nothing.
+/// (repair-i2), allocate, assign ESI ranges (repair-i9, repair-i8). Reads the DB, writes
+/// nothing.
 pub(crate) fn plan_offers(
     db: &Db,
     block: &SourceBlockRecord,
@@ -110,7 +137,12 @@ pub(crate) fn plan_offers(
     namespace_start: u32,
 ) -> anyhow::Result<OfferPlan> {
     let placements = db.list_placements_for_block(&block.block_id)?;
-    let cursor = esi_cursor(&placements, namespace_start);
+    // The stored record: the caller's copy may predate the last `record_offers`.
+    let stored_high_water = db
+        .get_source_block(&block.block_id)?
+        .map_or(0, |b| b.esi_high_water);
+    let high_water = stored_high_water.max(block.esi_high_water);
+    let cursor = esi_cursor(&placements, high_water, namespace_start);
 
     let excluded = get_existing_holder_ids(db, &block.block_id)?;
     let candidates: Vec<HolderCandidate> = pool
@@ -133,14 +165,32 @@ pub(crate) fn plan_offers(
         Err(e) => return Ok(OfferPlan::AllocationFailed(e)),
     };
 
+    let offers = assign_esi_ranges(&allocations, &placements, cursor);
+    // Below 2^24 every share is met in full; a dropped or short offer means the ceiling.
+    let esi_cut =
+        offers.len() < allocations.len() || offers.iter().any(|o| offered_count(o) < o.share);
+    if offers.is_empty() {
+        return Ok(OfferPlan::EsiExhausted { cursor });
+    }
     Ok(OfferPlan::Planned {
         cursor,
-        offers: assign_esi_ranges(&allocations, &placements, cursor),
+        offers,
+        esi_cut,
     })
+}
+
+fn offered_count(offer: &PlannedOffer) -> u32 {
+    offer
+        .esi_ranges
+        .iter()
+        .fold(0u32, |sum, &(_, count)| sum.saturating_add(count))
 }
 
 /// ESI ranges for each allocation (repair-i9, reject part). Only `device_id` and
 /// `symbol_count` of an allocation are used; its `start_esi` is replaced.
+///
+/// Fresh numbers stop at 2^24 (`MAX_ESI_EXCLUSIVE`, repair-i8 ceiling): a share that does not
+/// fit gets what is left; an allocation left with no range at all is dropped from the plan.
 ///
 /// A device with a reusable own range (`reusable_own_ranges`) gets it back first, then fresh
 /// numbers for the rest of its share. An own range LARGER than the share is kept whole, not
@@ -163,7 +213,8 @@ pub(crate) fn assign_esi_ranges(
             let mut ranges = reusable_own_ranges(&alloc.device_id, placements).unwrap_or_default();
             let own: u32 = ranges.iter().map(|&(_, count)| count).sum();
             if alloc.symbol_count > own {
-                let fresh = alloc.symbol_count - own;
+                let left = MAX_ESI_EXCLUSIVE.saturating_sub(next_fresh);
+                let fresh = (alloc.symbol_count - own).min(left);
                 ranges.push((next_fresh, fresh));
                 next_fresh = next_fresh.saturating_add(fresh);
             }
@@ -173,6 +224,7 @@ pub(crate) fn assign_esi_ranges(
                 esi_ranges: merge_ranges(ranges),
             }
         })
+        .filter(|offer| !offer.esi_ranges.is_empty())
         .collect()
 }
 
@@ -234,9 +286,10 @@ pub(crate) fn union_ranges(offers: &[PlannedOffer]) -> Vec<(u32, u32)> {
     )
 }
 
-/// Write the plan's rows as `Offered` (one txn) plus a `SymbolsPlaced` event per range.
-/// Overwrites the holder's previous non-may-hold row of this block (repair-i2 keeps
-/// `Alive`/`Uncertain`/`PresumedLost` holders out of the plan).
+/// Write the plan's rows as `Offered` (one txn) plus a `SymbolsPlaced` event per range, and
+/// raise the block's `esi_high_water` to the end of the highest range offered in the same
+/// txn (repair-i8). Overwrites the holder's previous non-may-hold row of this block
+/// (repair-i2 keeps `Alive`/`Uncertain`/`PresumedLost` holders out of the plan).
 ///
 /// repair-i16 (R1-f2): the same transaction re-reads the block and its placements first; a
 /// block that left service since the worker picked it (`Deleting`, a placement `Deleting`,
@@ -259,6 +312,13 @@ pub(crate) fn record_offers(
             "work_pipeline: block left service before the offers; none recorded"
         );
         return Ok(Vec::new());
+    }
+    if let Some(mut record) = txn.get_source_block(&block.block_id)? {
+        let high_water = high_water_after(offers, record.esi_high_water);
+        if high_water > record.esi_high_water {
+            record.esi_high_water = high_water;
+            txn.upsert_source_block(&record)?;
+        }
     }
     for offer in offers {
         txn.upsert_placement(&SymbolPlacement {

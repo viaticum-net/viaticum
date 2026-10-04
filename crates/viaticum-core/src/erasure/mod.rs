@@ -7,7 +7,7 @@ use raptorq::{
 };
 use sha2::Sha256;
 
-use crate::constants::RAPTORQ_MAX_SOURCE_SYMBOLS;
+use crate::constants::{MAX_ESI_EXCLUSIVE, RAPTORQ_MAX_SOURCE_SYMBOLS};
 use crate::types::{DeviceId, ErasureParams, SourceBlockId};
 
 /// One encoding symbol: ESI (which symbol) + T bytes of data.
@@ -86,6 +86,28 @@ pub enum ErasureError {
     /// Repair packet not produced by RaptorQ for the requested ESI.
     #[error("repair packet not produced for esi {esi}")]
     RepairPacketMissing { esi: u32 },
+
+    /// An ESI range reaches `MAX_ESI_EXCLUSIVE` (2^24) or overflows u32; raptorq would
+    /// panic on it (CS-ERA-6).
+    #[error("ESI range {start}+{count} reaches the ESI limit {max}")]
+    EsiOutOfRange { start: u32, count: u32, max: u32 },
+}
+
+/// Every range ends at or below `MAX_ESI_EXCLUSIVE` (checked addition, CS-ERA-6).
+fn check_esi_ranges(ranges: &[(u32, u32)]) -> Result<(), ErasureError> {
+    for &(start, count) in ranges {
+        match start.checked_add(count) {
+            Some(end) if end <= MAX_ESI_EXCLUSIVE => {}
+            _ => {
+                return Err(ErasureError::EsiOutOfRange {
+                    start,
+                    count,
+                    max: MAX_ESI_EXCLUSIVE,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Erasure coding abstraction. Stateless — all inputs explicit.
@@ -286,6 +308,7 @@ impl ErasureEncoder for RaptorQEncoder {
         ranges: &[(u32, u32)],
     ) -> Result<Vec<Symbol>, ErasureError> {
         check_source_symbol_limit(params)?;
+        check_esi_ranges(ranges)?;
         if source_block.is_empty() {
             return Err(ErasureError::EmptyBlock);
         }
@@ -306,6 +329,7 @@ impl ErasureEncoder for RaptorQEncoder {
         let mut symbols = Vec::with_capacity(total);
         for &(start_esi, count) in ranges {
             for i in 0..count {
+                // Below 2^24: `check_esi_ranges` above.
                 let esi = start_esi + i;
                 let raw_data: Vec<u8> = if esi < k {
                     source_packets

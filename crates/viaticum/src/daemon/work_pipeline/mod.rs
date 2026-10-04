@@ -23,6 +23,7 @@ use viaticum_core::types::{DeviceId, SourceBlockId, SourceBlockRecord, Timestamp
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
 
+mod esi_space;
 mod offer_plan;
 mod pool;
 mod worker;
@@ -30,6 +31,7 @@ mod worker;
 #[cfg(test)]
 mod tests;
 
+pub use esi_space::EsiSpace;
 pub use pool::{PoolSnapshot, pool_signature, snapshot_pool};
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -76,6 +78,8 @@ pub struct WorkPipelineConfig {
     /// The size limit of this machine: the rebuild reads no source file above it (J1,
     /// backup-i5). Default: the RaptorQ ceiling; the daemon sets the limit in force.
     pub max_source_bytes: u64,
+    /// Blocks out of ESI numbers (repair-i8 ceiling), shared with `status`.
+    pub esi_space: Arc<EsiSpace>,
 }
 
 impl Default for WorkPipelineConfig {
@@ -91,6 +95,7 @@ impl Default for WorkPipelineConfig {
             min_pool_size: 2,
             recheck_tx: None,
             max_source_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
+            esi_space: Arc::default(),
         }
     }
 }

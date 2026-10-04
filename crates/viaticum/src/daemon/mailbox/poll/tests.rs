@@ -320,6 +320,7 @@ async fn drop_notice_batch_dispatch_marks_each_placement_lost() {
     // Insert source blocks so get_source_block succeeds.
     let block1 = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: block_id_1,
         k: 6,
         t: 512,
@@ -337,6 +338,7 @@ async fn drop_notice_batch_dispatch_marks_each_placement_lost() {
     };
     let block2 = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: block_id_2,
         ..block1.clone()
     };
@@ -492,6 +494,7 @@ async fn drop_notice_immediate_deadline_triggers_repair_now() {
     // Insert source block.
     let block = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 6,
         t: 512,
@@ -622,6 +625,7 @@ async fn drop_notice_forged_signature_is_rejected() {
     // Insert source block.
     let block = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 6,
         t: 512,
@@ -1248,6 +1252,7 @@ async fn drop_notice_dispatch_drops_entry_not_addressed_to_us() {
     let block_id = SourceBlockId([0xF1; 32]);
     let block = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 6,
         t: 512,

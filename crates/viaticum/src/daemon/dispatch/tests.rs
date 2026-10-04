@@ -68,6 +68,7 @@ async fn make_test_state_with(
         mailbox_router: None,
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
+        esi_space: Default::default(),
     })
 }
 
@@ -136,6 +137,7 @@ fn insert_file_with_block(
     let block_id = SourceBlockId([7u8; 32]);
     let block = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 4,
         t: 1024,
@@ -301,6 +303,7 @@ async fn dispatch_device_revoke_returns_device_revoked_with_no_router() {
         mailbox_router: None, // no router → revocation goes nowhere (best-effort)
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
+        esi_space: Default::default(),
     });
 
     // Revoke device B.
@@ -414,6 +417,7 @@ fn make_block(
 ) -> SourceBlockRecord {
     SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: SourceBlockId([id; 32]),
         k: 10,
         t: 64,
@@ -932,6 +936,7 @@ async fn revocation_published_only_to_storage_relationship_peers() {
         mailbox_router: Some(router),
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
+        esi_space: Default::default(),
     });
 
     // Revoke device.
@@ -1091,6 +1096,7 @@ async fn revocation_dedup_peer_is_holder_and_owner() {
         mailbox_router: Some(router),
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
+        esi_space: Default::default(),
     });
 
     let revoked_hex: String = revoked_device_id
@@ -1330,6 +1336,7 @@ fn staging_test_state(
         mailbox_router: None,
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
+        esi_space: Default::default(),
     })
 }
 
@@ -1905,6 +1912,7 @@ fn held_ss_block(db: &Db, id: u8, holders: u8) -> viaticum_core::types::SourceBl
     let block_id = SourceBlockId([id; 32]);
     db.upsert_source_block(&SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 1,
         t: 64,

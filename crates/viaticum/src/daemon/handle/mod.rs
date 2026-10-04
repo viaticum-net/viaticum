@@ -123,6 +123,8 @@ pub struct DaemonState {
         std::sync::Arc<crate::daemon::dispatch::missing_sources::MissingSourceCache>,
     /// backup-i4: this machine's file size limit in bytes (`status`, `files`).
     pub max_file_size_bytes: u64,
+    /// Blocks the worker found out of ESI numbers (repair-i8 ceiling), for `status`.
+    pub esi_space: std::sync::Arc<crate::daemon::work_pipeline::EsiSpace>,
 }
 
 /// Web API pieces prepared before the swarm starts (see step 9.4 of `start`).
@@ -768,6 +770,7 @@ impl DaemonHandle {
             mailbox_router: Some(std::sync::Arc::clone(&early_mailbox_router)),
             missing_sources: Default::default(),
             max_file_size_bytes,
+            esi_space: Default::default(),
         });
 
         // Clone state for web API and metrics pusher.
@@ -1035,6 +1038,7 @@ impl DaemonHandle {
                     min_pool_size: 2,
                     recheck_tx: Some(recheck_tx.clone()),
                     max_source_bytes: max_file_size_bytes,
+                    esi_space: Arc::clone(&state.esi_space),
                 };
                 let worker = crate::daemon::work_pipeline::WorkPipeline::new(
                     db.clone(),

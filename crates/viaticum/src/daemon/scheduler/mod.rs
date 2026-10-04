@@ -903,6 +903,15 @@ impl Scheduler {
                     source_block_id,
                     holder_id,
                 } => {
+                    // Rows go only with the block (repair-i8: a live block's ESI cursor must
+                    // not lose a range); the deletion engine emits this for `Deleting` blocks.
+                    debug_assert!(
+                        !matches!(
+                            self.db.get_source_block(&source_block_id),
+                            Ok(Some(ref b)) if b.status != SourceBlockStatus::Deleting
+                        ),
+                        "CleanupPlacement for a block that is not being released"
+                    );
                     if let Err(e) = self.db.delete_placement(&source_block_id, &holder_id) {
                         error!(block_id = %source_block_id, holder_id = %holder_id, "deletion: failed to delete placement: {e}");
                     }

@@ -931,3 +931,29 @@ fn decode_with_k_above_max_returns_err() {
         Err(ErasureError::TooManySourceSymbols { .. })
     ));
 }
+
+// ─── CS-ERA-6: ESI ranges at the raptorq limit ─────────────────────────────
+
+/// raptorq asserts `esi < 2^24`; a range reaching past it (or overflowing u32) is an error,
+/// not a panic. The last valid ESI still encodes.
+#[test]
+fn encode_raw_ranges_rejects_range_past_2_pow_24_and_encodes_up_to_it() {
+    let enc = encoder();
+    let (source, params) = multi_symbol_params();
+    let max = crate::constants::MAX_ESI_EXCLUSIVE;
+
+    for range in [(max - 1, 2), (max, 1), (u32::MAX, 2)] {
+        assert!(
+            matches!(
+                enc.encode_raw_ranges(&source, &params, &[(0, 1), range]),
+                Err(ErasureError::EsiOutOfRange { .. })
+            ),
+            "range {range:?}"
+        );
+    }
+    let last = enc
+        .encode_raw_ranges(&source, &params, &[(max - 1, 1)])
+        .unwrap();
+    assert_eq!(last.len(), 1);
+    assert_eq!(last[0].esi, max - 1);
+}

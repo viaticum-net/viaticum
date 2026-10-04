@@ -107,6 +107,7 @@ pub(super) fn backed_up(
 pub(super) fn active_block(db: &Db, id: SourceBlockId) {
     db.upsert_source_block(&viaticum_core::types::SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: id,
         k: 3,
         t: 1024,

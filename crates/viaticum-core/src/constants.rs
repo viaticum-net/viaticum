@@ -98,6 +98,11 @@ pub const SYMBOL_SIZE: u16 = 65_535;
 /// `ErasureParams::compute` and at the erasure entry points (backup-i5).
 pub const RAPTORQ_MAX_SOURCE_SYMBOLS: u32 = 56_403;
 
+/// Every ESI of a block is below this: raptorq's `PayloadId` asserts `esi < 2^24` (an ESI
+/// at or above it panics inside the encoder). The ceiling of a block's ESI cursor
+/// (repair-i8, C-SP §2.6); checked at the erasure entry points (CS-ERA-6).
+pub const MAX_ESI_EXCLUSIVE: u32 = 1 << 24;
+
 /// Largest file this build can back up as one block: 3 GiB. Ceiling for the
 /// `backup.max_file_size_mb` override (files above it are not supported yet; splitting
 /// large files is a later feature). Leaves room for compression expansion (1/256) and
