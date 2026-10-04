@@ -366,8 +366,9 @@ pub enum MailboxRejectReason {
     /// CROWN-1 C2: a SelfPointer store without a valid `target_sig` (signature by
     /// the secret key of `entry.target`).
     Unauthorized,
-    /// CROWN-1 (mailbox-i42): `expires_at <= now`, or a SelfPointer whose `stored_at`
-    /// is more than `SELF_POINTER_MAX_FUTURE_SKEW_SECS` ahead of the postman's clock.
+    /// CROWN-1 (mailbox-i42): `expires_at <= now` beyond the transit grace (mailbox-i61:
+    /// within it the entry is `Expired`), or a SelfPointer whose `stored_at` is more than
+    /// `SELF_POINTER_MAX_FUTURE_SKEW_SECS` ahead of the postman's clock.
     ClockSkew,
     /// Review N5: the request's wire version `v` is not `MAILBOX_WIRE_VERSION`.
     UnsupportedWireVersion,
