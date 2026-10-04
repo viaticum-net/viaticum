@@ -13,6 +13,12 @@
 # Targets: static musl binaries for x86_64 and aarch64, cross-built with
 # cargo-zigbuild, without features (no e2e tools in a user build).
 #
+# Checks (any failure = no release): binary static (no NEEDED); no aws-lc-sys
+# in the tree of either target; the binary embeds the fresh index.html and the
+# build id; where the binary runs here, `--version` = `viaticum <build id>` and
+# `build-info` names the build id and the fresh index.html blake3 (M14′).
+# Not yet (R3a a4 part 2): manifest tarball, notices, SHA256SUMS, get.sh.
+#
 # Environment:
 #   VIATICUM_RELEASE_WORK  work dir (default ~/.cache/viaticum-release): source
 #                          archive, persistent cargo target dir, output.
@@ -82,6 +88,11 @@ build_web_ui() {
     log "web UI: npm ci && npm run build"
     (cd "$SRC/web-ui" && npm ci --no-audit --no-fund --loglevel=error && npm run build --silent) >&2
     [ -f "$SRC/web-ui/dist/index.html" ] || die "web UI build produced no dist/index.html"
+    # The FRESH index.html (copy + hash), kept before cargo embeds anything: the
+    # checks compare the binary with this, not with whatever dist/ holds later.
+    FRESH_INDEX="$WORK/fresh-index.html"
+    cp "$SRC/web-ui/dist/index.html" "$FRESH_INDEX"
+    WEB_INDEX_B3="$(b3sum --no-names "$FRESH_INDEX")"
 }
 
 build_target() {
@@ -114,6 +125,48 @@ aws_lc_report() {
     fi
 }
 
+# The binary must name this build and embed THIS web UI (install-i11, N8, M14′).
+# Static check (any target): the fresh dist/index.html bytes and the build id are in
+# the binary (rust-embed stores release assets uncompressed). Run check (when the
+# binary runs here: host arch, or qemu-aarch64[-static]): `--version` and
+# `build-info` report exactly this build id and the fresh index.html hash.
+check_identity() {
+    local bin="$1" target="$2"
+    python3 - "$bin" "$FRESH_INDEX" "$BUILD_ID" <<'PY' || die "$target: binary does not embed the fresh web UI or the build id"
+import sys
+binary = open(sys.argv[1], "rb").read()
+index = open(sys.argv[2], "rb").read()
+if binary.find(index) < 0:
+    sys.exit("fresh dist/index.html is not embedded")
+if binary.find(sys.argv[3].encode()) < 0:
+    sys.exit("build id is not in the binary")
+PY
+    local -a run=()
+    if [ "${target%%-*}" != "$(uname -m)" ]; then
+        if command -v qemu-aarch64-static >/dev/null 2>&1 && [ "${target%%-*}" = "aarch64" ]; then
+            run=(qemu-aarch64-static)
+        elif command -v qemu-aarch64 >/dev/null 2>&1 && [ "${target%%-*}" = "aarch64" ]; then
+            run=(qemu-aarch64)
+        else
+            log "$target: not executed here (no qemu-aarch64); static check only"
+            return 0
+        fi
+    fi
+    local version info
+    version="$("${run[@]}" "$bin" --version)"
+    [ "$version" = "viaticum $BUILD_ID" ] || die "$target: --version says '$version', expected 'viaticum $BUILD_ID'"
+    info="$("${run[@]}" "$bin" build-info)"
+    python3 - "$info" "$BUILD_ID" "$WEB_INDEX_B3" <<'PY' || die "$target: build-info disagrees with this build: $info"
+import json, sys
+info = json.loads(sys.argv[1])
+if info.get("build_id") != sys.argv[2]:
+    sys.exit("build_id %r != %r" % (info.get("build_id"), sys.argv[2]))
+if info.get("web_ui_index_blake3") != sys.argv[3]:
+    sys.exit("web_ui_index_blake3 %r != fresh dist %r" % (info.get("web_ui_index_blake3"), sys.argv[3]))
+PY
+    log "$target: --version and build-info match ($BUILD_ID, index.html $WEB_INDEX_B3)"
+}
+
 # A static binary has no NEEDED entries in its dynamic section.
 check_static() {
     local bin="$1"
@@ -132,6 +185,8 @@ main() {
     need_tool zig "zig in PATH, e.g. ~/.local/bin/zig"
     need_tool npm "node.js + npm"
     need_tool readelf "binutils"
+    need_tool b3sum "cargo install b3sum"
+    need_tool python3 "python 3"
 
     cd "$(git rev-parse --show-toplevel)"
     resolve_ref "$1"
@@ -155,6 +210,7 @@ main() {
         bin="$TARGET_DIR/$target/release/viaticum"
         [ -x "$bin" ] || die "no binary at $bin"
         check_static "$bin"
+        check_identity "$bin" "$target"
         mkdir -p "$OUT/$arch"
         cp "$bin" "$OUT/$arch/viaticum"
         tree="$(aws_lc_report "$target")"
