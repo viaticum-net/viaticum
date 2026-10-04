@@ -223,3 +223,24 @@ fn poll_seen_skips_records_seen_earlier_in_the_poll_and_expired_ones() {
     assert_ne!(poll_entry_key(&honest), poll_entry_key(&forged));
     assert_ne!(poll_entry_key(&honest), poll_entry_key(&other_class));
 }
+
+/// mailbox-i69: the unsigned `sender` decides where a holder answers a PosChallenge;
+/// a copy of the honest payload under another `sender` is another record.
+#[test]
+fn same_payload_under_another_sender_is_another_record() {
+    use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
+    use viaticum_core::types::IdentityPub;
+    let base = MailboxEntry {
+        target: MailboxAddress::for_master(&IdentityPub([1; 32])),
+        msg_id: [7; 16],
+        class: MailboxClass::PosChallenge,
+        payload_version: 1,
+        payload: b"signed challenge".to_vec(),
+        expires_at: 10_000,
+        stored_at: 100,
+        sender: Some(IdentityPub([2; 32])),
+    };
+    let mut forged = base.clone();
+    forged.sender = Some(IdentityPub([9; 32]));
+    assert_ne!(poll_entry_key(&base), poll_entry_key(&forged));
+}
