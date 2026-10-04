@@ -83,6 +83,18 @@ async fn dispatch_status_returns_status_response() {
 }
 
 #[tokio::test]
+async fn dispatch_status_carries_daemon_version() {
+    // install-i11: status.daemon_version is this binary's build id (= --version).
+    let state = make_test_state().await;
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert_eq!(data.daemon_version, crate::build_info::build_id());
+    let json = serde_json::to_value(&*data).expect("serialize");
+    assert_eq!(json["daemon_version"], crate::build_info::build_id());
+}
+
+#[tokio::test]
 async fn dispatch_status_identity_reflects_state() {
     let state = make_test_state().await;
     let response = dispatch(CliRequest::Status, &state).await;

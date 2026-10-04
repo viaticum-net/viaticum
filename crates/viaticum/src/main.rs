@@ -119,6 +119,9 @@ async fn main() -> ExitCode {
             let connection = resolve_or_exit(&cli, &global_dir);
             viaticum::cli::cmd_token(&connection, *url);
         }
+        Command::BuildInfo => {
+            println!("{}", viaticum::cli::render_build_info());
+        }
         other => {
             let connection = resolve_or_exit(&cli, &global_dir);
             match viaticum::cli::run_command(other, &connection) {

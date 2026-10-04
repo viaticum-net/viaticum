@@ -171,7 +171,7 @@ pub async fn run(
         return Ok(());
     }
 
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::async_builder()
         .timeout(Duration::from_secs(10))
         .build()?;
 

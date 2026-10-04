@@ -27,6 +27,9 @@ pub fn format_bytes(bytes: u64) -> String {
 pub fn render_status(data: &StatusData) -> String {
     let mut out = String::new();
     out.push_str("viaticum status\n");
+    if !data.daemon_version.is_empty() {
+        out.push_str(&format!("  version:        {}\n", data.daemon_version));
+    }
     out.push_str(&format!("  identity:       {}\n", data.node_identity));
     if !data.node_addr.is_empty() {
         out.push_str(&format!("  addr:           {}\n", data.node_addr));

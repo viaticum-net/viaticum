@@ -346,6 +346,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
     dr.files_without_source = state.missing_sources.get(&state.db).await;
 
     CliResponse::Status(Box::new(StatusData {
+        daemon_version: crate::build_info::build_id().to_string(),
         node_identity,
         device_id,
         node_addr,

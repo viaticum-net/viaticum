@@ -136,6 +136,10 @@ pub struct ConnCacheStatus {
 /// Data for the `status` subcommand.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatusData {
+    /// Build id of the running daemon (`<version>+<rev7>`, `<version>+dev` outside a
+    /// release build); the same string as `viaticum --version` (install-i11).
+    #[serde(default)]
+    pub daemon_version: String,
     /// This node's identity pubkey (hex).
     pub node_identity: String,
     /// This node's DeviceId, first 8 bytes hex (16 chars). Matches PeerSummary.identity_hex.

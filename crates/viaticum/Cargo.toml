@@ -40,6 +40,8 @@ libc = { workspace = true }
 # Start-failure classification matches on redb error variants (daemon-i1).
 redb = { workspace = true }
 reqwest = { workspace = true }
+# Only to install the `ring` provider for reqwest (http_client, R3 Р-4′).
+rustls = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
 toml_edit = "0.22"

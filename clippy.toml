@@ -1,0 +1,21 @@
+# reqwest is built without a default crypto provider (rustls-no-provider, R3 Р-4′):
+# a client built before `ring` is installed panics. Build clients only through
+# `viaticum::http_client::{blocking_builder, async_builder}`, the one place that
+# allows these lints.
+#
+# Types: naming a Client or a ClientBuilder at all (`Client::new()`,
+# `Client::default()`, `ClientBuilder::new()`, `ClientBuilder::default()`, a type
+# in a signature) is a way around the provider. Code that holds a client gets its
+# type inferred from `http_client`; a function that must name it gets a reviewed
+# `#[allow(clippy::disallowed_types)]`.
+disallowed-types = [
+    { path = "reqwest::Client", reason = "build it from viaticum::http_client::async_builder (installs the ring provider)" },
+    { path = "reqwest::ClientBuilder", reason = "get one from viaticum::http_client::async_builder (installs the ring provider)" },
+    { path = "reqwest::blocking::Client", reason = "build it from viaticum::http_client::blocking_builder (installs the ring provider)" },
+    { path = "reqwest::blocking::ClientBuilder", reason = "get one from viaticum::http_client::blocking_builder (installs the ring provider)" },
+]
+# Free functions that build a client inside.
+disallowed-methods = [
+    { path = "reqwest::get", reason = "builds a client without the ring provider; use viaticum::http_client" },
+    { path = "reqwest::blocking::get", reason = "builds a client without the ring provider; use viaticum::http_client" },
+]

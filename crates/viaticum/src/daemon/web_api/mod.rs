@@ -2,6 +2,8 @@
 
 mod embedded;
 
+pub(crate) use embedded::index_html_blake3 as embedded_index_html_blake3;
+
 #[cfg(test)]
 mod tests;
 

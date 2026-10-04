@@ -37,7 +37,7 @@ fn platform_default_data_dir() -> std::path::PathBuf {
 
 /// viaticum — decentralized P2P cold backup
 #[derive(Debug, Parser)]
-#[command(name = "viaticum", version)]
+#[command(name = "viaticum", version = crate::build_info::build_id())]
 pub struct Cli {
     /// Path to config file. Default: ~/.viaticum/config.toml
     #[arg(long, global = true)]
@@ -231,6 +231,11 @@ pub enum Command {
         #[arg(long)]
         url: bool,
     },
+
+    /// Print this binary's build id and the blake3 of its embedded web UI as JSON
+    /// (release checks, install-i11). Needs no daemon.
+    #[command(hide = true)]
+    BuildInfo,
 }
 
 #[derive(Debug, Subcommand)]
@@ -270,6 +275,12 @@ pub fn cmd_token(conn: &Connection, url_mode: bool) {
     } else {
         println!("{}", conn.token);
     }
+}
+
+/// `viaticum build-info` — the build id and the embedded web UI hash, one JSON line.
+pub fn render_build_info() -> String {
+    serde_json::to_string(&crate::build_info::build_info())
+        .expect("BuildInfo is plain strings and serializes")
 }
 
 /// `viaticum open` — launch the default browser on /auth/start.
@@ -336,7 +347,7 @@ pub fn run_command(cmd: &Command, connection: &Connection) -> Result<i32, CliErr
 }
 
 fn send_command_http(conn: &Connection, cmd: &Command) -> Result<CliResponse, CliError> {
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::http_client::blocking_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| CliError::Io(std::io::Error::other(e.to_string())))?;
@@ -384,8 +395,8 @@ fn command_to_http(cmd: &Command) -> Result<(reqwest::Method, String, Option<Str
         Command::Daemon { .. } | Command::Init { .. } | Command::Dr { .. } => {
             unreachable!("local-only command routed to HTTP dispatch")
         }
-        Command::Open | Command::Token { .. } => {
-            unreachable!("Open/Token handled locally in main.rs before run_command")
+        Command::Open | Command::Token { .. } | Command::BuildInfo => {
+            unreachable!("Open/Token/BuildInfo handled locally in main.rs before run_command")
         }
         Command::Restore { .. } => unreachable!("restore is handled by restore::run_restore"),
         Command::Status { .. } => Ok((Method::GET, "/api/status".into(), None)),

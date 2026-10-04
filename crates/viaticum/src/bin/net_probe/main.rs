@@ -68,7 +68,7 @@ fn run(args: &Args) -> Result<String, String> {
         })?;
     let (path, body) = request_of(&args.cmd);
     // Longer than send_to_device's own 30 s deadline: the daemon answers first.
-    let client = reqwest::blocking::Client::builder()
+    let client = viaticum::http_client::blocking_builder()
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|e| format!("http client: {e}"))?;

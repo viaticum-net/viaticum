@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 rust-version = "1.89"
@@ -109,8 +109,11 @@ ignore = "0.4"
 # System
 libc = "0.2"
 
-# HTTP client (metrics push)
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "json"] }
+# HTTP client (CLI `--server`, metrics push). rustls WITHOUT reqwest's default
+# provider (aws-lc-rs, a second C crypto library next to `ring`; R3 Р-4′: no
+# `aws-lc-sys` in the release); `viaticum::http_client` installs `ring` first.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "blocking", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 # HTTP server (web API)
 axum = "0.8"

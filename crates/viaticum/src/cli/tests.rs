@@ -254,6 +254,7 @@ fn format_bytes_gigabytes() {
 
 fn make_status_zero_peers() -> StatusData {
     StatusData {
+        daemon_version: String::new(),
         node_identity: "0000000000000000".into(),
         device_id: "0000000000000000".into(),
         node_addr: String::new(),
@@ -468,6 +469,7 @@ fn format_status_unknown_quota_names_the_path() {
 #[test]
 fn format_status_top_peers_printed() {
     let data = StatusData {
+        daemon_version: String::new(),
         node_identity: "a1b2c3d4e5f60708".into(),
         device_id: "a1b2c3d4e5f60708".into(),
         node_addr: String::new(),
@@ -965,6 +967,7 @@ fn cli_response_roundtrips_cbor() {
 
     let responses = vec![
         CliResponse::Status(Box::new(StatusData {
+            daemon_version: String::new(),
             node_identity: "aabbccdd11223344".into(),
             device_id: "aabbccdd11223344".into(),
             node_addr: String::new(),
@@ -1899,4 +1902,61 @@ fn render_status_reports_too_large_files_and_the_limit() {
         ),
         "got: {rendered}"
     );
+}
+
+// ============================================================
+// Version and build-info (install-i11)
+// ============================================================
+
+#[test]
+fn version_flag_prints_build_id() {
+    let err = Cli::try_parse_from(["viaticum", "--version"]).expect_err("--version exits");
+    assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+    assert_eq!(
+        err.to_string(),
+        format!("viaticum {}\n", crate::build_info::build_id())
+    );
+}
+
+#[test]
+fn build_info_command_parses_and_is_hidden_from_help() {
+    assert!(matches!(
+        parse(&["viaticum", "build-info"]),
+        Command::BuildInfo
+    ));
+    let help = <Cli as clap::CommandFactory>::command()
+        .render_help()
+        .to_string();
+    assert!(
+        !help.contains("build-info"),
+        "hidden command in help:\n{help}"
+    );
+}
+
+#[test]
+fn render_build_info_is_one_json_line_of_build_info() {
+    let line = super::render_build_info();
+    assert!(!line.contains('\n'));
+    let parsed: crate::build_info::BuildInfo = serde_json::from_str(&line).expect("JSON");
+    assert_eq!(parsed, crate::build_info::build_info());
+}
+
+#[test]
+fn render_status_shows_daemon_version() {
+    let mut data = make_status_zero_peers();
+    data.daemon_version = "0.1.0-alpha.1+abc1234".into();
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("  version:        0.1.0-alpha.1+abc1234\n"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn status_json_without_daemon_version_decodes_as_empty() {
+    // An older daemon's status has no daemon_version: the CLI still decodes it.
+    let mut v = serde_json::to_value(make_status_zero_peers()).expect("serialize");
+    v.as_object_mut().expect("object").remove("daemon_version");
+    let data: StatusData = serde_json::from_value(v).expect("decode without the field");
+    assert_eq!(data.daemon_version, "");
 }
