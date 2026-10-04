@@ -45,7 +45,7 @@ cargo build --release --workspace
 ./target/release/viaticum init
 
 # run the daemon and watch a folder
-./target/release/viaticum daemon --watch ~/Documents
+./target/release/viaticum daemon --watch-dir ~/Documents
 
 # open the web UI in your browser
 ./target/release/viaticum open

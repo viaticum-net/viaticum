@@ -12,6 +12,7 @@ use viaticum_core::types::{
 
 use super::no_answer::NoAnswerPauses;
 use super::{RestoreCoordinator, RestoreError, pipeline};
+use crate::daemon::backup::rebuild::RebuildScope;
 use crate::daemon::restore::staging::StagingWriter;
 
 impl RestoreCoordinator {
@@ -43,6 +44,9 @@ impl RestoreCoordinator {
                 &self.db,
                 &block_record,
                 &self.config.epoch_key,
+                // Local tier: no recheck, any Present record (hash-checked reads), no
+                // source file above this machine's size limit read.
+                &RebuildScope::default().with_max_source_bytes(self.config.max_source_bytes),
             )
             .await
         {
@@ -157,19 +161,20 @@ impl RestoreCoordinator {
     ) -> Result<(), RestoreError> {
         let file_bytes = match block_type {
             SourceBlockType::Pack { .. } => {
-                let extracted =
-                    pipeline::extract_from_pack(plaintext, record.file_id).map_err(|e| {
+                pipeline::extract_member(plaintext, record.file_id, &version.content_hash)
+                    .map_err(|e| {
                         RestoreError::PackIndexParseFailed(version.source_block_id, e.to_string())
-                    })?;
-                match extracted {
-                    Some(bytes) => bytes,
-                    None => {
-                        return Err(RestoreError::PackIndexParseFailed(
+                    })?
+                    .ok_or_else(|| {
+                        RestoreError::PackIndexParseFailed(
                             version.source_block_id,
-                            format!("file_id {} not found in pack", record.file_id),
-                        ));
-                    }
-                }
+                            format!(
+                                "no pack entry with file_id {} or content hash {}",
+                                record.file_id,
+                                pipeline::hex_encode(&version.content_hash)
+                            ),
+                        )
+                    })?
             }
             SourceBlockType::Single => plaintext.to_vec(),
         };

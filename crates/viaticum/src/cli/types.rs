@@ -105,8 +105,20 @@ pub struct StatusData {
     pub blocks_needing_repair: u32,
     /// Peer summaries (up to 20 entries, sorted by trust descending).
     pub peers: Vec<PeerSummary>,
-    /// Effective quota in bytes. 0 = unlimited.
+    /// Effective quota in bytes when `quota_state` is `bytes`; 0 then means no room at all
+    /// (free disk at or below the reserve, holder-i1) — never "unlimited".
     pub effective_quota_bytes: u64,
+    /// `bytes` — the quota is known; `unknown` — the free disk could not be read and no
+    /// soft quota is set: offers are refused, nothing is evicted (holder-i2).
+    #[serde(default)]
+    pub quota_state: String,
+    /// "could not read free space on <path>; …" when the free disk could not be read, else "".
+    #[serde(default)]
+    pub quota_note: String,
+    /// holder-i4: the free disk is below the reserve — `Some(bytes the pressure tick gives
+    /// back)` (friends' data, down to the hard floor), at any quota; `None` otherwise.
+    #[serde(default)]
+    pub below_reserve_giving_back_bytes: Option<u64>,
     /// Bytes currently used for held symbols.
     pub used_bytes: u64,
     /// Total PoS challenges issued (all peers, all weeks).
@@ -201,6 +213,16 @@ pub struct StatusData {
     /// restore (the newest restorable pointer place); 0 = DR not ready.
     #[serde(default)]
     pub dr_restores_state_of: u64,
+    /// backup-i4: files under the watched folders that are above this machine's size
+    /// limit and so not backed up (current marks, not history).
+    #[serde(default)]
+    pub files_too_large: u32,
+    /// backup-i4: this machine's file size limit in bytes.
+    #[serde(default)]
+    pub max_file_size_bytes: u64,
+    /// backup-i24: this machine's block work budget in bytes; 0 until R1-d-b sets one.
+    #[serde(default)]
+    pub block_work_budget_bytes: u64,
 }
 
 /// Peer summary shown in `viaticum status`.
@@ -472,6 +494,10 @@ pub enum EffectiveStatus {
     /// We had `target` Alive at some point; now `live < target` after losses.
     /// Repair pipeline is responsible for bringing it back.
     Degraded { live: u32, lost: u32, target: u32 },
+    /// The version's block is not in service (being released, in the release window, or
+    /// missing): the network is dropping it, whatever the placements count; a file still
+    /// on disk is backed up again under a new block (backup-i8, backup-i21).
+    Releasing,
 }
 
 /// Owner-side estimate of why restoring a version would not succeed right now
@@ -488,6 +514,10 @@ pub enum RestoreBlocker {
     },
     /// All `Alive` holders are unreachable (last_seen too old).
     AllHoldersOffline { last_seen_secs_ago: u64 },
+    /// The version's block is being released (`EffectiveStatus::Releasing`): holders
+    /// that got its Delete stop serving it, whatever the placements count (restore-i3,
+    /// 2026-09-30).
+    BeingReleased,
 }
 
 /// File entry for `viaticum files`.
@@ -510,6 +540,21 @@ pub struct FileEntry {
     /// local source, so deleting the local copy is safe. Conservative: false when
     /// not backed up, no block found, or below target.
     pub is_safe_to_delete: bool,
+    /// backup-i4: the file's current content is above this machine's size limit and is not
+    /// backed up. An earlier version, if any, is still kept (backup-i7).
+    #[serde(default)]
+    pub too_large: Option<TooLargeInfo>,
+}
+
+/// A too-large mark as shown to the user (`files`, web UI).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TooLargeInfo {
+    /// Size of the file when last seen.
+    pub size_bytes: u64,
+    /// This machine's limit at that time.
+    pub limit_bytes: u64,
+    /// ISO-8601 date the file was first seen above the limit.
+    pub since: String,
 }
 
 /// Version entry for `viaticum versions <path>`.

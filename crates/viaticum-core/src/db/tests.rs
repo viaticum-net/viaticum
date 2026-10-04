@@ -24,6 +24,7 @@ fn make_file_record(path: &str, file_id: u64) -> FileRecord {
         devices: vec![(DeviceId([0u8; 32]), LocalState::Present)],
         versions: vec![],
         first_seen: Timestamp(1000),
+        on_disk_confirmed: true,
     }
 }
 
@@ -45,6 +46,7 @@ fn file_with_versions(path: &str, file_id: u64, versions: &[([u8; 32], bool)]) -
 
 fn make_source_block(seed: u8, status: SourceBlockStatus) -> SourceBlockRecord {
     SourceBlockRecord {
+        seal_generation: 0,
         block_id: block_id(seed),
         k: 10,
         t: 65535,
@@ -349,35 +351,38 @@ fn event_log_sequence_monotonic() {
 // content_hash index (B-1)
 // ============================================================
 
+/// Paths of `files_with_content_hash(h)`, for assertions.
+fn paths_with_hash(db: &Db, h: &[u8; 32]) -> Vec<String> {
+    db.files_with_content_hash(h)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.path)
+        .collect()
+}
+
 #[test]
-fn content_index_finds_backed_up_file_by_hash() {
+fn files_with_content_hash_returns_every_record_with_that_hash() {
     let db = test_db();
     let h1 = [11u8; 32];
     let h2 = [22u8; 32];
+    // Backed up or pending, current or older version: every record holding h1.
+    db.upsert_file(&file_with_versions("c.txt", 3, &[(h2, true), (h1, false)]))
+        .unwrap();
     db.upsert_file(&file_with_versions("a.txt", 1, &[(h1, true)]))
         .unwrap();
     db.upsert_file(&file_with_versions("b.txt", 2, &[(h2, false)]))
         .unwrap();
 
-    assert!(db.is_content_backed_up(&h1).unwrap());
-    assert!(
-        !db.is_content_backed_up(&h2).unwrap(),
-        "h2 version is not backed up"
-    );
-    assert!(
-        !db.is_content_backed_up(&[33u8; 32]).unwrap(),
-        "unknown hash"
-    );
+    assert_eq!(paths_with_hash(&db, &h1), vec!["a.txt", "c.txt"]);
+    assert_eq!(paths_with_hash(&db, &h2), vec!["b.txt", "c.txt"]);
+}
 
-    assert_eq!(
-        db.find_file_by_content_hash(&h1).unwrap().map(|r| r.path),
-        Some("a.txt".to_string())
-    );
-    assert_eq!(
-        db.find_file_by_content_hash(&h2).unwrap().map(|r| r.path),
-        Some("b.txt".to_string())
-    );
-    assert!(db.find_file_by_content_hash(&[33u8; 32]).unwrap().is_none());
+#[test]
+fn files_with_content_hash_empty_for_unknown_hash() {
+    let db = test_db();
+    db.upsert_file(&file_with_versions("a.txt", 1, &[([11u8; 32], true)]))
+        .unwrap();
+    assert!(db.files_with_content_hash(&[33u8; 32]).unwrap().is_empty());
 }
 
 #[test]
@@ -386,14 +391,13 @@ fn content_index_removed_on_delete() {
     let h = [44u8; 32];
     db.upsert_file(&file_with_versions("c.txt", 3, &[(h, true)]))
         .unwrap();
-    assert!(db.is_content_backed_up(&h).unwrap());
+    assert_eq!(paths_with_hash(&db, &h), vec!["c.txt"]);
 
     db.delete_file("c.txt").unwrap();
     assert!(
-        !db.is_content_backed_up(&h).unwrap(),
+        paths_with_hash(&db, &h).is_empty(),
         "index entry must be removed when the file is deleted"
     );
-    assert!(db.find_file_by_content_hash(&h).unwrap().is_none());
 }
 
 #[test]
@@ -409,10 +413,10 @@ fn content_index_drops_stale_hash_on_version_change() {
         .unwrap();
 
     assert!(
-        !db.is_content_backed_up(&h_old).unwrap(),
+        paths_with_hash(&db, &h_old).is_empty(),
         "stale hash key must be removed when the version set changes"
     );
-    assert!(db.is_content_backed_up(&h_new).unwrap());
+    assert_eq!(paths_with_hash(&db, &h_new), vec!["d.txt"]);
 }
 
 #[test]
@@ -444,8 +448,9 @@ fn content_index_backfilled_at_open_for_legacy_db() {
 
     // Reopen → open() must backfill the index from FILES.
     let db2 = Db::open(&tmp_path).unwrap();
-    assert!(
-        db2.is_content_backed_up(&h).unwrap(),
+    assert_eq!(
+        paths_with_hash(&db2, &h),
+        vec!["e.txt"],
         "content index must be backfilled at open for a pre-B1 database"
     );
 }
@@ -773,6 +778,7 @@ fn committed_bytes_sums_active_blocks() {
 
     // Block A: Active, encrypted_size=Some(1000)
     let block_a = SourceBlockRecord {
+        seal_generation: 0,
         block_id: block_id(10),
         k: 5,
         t: 100,
@@ -791,6 +797,7 @@ fn committed_bytes_sums_active_blocks() {
 
     // Block B: Active, encrypted_size=None → fallback to k*t = 10*100 = 1000
     let block_b = SourceBlockRecord {
+        seal_generation: 0,
         block_id: block_id(11),
         k: 10,
         t: 100,
@@ -809,6 +816,7 @@ fn committed_bytes_sums_active_blocks() {
 
     // Block C: Deleted, encrypted_size=Some(500) → must NOT be counted
     let block_c = SourceBlockRecord {
+        seal_generation: 0,
         block_id: block_id(12),
         k: 5,
         t: 100,
@@ -847,6 +855,7 @@ fn update_block_cached_fields_persists_to_db() {
 
     // Insert a block with default (zero) cached fields.
     let initial = SourceBlockRecord {
+        seal_generation: 0,
         block_id: bid,
         k: 5,
         t: 65535,
@@ -1271,6 +1280,7 @@ fn db_crash_recovery_backup_preserves_data() {
             devices: vec![],
             versions: vec![],
             first_seen: Timestamp(100),
+            on_disk_confirmed: true,
         };
         db.upsert_file(&file).unwrap();
         drop(db);
@@ -1427,6 +1437,7 @@ fn refresh_peer_storage_bytes_updates_trust_s() {
     // Source block t=1000 → bytes = 10 * 1000 = 10_000.
     let block_id_a = SourceBlockId([0xA0u8; 32]);
     let sb_a = SourceBlockRecord {
+        seal_generation: 0,
         block_id: block_id_a,
         k: 10,
         t: 1000,
@@ -1506,6 +1517,7 @@ fn refresh_peer_storage_bytes_neutral_when_we_store_nothing() {
     // Peer holds 5 symbols of ours (Alive).
     let block_id_b = SourceBlockId([0xC0u8; 32]);
     let sb = SourceBlockRecord {
+        seal_generation: 0,
         block_id: block_id_b,
         k: 5,
         t: 2000,
@@ -1562,6 +1574,7 @@ fn refresh_peer_storage_bytes_only_alive_and_active_count() {
     // Source block for placements.
     let block_id_c = SourceBlockId([0xD0u8; 32]);
     let sb = SourceBlockRecord {
+        seal_generation: 0,
         block_id: block_id_c,
         k: 10,
         t: 500,
@@ -2626,6 +2639,7 @@ fn make_block_with(
     target_reliability: f64,
 ) -> SourceBlockRecord {
     SourceBlockRecord {
+        seal_generation: 0,
         block_id: SourceBlockId([seed; 32]),
         k: 10,
         t: 65535,

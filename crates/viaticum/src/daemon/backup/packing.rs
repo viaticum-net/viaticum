@@ -61,94 +61,60 @@ pub fn extract_file_from_pack(
     file_id: FileId,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let parsed = parse_pack_index(plaintext)?;
-    let file_data_start = parsed.index_len;
-    let file_data = &plaintext[file_data_start..];
+    let file_data = &plaintext[parsed.index_len..];
+    match parsed.entries.iter().find(|e| e.file_id == file_id) {
+        Some(entry) => Ok(Some(entry_bytes(file_data, entry)?.to_vec())),
+        None => Ok(None),
+    }
+}
 
+/// The bytes of the pack member whose content hashes to `content_hash`, or `None`
+/// (restore-i38): a path that got its content by a rename, a copy or a swap points at a
+/// member packed under another `file_id`. The first matching member wins — members with
+/// the same hash hold the same bytes.
+pub fn extract_pack_entry_by_hash(
+    plaintext: &[u8],
+    content_hash: &[u8; 32],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let parsed = parse_pack_index(plaintext)?;
+    let file_data = &plaintext[parsed.index_len..];
     for entry in &parsed.entries {
-        if entry.file_id == file_id {
-            let start = entry.offset as usize;
-            // CS-DR-11: use checked_add — a corrupt pack index (behind AEAD, own
-            // data) with offset+size near usize::MAX would otherwise wrap, pass
-            // the bounds check below, and slice-panic. On overflow, error out.
-            let end = match start.checked_add(entry.size as usize) {
-                Some(e) => e,
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "pack entry range overflow: file_id={}, offset={}, size={}",
-                        entry.file_id,
-                        entry.offset,
-                        entry.size
-                    ));
-                }
-            };
-            if end > file_data.len() {
-                return Err(anyhow::anyhow!(
-                    "pack entry out of bounds: file_id={}, offset={}, size={}",
-                    entry.file_id,
-                    entry.offset,
-                    entry.size
-                ));
-            }
-            return Ok(Some(file_data[start..end].to_vec()));
+        let bytes = entry_bytes(file_data, entry)?;
+        if blake3::hash(bytes).as_bytes() == content_hash {
+            return Ok(Some(bytes.to_vec()));
         }
     }
     Ok(None)
 }
 
-/// Rebuild the plaintext for a source block by re-reading files from disk.
-///
-/// Used by repair when block.bin is absent (cleaned up after delivery).
-/// Reads each file referenced in the block record, rebuilds the same
-/// plaintext that was originally passed to compress_and_encrypt.
-pub fn rebuild_plaintext_from_db(
-    db: &viaticum_core::db::Db,
-    block_record: &viaticum_core::types::SourceBlockRecord,
-) -> anyhow::Result<Vec<u8>> {
-    use viaticum_core::types::SourceBlockType;
-
-    match &block_record.block_type {
-        SourceBlockType::Single => {
-            // Single block: find any file version referencing this block_id.
-            let file_record = find_file_for_block(db, block_record.block_id)?;
-            let bytes = std::fs::read(&file_record.path)
-                .map_err(|e| anyhow::anyhow!("read source file {}: {e}", file_record.path))?;
-            Ok(bytes)
-        }
-        SourceBlockType::Pack { entries } => {
-            // Pack block: rebuild [CBOR index][file1][file2]...
-            let mut file_bytes_list = Vec::with_capacity(entries.len());
-            for entry in entries {
-                let file_record = db
-                    .get_file_by_id(entry.file_id)?
-                    .ok_or_else(|| anyhow::anyhow!("file_id {} not found in DB", entry.file_id))?;
-                let bytes = std::fs::read(&file_record.path)
-                    .map_err(|e| anyhow::anyhow!("read source file {}: {e}", file_record.path))?;
-                file_bytes_list.push((entry.file_id, bytes));
-            }
-
-            // Rebuild pack index + data in same order as original.
-            let mut pack_entries = Vec::with_capacity(entries.len());
-            let mut offset = 0u64;
-            for (file_id, bytes) in &file_bytes_list {
-                pack_entries.push(viaticum_core::types::PackEntry {
-                    file_id: *file_id,
-                    offset,
-                    size: bytes.len() as u64,
-                });
-                offset += bytes.len() as u64;
-            }
-
-            let index_bytes = viaticum_core::types::to_cbor_bytes(&pack_entries);
-            let mut plaintext = index_bytes;
-            for (_, bytes) in &file_bytes_list {
-                plaintext.extend_from_slice(bytes);
-            }
-            Ok(plaintext)
-        }
+/// The slice of one member in the file data after the index.
+fn entry_bytes<'a>(file_data: &'a [u8], entry: &PackEntry) -> anyhow::Result<&'a [u8]> {
+    let start = entry.offset as usize;
+    // CS-DR-11: use checked_add — a corrupt pack index (behind AEAD, own data) with
+    // offset+size near usize::MAX would otherwise wrap, pass the bounds check below,
+    // and slice-panic. On overflow, error out.
+    let Some(end) = start.checked_add(entry.size as usize) else {
+        return Err(anyhow::anyhow!(
+            "pack entry range overflow: file_id={}, offset={}, size={}",
+            entry.file_id,
+            entry.offset,
+            entry.size
+        ));
+    };
+    if end > file_data.len() {
+        return Err(anyhow::anyhow!(
+            "pack entry out of bounds: file_id={}, offset={}, size={}",
+            entry.file_id,
+            entry.offset,
+            entry.size
+        ));
     }
+    Ok(&file_data[start..end])
 }
 
-/// Find a FileRecord whose version references the given block_id.
+/// Find a FileRecord whose version references the given block_id — the worker's
+/// `file_id` attribution of a Single block's placements. Not a rebuild source any more:
+/// the rebuild reads by content (`rebuild::rebuild_plaintext_from_db`).
 ///
 /// Prefers a record with a locally-present device: after a rename the old path
 /// can linger as a `Deleted` record still referencing the same block, and reading

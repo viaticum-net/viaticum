@@ -74,6 +74,9 @@ fn config_for(dir: &TempDir) -> WatcherConfig {
         data_dir,
         rescan_interval_secs: 604800, // 1 week — effectively disabled for test duration
         watch_states: None,
+        time_scale: 1,
+        recheck_rx: None,
+        resubmit_rx: None,
     }
 }
 
@@ -255,6 +258,9 @@ async fn watcher_starts_with_empty_dir_list_without_error() {
         data_dir: tmp.path().to_path_buf(),
         rescan_interval_secs: 0,
         watch_states: None,
+        time_scale: 1,
+        recheck_rx: None,
+        resubmit_rx: None,
     };
     let cancel_clone = cancel.clone();
     let handle = tokio::spawn(async move {
@@ -290,6 +296,9 @@ async fn debounce_multiple_changes_emit_one_event() {
         data_dir: TempDir::new().unwrap().keep(),
         rescan_interval_secs: 0,
         watch_states: None,
+        time_scale: 1,
+        recheck_rx: None,
+        resubmit_rx: None,
     };
 
     let cancel_clone = cancel.clone();
@@ -349,6 +358,9 @@ async fn file_deleted_before_debounce_emits_deleted_event() {
         data_dir: TempDir::new().unwrap().keep(),
         rescan_interval_secs: 0,
         watch_states: None,
+        time_scale: 1,
+        recheck_rx: None,
+        resubmit_rx: None,
     };
 
     let cancel_clone = cancel.clone();
@@ -463,6 +475,9 @@ async fn rapid_changes_no_panic() {
         data_dir: TempDir::new().unwrap().keep(),
         rescan_interval_secs: 0,
         watch_states: None,
+        time_scale: 1,
+        recheck_rx: None,
+        resubmit_rx: None,
     };
 
     let cancel_clone = cancel.clone();
@@ -627,6 +642,9 @@ async fn watcher_initial_scan_respects_viaticumignore() {
         data_dir,
         rescan_interval_secs: 604800,
         watch_states: None,
+        time_scale: 1,
+        recheck_rx: None,
+        resubmit_rx: None,
     };
 
     let cancel_clone = cancel.clone();
@@ -743,6 +761,9 @@ async fn watcher_add_command_registers_new_dir_and_emits_dirty_events() {
         data_dir: data_dir.path().to_path_buf(),
         rescan_interval_secs: 604800,
         watch_states: None,
+        time_scale: 1,
+        recheck_rx: None,
+        resubmit_rx: None,
     };
     tokio::spawn(async move {
         start_watcher(config, dirty_tx, ctrl_rx, cancel_clone)
@@ -901,6 +922,9 @@ async fn watcher_keeps_watching_other_dirs_when_one_is_missing() {
         data_dir,
         rescan_interval_secs: 604800,
         watch_states: Some(Arc::clone(&states)),
+        time_scale: 1,
+        recheck_rx: None,
+        resubmit_rx: None,
     };
 
     let (dirty_tx, mut dirty_rx) = mpsc::channel(64);

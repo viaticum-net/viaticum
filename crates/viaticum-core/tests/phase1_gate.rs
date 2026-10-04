@@ -261,6 +261,7 @@ fn db_stores_and_retrieves_full_records() {
             backed_up_at: Some(t),
         }],
         first_seen: t,
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).expect("upsert_file");
 
@@ -274,6 +275,7 @@ fn db_stores_and_retrieves_full_records() {
 
     // Insert SourceBlockRecord.
     let sbr = SourceBlockRecord {
+        seal_generation: 0,
         block_id: bid,
         k: 1,
         t: 65_535,
@@ -511,10 +513,12 @@ fn full_owner_flow() {
             backed_up_at: None,
         }],
         first_seen: t,
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).expect("upsert_file");
 
     let sbr = SourceBlockRecord {
+        seal_generation: 0,
         block_id: bid,
         k: params.k,
         t: params.t,

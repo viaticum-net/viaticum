@@ -589,35 +589,6 @@ impl ClusterState {
             .collect()
     }
 
-    /// Check if a content_hash is already backed up.
-    pub fn is_content_backed_up(&self, content_hash: &[u8; 32]) -> Result<bool, ClusterStateError> {
-        let files = self.db.list_all_files()?;
-        for file in &files {
-            for version in &file.versions {
-                if &version.content_hash == content_hash && version.backed_up_at.is_some() {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    /// Find the source_block_id for an already-backed-up content_hash.
-    pub fn find_source_block_for_content(
-        &self,
-        content_hash: &[u8; 32],
-    ) -> Result<Option<crate::types::SourceBlockId>, ClusterStateError> {
-        let files = self.db.list_all_files()?;
-        for file in &files {
-            for version in &file.versions {
-                if &version.content_hash == content_hash && version.backed_up_at.is_some() {
-                    return Ok(Some(version.source_block_id));
-                }
-            }
-        }
-        Ok(None)
-    }
-
     /// Apply a batch of events from another device.
     pub fn apply_events(
         &mut self,

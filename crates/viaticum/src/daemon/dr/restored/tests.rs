@@ -22,7 +22,40 @@ fn file(id: u64, path: &str, devices: Vec<(DeviceId, LocalState)>) -> FileRecord
         devices,
         versions: vec![],
         first_seen: Timestamp(1),
+        on_disk_confirmed: false,
     }
+}
+
+/// dr-i64: after DR no record is confirmed on disk, whatever the lost machine had —
+/// a recheck may then never mark a restored record deleted just because this machine
+/// does not have the file (yet).
+#[test]
+fn prepare_restored_state_clears_on_disk_confirmed() {
+    let d_lost = device(0x11);
+    let d_dr = device(0x22);
+    let sibling = device(0x33);
+    let lost_db = Db::open_in_memory().unwrap();
+    for (id, path, dev) in [(1, "/data/a", d_lost), (2, "/data/b", sibling)] {
+        let mut rec = file(id, path, vec![(dev, LocalState::Present)]);
+        rec.on_disk_confirmed = true;
+        lost_db.upsert_file(&rec).unwrap();
+    }
+    let state = snapshot_db(&lost_db).unwrap();
+    assert!(state.files.iter().all(|f| f.on_disk_confirmed), "setup");
+
+    let prepared = prepare_restored_state(state, &summary(d_lost, 2), d_dr);
+
+    assert_eq!(prepared.state.files.len(), 2);
+    assert!(
+        prepared.state.files.iter().all(|f| !f.on_disk_confirmed),
+        "every restored record must be unconfirmed: {:?}",
+        prepared
+            .state
+            .files
+            .iter()
+            .map(|f| (&f.path, f.on_disk_confirmed))
+            .collect::<Vec<_>>()
+    );
 }
 
 /// A real Ed25519 device (so it maps to a PeerId).

@@ -99,6 +99,7 @@ fn repair_multiple_holders_from_same_raw_files_get_distinct_bound_bytes() {
 
 fn make_block_for_hook(bid: SourceBlockId) -> SourceBlockRecord {
     SourceBlockRecord {
+        seal_generation: 0,
         block_id: bid,
         k: 5,
         t: 1,

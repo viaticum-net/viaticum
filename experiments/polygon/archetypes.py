@@ -12,7 +12,7 @@ WHY THIS MODULE EXISTS (intent / acceptance criteria — fixed before the code):
 
   AC1 (config fidelity): each archetype maps to plausible daemon knobs. Storage
        capacity is expressed as `soft_quota_gb` because the daemon computes
-       effective_quota = min(soft_quota, disk_free - disk_reserve); the free-rider
+       effective_quota = min(soft_quota, disk_free + held - disk_reserve); the free-rider
        / hoarder GET-for-others ceiling MUST be capped via soft_quota, never via
        hard_quota (see spec assumption: hard_quota does not cap GET-for-others).
   AC2 (uptime fidelity): each archetype's `uptime_pattern` expands into a concrete

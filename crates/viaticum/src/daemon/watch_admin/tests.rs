@@ -61,6 +61,7 @@ fn make_file_record(file_id: u64, path: &str, k: u32, t: u16, backed_up: bool) -
             backed_up_at: if backed_up { Some(now) } else { None },
         }],
         first_seen: now,
+        on_disk_confirmed: true,
     }
 }
 
@@ -513,6 +514,7 @@ async fn remove_watch_with_purge_marks_all_devices_deleted_for_each_file() {
             backed_up_at: Some(now),
         }],
         first_seen: now,
+        on_disk_confirmed: true,
     };
     db.upsert_file(&record).unwrap();
 
@@ -978,6 +980,7 @@ fn get_watches_reads_cached_rollup_without_db_scan() {
                     backed_up: 40,
                     at_risk: 1,
                     lost: 1,
+                    too_large: 0,
                     encoding: 0,
                     queued: 0,
                     total_bytes: 1000,
@@ -1095,6 +1098,7 @@ fn watch_entry_json_key_is_importance_multiplier() {
         backed_up: 0,
         at_risk: 0,
         lost: 0,
+        too_large: 0,
         encoding: 0,
         queued: 0,
         rollup_age_secs: None,
@@ -1263,4 +1267,96 @@ async fn add_watch_allows_user_folder_inside_data_dir() {
         .await;
 
     assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+// ─── R1-d-a (backup-i4): too-large files in the rollup ───────────────────────
+
+fn too_large_mark(size_bytes: u64) -> viaticum_core::types::TooLargeMark {
+    viaticum_core::types::TooLargeMark {
+        size_bytes,
+        limit_bytes: 268_435_456,
+        first_seen: Timestamp(1),
+        last_seen: Timestamp(2),
+    }
+}
+
+fn watch_config(path: String) -> WatchConfig {
+    WatchConfig {
+        path,
+        importance_multiplier: 0.5,
+        was_legacy_importance: false,
+        classification: None,
+        bursts: None,
+    }
+}
+
+#[test]
+fn rollup_excludes_marked_file_from_backed_up() {
+    let tmp = TempDir::new().unwrap();
+    let db = test_db();
+    let watch_dir = TempDir::new().unwrap();
+    let prefix = watch_dir.path().to_string_lossy().to_string();
+    let grown = format!("{prefix}/grow.bin");
+    let never = format!("{prefix}/huge.mkv");
+
+    db.upsert_file(&make_file_record(
+        1,
+        &format!("{prefix}/a.txt"),
+        10,
+        64,
+        true,
+    ))
+    .unwrap();
+    // Backed up once, then grew over the limit: the old version is kept, not counted.
+    db.upsert_file(&make_file_record(2, &grown, 10, 64, true))
+        .unwrap();
+    db.put_too_large(&grown, &too_large_mark(300 << 20))
+        .unwrap();
+    // Never backed up: a mark and no record.
+    db.put_too_large(&never, &too_large_mark(4 << 30)).unwrap();
+    // A mark outside the folder is not this folder's.
+    db.put_too_large("/elsewhere/x.bin", &too_large_mark(4 << 30))
+        .unwrap();
+
+    let (admin, _rx) = make_watch_admin_with_config(
+        tmp.path().join("config.toml"),
+        vec![watch_config(prefix)],
+        db,
+    );
+    admin.recompute_all_rollups().unwrap();
+
+    let entries = admin.list_watches();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].backed_up, 1, "only a.txt is backed up");
+    assert_eq!(entries[0].too_large, 2, "grow.bin and huge.mkv");
+    assert_eq!(
+        entries[0].total_files, 3,
+        "the unrecorded marked file counts"
+    );
+    assert_eq!(entries[0].traffic_light, "orange");
+    let json = serde_json::to_value(&entries[0]).unwrap();
+    assert_eq!(json["too_large"], 2);
+}
+
+#[test]
+fn traffic_light_orange_when_folder_has_too_large_file() {
+    let rollup = FolderRollup {
+        total_files: 3,
+        backed_up: 2,
+        too_large: 1,
+        ..FolderRollup::default()
+    };
+    assert_eq!(traffic_light(&WatchStatus::Idle, &rollup), "orange");
+    // Lost stays red; Error stays orange; a yellow reason does not hide the too-large file.
+    let lost = FolderRollup {
+        lost: 1,
+        ..rollup.clone()
+    };
+    assert_eq!(traffic_light(&WatchStatus::Idle, &lost), "red");
+    let at_risk = FolderRollup {
+        at_risk: 1,
+        ..rollup.clone()
+    };
+    assert_eq!(traffic_light(&WatchStatus::Working, &at_risk), "orange");
+    assert_eq!(traffic_light(&WatchStatus::Error, &rollup), "orange");
 }

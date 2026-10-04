@@ -445,3 +445,105 @@ async fn no_bak_created_when_config_file_is_missing() {
     let cfg = admin.read_editable().unwrap();
     assert_eq!(cfg.network.listen_port, 7777);
 }
+
+// ─── daemon-i10 (F13): numbers as the user wrote them ─────────────────────────
+
+// Hand-written config: the amounts are TOML integers, not floats.
+fn integer_amounts_config() -> &'static str {
+    r#"[storage]
+disk_reserve_gb = 7
+soft_quota_gb = 50
+
+[network]
+listen_port = 4500
+"#
+}
+
+/// The number at `[section].key` of the file on disk, integer or float.
+fn number_on_disk(p: &Path, section: &str, key: &str) -> f64 {
+    let doc: toml_edit::DocumentMut = std::fs::read_to_string(p).unwrap().parse().unwrap();
+    let item = &doc[section][key];
+    item.as_float()
+        .or_else(|| item.as_integer().map(|i| i as f64))
+        .unwrap_or_else(|| panic!("{section}.{key} is not a number on disk: {item}"))
+}
+
+// Mutation: read_gb accepts only `as_float()` → the integer quota reads as the
+// default (0 = whole disk) and this test goes red.
+#[test]
+fn read_editable_reads_integer_quota_and_reserve_as_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let admin = ConfigAdmin::new(write_config(&dir, integer_amounts_config()));
+    let cfg = admin.read_editable().unwrap();
+    assert_eq!(cfg.storage.soft_quota_gb, 50.0);
+    assert_eq!(cfg.storage.disk_reserve_gb, 7.0);
+    assert_eq!(cfg.network.listen_port, 4500);
+}
+
+// Mutation: read_gb drops the `as_float()` branch → a fractional amount is lost.
+#[test]
+fn read_editable_reads_fractional_float_amounts() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = "[storage]\ndisk_reserve_gb = 2.5\nsoft_quota_gb = 12.75\n";
+    let admin = ConfigAdmin::new(write_config(&dir, body));
+    let cfg = admin.read_editable().unwrap();
+    assert_eq!(cfg.storage.disk_reserve_gb, 2.5);
+    assert_eq!(cfg.storage.soft_quota_gb, 12.75);
+}
+
+// The whole form round-trip the Settings page does: GET, then PUT unchanged.
+// Mutation: integer amounts read as defaults → Save writes the defaults over
+// 50 / 7 and this test goes red.
+#[tokio::test]
+async fn save_of_unchanged_form_keeps_integer_amounts_in_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_config(&dir, integer_amounts_config());
+    let admin = ConfigAdmin::new(p.clone());
+    let form = admin.read_editable().unwrap();
+    admin.update(form.clone()).await.unwrap();
+
+    assert_eq!(number_on_disk(&p, "storage", "soft_quota_gb"), 50.0);
+    assert_eq!(number_on_disk(&p, "storage", "disk_reserve_gb"), 7.0);
+    assert_eq!(number_on_disk(&p, "network", "listen_port"), 4500.0);
+    assert_eq!(admin.read_editable().unwrap(), form);
+}
+
+// An absent key is not written in the config: the default is the value in force.
+#[test]
+fn read_editable_uses_defaults_for_absent_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let admin = ConfigAdmin::new(write_config(&dir, "[storage]\nsoft_quota_gb = 50\n"));
+    let cfg = admin.read_editable().unwrap();
+    let defaults = viaticum_core::config::AppConfig::default();
+    assert_eq!(cfg.storage.soft_quota_gb, 50.0);
+    assert_eq!(
+        cfg.storage.disk_reserve_gb,
+        defaults.storage.disk_reserve_gb
+    );
+    assert_eq!(cfg.network.listen_port, defaults.network.listen_port);
+}
+
+fn matches_unreadable(err: &ConfigAdminError, field: &str) {
+    match err {
+        ConfigAdminError::Unreadable { field: f, .. } => assert_eq!(f, field),
+        other => panic!("expected Unreadable, got {other:?}"),
+    }
+}
+
+// Mutation: read_gb falls back to the default for a non-number → Ok, test red.
+#[test]
+fn read_editable_refuses_non_number_quota_instead_of_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let admin = ConfigAdmin::new(write_config(&dir, "[storage]\nsoft_quota_gb = \"50\"\n"));
+    let err = admin.read_editable().unwrap_err();
+    matches_unreadable(&err, "storage.soft_quota_gb");
+}
+
+// Mutation: read_port falls back to the default for an out-of-range port → Ok, red.
+#[test]
+fn read_editable_refuses_out_of_range_port_instead_of_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let admin = ConfigAdmin::new(write_config(&dir, "[network]\nlisten_port = 70000\n"));
+    let err = admin.read_editable().unwrap_err();
+    matches_unreadable(&err, "network.listen_port");
+}

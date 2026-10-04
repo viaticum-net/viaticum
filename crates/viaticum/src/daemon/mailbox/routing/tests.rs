@@ -672,6 +672,44 @@ async fn contact_on_ack_refreshes_last_seen() {
     assert!(db.get_peer(&device_id).unwrap().unwrap().last_seen.0 >= before);
 }
 
+/// dr-i50 / pos-i8: a postman's answer to our poll's fetch is a contact too — its
+/// `last_seen` moves to now inside `MailboxRouter::poll`, before the entries are
+/// returned, whatever the poll loop then does with them (the PoS memory of pos-i5
+/// skips most of them).
+#[tokio::test]
+async fn poll_fetch_contact_refreshes_last_seen() {
+    let key = viaticum_core::cluster::derive_device_key(&[0x79u8; 64], &[0x01u8; 32]).unwrap();
+    let device_id = DeviceId(key.verifying_key().to_bytes());
+    let db = test_db();
+    let mut record = make_peer_record(device_id, INITIAL_TRUST_P, 0.0, 0.3);
+    record.last_seen = Timestamp(1_000);
+    db.upsert_peer(&record).unwrap();
+
+    let my_master = make_identity(79);
+    let before = Timestamp::now().0;
+    let entry = make_entry(
+        my_master,
+        make_msg_id(52),
+        before,
+        MailboxClass::PosChallenge,
+    );
+    let mut responses: HashMap<DeviceId, Vec<MailboxEntry>> = HashMap::new();
+    responses.insert(device_id, vec![entry]);
+    let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
+    let router = MailboxRouter::with_sender(sender, db.clone());
+
+    let entries = router
+        .poll(&MailboxAddress::for_master(&my_master), None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(entries.len(), 1);
+    assert!(
+        db.get_peer(&device_id).unwrap().unwrap().last_seen.0 >= before,
+        "a fetch answer must refresh the postman's last_seen"
+    );
+}
+
 // ─── CS-DR-1: DR collects every pointer from every batch ─────────────────────
 //
 // CROWN-1 C3a: the pointers live sealed in the seed-derived rendezvous box; the walk

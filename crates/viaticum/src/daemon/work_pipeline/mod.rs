@@ -6,7 +6,8 @@
 //
 // Module layout:
 //   mod.rs      -- WorkPipeline struct, public API, run_loop, reset_all_cooldowns
-//   worker.rs   -- run_block_iteration: exclude → allocate → encode → deliver
+//   worker.rs   -- run_block_iteration: plan → encode → deliver
+//   offer_plan/ -- exclude → allocate → ESI ranges per holder (repair-i9) → Offered rows
 //   pool.rs     -- pool snapshot + pool_signature computation
 //   tests.rs    -- all ATDD unit tests
 
@@ -22,6 +23,7 @@ use viaticum_core::types::{DeviceId, SourceBlockId, SourceBlockRecord, Timestamp
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
 
+mod offer_plan;
 mod pool;
 mod worker;
 
@@ -68,6 +70,12 @@ pub struct WorkPipelineConfig {
     /// Minimum pool size to attempt delivery. Below this, park the block without encoding.
     /// Default: 2.
     pub min_pool_size: usize,
+    /// Where a rebuild reports gone paths (К2b, delete-i12 (в)); the watcher rechecks
+    /// them. `None` in tests.
+    pub recheck_tx: Option<crate::daemon::backup::rebuild::RecheckTx>,
+    /// The size limit of this machine: the rebuild reads no source file above it (J1,
+    /// backup-i5). Default: the RaptorQ ceiling; the daemon sets the limit in force.
+    pub max_source_bytes: u64,
 }
 
 impl Default for WorkPipelineConfig {
@@ -81,6 +89,8 @@ impl Default for WorkPipelineConfig {
             epoch_key: [0u8; 32],
             data_dir: std::path::PathBuf::new(),
             min_pool_size: 2,
+            recheck_tx: None,
+            max_source_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
         }
     }
 }
@@ -92,6 +102,8 @@ enum ParkReason {
     NoSwarm,
     NoCandidates,
     IterationError,
+    /// The block left service before its offers were written (repair-i16).
+    LeftService,
 }
 
 impl ParkReason {
@@ -101,6 +113,7 @@ impl ParkReason {
             ParkReason::NoSwarm => "no swarm",
             ParkReason::NoCandidates => "no candidates",
             ParkReason::IterationError => "iteration error",
+            ParkReason::LeftService => "left service (being released)",
         }
     }
 }
@@ -126,6 +139,9 @@ enum BlockAttempt {
     PoolUnusable,
     /// The iteration failed (e.g. unreadable source); parked.
     Error,
+    /// The block left service before its offers were written (repair-i16); parked; the
+    /// next block may do better.
+    LeftService,
 }
 
 // ─── WorkPipeline ─────────────────────────────────────────────────────────────
@@ -284,7 +300,10 @@ impl WorkPipeline {
             picked_any = true;
 
             let attempt = self.work_on_block(&block, &pool, now).await?;
-            if attempt != BlockAttempt::NoCandidates {
+            if !matches!(
+                attempt,
+                BlockAttempt::NoCandidates | BlockAttempt::LeftService
+            ) {
                 break;
             }
         }
@@ -355,7 +374,10 @@ impl WorkPipeline {
                     offered = wo.offered,
                     "work_pipeline: iteration complete"
                 );
-                if wo.offered > 0 {
+                if wo.left_service {
+                    self.update_block_cooldown(block, pool, now, Some(ParkReason::LeftService));
+                    Ok(BlockAttempt::LeftService)
+                } else if wo.offered > 0 {
                     // Offers went out (accepted or not): retry after the normal
                     // cooldown — a network failure is not "nobody can take it".
                     self.update_block_cooldown(block, pool, now, None);
@@ -408,6 +430,11 @@ impl WorkPipeline {
                 block_id = %block.block_id,
                 reason = reason.as_str(),
                 "work_pipeline: block parked (nobody can take symbols)"
+            ),
+            Some(reason @ ParkReason::LeftService) => tracing::info!(
+                block_id = %block.block_id,
+                reason = reason.as_str(),
+                "work_pipeline: block parked (left service before the offers)"
             ),
             Some(reason) => tracing::info!(
                 block_id = %block.block_id,

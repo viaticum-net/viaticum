@@ -1,6 +1,8 @@
 // TODO(bug-b): hash-PoS for SS-blocks — separate near-term task, high priority.
 // SS-blocks excluded from due_challenges via ss_block_id_set filter until implemented.
 
+use std::collections::HashMap;
+
 use crate::constants::{
     POS_BASE_CHALLENGES_PER_WEEK, POS_CONSECUTIVE_MISS_PRESUMED_LOST,
     POS_CONSECUTIVE_MISS_UNCERTAIN, POS_VOLUME_DIVISOR, SECS_PER_WEEK,
@@ -38,6 +40,9 @@ pub enum VerifyOutcome {
 pub struct ChallengeScheduleEntry {
     pub holder_id: DeviceId,
     pub source_block_id: SourceBlockId,
+    /// Challenges per week for this placement: the value its interval was derived from
+    /// (pos-i7: the scheduler logs it per challenge and its min/max per issue tick).
+    pub cpw: u32,
 }
 
 /// Error type for PoS engine operations.
@@ -85,6 +90,10 @@ pub fn challenges_per_week(symbol_count: u32, trust_score: f64) -> u32 {
 ///
 /// trust_fn: closure to look up trust score for a holder.
 /// time_scale: acceleration factor (1 = real time). Divides the challenge interval.
+///
+/// Linear in the number of placements (pos-i7): `last_verified` is indexed once by
+/// (block, holder), so each placement's lookup is O(1). A duplicate (block, holder) in
+/// `last_verified` resolves to its first occurrence, as the former linear `find` did.
 pub fn due_challenges<F>(
     placements: &[SymbolPlacement],
     last_verified: &[(SourceBlockId, DeviceId, Option<Timestamp>)],
@@ -96,6 +105,11 @@ where
     F: Fn(&DeviceId) -> f64,
 {
     let scale = time_scale.max(1);
+    let mut lv_index: HashMap<(SourceBlockId, DeviceId), Option<Timestamp>> =
+        HashMap::with_capacity(last_verified.len());
+    for (block, holder, ts) in last_verified {
+        lv_index.entry((*block, *holder)).or_insert(*ts);
+    }
     placements
         .iter()
         .filter_map(|p| {
@@ -108,10 +122,10 @@ where
             let cpw = challenges_per_week(p.symbol_count(), trust);
             let interval_secs = (SECS_PER_WEEK / cpw as u64) / scale;
 
-            let lv = last_verified
-                .iter()
-                .find(|(bid, hid, _)| *bid == p.source_block_id && *hid == p.holder_id)
-                .and_then(|(_, _, ts)| *ts);
+            let lv = lv_index
+                .get(&(p.source_block_id, p.holder_id))
+                .copied()
+                .flatten();
 
             let is_due = match lv {
                 None => true,
@@ -125,6 +139,7 @@ where
             Some(ChallengeScheduleEntry {
                 holder_id: p.holder_id,
                 source_block_id: p.source_block_id,
+                cpw,
             })
         })
         .collect()
@@ -319,11 +334,9 @@ pub fn verify_hash_response(
 
 // ─── PendingHashChallenge ────────────────────────────────────────────────────
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
 /// In-memory record for one outstanding block-level chain hash challenge.
-/// Keyed by (SourceBlockId, DeviceId) in the shared map.
+/// Keyed by (SourceBlockId, DeviceId) in the daemon's pending index
+/// (`daemon::scheduler::PendingIndex`).
 #[derive(Debug, Clone)]
 pub struct PendingHashChallenge {
     pub source_block_id: SourceBlockId,
@@ -347,10 +360,6 @@ pub struct PendingHashChallenge {
     /// response of an honest holder and wrongly time it out.
     pub holder_master: IdentityPub,
 }
-
-/// Shared map of in-flight hash challenges keyed by (SourceBlockId, DeviceId).
-pub type PendingHashChallenges =
-    Arc<Mutex<HashMap<(SourceBlockId, DeviceId), PendingHashChallenge>>>;
 
 #[cfg(test)]
 mod tests;

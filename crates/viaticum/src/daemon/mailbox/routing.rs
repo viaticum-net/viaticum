@@ -52,7 +52,7 @@ mod dr_walk;
 mod fanout;
 mod verdict;
 
-use fanout::{record_avail_contact, store_fanout, unix_now};
+use fanout::{record_avail_contact, record_contact_off_runtime, store_fanout, unix_now};
 
 pub use dr_walk::DrWalk;
 pub use verdict::{PublishOutcome, PublishVerdict};
@@ -346,7 +346,7 @@ impl MailboxRouter {
         for handle in handles {
             match handle.await {
                 Ok((device_id, Ok(resp))) => {
-                    record_avail_contact(&self.db, device_id, now_secs);
+                    record_contact_off_runtime(&self.db, device_id, now_secs);
                     for entry in resp.entries {
                         // Skip expired entries (should not happen; postman filters them,
                         // but be defensive against clock skew).

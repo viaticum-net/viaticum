@@ -98,6 +98,40 @@ RaptorQ (RFC 6330) via `raptorq` crate.
 **Per-holder binding:** Each holder's symbols are XOR'd with `ChaCha20(HKDF(block_id, holder_id))`. Prevents collusion — two holders can't pool symbols because each has unique binding.
 
 **Dedup:** Content-addressed. Same content_hash -> same ciphertext -> same source_block_id -> zero additional traffic/storage.
+The dedup target is only a block the owner keeps **in service**: its record exists, its
+status is `Active`, and none of its placements is `Deleting`. The same rule
+(`Serviceability`) is used by the dedup of an event, the flush-time "already in the
+network" check, the choice of a block generation, the reconcile, `is_safe_to_delete`,
+the files view's `effective_status` and the watch-root rule. A file whose content lies
+only on a block being released (a file put back after its Delete went out, the same PDF
+downloaded again) is backed up again.
+
+**Block generation (N1).** The seal is deterministic, so the same packed plaintext (a
+file returned to its path in a pack of one, a large file) would get the id of the block
+being released — the id an old Delete, still replayed by mailbox postmen, addresses. The
+nonce is therefore derived with a generation `g`: HKDF-SHA256(salt = blake3(compressed),
+ikm = epoch key, info = `"viaticum-block-nonce"` for `g = 0`, `"viaticum-block-nonce/generation" || g`
+(LE) otherwise). The packing takes the lowest `g` whose id has no record (free) or is in
+service (kept as it is); ids in the release window or being released are skipped. The
+choice is re-checked inside the write transaction. `g` is stored in the block record
+(`seal_generation`, omitted when 0, so blocks and SystemState from before are unchanged)
+and rides SystemState; every rebuild (worker, PoS, local restore tier) seals at it.
+Decryption reads the nonce from the blob and needs no generation. An id becomes free only
+after `CleanupBlock`, no earlier than the holder window after the Delete (until L2 that
+window is counted from the theoretical release time — owner deletion + owner window — not
+from the moment the Delete was actually published; a node that was off longer than the
+owner window can therefore free an id while its late Delete still lives), and a Delete
+lives at a postman at most its TTL plus one sweep: `TTL + sweep < holder window` is a
+compile-time assertion.
+
+**Reconcile.** At start and every `max(1 h / time_scale, 60 s)` the backup coordinator
+lists records present on this device whose current version is on a block being released
+or missing, or is pending and in no packing queue (a `kill -9` before the idle flush),
+and hands the paths to the watcher. The watcher re-submits a path as `Modified` only under
+an active, accepted watch root with the recorded identity, through the scan filters, for
+an existing file; one INFO line per root per batch. The reconcile never deletes, marks or
+reads a file; a path whose record does not change after its re-submission backs off
+(1, 2, 4 … 24 passes).
 
 ## Proof-of-Storage (PoS)
 
@@ -219,7 +253,9 @@ therefore decides per block, over the whole catalog:
   reference it, so each deleted file keeps its full undo window even if a pack sibling
   was deleted long ago.
 - A block whose DropNotice already went out is not recalled if a live record starts
-  referencing it again; it just gets no further deletion actions.
+  referencing it again; it just gets no further deletion actions. A file put back after
+  that is not deduplicated onto the released block: it is backed up again, under a new
+  block generation when the plaintext is the same (see Erasure Coding, "Block generation").
 
 Deleted files inside a still-live pack stay in the network (and restorable) as long as
 the pack lives; reclaiming that space is vacuum's job (not implemented).

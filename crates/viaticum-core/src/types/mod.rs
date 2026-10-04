@@ -1,5 +1,6 @@
 use crate::constants::{
-    DECODE_OVERHEAD, OVERHEAD_BASE, OVERHEAD_SCALE, SECS_PER_DAY, SECS_PER_WEEK, SYMBOL_SIZE,
+    DECODE_OVERHEAD, OVERHEAD_BASE, OVERHEAD_SCALE, RAPTORQ_MAX_SOURCE_SYMBOLS, SECS_PER_DAY,
+    SECS_PER_WEEK, SYMBOL_SIZE,
 };
 
 // ============================================================
@@ -137,7 +138,7 @@ pub struct ErasureParams {
 pub enum ErasureParamsError {
     #[error("source block is empty")]
     EmptySourceBlock,
-    #[error("source block too large: {0} bytes (k would overflow u32)")]
+    #[error("source block too large: {0} bytes (k would exceed the RaptorQ single-block limit)")]
     TooLarge(u64),
 }
 
@@ -147,18 +148,18 @@ impl ErasureParams {
     /// Returns `Err(EmptySourceBlock)` if `source_block_size == 0` — an empty
     /// block cannot be erasure-coded (k=0 is invalid for RaptorQ).
     ///
-    /// Returns `Err(TooLarge)` if the resulting k would exceed `u32::MAX` — the
-    /// silent `as u32` truncation would produce a wrong k value (review L-1).
+    /// Returns `Err(TooLarge)` if the resulting k would exceed
+    /// `RAPTORQ_MAX_SOURCE_SYMBOLS` — the raptorq crate panics above it.
     pub fn compute(source_block_size: u64, importance: f64) -> Result<Self, ErasureParamsError> {
         if source_block_size == 0 {
             return Err(ErasureParamsError::EmptySourceBlock);
         }
         let t = SYMBOL_SIZE;
         let k_raw = (source_block_size as f64 / t as f64).ceil() as u64;
-        // Reserve headroom for DECODE_OVERHEAD and the overhead multiplier so
-        // k_eff and n do not silently overflow. Cap at u32::MAX / 4 to keep the
-        // margin generous even with importance=1.0 (overhead = 3x).
-        let k_limit = (u32::MAX / 4) as u64;
+        // The raptorq crate panics on K above RAPTORQ_MAX_SOURCE_SYMBOLS (one source
+        // block); refuse it here as an error (backup-i5). This also keeps k_eff and n
+        // far from u32 overflow.
+        let k_limit = RAPTORQ_MAX_SOURCE_SYMBOLS as u64;
         if k_raw > k_limit {
             return Err(ErasureParamsError::TooLarge(source_block_size));
         }
@@ -251,9 +252,18 @@ pub struct FileRecord {
     pub devices: Vec<(DeviceId, LocalState)>,
     pub versions: Vec<FileVersion>,
     pub first_seen: Timestamp,
+    /// This device saw the file at this path (an event or a scan found it on disk).
+    /// Cleared by DR (`prepare_restored_state`) and by a watch root change. A record
+    /// without the field decodes as unconfirmed: the safe side, since only a confirmed
+    /// record may be marked deleted by a recheck (dr-i64).
+    #[serde(default)]
+    pub on_disk_confirmed: bool,
 }
 
-/// One version of a file (immutable once created).
+/// One version of a file. A backed-up version is never rewritten. The pending one
+/// (`backed_up_at == None`, sentinel block; at most one per record, and it is the last)
+/// is completed in place when its batch is packed — with the hash of the bytes actually
+/// packed — or dropped when a newer event for the path supersedes it (backup-i9, i23).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileVersion {
     pub content_hash: [u8; 32],
@@ -317,9 +327,25 @@ pub struct SourceBlockRecord {
     /// Default: 0.0 (pre-migration sentinel).
     #[serde(default)]
     pub target_reliability: f64,
+
+    /// N1 (backup-i8, delete-i9): generation of this block's seal (not the SS ledger's
+    /// `generation`). 0 for every block sealed before L1b and whenever the id at generation
+    /// 0 is free or in service; content backed up again while the block of the same
+    /// plaintext is being released takes the next generation, so its id differs from the
+    /// one an old Delete addresses. Enters the nonce derivation
+    /// (`backup::pipeline::seal_compressed`); rides SystemState with the record. Not
+    /// serialized when 0, so records and SS plaintexts of generation 0 stay byte-identical
+    /// (INV-G0).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub seal_generation: u32,
     // B-4: worker cooldown (last_attempted_at / last_pool_signature) moved to the
     // RAM-only HotCache::block_cooldown — never persisted, resets on restart.
     // Old records may still carry these CBOR map keys; serde ignores them.
+}
+
+/// `skip_serializing_if` for [`SourceBlockRecord::seal_generation`] (INV-G0).
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 impl SourceBlockRecord {
@@ -579,6 +605,21 @@ pub struct FourRPhaseRecord {
     /// Wall clock of the last change of `evicting` (`None` = never changed).
     #[serde(default)]
     pub since: Option<Timestamp>,
+}
+
+/// A file the daemon refused to back up because it is larger than this machine's limit
+/// (backup-i4). Node-local: keyed by path in `TOO_LARGE_SOURCES`, NOT part of the
+/// SystemState snapshot and not carried by DR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TooLargeMark {
+    /// Size of the file when last evaluated (`metadata().len()`).
+    pub size_bytes: u64,
+    /// The limit in force at that evaluation.
+    pub limit_bytes: u64,
+    /// When the path was first marked (kept across re-evaluations).
+    pub first_seen: Timestamp,
+    /// When the path was last evaluated as too large.
+    pub last_seen: Timestamp,
 }
 
 /// 4R pair-ledger accumulators for ONE economic pair: this node and one **master

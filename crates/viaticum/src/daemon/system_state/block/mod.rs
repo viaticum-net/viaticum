@@ -6,7 +6,7 @@
 //
 // Because a snapshot has no backing watch-dir file to re-read, the owner RETAINS
 // the block blob on disk under <data_dir>/system_state/<block_hex>.bin. The PoS
-// re-encode path (scheduler::load_source_block_data) reads this retained blob;
+// re-encode path (scheduler::issue::prepare::load_source_block) reads this retained blob;
 // integrity is guaranteed by blake3(blob) == block_id (no separate source_hash).
 //
 // Key choice: SS blocks are encrypted with the DR-STABLE key
@@ -125,6 +125,7 @@ pub fn ss_source_block_record(
         .map_err(|e| anyhow::anyhow!("erasure params for SystemState block: {e}"))?;
     let target_rel = viaticum_core::reliability::target_reliability(SYSTEM_STATE_IMPORTANCE);
     Ok(SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: params.k,
         t: params.t,

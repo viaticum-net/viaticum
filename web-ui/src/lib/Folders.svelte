@@ -235,6 +235,9 @@
             {#if entry.at_risk > 0}
               <span class="warn">At risk: <strong>{entry.at_risk}</strong></span>
             {/if}
+            {#if entry.too_large > 0}
+              <span class="warn" title="Too large for this machine: not supported yet, not backed up.">{entry.too_large} file{entry.too_large === 1 ? '' : 's'} too large</span>
+            {/if}
             {#if entry.lost > 0}
               <span class="danger-text">Lost: <strong>{entry.lost}</strong></span>
             {/if}

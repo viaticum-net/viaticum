@@ -49,6 +49,7 @@ fn sample_file(db: &Db, id: u64, path: &str) {
             backed_up_at: None,
         }],
         first_seen: Timestamp(1000),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&rec).unwrap();
 }

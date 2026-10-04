@@ -11,7 +11,8 @@
 //   3. commitment_plus_reliability_flags_weak_holder
 //      — compute scores → build report → flag for proactive repair
 //   4. disk_pressure_effective_quota_blocks_over_soft_cap
-//      — compute_effective_quota + should_reject_offers integration
+//      — compute_effective_quota + should_reject_offers + evaluate_pressure integration
+//        (Scenario D: a full disk is Critical, holder-i1)
 //   5. full_pipeline_with_phase4_integration
 //      — backup → mark holder Lost → check reliability → proactive repair
 //
@@ -21,7 +22,9 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 use viaticum::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
-use viaticum_core::budget::{compute_effective_quota, should_reject_offers};
+use viaticum_core::budget::{
+    DiskPressure, Quota, compute_effective_quota, evaluate_pressure, should_reject_offers,
+};
 use viaticum_core::commitment::{
     CommitmentScore, CommitmentTier, HolderProfile, compute_commitment, flag_for_proactive_repair,
 };
@@ -37,8 +40,9 @@ use viaticum_core::reliability::{
     BlockReliabilityInput, HolderReliabilityInput, build_report, commitment_to_survival_prob,
 };
 use viaticum_core::types::{
-    DeviceId, FileId, FileRecord, FileVersion, LocalState, PlacementStatus, SourceBlockId,
-    SourceBlockRecord, SourceBlockStatus, SourceBlockType, SymbolPlacement, Timestamp,
+    DeviceId, FileId, FileRecord, FileVersion, HoldingRecord, HoldingStatus, IdentityPub,
+    LocalState, PlacementStatus, SourceBlockId, SourceBlockRecord, SourceBlockStatus,
+    SourceBlockType, SymbolPlacement, Timestamp,
 };
 
 // ─── Shared fixtures ──────────────────────────────────────────────────────────
@@ -64,7 +68,6 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         epoch_key: EPOCH_KEY,
         device_id: DEVICE_A,
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
@@ -73,6 +76,8 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     }
 }
 
@@ -134,7 +139,6 @@ fn config_source_block_size_drives_backup() {
             epoch_key: EPOCH_KEY,
             device_id: DEVICE_A,
             mock_holders: test_holders(),
-            cluster_state: None,
             watch_configs: vec![],
             time_scale: 1,
             mock_offer_budget_gb: None,
@@ -143,6 +147,8 @@ fn config_source_block_size_drives_backup() {
             live_watch_configs: None,
             peer_backoff: None,
             work_event_tx: None,
+            resubmit_tx: None,
+            max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
         },
         Arc::new(RaptorQEncoder::new()),
     );
@@ -229,10 +235,12 @@ fn deletion_cooldown_full_lifecycle() {
             backed_up_at: Some(now),
         }],
         first_seen: now,
+        on_disk_confirmed: true,
     };
 
     // Active source block of type Single
     let block = SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 4,
         t: 65535,
@@ -333,6 +341,7 @@ fn deletion_cooldown_full_lifecycle() {
 
     // Update block to Deleting and both placements to Deleting
     let block_deleting = SourceBlockRecord {
+        seal_generation: 0,
         status: SourceBlockStatus::Deleting,
         ..block.clone()
     };
@@ -524,21 +533,22 @@ fn commitment_plus_reliability_flags_weak_holder() {
 
 // ─── Test 4: disk_pressure_effective_quota_blocks_over_soft_cap ───────────────
 //
-// Two-tier quota: soft cap and disk-free constraint.
-// should_reject_offers triggers when near the soft cap.
+// Two-tier quota: soft cap and disk-free constraint (holdings counted once, holder-i3).
+// should_reject_offers triggers when near the soft cap; a full disk is Critical (holder-i1).
 
 #[test]
 fn disk_pressure_effective_quota_blocks_over_soft_cap() {
     let gb = 1_024 * 1_024 * 1_024u64;
 
-    // Scenario A: soft_quota=50 GiB, disk_free=200 GiB, reserve=20 GiB
+    // Scenario A: soft_quota=50 GiB, disk_free=200 GiB, reserve=20 GiB, nothing held
     // → effective = min(50, 180) = 50 GiB
     let soft_quota_bytes = 50 * gb;
     let disk_free = 200 * gb;
     let disk_reserve = 20 * gb;
-    let effective = compute_effective_quota(soft_quota_bytes, disk_free, disk_reserve);
+    let effective = compute_effective_quota(soft_quota_bytes, Some(disk_free), 0, disk_reserve);
     assert_eq!(
-        effective, soft_quota_bytes,
+        effective,
+        Quota::Bytes(soft_quota_bytes),
         "soft_quota wins when disk has plenty of room"
     );
 
@@ -559,32 +569,67 @@ fn disk_pressure_effective_quota_blocks_over_soft_cap() {
     // Scenario B: disk_free is tight → disk constraint overrides soft_quota
     // disk_free=22 GiB, reserve=20 GiB → available_from_disk=2 GiB < soft_quota=50 GiB
     let disk_free_tight = 22 * gb;
-    let effective_tight = compute_effective_quota(soft_quota_bytes, disk_free_tight, disk_reserve);
+    let effective_tight =
+        compute_effective_quota(soft_quota_bytes, Some(disk_free_tight), 0, disk_reserve);
     assert_eq!(
         effective_tight,
-        2 * gb,
+        Quota::Bytes(2 * gb),
         "available disk space (2 GiB) must override soft_quota"
     );
 
-    // Scenario C: soft_quota=0 (unlimited) → effective = disk_free - reserve
-    let effective_no_cap = compute_effective_quota(0, disk_free, disk_reserve);
+    // Scenario C: soft_quota=0 (no soft cap) → effective = disk_free + held - reserve
+    let effective_no_cap = compute_effective_quota(0, Some(disk_free), 10 * gb, disk_reserve);
     assert_eq!(
         effective_no_cap,
-        180 * gb,
-        "unlimited soft_quota → effective = disk_free - reserve"
+        Quota::Bytes(190 * gb),
+        "no soft cap → effective = disk_free + held - reserve (held counted once)"
     );
 
-    // Scenario D: disk fully consumed (reserve >= disk_free) → effective = 0
-    let effective_zero = compute_effective_quota(soft_quota_bytes, disk_reserve, disk_reserve);
-    assert_eq!(
-        effective_zero, 0,
-        "disk_free == reserve → effective quota = 0"
+    // Scenario D (holder-i1): the disk is full of the friend's own files — free disk plus
+    // what we hold is at the reserve → no room at all: Critical, NOT "unlimited".
+    let held = 5 * gb;
+    let effective_zero = compute_effective_quota(
+        soft_quota_bytes,
+        Some(disk_reserve - held),
+        held,
+        disk_reserve,
     );
-    // When quota=0 and we've been told it's unlimited (soft_quota=0 branch), that is handled
-    // above. But when effective=0 and used>0, should_reject_offers must handle quota=0 safely.
+    assert_eq!(
+        effective_zero,
+        Quota::Bytes(0),
+        "free + held == reserve → effective quota = 0"
+    );
     assert!(
-        !should_reject_offers(0, 0),
-        "quota=0 (unlimited sentinel) → should never reject"
+        should_reject_offers(effective_zero, held),
+        "no room → every offer is refused"
+    );
+    assert!(
+        should_reject_offers(effective_zero, 0),
+        "no room → refused even with nothing held"
+    );
+    let holdings: Vec<HoldingRecord> = (0u8..5)
+        .map(|i| HoldingRecord {
+            source_block_id: SourceBlockId([i; 32]),
+            owner_id: IdentityPub([i; 32]),
+            esi_ranges: vec![(0, 1)],
+            importance: 0.5,
+            total_bytes: gb,
+            status: HoldingStatus::Active,
+            received_at: Timestamp(0),
+            delete_requested_at: None,
+            drop_notice_sent_at: None,
+        })
+        .collect();
+    let critical = evaluate_pressure(effective_zero, 2 * gb, held, &holdings, |_| 0.5, 0);
+    assert_eq!(
+        critical.pressure,
+        DiskPressure::Hard,
+        "no room → Critical (hard pressure), not Normal"
+    );
+    assert_eq!(
+        critical.freed_bytes,
+        3 * gb,
+        "friends' data is given back down to the hard floor (2 GiB)"
     );
 }
 

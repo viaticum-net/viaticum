@@ -44,6 +44,7 @@ fn test_state() -> (Arc<DaemonState>, mpsc::Receiver<RestoreRequest>) {
             backed_up_at: Some(Timestamp(20)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     })
     .unwrap();
     state_with(db, jobs)
@@ -75,6 +76,7 @@ fn state_with(db: Db, jobs: RestoreJobs) -> (Arc<DaemonState>, mpsc::Receiver<Re
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: None,
         missing_sources: Default::default(),
+        max_file_size_bytes: 0,
     });
     (state, restore_rx)
 }
@@ -384,7 +386,6 @@ async fn restore_job_outlives_the_client_that_submitted_it() {
             epoch_key: KEY,
             device_id: DeviceId([1u8; 32]),
             mock_holders: vec![],
-            cluster_state: None,
             watch_configs: vec![],
             time_scale: 1,
             mock_offer_budget_gb: None,
@@ -393,6 +394,8 @@ async fn restore_job_outlives_the_client_that_submitted_it() {
             live_watch_configs: None,
             peer_backoff: None,
             work_event_tx: None,
+            resubmit_tx: None,
+            max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
         },
         Arc::new(RaptorQEncoder::new()),
     );

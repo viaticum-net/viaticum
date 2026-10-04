@@ -261,18 +261,39 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         .restore_staging
         .lock()
         .expect("restore staging status lock poisoned");
-    let effective_quota_bytes = {
-        let disk_free = crate::daemon::handle::disk_available_bytes(&state.data_dir);
-        viaticum_core::budget::compute_effective_quota(
-            state.soft_quota_bytes,
-            disk_free,
-            state.disk_reserve_bytes,
-        )
+    // holder-i1..i3: one disk read and one holdings number for the quota, its state and the
+    // staging squeeze flag.
+    let disk_free = crate::daemon::handle::disk_available_bytes(&state.data_dir);
+    let quota = viaticum_core::budget::compute_effective_quota(
+        state.soft_quota_bytes,
+        disk_free,
+        holdings_bytes,
+        state.disk_reserve_bytes,
+    );
+    let (effective_quota_bytes, quota_state) = match quota {
+        viaticum_core::budget::Quota::Bytes(n) => (n, "bytes"),
+        viaticum_core::budget::Quota::Unknown => (0, "unknown"),
+        // Never produced by compute_effective_quota (tests only).
+        viaticum_core::budget::Quota::Unlimited => (0, "unlimited"),
+    };
+    let quota_note = if disk_free.is_none() {
+        crate::daemon::holder_cleanup::unreadable_disk_note(&state.data_dir, state.soft_quota_bytes)
+    } else {
+        String::new()
+    };
+    // holder-i4: below the reserve (at any quota), say so and what the pressure tick gives
+    // back — the Hard deficit, bounded by the hard floor.
+    let below_reserve_giving_back_bytes = match (disk_free, quota) {
+        (Some(free), viaticum_core::budget::Quota::Bytes(q)) if free < state.disk_reserve_bytes => {
+            let above_floor = holdings_bytes.saturating_sub(state.hard_quota_bytes);
+            Some(viaticum_core::budget::hard_eviction_deficit(q, holdings_bytes).min(above_floor))
+        }
+        _ => None,
     };
     let staging_squeezes_holdings = crate::daemon::restore::cleanup::staging_squeezes_holdings(
         crate::daemon::restore::cleanup::holder_stops_taking_data(
             state.soft_quota_bytes,
-            crate::daemon::restore::cleanup::disk_free_bytes(&state.data_dir),
+            disk_free,
             state.disk_reserve_bytes,
             holdings_bytes,
         ),
@@ -295,6 +316,9 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         blocks_needing_repair,
         peers: peer_summaries,
         effective_quota_bytes,
+        quota_state: quota_state.to_string(),
+        quota_note,
+        below_reserve_giving_back_bytes,
         used_bytes: holdings_bytes,
         pos_total_challenges,
         pos_total_passes,
@@ -327,7 +351,42 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         dr_waiting_since: dr.waiting_since,
         dr_waiting: dr.waiting,
         dr_restores_state_of: dr.restores_state_of,
+        files_too_large: count_too_large_under_watches(state),
+        max_file_size_bytes: state.max_file_size_bytes,
+        // R1-d-b sets the block work budget.
+        block_work_budget_bytes: 0,
     }))
+}
+
+/// backup-i4: the too-large marks of files under the watch directories now. A mark left
+/// by a folder that was unwatched since is not counted (the start pass drops it). Without a
+/// watch admin (web API off; tests) every mark counts. A DB error counts none.
+fn count_too_large_under_watches(state: &DaemonState) -> u32 {
+    let marks = match state.db.list_too_large() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(err = %e, "status: cannot list the too-large marks");
+            return 0;
+        }
+    };
+    let Some(admin) = state.watch_admin.as_ref() else {
+        return marks.len() as u32;
+    };
+    let roots: Vec<std::path::PathBuf> = admin
+        .live_configs
+        .read()
+        .expect("live_configs lock poisoned")
+        .iter()
+        .map(|wc| viaticum_core::config::expand_watch_path(&wc.path))
+        .collect();
+    marks
+        .iter()
+        .filter(|(path, _)| {
+            roots
+                .iter()
+                .any(|root| std::path::Path::new(path).starts_with(root))
+        })
+        .count() as u32
 }
 
 /// Status fields about DR readiness (dr-i9, dr-i39, dr-i41, dr-i49; mailbox-i49, i54)
@@ -452,12 +511,22 @@ pub(crate) fn waiting_words(reason: WaitingReason) -> &'static str {
 /// version is not backed up, the block record is missing, or it is below target
 /// (a target of 0.0 is the pre-migration sentinel and never counts as safe).
 /// "At target" is `reliability::meets_target` — the one tolerance-aware definition
-/// (repair-i3).
+/// (repair-i3). A block not in service (being released, in the window, missing) is never
+/// safe, whatever its cached reliability says (backup-i8, backup-i21: the cache is not
+/// recomputed when the block turns `Deleting`).
 fn compute_is_safe_to_delete(state: &DaemonState, file: &FileRecord) -> bool {
+    // backup-i4: a file whose current content is above the limit is not protected, whatever
+    // its older version says. A DB error answers "no".
+    if !matches!(state.db.get_too_large(&file.path), Ok(None)) {
+        return false;
+    }
     let Some(version) = file.versions.last() else {
         return false;
     };
     if version.backed_up_at.is_none() {
+        return false;
+    }
+    if !block_in_service(state, &version.source_block_id) {
         return false;
     }
     match state.db.get_source_block(&version.source_block_id) {
@@ -472,10 +541,26 @@ fn compute_is_safe_to_delete(state: &DaemonState, file: &FileRecord) -> bool {
     }
 }
 
+/// The block is in service (`Serviceability::Serviceable`, backup-i21). A DB error answers
+/// "no": the conservative side for both readers.
+fn block_in_service(state: &DaemonState, block: &viaticum_core::types::SourceBlockId) -> bool {
+    state
+        .db
+        .block_serviceability(block)
+        .is_ok_and(|s| s.is_serviceable())
+}
+
 fn compute_effective_status(state: &DaemonState, version: &FileVersion) -> EffectiveStatus {
     // backed_up_at == None means the encoder pipeline hasn't produced a block yet.
     if version.backed_up_at.is_none() {
         return EffectiveStatus::Queued;
+    }
+    // A block not in service is never "restorable / on target", whatever its placements
+    // count (backup-i8): the network is releasing it; the file is backed up again.
+    match state.db.block_serviceability(&version.source_block_id) {
+        Ok(s) if s.is_serviceable() => {}
+        Ok(_) => return EffectiveStatus::Releasing,
+        Err(_) => return EffectiveStatus::Queued, // Conservative on DB error.
     }
 
     let target = version.k + viaticum_core::constants::DECODE_OVERHEAD;
@@ -523,6 +608,14 @@ fn compute_effective_status(state: &DaemonState, version: &FileVersion) -> Effec
     }
 }
 
+fn too_large_info(mark: &viaticum_core::types::TooLargeMark) -> crate::cli::types::TooLargeInfo {
+    crate::cli::types::TooLargeInfo {
+        size_bytes: mark.size_bytes,
+        limit_bytes: mark.limit_bytes,
+        since: timestamp_to_iso_date(mark.first_seen),
+    }
+}
+
 fn dispatch_files(state: &DaemonState, path_prefix: Option<String>) -> CliResponse {
     let records = match path_prefix {
         Some(ref prefix) => state.db.list_files_with_prefix(prefix),
@@ -535,7 +628,15 @@ fn dispatch_files(state: &DaemonState, path_prefix: Option<String>) -> CliRespon
         }
     };
 
-    let entries: Vec<FileEntry> = records
+    let marks: std::collections::HashMap<String, viaticum_core::types::TooLargeMark> =
+        match state.db.list_too_large() {
+            Ok(m) => m.into_iter().collect(),
+            Err(e) => {
+                return CliResponse::Error(format!("db error listing too-large marks: {e}"));
+            }
+        };
+
+    let mut entries: Vec<FileEntry> = records
         .iter()
         .map(|f| {
             let latest = f.versions.last();
@@ -564,9 +665,34 @@ fn dispatch_files(state: &DaemonState, path_prefix: Option<String>) -> CliRespon
                 local_state,
                 effective_status,
                 is_safe_to_delete,
+                too_large: marks.get(&f.path).map(too_large_info),
             }
         })
         .collect();
+
+    // A marked file with no catalog record was never backed up: the mark is all there is.
+    let listed: std::collections::HashSet<&str> = records.iter().map(|f| f.path.as_str()).collect();
+    let mut synthetic: Vec<FileEntry> = marks
+        .iter()
+        .filter(|(path, _)| {
+            !listed.contains(path.as_str())
+                && path_prefix.as_ref().is_none_or(|p| path.starts_with(p))
+        })
+        .map(|(path, mark)| FileEntry {
+            path: path.clone(),
+            versions: 0,
+            last_backed_up: "never".to_string(),
+            size_bytes: 0,
+            local_state: "present".to_string(),
+            effective_status: None,
+            is_safe_to_delete: false,
+            too_large: Some(too_large_info(mark)),
+        })
+        .collect();
+    if !synthetic.is_empty() {
+        entries.append(&mut synthetic);
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+    }
 
     CliResponse::Files(entries)
 }
@@ -606,6 +732,9 @@ fn dispatch_versions(state: &DaemonState, path: &str) -> CliResponse {
                         holders_offline,
                     })
                 }
+                // restore-i3 (2026-09-30): holders that got the block's Delete no longer
+                // serve it; never shown as restorable.
+                EffectiveStatus::Releasing => Some(RestoreBlocker::BeingReleased),
                 _ => None,
             };
             VersionEntry {

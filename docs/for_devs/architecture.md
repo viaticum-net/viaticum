@@ -425,6 +425,8 @@ batch plaintext = [PackIndex CBOR] + [file1 bytes] + [file2 bytes] + ...
 
 **Async run():** receives `DirtyEvent` from an mpsc channel. Three timers: idle, fallback, channel close.
 
+**Size limit:** a file is one erasure-coded block (RaptorQ has a fixed maximum block size), so a file above the limit `N` of the machine is not backed up. `N` is `backup.max_file_size_mb` if set (at most 3072 MiB, the RaptorQ ceiling), otherwise `RAM/32` clamped to [32 MiB, 1 GiB]; `RAM` is the smaller of `MemTotal` and the cgroup memory limit (v2 `memory.max`, v1 `memory.limit_in_bytes`). The size is `metadata().len()`: `size > N` is refused before the file is opened, `size == N` is backed up. Every read of a source file (event, flush, rebuild for PoS, repair and the local restore tier) is bounded by `N`. The refusal is a node-local "too large" mark (path, size, limit; not in the catalog, not sent to peers, not restored by DR), shown by `files`, `status` and the web UI, with one WARN per file. A protected file that grows above `N` keeps its earlier version in the network; the mark says that version is no longer checked. The pack size is `B_eff = min(source_block_size, N/2)`, so a pack never costs more memory than the largest accepted file. The memory budget for heavy block work is not part of this yet.
+
 ---
 
 ### restore
@@ -589,7 +591,8 @@ Deferred payloads (PoS, Delete, DropNotice, Revocation, SelfPointer) arrive as `
 **Pipeline:**
 ```
 fs event → notify::Event → std channel → tokio task → debounce (30 min)
-  → DirtyEvent { path, kind: Added/Modified/Deleted, device_id }
+  → moves resolved by the disk, root identity checked
+  → DirtyEvent { path, kind: Added/Modified/Deleted/GoneOnRecheck/RootLost/RootChanged, device_id }
   → mpsc → BackupCoordinator
 ```
 
@@ -605,6 +608,40 @@ denied on a subfolder, inotify limit) stays in Error but is still scanned, and l
 events from the part that is watched are kept.
 A full scan at start (when the last one is older than the rescan interval) and a
 weekly rescan emit every file; live events cover changes in between.
+
+**Moves, deletions and the watch root** (`watcher/event_loop.rs`, `watcher/roots.rs`):
+
+- A rename (`Modify(Name(_))`, any form: From, To, Both, Any) and a directory removal
+  are resolved at the end of the debounce by what is on disk: the path is gone → a
+  deletion; a file → `Added` (a known content is deduplicated, no traffic); a directory
+  moved in → its subtree is scanned. A file created and gone within the debounce (an
+  editor's temporary file, a `.part`) leaves nothing.
+- A deletion is sent only while the watch root is on disk and is the same directory
+  as recorded: on Unix (inode, creation time) when the creation time is known — the
+  device number is not stable across remounts — else (device, inode); the creation
+  time on Windows. It is read from metadata (no descriptor is held) and kept in
+  `<data_dir>/watch_roots.json`; an empty directory is never recorded (it may be an
+  unmounted mount point). A root that vanished or was replaced (moved away, removed,
+  remounted) deletes nothing: recent deletions under it whose Delete has not gone out
+  are undone, its records lose their on-disk confirmation, and the folder is in Error
+  until it is back (the next Scan or periodic scan finds it present and not empty: new
+  identity, error cleared, rescan). The same check runs at start and before every
+  scan, so a root that went while the daemon was down, or whose removal event died with
+  a shutdown inside the debounce, is caught too.
+- An inotify queue overflow (events lost) → WARN and a full scan after a quiet window.
+- A recheck: when the rebuild of a block for PoS or repair does not find a path, the
+  path is sent to the watcher on its own channel; it becomes a deletion only if the
+  root is intact and not in Error, the path is gone, its parent exists and is not
+  empty, and the record is confirmed on disk (the node saw the file at that path; DR
+  and a root change clear the confirmation).
+- Paths use the configured spelling of their root: an event reported under the
+  root's canonical path (macOS FSEvents) is rewritten, so the scan and live events
+  give one catalog path per file.
+
+The block rebuild itself (`backup/rebuild.rs`) reads by content: a pack member's hash
+is the hash of the first version of its record on that block, and its bytes are read
+from any path of this device holding that content — renamed, copied or swapped files
+keep their blocks provable and repairable without new uploads.
 
 ---
 
@@ -771,6 +808,7 @@ process_sync_response():
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `source_block_size` | 128 MB | Source block size. Reduce for low-memory hardware (32 MB → ~65 MB peak RAM) |
+| `max_file_size_mb` | 0 (automatic) | Largest file backed up, in MiB; `0` = `RAM/32` clamped to [32 MiB, 1 GiB]; at most 3072. Larger files are marked "too large" and not backed up |
 | `symbols_dir` | `"symbols"` | Directory for symbol files |
 | `epoch_key` | — | 32-byte encryption key (derived from master key) |
 | `device_id` | — | Device identifier |

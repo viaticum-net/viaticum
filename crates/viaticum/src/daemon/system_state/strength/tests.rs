@@ -22,6 +22,7 @@ const DAY: u64 = 24 * 3600;
 fn ss_record(db: &Db, id: u8) -> SourceBlockId {
     let block_id = SourceBlockId([id; 32]);
     db.upsert_source_block(&SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 1,
         t: 64,

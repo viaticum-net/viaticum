@@ -124,7 +124,23 @@
         <dt>Holding for others</dt>
         <dd>{formatBytes(status.holding_bytes)}</dd>
         <dt>Quota</dt>
-        <dd>{status.effective_quota_bytes ? formatBytes(status.effective_quota_bytes) : 'unlimited'}</dd>
+        <!-- holder-i1/i2: 0 is "no room", never "unlimited"; an unread disk says so -->
+        <dd>{status.quota_state === 'unknown'
+          ? 'unknown'
+          : status.effective_quota_bytes
+            ? formatBytes(status.effective_quota_bytes)
+            : '0 B — disk at reserve, giving space back'}</dd>
+        {#if status.quota_note}
+          <dt>Warning</dt>
+          <dd>{status.quota_note}</dd>
+        {/if}
+        <!-- holder-i4: below the reserve at any quota -->
+        {#if status.below_reserve_giving_back_bytes != null}
+          <dt>Disk below reserve</dt>
+          <dd>{status.below_reserve_giving_back_bytes
+            ? `giving back ${formatBytes(status.below_reserve_giving_back_bytes)}`
+            : 'holding nothing for friends, not taking their data'}</dd>
+        {/if}
         <dt>Used</dt>
         <dd>{formatBytes(status.used_bytes)}</dd>
       </dl>
@@ -139,6 +155,15 @@
         <dd>{formatBytes(status.backed_up_bytes)}</dd>
         <dt>Blocks OK / At risk</dt>
         <dd>{status.blocks_ok} / {status.blocks_at_risk}</dd>
+        <!-- backup-i4: files above this machine's size limit are not backed up -->
+        {#if status.max_file_size_bytes > 0}
+          <dt>File size limit</dt>
+          <dd>{formatBytes(status.max_file_size_bytes)} on this machine</dd>
+        {/if}
+        {#if status.files_too_large > 0}
+          <dt>Too large</dt>
+          <dd class="warn-text" title="Too large for this machine: not supported yet, not backed up. Splitting large files is planned.">{status.files_too_large} file{status.files_too_large === 1 ? '' : 's'} not backed up</dd>
+        {/if}
       </dl>
     </div>
 
@@ -280,4 +305,5 @@
   .status-healthy  { background: #1b3d2f; color: #3fb950; }
   .status-degraded { background: #3d1b1b; color: #f85149; }
   .status-empty    { background: #21262d; color: #8b949e; }
+  .warn-text { color: #d29922; }
 </style>

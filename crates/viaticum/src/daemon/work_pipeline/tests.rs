@@ -110,6 +110,7 @@ fn make_block_record(
     target_reliability: f64,
 ) -> SourceBlockRecord {
     SourceBlockRecord {
+        seal_generation: 0,
         block_id: bid,
         k: 5,
         t: 1024,
@@ -137,6 +138,8 @@ fn make_config() -> WorkPipelineConfig {
         epoch_key: [0u8; 32],
         data_dir: std::path::PathBuf::new(),
         min_pool_size: 2,
+        recheck_tx: None,
+        max_source_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     }
 }
 
@@ -602,7 +605,7 @@ async fn rebuild_source_blob_produces_correct_block_id() {
 
     // Now rebuild the blob and verify hash.
     let block_record = db.get_source_block(&block_id).unwrap().unwrap();
-    let rebuilt = rebuild_source_blob(&db, &block_record, &epoch_key)
+    let rebuilt = rebuild_source_blob(&db, &block_record, &epoch_key, &Default::default())
         .await
         .unwrap();
 
@@ -660,11 +663,146 @@ async fn rebuild_source_blob_fails_gracefully_when_source_file_deleted() {
     std::fs::remove_file(&source_file).unwrap();
 
     let block_record = db.get_source_block(&block_id).unwrap().unwrap();
-    let result = rebuild_source_blob(&db, &block_record, &epoch_key).await;
+    let result = rebuild_source_blob(&db, &block_record, &epoch_key, &Default::default()).await;
     assert!(
         result.is_err(),
         "rebuild_source_blob must return Err when source file is deleted"
     );
+}
+
+// ─── К2b: the worker's source load reports gone paths, keeps the error type ────
+
+/// A pack whose member was renamed away with its event lost and whose content is on
+/// no other path: the worker's source load fails with `RebuildError::SourceMissing`
+/// still recognisable through the context, and the gone path went to the recheck.
+#[tokio::test]
+async fn worker_rebuild_of_pack_with_missing_member_sends_recheck_and_keeps_error_type() {
+    use crate::daemon::backup::rebuild::RebuildError;
+    use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
+
+    let db = make_db();
+    let dir = tempdir().unwrap();
+    let encoder =
+        Arc::new(RaptorQEncoder::new()) as Arc<dyn viaticum_core::erasure::ErasureEncoder>;
+    let epoch_key = [7u8; 32];
+    let mut coord = BackupCoordinator::new(
+        db.clone(),
+        BackupConfig {
+            symbols_dir: dir.path().to_path_buf(),
+            source_block_size: 1024 * 1024,
+            epoch_key,
+            device_id: device_id(0),
+            ..Default::default()
+        },
+        encoder,
+    );
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    std::fs::write(&a, b"member a of the pack").unwrap();
+    std::fs::write(&b, b"member b of the pack").unwrap();
+    for p in [&a, &b] {
+        coord
+            .process_event(DirtyEvent {
+                path: p.to_string_lossy().into_owned(),
+                kind: DirtyKind::Added,
+                device_id: device_id(0),
+            })
+            .unwrap();
+    }
+    let results = coord.flush_all(true, &Default::default()).unwrap();
+    assert_eq!(results.len(), 1, "setup: one pack");
+    let block = db
+        .get_source_block(&results[0].source_block_id)
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(&a).unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let mut config = make_config();
+    config.device_id = device_id(0);
+    config.epoch_key = epoch_key;
+    config.data_dir = dir.path().to_path_buf();
+    config.recheck_tx = Some(tx);
+    let err = super::worker::load_source_blob(&db, &config, &block)
+        .await
+        .expect_err("a's content is on no path");
+
+    assert!(
+        matches!(
+            err.downcast_ref::<RebuildError>(),
+            Some(RebuildError::SourceMissing { .. })
+        ),
+        "error type lost: {err:#}"
+    );
+    assert_eq!(rx.try_recv().ok(), Some(a.clone()));
+}
+
+/// backup-i5 (J1): the worker's source load passes the machine's size limit to the rebuild.
+/// The file is there, one byte over the limit: it is not read (`SourceMissing`), not
+/// reported gone; with the limit at the file's size the same load succeeds.
+#[tokio::test]
+async fn worker_source_load_does_not_read_a_file_over_max_source_bytes() {
+    use crate::daemon::backup::rebuild::RebuildError;
+    use crate::daemon::backup::{BackupConfig, BackupCoordinator, DirtyEvent, DirtyKind};
+
+    let db = make_db();
+    let dir = tempdir().unwrap();
+    let encoder =
+        Arc::new(RaptorQEncoder::new()) as Arc<dyn viaticum_core::erasure::ErasureEncoder>;
+    let epoch_key = [7u8; 32];
+    let mut coord = BackupCoordinator::new(
+        db.clone(),
+        BackupConfig {
+            symbols_dir: dir.path().to_path_buf(),
+            source_block_size: 1024 * 1024,
+            epoch_key,
+            device_id: device_id(0),
+            ..Default::default()
+        },
+        encoder,
+    );
+    let a = dir.path().join("a.txt");
+    let bytes = b"the file the worker must not read over the limit".repeat(20);
+    std::fs::write(&a, &bytes).unwrap();
+    coord
+        .process_event(DirtyEvent {
+            path: a.to_string_lossy().into_owned(),
+            kind: DirtyKind::Added,
+            device_id: device_id(0),
+        })
+        .unwrap();
+    let results = coord.flush_all(true, &Default::default()).unwrap();
+    assert_eq!(results.len(), 1, "setup: one block");
+    let block = db
+        .get_source_block(&results[0].source_block_id)
+        .unwrap()
+        .unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let mut config = make_config();
+    config.device_id = device_id(0);
+    config.epoch_key = epoch_key;
+    config.data_dir = dir.path().to_path_buf();
+    config.recheck_tx = Some(tx);
+
+    config.max_source_bytes = bytes.len() as u64;
+    let blob = super::worker::load_source_blob(&db, &config, &block)
+        .await
+        .expect("control: the limit admits the file");
+    assert_eq!(blake3::hash(&blob).as_bytes(), &block.block_id.0);
+
+    config.max_source_bytes = bytes.len() as u64 - 1;
+    let err = super::worker::load_source_blob(&db, &config, &block)
+        .await
+        .expect_err("the only candidate is over the limit");
+    assert!(
+        matches!(
+            err.downcast_ref::<RebuildError>(),
+            Some(RebuildError::SourceMissing { .. })
+        ),
+        "{err:#}"
+    );
+    assert!(rx.try_recv().is_err(), "a file that is there is not gone");
 }
 
 // ─── PoS Lost re-queuing via next_work_item ───────────────────────────────────
@@ -1619,6 +1757,7 @@ fn resolve_primary_file_id_single_block_without_placements_reverse_looks_up_file
             backed_up_at: Some(Timestamp::now()),
         }],
         first_seen: Timestamp::now(),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).unwrap();
 
@@ -1951,5 +2090,154 @@ async fn stuck_high_priority_block_does_not_starve_lower_block() {
         db.block_cooldown(&rec_b.block_id).last_attempted_at,
         Some(earlier),
         "B was picked"
+    );
+}
+
+// ─── repair-i9: delivery binds each placement ESI by ESI, not by position ───────
+
+const BIND_NS: u32 = 3 << 20;
+
+/// Raw symbol whose bytes name its ESI, so a symbol taken for the wrong ESI is visible.
+fn raw_symbol(esi: u32) -> viaticum_core::erasure::Symbol {
+    viaticum_core::erasure::Symbol {
+        esi,
+        data: esi.to_le_bytes().repeat(4),
+    }
+}
+
+fn raw_for_ranges(ranges: &[(u32, u32)]) -> Vec<viaticum_core::erasure::Symbol> {
+    ranges
+        .iter()
+        .flat_map(|&(start, count)| start..start + count)
+        .map(raw_symbol)
+        .collect()
+}
+
+fn bind_placement(ranges: Vec<(u32, u32)>) -> viaticum_core::types::SymbolPlacement {
+    let mut p = placement(
+        block_id(0xD1),
+        device_id(0xD2),
+        viaticum_core::types::PlacementStatus::Offered,
+        0,
+    );
+    p.esi_ranges = ranges;
+    p
+}
+
+/// Mutation Mu1: positional lookup (`idx = esi - first.esi`) → the ESIs after the gap are
+/// not found (or found wrong) → this test reddens.
+#[test]
+fn bind_placement_symbols_with_non_contiguous_ranges_binds_each_esi_to_its_own_symbol() {
+    use crate::daemon::work_pipeline::worker::bind_placement_symbols;
+    use viaticum_core::erasure::ErasureEncoder;
+
+    let encoder = RaptorQEncoder::new();
+    let placement = bind_placement(vec![(BIND_NS, 4), (BIND_NS + 10, 2)]);
+    // Union of the plan: this placement plus another holder's range above it; the gap
+    // BIND_NS+4..BIND_NS+10 is not encoded.
+    let raw = raw_for_ranges(&[(BIND_NS, 4), (BIND_NS + 10, 2), (BIND_NS + 20, 3)]);
+
+    let bound = bind_placement_symbols(&encoder, &placement.source_block_id, &placement, &raw)
+        .expect("every placement ESI is in the raw symbols");
+
+    let want_esis: Vec<u32> = (BIND_NS..BIND_NS + 4)
+        .chain(BIND_NS + 10..BIND_NS + 12)
+        .collect();
+    assert_eq!(bound.iter().map(|s| s.esi).collect::<Vec<_>>(), want_esis);
+    for s in &bound {
+        let want = encoder.apply_binding(
+            raw_symbol(s.esi),
+            &placement.source_block_id,
+            &placement.holder_id,
+        );
+        assert_eq!(
+            s.data, want.data,
+            "ESI {} carries its own bound bytes",
+            s.esi
+        );
+    }
+}
+
+#[test]
+fn bind_placement_symbols_when_a_placement_esi_is_missing_returns_error() {
+    use crate::daemon::work_pipeline::worker::bind_placement_symbols;
+
+    let encoder = RaptorQEncoder::new();
+    let placement = bind_placement(vec![(BIND_NS, 4), (BIND_NS + 10, 2)]);
+    // BIND_NS+11 was not encoded.
+    let raw = raw_for_ranges(&[(BIND_NS, 4), (BIND_NS + 10, 1)]);
+
+    let result = bind_placement_symbols(&encoder, &placement.source_block_id, &placement, &raw);
+
+    assert!(
+        result.is_err(),
+        "a missing ESI must fail the delivery, not shrink it silently"
+    );
+}
+
+/// repair-i16 (R1-f2, L1b): the worker picked the block while it was `Active`, and the
+/// deletion executor turned it `Deleting` before the offers were written — nothing is
+/// offered or delivered (0 rows, 0 attempts). Control: a block in service in the same pool
+/// gets its offers written and attempted.
+#[tokio::test]
+async fn worker_iteration_delivers_only_recorded_offers() {
+    use viaticum_core::types::SourceBlockStatus;
+
+    let data_dir = tempdir().unwrap();
+    let db = make_db();
+    let peers = [device_id(0x91), device_id(0x92)];
+    add_pool_peers(&db, &peers);
+    let pool = super::PoolSnapshot {
+        candidates: peers
+            .iter()
+            .map(|&device_id| HolderCandidate {
+                device_id,
+                trust: 0.9,
+            })
+            .collect(),
+        signature: 7,
+    };
+    let mut config = make_config();
+    config.data_dir = data_dir.path().to_path_buf();
+    let swarm = lonely_swarm(0x36).await;
+    let encoder =
+        Arc::new(RaptorQEncoder::new()) as Arc<dyn viaticum_core::erasure::ErasureEncoder>;
+    let run = |rec: SourceBlockRecord| {
+        let (db, config, encoder, swarm, pool) = (&db, &config, &encoder, &swarm, &pool);
+        async move {
+            super::worker::run_block_iteration(
+                db, config, encoder, swarm, None, None, None, &rec, pool,
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    let served = retained_block(data_dir.path(), 0x93, 1.0);
+    db.upsert_source_block(&served).unwrap();
+    let control = run(served.clone()).await;
+    assert!(control.offered > 0, "control: offers written");
+    assert_eq!(
+        control.failed, control.offered,
+        "control: delivery attempted"
+    );
+
+    let released = retained_block(data_dir.path(), 0x94, 1.0);
+    let mut in_db = released.clone();
+    in_db.status = SourceBlockStatus::Deleting;
+    db.upsert_source_block(&in_db).unwrap();
+    let outcome = run(released.clone()).await;
+
+    assert_eq!(outcome.offered, 0);
+    assert!(
+        outcome.left_service,
+        "parked as left service, not 'no candidates'"
+    );
+    assert!(!control.left_service);
+    assert_eq!((outcome.acked, outcome.failed), (0, 0), "nothing delivered");
+    assert!(
+        db.list_placements_for_block(&released.block_id)
+            .unwrap()
+            .is_empty()
     );
 }

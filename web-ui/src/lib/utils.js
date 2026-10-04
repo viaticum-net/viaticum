@@ -72,9 +72,42 @@ export function statusBadge(s) {
         tooltip: `${s.lost} of ${s.target} symbols lost; only ${s.live} alive. Repair pipeline is rebuilding from survivors.`,
       };
     }
+    case 'releasing':
+      return {
+        label: 'Being released',
+        kind: 'working',
+        tooltip: 'Friends are dropping this copy; if the file is still in your folder it will be backed up again.',
+      };
     default:
       return { label: s.kind ?? 'Unknown', kind: 'pending', tooltip: 'Unrecognised status.' };
   }
+}
+
+// A file above this machine's size limit (FileEntry.too_large, backup-i4, backup-i7): the
+// badge and the words for it. `lastBackedUp` is FileEntry.last_backed_up: "never", or the
+// date of an earlier version that the network keeps but no longer checks. `localState` is
+// FileEntry.local_state: a deleted file's copies are being released, not kept.
+// Returns null for a file that is not too large, else { label, kind, tooltip }.
+export function tooLargeBadge(tooLarge, lastBackedUp, localState) {
+  if (!tooLarge) return null;
+  const range = `${formatBytes(tooLarge.size_bytes)} > ${formatBytes(tooLarge.limit_bytes)}`;
+  const hasEarlier = lastBackedUp && lastBackedUp !== 'never' && lastBackedUp !== 'pending';
+  const kept = !hasEarlier
+    ? ''
+    : localState === 'deleted'
+      ? ' Deleted; its copies are released after the deletion window.'
+      : ` The version of ${lastBackedUp} is kept in the network but is no longer checked.`;
+  return {
+    label: 'Too large',
+    kind: 'bad',
+    tooltip: `Too large for this machine (${range}): not supported yet, not backed up. Splitting large files is planned.${kept}`,
+  };
+}
+
+// Whether a FileEntry counts as backed up in the tree roll-ups: not pending, not never
+// backed up, and its current content is not too large.
+export function isBackedUp(f) {
+  return f.last_backed_up !== 'pending' && f.last_backed_up !== 'never' && !f.too_large;
 }
 
 // Convert a RestoreBlocker JSON (VersionEntry.restore_blocker: the owner's own
@@ -93,6 +126,12 @@ export function explainRestoreBlocker(b) {
       return {
         reason: 'All known holders for this block are offline.',
         hint: 'Wait for at least one holder to come online.',
+        eta: '',
+      };
+    case 'being_released':
+      return {
+        reason: 'This version is being released: friends are dropping their copies.',
+        hint: 'If the file is back in your folder, it is being backed up again under a new block.',
         eta: '',
       };
     default:

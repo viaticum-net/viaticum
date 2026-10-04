@@ -6,12 +6,9 @@
 // AC-9: pending_delivery_reject_signals_correctly
 // AC-10: pending_delivery_times_out_when_no_response
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tempfile::TempDir;
-use viaticum_core::cluster::{
-    ClusterState, derive_master_key, issue_device_certificate, master_identity,
-};
 use viaticum_core::db::Db;
 use viaticum_core::erasure::{ErasureEncoder, RaptorQEncoder};
 use viaticum_core::types::{
@@ -34,7 +31,6 @@ fn test_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         epoch_key: [42u8; 32],
         device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
@@ -43,6 +39,8 @@ fn test_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -123,10 +121,13 @@ fn process_event_deleted_marks_local_state() {
 
     let path = write_file(&files_dir, "doc.txt", b"some content");
 
-    // Add the file first
+    // Add the file and back it up (a never backed-up record is removed outright on
+    // deletion, delete-i12).
     coord.process_event(added_event(&path)).unwrap();
+    coord.flush_all(true, &Default::default()).unwrap();
 
     // Then delete it
+    std::fs::remove_file(&path).unwrap();
     coord.process_event(deleted_event(&path)).unwrap();
 
     let record = db.get_file(&path).unwrap().expect("record should exist");
@@ -373,7 +374,6 @@ async fn pipeline_roundtrip_can_decode() {
         epoch_key,
         device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
@@ -382,6 +382,8 @@ async fn pipeline_roundtrip_can_decode() {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     let encoder: Arc<dyn ErasureEncoder> = Arc::new(RaptorQEncoder::new());
     let mut coord = BackupCoordinator::new(db.clone(), config, encoder.clone());
@@ -409,10 +411,14 @@ async fn pipeline_roundtrip_can_decode() {
 
     // Wave 11b: no raw/ files on disk. Use rebuild_source_blob to get the stored blob.
     let block_record = db.get_source_block(&block_id).unwrap().unwrap();
-    let stored_blob =
-        crate::daemon::backup::pipeline::rebuild_source_blob(&db, &block_record, &epoch_key)
-            .await
-            .expect("rebuild_source_blob must succeed");
+    let stored_blob = crate::daemon::backup::pipeline::rebuild_source_blob(
+        &db,
+        &block_record,
+        &epoch_key,
+        &Default::default(),
+    )
+    .await
+    .expect("rebuild_source_blob must succeed");
 
     assert_eq!(
         stored_blob.len(),
@@ -457,6 +463,9 @@ fn process_event_modified_adds_new_version() {
     let path = write_file(&files_dir, "evolving.txt", b"version 1 content");
 
     coord.process_event(added_event(&path)).unwrap();
+    // Version 1 is backed up before the edit: an edit of a still-pending version
+    // replaces it instead (≤ 1 pending version per path, backup-i9 — tests_current.rs).
+    coord.flush_all(true, &Default::default()).unwrap();
 
     // Overwrite the file with new content
     std::fs::write(
@@ -567,8 +576,11 @@ fn dedup_skips_file_already_backed_up() {
             backed_up_at: Some(Timestamp(2_000_000)),
         }],
         first_seen: Timestamp(1_000_000),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&existing_record).unwrap();
+    // L1b: the dedup target is a block in service (backup-i21).
+    super::tests_current::active_block(&db, SourceBlockId([1u8; 32]));
 
     // Write the file locally and process the event.
     let path = write_file(&files_dir, "local_copy.txt", content);
@@ -611,6 +623,7 @@ fn dedup_does_not_skip_file_not_yet_backed_up() {
             backed_up_at: None, // not yet uploaded
         }],
         first_seen: Timestamp(1_000_000),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&existing_record).unwrap();
 
@@ -627,71 +640,9 @@ fn dedup_does_not_skip_file_not_yet_backed_up() {
     );
 }
 
-// ─── Test 15: dedup_via_cluster_state_skips_already_backed_up ────────────────
-
-/// Same as test 13, but using ClusterState for the dedup check.
-#[test]
-fn dedup_via_cluster_state_skips_already_backed_up() {
-    let db = Db::open_in_memory().unwrap();
-    let symbols_dir = TempDir::new().unwrap();
-    let files_dir = TempDir::new().unwrap();
-
-    let content = b"cluster dedup content already backed up";
-    let content_hash: [u8; 32] = *blake3::hash(content).as_bytes();
-
-    // Pre-insert a FileRecord with backed_up_at=Some.
-    let existing_record = FileRecord {
-        file_id: FileId(1),
-        path: "/cluster/device_a/file.txt".to_string(),
-        importance: 0.5,
-        devices: vec![(DeviceId([9u8; 32]), LocalState::Present)],
-        versions: vec![FileVersion {
-            content_hash,
-            source_block_id: SourceBlockId([2u8; 32]),
-            k: 4,
-            t: 65535,
-            created_at: Timestamp(1_000_000),
-            backed_up_at: Some(Timestamp(3_000_000)),
-        }],
-        first_seen: Timestamp(1_000_000),
-    };
-    db.upsert_file(&existing_record).unwrap();
-
-    let seed = [99u8; 32];
-    let master_key = derive_master_key(&seed).unwrap();
-    let master_pub = master_identity(&master_key);
-    let dev_id = DeviceId([99u8; 32]);
-    let _dev_key = viaticum_core::cluster::derive_device_key(&seed, &dev_id.0).unwrap();
-    let cert = issue_device_certificate(&master_key, dev_id, Timestamp(1));
-    let cs = ClusterState::init(db.clone(), master_pub, cert, Timestamp(1), Timestamp(1)).unwrap();
-    let cluster_state = Arc::new(Mutex::new(cs));
-    let config = BackupConfig {
-        source_block_size: SMALL_BLOCK_SIZE,
-        symbols_dir: symbols_dir.path().to_path_buf(),
-        epoch_key: [42u8; 32],
-        device_id: DeviceId([1u8; 32]),
-        mock_holders: test_holders(),
-        cluster_state: Some(cluster_state),
-        watch_configs: vec![],
-        time_scale: 1,
-        mock_offer_budget_gb: None,
-        master_signing_key: None,
-        swarm: None,
-        live_watch_configs: None,
-        peer_backoff: None,
-        work_event_tx: None,
-    };
-    let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
-
-    let path = write_file(&files_dir, "device_b_copy.txt", content);
-    coord.process_event(added_event(&path)).unwrap();
-
-    let queue_len: usize = coord.queues.values().map(|q| q.len()).sum();
-    assert_eq!(
-        queue_len, 0,
-        "ClusterState dedup should skip file already backed up"
-    );
-}
+// ─── Test 15 (dedup via ClusterState) removed in L1: backup no longer reads
+// ClusterState (its per-event full FILES scan, R1-f A19); dedup goes through the
+// content index — test 13 and backup/tests_current.rs cover it.
 
 // ─── Phase 7.5 tests ──────────────────────────────────────────────────────────
 
@@ -730,7 +681,6 @@ fn coord_with_watch(
         epoch_key: [42u8; 32],
         device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs,
         time_scale: 1,
         mock_offer_budget_gb: None,
@@ -739,6 +689,8 @@ fn coord_with_watch(
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -985,7 +937,6 @@ fn same_content_two_devices_both_in_file_record() {
         epoch_key: [42u8; 32],
         device_id: device_a,
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
@@ -994,6 +945,8 @@ fn same_content_two_devices_both_in_file_record() {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     let mut coord_a = BackupCoordinator::new(db.clone(), config_a, Arc::new(RaptorQEncoder::new()));
     coord_a
@@ -1013,7 +966,6 @@ fn same_content_two_devices_both_in_file_record() {
         epoch_key: [42u8; 32],
         device_id: device_b,
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
@@ -1022,6 +974,8 @@ fn same_content_two_devices_both_in_file_record() {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     let mut coord_b = BackupCoordinator::new(db.clone(), config_b, Arc::new(RaptorQEncoder::new()));
     coord_b
@@ -1063,7 +1017,6 @@ fn flush_queue_deferred_files_remain_in_queue() {
         epoch_key: [42u8; 32],
         device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         // Zero budget: all files must be deferred.
@@ -1073,6 +1026,8 @@ fn flush_queue_deferred_files_remain_in_queue() {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1128,7 +1083,6 @@ fn flush_queue_budget_selects_highest_importance_first() {
         epoch_key: [42u8; 32],
         device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: Some(1e-4),
@@ -1137,6 +1091,8 @@ fn flush_queue_budget_selects_highest_importance_first() {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1210,7 +1166,6 @@ fn large_file_skipped_when_budget_insufficient() {
         epoch_key: [42u8; 32],
         device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         // Zero budget: large file must be skipped.
@@ -1220,6 +1175,8 @@ fn large_file_skipped_when_budget_insufficient() {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1441,7 +1398,6 @@ fn test_coord_no_mock(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         epoch_key: [42u8; 32],
         device_id: DeviceId([1u8; 32]),
         mock_holders: vec![], // empty → use DB path
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
@@ -1450,6 +1406,8 @@ fn test_coord_no_mock(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -1598,7 +1556,6 @@ fn get_candidates_excludes_cluster_siblings() {
         epoch_key: [42u8; 32],
         device_id: DeviceId([1u8; 32]),
         mock_holders: vec![],
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
@@ -1607,6 +1564,8 @@ fn get_candidates_excludes_cluster_siblings() {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     let coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1883,7 +1842,6 @@ fn backup_block_record_n_comes_from_solver() {
         epoch_key: [42u8; 32],
         device_id: DeviceId([1u8; 32]),
         mock_holders: holders.clone(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: Some(1000.0),
@@ -1892,6 +1850,8 @@ fn backup_block_record_n_comes_from_solver() {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -1953,7 +1913,6 @@ fn backup_block_record_falls_back_to_params_n_when_no_candidates() {
         epoch_key: [42u8; 32],
         device_id: DeviceId([1u8; 32]),
         mock_holders: vec![], // empty → candidates empty → static fallback
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: Some(1000.0),
@@ -1962,6 +1921,8 @@ fn backup_block_record_falls_back_to_params_n_when_no_candidates() {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -2115,7 +2076,6 @@ fn test_coord_unlimited_budget(db: Db, symbols_dir: &TempDir) -> BackupCoordinat
         epoch_key: [42u8; 32],
         device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: Some(1000.0), // unlimited budget
@@ -2124,6 +2084,8 @@ fn test_coord_unlimited_budget(db: Db, symbols_dir: &TempDir) -> BackupCoordinat
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -2323,7 +2285,6 @@ fn block_creation_when_no_holder_candidates_available_creates_block_with_zero_pl
         epoch_key: [42u8; 32],
         device_id: DeviceId([1u8; 32]),
         mock_holders: vec![], // empty
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: Some(1000.0),
@@ -2332,6 +2293,8 @@ fn block_creation_when_no_holder_candidates_available_creates_block_with_zero_pl
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -2412,7 +2375,6 @@ fn select_backup_batch_order_observable_in_resulting_block_records() {
         epoch_key: [42u8; 32],
         device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: Some(1000.0),
@@ -2421,6 +2383,8 @@ fn select_backup_batch_order_observable_in_resulting_block_records() {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -2498,7 +2462,6 @@ fn flush_queue_preserves_importance_order_across_packs() {
         epoch_key: [42u8; 32],
         device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: Some(1000.0),
@@ -2507,6 +2470,8 @@ fn flush_queue_preserves_importance_order_across_packs() {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     let mut coord = BackupCoordinator::new(db.clone(), config, Arc::new(RaptorQEncoder::new()));
 
@@ -2566,6 +2531,7 @@ fn flush_queue_preserves_importance_order_across_packs() {
 /// Build a minimal SourceBlockRecord for W11a hook tests.
 fn make_block_for_hook(block_id: SourceBlockId) -> viaticum_core::types::SourceBlockRecord {
     viaticum_core::types::SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 5,
         t: 1,
@@ -2802,6 +2768,7 @@ fn find_file_for_block_prefers_present_over_stale_renamed_copy() {
         devices: vec![(DeviceId([1u8; 32]), LocalState::Deleted(Timestamp(0)))],
         versions: vec![version(block_id)],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     })
     .unwrap();
     // Live record — same block, locally present, path sorts later.
@@ -2812,6 +2779,7 @@ fn find_file_for_block_prefers_present_over_stale_renamed_copy() {
         devices: vec![(DeviceId([1u8; 32]), LocalState::Present)],
         versions: vec![version(block_id)],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     })
     .unwrap();
 

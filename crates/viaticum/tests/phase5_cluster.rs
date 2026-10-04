@@ -80,19 +80,15 @@ fn holders_5() -> Vec<HolderCandidate> {
         .collect()
 }
 
-/// BackupConfig with cluster_state attached.
-fn backup_cfg_with_cluster(
-    symbols_dir: &TempDir,
-    device_id: DeviceId,
-    cluster_state: Arc<Mutex<ClusterState>>,
-) -> BackupConfig {
+/// BackupConfig of one device. Backup dedups through the shared DB's content index
+/// (the ClusterState branch that scanned every file per event is gone, R1-f A19).
+fn backup_cfg_for(symbols_dir: &TempDir, device_id: DeviceId) -> BackupConfig {
     BackupConfig {
         source_block_size: SMALL_BLOCK_SIZE,
         symbols_dir: symbols_dir.path().to_path_buf(),
         epoch_key: EPOCH_KEY,
         device_id,
         mock_holders: holders_5(),
-        cluster_state: Some(cluster_state),
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
@@ -101,6 +97,8 @@ fn backup_cfg_with_cluster(
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     }
 }
 
@@ -115,17 +113,14 @@ fn write_file(dir: &TempDir, name: &str, content: &[u8]) -> String {
 //
 // Shared DB (simulates two devices with synced state on same hardware, or
 // post-sync). Device A backs up a file. Device B encounters the same file:
-// BackupCoordinator detects the content is already backed up via ClusterState
-// and produces zero new source blocks (dedup skip).
+// BackupCoordinator detects the content is already backed up through the shared
+// DB's content index and produces zero new source blocks (dedup skip).
 
 #[test]
 fn two_devices_backup_then_dedup_on_second() {
     let db = Db::open_in_memory().unwrap();
     let symbols_dir = TempDir::new().unwrap();
     let files_dir = TempDir::new().unwrap();
-
-    // Shared cluster state: both devices registered.
-    let cluster_state = Arc::new(Mutex::new(init_cluster(db.clone())));
 
     // Content for the file both devices will "see".
     let content: Vec<u8> = (0..4096u32).map(|i| (i * 3 + 7) as u8).collect();
@@ -134,7 +129,7 @@ fn two_devices_backup_then_dedup_on_second() {
     // Device A: back up the file.
     let mut backup_a = BackupCoordinator::new(
         db.clone(),
-        backup_cfg_with_cluster(&symbols_dir, device_a_id(), Arc::clone(&cluster_state)),
+        backup_cfg_for(&symbols_dir, device_a_id()),
         Arc::new(RaptorQEncoder::new()),
     );
     backup_a
@@ -157,7 +152,7 @@ fn two_devices_backup_then_dedup_on_second() {
     // Device B: same file path, same content → dedup must skip encoding.
     let mut backup_b = BackupCoordinator::new(
         db.clone(),
-        backup_cfg_with_cluster(&symbols_dir, device_b_id(), Arc::clone(&cluster_state)),
+        backup_cfg_for(&symbols_dir, device_b_id()),
         Arc::new(RaptorQEncoder::new()),
     );
     backup_b

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
 
@@ -28,6 +28,14 @@ fn test_jobs() -> RestoreJobs {
 }
 
 async fn make_test_state() -> Arc<DaemonState> {
+    make_test_state_with(std::path::PathBuf::from("/tmp"), 0, 0).await
+}
+
+async fn make_test_state_with(
+    data_dir: std::path::PathBuf,
+    soft_quota_bytes: u64,
+    disk_reserve_bytes: u64,
+) -> Arc<DaemonState> {
     let db = Db::open_in_memory().expect("in-memory db");
     let device_id = DeviceId([0u8; 32]);
 
@@ -46,9 +54,9 @@ async fn make_test_state() -> Arc<DaemonState> {
         cluster_state: None,
         master_key,
         seed: vec![0u8; 64],
-        data_dir: std::path::PathBuf::from("/tmp"),
-        soft_quota_bytes: 0,
-        disk_reserve_bytes: 0,
+        data_dir,
+        soft_quota_bytes,
+        disk_reserve_bytes,
         hard_quota_bytes: 0,
         time_scale: 1,
         swarm_handle: None,
@@ -59,6 +67,7 @@ async fn make_test_state() -> Arc<DaemonState> {
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: None,
         missing_sources: Default::default(),
+        max_file_size_bytes: 0,
     })
 }
 
@@ -126,6 +135,7 @@ fn insert_file_with_block(
     };
     let block_id = SourceBlockId([7u8; 32]);
     let block = SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 4,
         t: 1024,
@@ -156,6 +166,7 @@ fn insert_file_with_block(
             backed_up_at: if backed_up { Some(Timestamp(1)) } else { None },
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     state.db.upsert_file(&file).unwrap();
 }
@@ -289,6 +300,7 @@ async fn dispatch_device_revoke_returns_device_revoked_with_no_router() {
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: None, // no router → revocation goes nowhere (best-effort)
         missing_sources: Default::default(),
+        max_file_size_bytes: 0,
     });
 
     // Revoke device B.
@@ -401,6 +413,7 @@ fn make_block(
     status: SourceBlockStatus,
 ) -> SourceBlockRecord {
     SourceBlockRecord {
+        seal_generation: 0,
         block_id: SourceBlockId([id; 32]),
         k: 10,
         t: 64,
@@ -918,6 +931,7 @@ async fn revocation_published_only_to_storage_relationship_peers() {
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: Some(router),
         missing_sources: Default::default(),
+        max_file_size_bytes: 0,
     });
 
     // Revoke device.
@@ -1076,6 +1090,7 @@ async fn revocation_dedup_peer_is_holder_and_owner() {
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: Some(router),
         missing_sources: Default::default(),
+        max_file_size_bytes: 0,
     });
 
     let revoked_hex: String = revoked_device_id
@@ -1314,6 +1329,7 @@ fn staging_test_state(
         peer_backoff: std::sync::Arc::new(crate::daemon::peer_backoff::PeerBackoff::default()),
         mailbox_router: None,
         missing_sources: Default::default(),
+        max_file_size_bytes: 0,
     })
 }
 
@@ -1432,6 +1448,7 @@ fn catalog_file(path: &str, id: u64, backed_up: bool) -> viaticum_core::types::F
             backed_up_at: backed_up.then_some(Ts(20)),
         }],
         first_seen: Ts(0),
+        on_disk_confirmed: true,
     }
 }
 
@@ -1718,6 +1735,7 @@ fn catalog_file_with_states(
             .collect(),
         versions: vec![],
         first_seen: viaticum_core::types::Timestamp(1),
+        on_disk_confirmed: true,
     }
 }
 
@@ -1886,6 +1904,7 @@ fn held_ss_block(db: &Db, id: u8, holders: u8) -> viaticum_core::types::SourceBl
     };
     let block_id = SourceBlockId([id; 32]);
     db.upsert_source_block(&SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 1,
         t: 64,
@@ -1997,4 +2016,384 @@ async fn status_shows_waiting_since_and_reason() {
     };
     assert_eq!(data.dr_waiting_since, 1_790_000_123);
     assert_eq!(data.dr_waiting, "catalog blocks not placed");
+}
+
+// ─── F-Q: quota fields of status (holder-i2, holder-i4) ─────────────────────────
+
+async fn status_of(state: &Arc<DaemonState>) -> Box<crate::cli::types::StatusData> {
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, state).await else {
+        panic!("expected Status");
+    };
+    data
+}
+
+/// holder-i2: an unreadable data dir without a soft quota ⇒ `quota_state: unknown` and the
+/// note naming the path; with a soft quota ⇒ `bytes` (the soft quota), the note still said.
+#[tokio::test]
+async fn status_of_an_unreadable_disk_is_unknown_and_names_the_path() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let missing = dir.path().join("gone");
+    let data = status_of(&make_test_state_with(missing.clone(), 0, 0).await).await;
+    assert_eq!(data.quota_state, "unknown");
+    assert!(
+        data.quota_note.contains(&format!(
+            "could not read free space on {}",
+            missing.display()
+        )),
+        "{}",
+        data.quota_note
+    );
+    assert_eq!(data.below_reserve_giving_back_bytes, None);
+
+    let data = status_of(&make_test_state_with(missing, 1000, 0).await).await;
+    assert_eq!(data.quota_state, "bytes");
+    assert_eq!(data.effective_quota_bytes, 1000);
+    assert!(
+        data.quota_note.contains("soft quota"),
+        "{}",
+        data.quota_note
+    );
+}
+
+/// holder-i4: free disk below the reserve ⇒ status says what the tick gives back, also when
+/// the quota is not 0 (held over the gap); a readable disk above the reserve ⇒ nothing.
+#[tokio::test]
+async fn status_below_reserve_says_what_is_given_back_at_any_quota() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let free = crate::daemon::handle::disk_available_bytes(dir.path()).unwrap();
+    // Held is only a DB number here; large, so the disk moving between reads (parallel
+    // tests on the same filesystem) stays small against it.
+    let held = 1024 * 1024 * 1024 * 1024u64;
+    // reserve = free + held/2 ⇒ Q = free + held − reserve = held/2 > 0, free < reserve.
+    let state = make_test_state_with(dir.path().to_path_buf(), 0, free + held / 2).await;
+    state
+        .db
+        .upsert_holding(&viaticum_core::types::HoldingRecord {
+            source_block_id: viaticum_core::types::SourceBlockId([7; 32]),
+            owner_id: IdentityPub([7; 32]),
+            esi_ranges: vec![(0, 1)],
+            importance: 0.5,
+            total_bytes: held,
+            status: viaticum_core::types::HoldingStatus::Active,
+            received_at: viaticum_core::types::Timestamp(0),
+            delete_requested_at: None,
+            drop_notice_sent_at: None,
+        })
+        .unwrap();
+    let data = status_of(&state).await;
+    assert_eq!(data.quota_state, "bytes");
+    // The disk moves a little between the two reads: Q ≈ held/2, given back ≈ held − 0.85·Q.
+    assert!(data.effective_quota_bytes > 0, "quota is not 0 here");
+    let back = data
+        .below_reserve_giving_back_bytes
+        .expect("below the reserve ⇒ Some");
+    assert!(
+        back >= held / 4,
+        "gives back about the gap and more: {back}"
+    );
+    assert!(back <= held, "never more than held: {back}");
+
+    let data = status_of(&make_test_state_with(dir.path().to_path_buf(), 0, 0).await).await;
+    assert_eq!(data.below_reserve_giving_back_bytes, None);
+    assert!(data.quota_note.is_empty());
+}
+
+// ── L1b (backup-i8, backup-i21): a block not in service is never "safe" / "restorable" ──
+
+/// The file entry of `path` from `dispatch_files`.
+async fn file_entry(state: &DaemonState, path: &str) -> crate::cli::types::FileEntry {
+    let CliResponse::Files(entries) =
+        dispatch(CliRequest::Files { path_prefix: None }, state).await
+    else {
+        panic!("expected Files");
+    };
+    entries
+        .into_iter()
+        .find(|e| e.path == path)
+        .expect("file entry present")
+}
+
+/// The block of `insert_file_with_block`, its status set to `status`.
+fn set_block_status(state: &DaemonState, status: viaticum_core::types::SourceBlockStatus) {
+    let id = viaticum_core::types::SourceBlockId([7u8; 32]);
+    let mut block = state.db.get_source_block(&id).unwrap().unwrap();
+    block.status = status;
+    state.db.upsert_source_block(&block).unwrap();
+}
+
+/// A placement of the `insert_file_with_block` block at holder `holder` with `count` symbols.
+fn block_placement(
+    state: &DaemonState,
+    holder: u8,
+    count: u32,
+    status: viaticum_core::types::PlacementStatus,
+) {
+    use viaticum_core::types::{FileId, SourceBlockId, SymbolPlacement, Timestamp};
+    state
+        .db
+        .upsert_placement(&SymbolPlacement {
+            source_block_id: SourceBlockId([7u8; 32]),
+            holder_id: DeviceId([holder; 32]),
+            file_id: FileId(1),
+            esi_ranges: vec![(u32::from(holder) * 100, count)],
+            binding_seed: [0; 32],
+            status,
+            last_verified: None,
+            placed_at: Timestamp(1),
+            consecutive_misses: 0,
+        })
+        .unwrap();
+}
+
+/// M8: the cache says "at target" (it is not recomputed when the block turns `Deleting`),
+/// but the network is releasing the block.
+#[tokio::test]
+async fn is_safe_to_delete_false_when_block_is_deleting_even_if_cached_reliability_high() {
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "doc.pdf", 0.99, 0.95, true);
+    assert!(
+        safe_to_delete_flag(&state, "doc.pdf").await,
+        "control: in service"
+    );
+
+    set_block_status(&state, viaticum_core::types::SourceBlockStatus::Deleting);
+
+    assert!(!safe_to_delete_flag(&state, "doc.pdf").await);
+}
+
+#[tokio::test]
+async fn is_safe_to_delete_false_when_a_placement_is_deleting() {
+    use viaticum_core::types::PlacementStatus;
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "doc.pdf", 0.99, 0.95, true);
+    block_placement(&state, 0x51, 20, PlacementStatus::Alive);
+    assert!(safe_to_delete_flag(&state, "doc.pdf").await, "control");
+
+    block_placement(&state, 0x52, 20, PlacementStatus::Deleting);
+
+    assert!(!safe_to_delete_flag(&state, "doc.pdf").await);
+}
+
+/// M8: `effective_status` counts placements; a block being released is `Releasing` even
+/// with enough `Alive` symbols to decode.
+#[tokio::test]
+async fn effective_status_is_releasing_when_block_is_deleting_even_with_alive_placements() {
+    use crate::cli::types::EffectiveStatus;
+    use viaticum_core::types::{PlacementStatus, SourceBlockStatus};
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "doc.pdf", 0.99, 0.95, true);
+    block_placement(&state, 0x51, 50, PlacementStatus::Alive);
+    assert!(
+        matches!(
+            file_entry(&state, "doc.pdf").await.effective_status,
+            Some(EffectiveStatus::Restorable { .. })
+        ),
+        "control: restorable in service"
+    );
+
+    set_block_status(&state, SourceBlockStatus::Deleting);
+    assert_eq!(
+        file_entry(&state, "doc.pdf").await.effective_status,
+        Some(EffectiveStatus::Releasing)
+    );
+
+    // A Deleting placement alone (status still Active) is the same answer.
+    set_block_status(&state, SourceBlockStatus::Active);
+    block_placement(&state, 0x52, 1, PlacementStatus::Deleting);
+    assert_eq!(
+        file_entry(&state, "doc.pdf").await.effective_status,
+        Some(EffectiveStatus::Releasing)
+    );
+}
+
+async fn doc_versions(state: &DaemonState) -> Vec<crate::cli::types::VersionEntry> {
+    let CliResponse::Versions(v) = dispatch(
+        CliRequest::Versions {
+            path: "doc.pdf".into(),
+        },
+        state,
+    )
+    .await
+    else {
+        panic!("expected Versions");
+    };
+    v
+}
+
+/// restore-i3 (2026-09-30): a version whose block is being released shows the restore
+/// blocker "being released", not "restorable" with no blocker, although its `Alive`
+/// placements could decode it.
+#[tokio::test]
+async fn restore_blocker_is_being_released_when_block_is_deleting() {
+    use crate::cli::types::{EffectiveStatus, RestoreBlocker};
+    use viaticum_core::types::{PlacementStatus, SourceBlockStatus};
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "doc.pdf", 0.99, 0.95, true);
+    block_placement(&state, 0x51, 50, PlacementStatus::Alive);
+    let before = doc_versions(&state).await;
+    assert!(matches!(
+        before[0].effective_status,
+        EffectiveStatus::Restorable { .. }
+    ));
+    assert_eq!(before[0].restore_blocker, None, "control: in service");
+
+    set_block_status(&state, SourceBlockStatus::Deleting);
+
+    let after = doc_versions(&state).await;
+    assert_eq!(after[0].effective_status, EffectiveStatus::Releasing);
+    assert_eq!(
+        after[0].restore_blocker,
+        Some(RestoreBlocker::BeingReleased)
+    );
+}
+
+// ── R1-d-a (backup-i4, backup-i7): a file above the size limit is shown, never "safe" ──
+
+fn too_large_mark(size_bytes: u64) -> viaticum_core::types::TooLargeMark {
+    viaticum_core::types::TooLargeMark {
+        size_bytes,
+        limit_bytes: 268_435_456,
+        first_seen: viaticum_core::types::Timestamp(86_400 * 365),
+        last_seen: viaticum_core::types::Timestamp(86_400 * 366),
+    }
+}
+
+async fn files_of(state: &DaemonState) -> Vec<crate::cli::types::FileEntry> {
+    let CliResponse::Files(entries) =
+        dispatch(CliRequest::Files { path_prefix: None }, state).await
+    else {
+        panic!("expected Files");
+    };
+    entries
+}
+
+#[tokio::test]
+async fn files_lists_marked_file_without_record_as_never_backed_up() {
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "doc.pdf", 0.99, 0.95, true);
+    state
+        .db
+        .put_too_large("huge.mkv", &too_large_mark(4_294_967_296))
+        .unwrap();
+
+    let entries = files_of(&state).await;
+    assert_eq!(entries.len(), 2, "the catalog file and the marked one");
+
+    let huge = entries.iter().find(|e| e.path == "huge.mkv").unwrap();
+    assert_eq!(huge.last_backed_up, "never");
+    assert!(!huge.is_safe_to_delete);
+    assert_eq!(huge.versions, 0);
+    assert_eq!(huge.effective_status, None);
+    let info = huge.too_large.as_ref().expect("too_large is set");
+    assert_eq!(info.size_bytes, 4_294_967_296);
+    assert_eq!(info.limit_bytes, 268_435_456);
+    assert_eq!(info.since, "1971-01-01");
+
+    let doc = entries.iter().find(|e| e.path == "doc.pdf").unwrap();
+    assert_eq!(doc.too_large, None, "an unmarked file has no too_large");
+
+    // The JSON path the E2E reads: `.too_large.size_bytes` on the file entry itself.
+    let json = serde_json::to_value(huge).unwrap();
+    assert_eq!(json["too_large"]["size_bytes"], 4_294_967_296u64);
+    assert_eq!(json["last_backed_up"], "never");
+}
+
+#[tokio::test]
+async fn files_prefix_filters_marked_files_without_record() {
+    let state = make_test_state().await;
+    state
+        .db
+        .put_too_large("/a/huge.mkv", &too_large_mark(1 << 32))
+        .unwrap();
+    state
+        .db
+        .put_too_large("/b/huge.mkv", &too_large_mark(1 << 32))
+        .unwrap();
+    let CliResponse::Files(entries) = dispatch(
+        CliRequest::Files {
+            path_prefix: Some("/a/".to_string()),
+        },
+        &state,
+    )
+    .await
+    else {
+        panic!("expected Files");
+    };
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, "/a/huge.mkv");
+}
+
+#[tokio::test]
+async fn is_safe_to_delete_false_when_mark_present() {
+    let state = make_test_state().await;
+    insert_file_with_block(&state, "grow.bin", 0.99, 0.95, true);
+    assert!(
+        safe_to_delete_flag(&state, "grow.bin").await,
+        "control: no mark, at target"
+    );
+
+    state
+        .db
+        .put_too_large("grow.bin", &too_large_mark(300 << 20))
+        .unwrap();
+
+    let entry = file_entry(&state, "grow.bin").await;
+    assert!(!entry.is_safe_to_delete, "a mark makes it unsafe");
+    assert!(entry.too_large.is_some());
+    assert_ne!(
+        entry.last_backed_up, "never",
+        "the earlier version's date stays"
+    );
+    assert_eq!(entry.versions, 1);
+}
+
+#[tokio::test]
+async fn status_counts_too_large_files_under_watch_dirs() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let watch = dir.path().join("watched");
+    let mut state = make_test_state().await;
+    let live = Arc::new(RwLock::new(vec![viaticum_core::config::WatchConfig {
+        path: watch.to_string_lossy().into_owned(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+        bursts: None,
+    }]));
+    let (tx, _rx) = mpsc::channel(4);
+    let admin = crate::daemon::watch_admin::WatchAdmin::new(
+        dir.path().join("config.toml"),
+        live,
+        tx,
+        state.db.clone(),
+    );
+    let inner = Arc::get_mut(&mut state).expect("state is not shared yet");
+    inner.watch_admin = Some(Arc::new(admin));
+    inner.max_file_size_bytes = 268_435_456;
+
+    let inside = watch.join("huge.mkv").to_string_lossy().into_owned();
+    let nested = watch.join("sub/big.bin").to_string_lossy().into_owned();
+    let outside = dir.path().join("elsewhere/x.bin");
+    state
+        .db
+        .put_too_large(&inside, &too_large_mark(1 << 32))
+        .unwrap();
+    state
+        .db
+        .put_too_large(&nested, &too_large_mark(1 << 30))
+        .unwrap();
+    state
+        .db
+        .put_too_large(&outside.to_string_lossy(), &too_large_mark(1 << 30))
+        .unwrap();
+
+    let data = status_of(&state).await;
+    assert_eq!(
+        data.files_too_large, 2,
+        "the mark outside the watched folder is not counted"
+    );
+    assert_eq!(data.max_file_size_bytes, 268_435_456);
+    assert_eq!(data.block_work_budget_bytes, 0, "R1-d-b sets it");
+
+    let json = serde_json::to_value(&*data).unwrap();
+    assert_eq!(json["files_too_large"], 2, "the name the E2E reads");
 }

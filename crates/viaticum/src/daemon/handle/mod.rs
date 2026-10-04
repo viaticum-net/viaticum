@@ -32,7 +32,9 @@ use crate::daemon::identity::{
 use crate::daemon::processor::Processor;
 use crate::daemon::repair::RepairTrigger;
 use crate::daemon::restore::{RestoreConfig, RestoreCoordinator, RestoreRequest};
-use crate::daemon::scheduler::{PendingChallenges, Scheduler, SchedulerConfig};
+use crate::daemon::scheduler::{
+    PendingChallenges, Scheduler, SchedulerConfig, new_pending_challenges,
+};
 use crate::daemon::watcher::{WatcherCommand, WatcherConfig};
 
 use shutdown::{NamedTask, ShutdownOutcome};
@@ -119,6 +121,8 @@ pub struct DaemonState {
     /// dr-i11: background-counted "files without a local source" for `status`.
     pub missing_sources:
         std::sync::Arc<crate::daemon::dispatch::missing_sources::MissingSourceCache>,
+    /// backup-i4: this machine's file size limit in bytes (`status`, `files`).
+    pub max_file_size_bytes: u64,
 }
 
 /// Web API pieces prepared before the swarm starts (see step 9.4 of `start`).
@@ -532,7 +536,15 @@ impl DaemonHandle {
         };
 
         // ── 10. Build subsystems ──────────────────────────────────────────────
-        let source_block_size = viaticum_core::config::source_block_size_bytes(&app_config);
+        // backup-i4, backup-i5: the size limit of this machine and the pack size that
+        // follows from it (B_eff). Logged once: the limit, its source, the RAM it came from.
+        let size_limits = crate::daemon::backup::size_limit::SizeLimits::resolve(
+            app_config.backup.max_file_size_mb,
+            viaticum_core::config::source_block_size_bytes(&app_config),
+        );
+        size_limits.log_start();
+        let source_block_size = size_limits.pack_size;
+        let max_file_size_bytes = size_limits.max_file_size;
 
         // ── Step A: Build live_configs Arc ────────────────────────────────────
         // Merge CLI watch_dirs with [[watch]] entries from config. Every folder is
@@ -591,6 +603,18 @@ impl DaemonHandle {
 
         // ── Step B: Create watcher command channel ────────────────────────────
         let (watcher_cmd_tx, watcher_cmd_rx) = mpsc::channel::<WatcherCommand>(64);
+        // Recheck channel (К2b/К3): the PoS rebuild and the worker report gone paths,
+        // the watcher decides whether each is a deletion. Its own channel, so a burst
+        // of rechecks never blocks WatchAdmin commands (A21, N8).
+        let (recheck_tx, recheck_rx) =
+            mpsc::channel::<PathBuf>(crate::daemon::backup::rebuild::RECHECK_CHANNEL_CAPACITY);
+        // Resubmit channel (L1b, backup-i8, backup-i25): the backup reconcile hands paths to
+        // the watcher, which re-submits them under its roots and filters. The coordinator
+        // only `try_send`s, so neither side ever waits on the other.
+        let (resubmit_tx, resubmit_rx) =
+            mpsc::channel::<crate::daemon::backup::reconcile::ResubmitBatch>(
+                crate::daemon::backup::reconcile::RESUBMIT_CHANNEL_CAPACITY,
+            );
 
         // Create accepted_offers map shared between BackupCoordinator and Processor.
         let accepted_offers = crate::daemon::processor::make_empty_accepted_offers();
@@ -612,11 +636,11 @@ impl DaemonHandle {
             db.clone(),
             BackupConfig {
                 source_block_size,
+                max_file_size_bytes,
                 symbols_dir: symbols_dir.clone(),
                 epoch_key: epoch_key_bytes,
                 device_id,
                 mock_holders: vec![],
-                cluster_state: Some(cluster_state.clone()),
                 watch_configs: initial_watch_configs.clone(),
                 time_scale: cfg.time_scale.max(1),
                 mock_offer_budget_gb: None,
@@ -626,6 +650,7 @@ impl DaemonHandle {
                 live_watch_configs: Some(Arc::clone(&live_configs)),
                 peer_backoff: Some(Arc::clone(&peer_backoff)),
                 work_event_tx: Some(work_event_tx.clone()),
+                resubmit_tx: Some(resubmit_tx),
             },
             encoder.clone(),
         );
@@ -657,6 +682,7 @@ impl DaemonHandle {
                     disk_reserve_bytes: viaticum_core::config::disk_reserve_bytes(&app_config),
                 }),
                 time_scale: cfg.time_scale.max(1),
+                max_source_bytes: max_file_size_bytes,
             },
             encoder.clone(),
         );
@@ -730,6 +756,7 @@ impl DaemonHandle {
             // T-13b-2: router shared with dispatch_device_revoke for directed revocation publish.
             mailbox_router: Some(std::sync::Arc::clone(&early_mailbox_router)),
             missing_sources: Default::default(),
+            max_file_size_bytes,
         });
 
         // Clone state for web API and metrics pusher.
@@ -934,10 +961,10 @@ impl DaemonHandle {
         }
 
         // ── Phase 7.2: spawn Processor ────────────────────────────────────────
-        // PendingChallenges map: owned by the Scheduler (it both writes challenges
-        // and resolves mailbox PoS responses against them). Wired below.
-        let pending_challenges: PendingChallenges =
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        // In-flight PoS challenges: written by the Scheduler (it issues challenges and
+        // resolves mailbox PoS responses against them), read by the mailbox poll loop
+        // (it forwards only responses to pending challenges, pos-i6). Wired below.
+        let pending_challenges: PendingChallenges = new_pending_challenges();
 
         // Raw quota values from config. 0 = "not configured" (use disk-based limit).
         // Processor and holder_cleanup compute effective_quota from disk_free at runtime.
@@ -995,6 +1022,8 @@ impl DaemonHandle {
                     epoch_key: epoch_key_bytes,
                     data_dir: cfg.data_dir.clone(),
                     min_pool_size: 2,
+                    recheck_tx: Some(recheck_tx.clone()),
+                    max_source_bytes: max_file_size_bytes,
                 };
                 let worker = crate::daemon::work_pipeline::WorkPipeline::new(
                     db.clone(),
@@ -1070,6 +1099,9 @@ impl DaemonHandle {
                     .watch_admin
                     .as_ref()
                     .map(|a| Arc::clone(&a.watch_states)),
+                time_scale,
+                recheck_rx: Some(recheck_rx),
+                resubmit_rx: Some(resubmit_rx),
             };
             let dirty_tx_watcher = dirty_tx.clone();
             let cancel_watcher = cancel.clone();
@@ -1088,20 +1120,21 @@ impl DaemonHandle {
             ));
         }
         // ── Phase 6.5: Scheduler + Mailbox poll (T-6) ────────────────────────
-        // Pass the same PendingChallenges Arc created for Processor above.
-        // Scheduler writes to it; Processor reads it when verifying PosResponse.
+        // The PendingChallenges created above: the Scheduler writes it, the mailbox poll
+        // loop reads it to forward only responses to pending challenges (pos-i6).
 
         // T-6: MailboxRouter already built in step 11.5 (early_mailbox_router).
         // Reuse the same Arc here for scheduler + mailbox poll wiring.
-        // pos_response_tx: poll loop → scheduler (bounded 256, try_send + WARN on full).
+        // pos_response_tx: poll loop → scheduler (bounded POS_RESPONSE_CHANNEL_CAP,
+        // try_send; a full channel defers the response to the next poll, pos-i6).
         let (pos_response_tx, pos_response_rx) =
-            mpsc::channel::<viaticum_core::messages::PosHashResponseMsg>(256);
+            crate::daemon::mailbox::poll::pos_response_channel();
 
         // Reuse early_mailbox_router built above (step 11.5). Same instance used in
         // DaemonState.mailbox_router (for dispatch_device_revoke / T-13b-2).
         let mailbox_router = std::sync::Arc::clone(&early_mailbox_router);
 
-        let scheduler = Scheduler::new(
+        let mut scheduler = Scheduler::new(
             db.clone(),
             SchedulerConfig {
                 pos_interval_secs: 3600,
@@ -1111,7 +1144,7 @@ impl DaemonHandle {
                 pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
             },
             repair_tx.clone(),
-            pending_challenges,
+            std::sync::Arc::clone(&pending_challenges),
             std::sync::Arc::clone(&mailbox_router),
             identity_pub,
             master_key.clone(),
@@ -1119,6 +1152,11 @@ impl DaemonHandle {
             encoder.clone(),
             epoch_key_bytes,
             cfg.data_dir.clone(),
+        );
+        // К2b: the PoS rebuild reads this device's records and reports gone paths.
+        scheduler.set_rebuild_scope(
+            crate::daemon::backup::rebuild::RebuildScope::new(device_id, Some(recheck_tx.clone()))
+                .with_max_source_bytes(max_file_size_bytes),
         );
         let cancel_scheduler = cancel.clone();
         tasks.push((
@@ -1143,11 +1181,11 @@ impl DaemonHandle {
                 ProcessorRevocationHandler,
             };
 
-            let pos_handler = ProcessorPosHandler::new(PosResponder::new(
-                db.clone(),
-                holdings_dir.clone(),
-                master_key.clone(),
-            ));
+            // pos-i5-a: the freshness window of an answered challenge scales with the run.
+            let pos_handler = ProcessorPosHandler::new(
+                PosResponder::new(db.clone(), holdings_dir.clone(), master_key.clone())
+                    .with_time_scale(time_scale),
+            );
 
             // T-13a: pass repair_tx so ProcessorDropHandler can wake the repair worker
             // for immediate-drop DropNotice entries (deadline ≈ now).
@@ -1164,6 +1202,7 @@ impl DaemonHandle {
 
             let poll_router = std::sync::Arc::clone(&mailbox_router);
             let poll_pos_tx = pos_response_tx.clone();
+            let poll_pending = std::sync::Arc::clone(&pending_challenges);
             let poll_identity = identity_pub;
             let poll_cancel = cancel.clone();
             tasks.push((
@@ -1172,6 +1211,7 @@ impl DaemonHandle {
                     run_mailbox_poll(
                         poll_router,
                         poll_pos_tx,
+                        poll_pending,
                         std::sync::Arc::new(pos_handler),
                         std::sync::Arc::new(drop_handler),
                         std::sync::Arc::new(delete_handler),
@@ -1472,16 +1512,30 @@ async fn open_db_with_retry(path: &std::path::Path) -> Result<Db, DbError> {
 
 // ── Disk space ────────────────────────────────────────────────────────────────
 
-/// Query available bytes on the filesystem containing `path` via `sysinfo`.
-/// Returns 0 if no mount point matches (conservative — treats as "disk full").
-pub(crate) fn disk_available_bytes(path: &std::path::Path) -> u64 {
-    use sysinfo::Disks;
-    let disks = Disks::new_with_refreshed_list();
+/// Free bytes available to this user on the filesystem holding `path` (holder-i2, F6):
+/// `statvfs` of the canonical path itself — no mount-point lookup, so NAS, container and
+/// tmpfs data dirs are read too. `None` = could not be read (never "disk full": the quota
+/// is then `Quota::Unknown` or the soft quota, see `budget::compute_effective_quota`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn disk_available_bytes(path: &std::path::Path) -> Option<u64> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let st = rustix::fs::statvfs(&canonical).ok()?;
+    Some(st.f_bavail.saturating_mul(st.f_frsize))
+}
+
+/// Free bytes on the filesystem holding `path` via `sysinfo` (no `statvfs` here); `None`
+/// when the path is missing or no mount point matches (unknown — never read as "disk full").
+/// `std::path::absolute`, not `canonicalize`: on Windows the latter returns a verbatim
+/// `\\?\C:\…` path that never `starts_with` the mount point `C:\`.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn disk_available_bytes(path: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(path).ok()?;
+    let abs = std::path::absolute(path).ok()?;
+    let disks = sysinfo::Disks::new_with_refreshed_list();
     disks
         .list()
         .iter()
-        .filter(|d| path.starts_with(d.mount_point()))
+        .filter(|d| abs.starts_with(d.mount_point()))
         .max_by_key(|d| d.mount_point().as_os_str().len())
         .map(|d| d.available_space())
-        .unwrap_or(0)
 }

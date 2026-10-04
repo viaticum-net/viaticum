@@ -35,8 +35,9 @@
 #               a circle of friends the postmen are the friends; no scenario forges an
 #               envelope; a holder clock running ahead of the owner's by more than the SCALED
 #               TTL on multi-machine demos (the postman's clamp is on the raw TTL); a DELAYED first delivery of a notice arriving after repair re-placed
-#               the block on the same holder (unit DN1-12; ESI ranges cannot filter it: repair
-#               may reuse the same ESIs for the same holder, seen in this very run).
+#               the block on the same holder (unit DN1-12; since repair-i8 the re-placement
+#               gets fresh ESIs, so the ranges could tell the stale notice apart, but rule 2 of
+#               choose_placement_for_notice still marks the new placement Lost until Р-3).
 # Steps:        1. start 4 daemons, star-connect -> O has 3 authenticated peers (30 s)
 #               2. O writes f1 (1 MiB random) -> restorable within 60 s; B1 = its block; symbols
 #                    of B1 on the disks of A, P1 AND P2 (block_symbols_on) — premise, else

@@ -73,7 +73,18 @@
 #                    (sha256 before != after) -> within 20 s O: `mailbox PosResponse resolved`
 #                    block B2 holder F outcome=Fail; F's log `responding with chain hash` for
 #                    B2 after the corruption time; `kind=Silent` events for F == number of
-#                    those Fail lines (>= 1), all block B2; F's ann/presumed events 0 (4r-i27)
+#                    those Fail lines (>= 1), all block B2; F's ann/presumed events 0 (4r-i27).
+#                    Whole run (end of step 8): exactly ONE Fail resolution for (B2, F) —
+#                    the corruption does not loop (repair-i8, repair-i10). Red on old code:
+#                    the cursor skipped Lost rows, so after the Fail of F's TOP range repair
+#                    re-offered F the same ESIs, F answered "already held" by file length,
+#                    the placement went Alive with the bad symbol and failed again
+#                    (Fail->Lost->Alive every ~3 s; 56 Fail == 56 Silent passed the per-step
+#                    check). Only exercised when F's B2 range is the top one on the holders'
+#                    disks (read before the corruption); otherwise ROUGH "loop door not
+#                    exercised" — a 1 there proves nothing about repair-i8. The disk view
+#                    misses an owner row above F's that holds nothing (an `Offered` row of a
+#                    peer that refused); no holder refuses here, so it is not expected
 #               5. [adversarial] O deletes f3 from its watch dir (daemon alive) -> within 120 s
 #                    >= 1 holder log `expired holding cleaned up, immediate-drop DropNotice
 #                    sent via mailbox` for B3/owner O and O's `received SymbolDropNotice` for
@@ -119,8 +130,8 @@
 #   - Step 6's premise guard reads O's `work_pipeline:` lines naming K's device after the
 #     kill: every offer/transfer attempt of the worker logs the holder's device there.
 #   - Step 7's fold check takes EVERY row with events of that kind (a second Fail after a
-#     repair re-placed B2 on F would add a legitimate row) and the melt window starts after
-#     the last of them.
+#     repair re-placed B2 on F would add a row — since repair-i8/i10 that second Fail is itself
+#     a FAIL of step 4's whole-run check) and the melt window starts after the last of them.
 #   - Whole-run re-checks at the end (B3 has zero events; A has exactly one Announced; F's
 #     Silent events still equal its Fail lines) are booked on the step that owns them.
 #   - Step 3 no longer reaches the episode check with a stale notice: DN-1 stops every
@@ -559,6 +570,19 @@ if [ -z "$SYM" ]; then
     fail "FAIL(setup): F (node-0$F) has no symbol file of B2 any more"
     finish
 fi
+# repair-i8 door: is F's B2 range the TOP one (max ESI on F's disk >= every other holder's)?
+max_esi_on() { # IDX BLOCK_HEX -> max ESI of the block's symbol files on that node's disk, or -1
+    find "$(node_dir "$1")/holdings/$2" -maxdepth 1 -type f -name '*.bin' 2>/dev/null \
+        | sed 's#.*/##; s#\.bin$##' | grep -E '^[0-9]+$' | sort -n | tail -1 | grep . || echo -1
+}
+F_MAX=$(max_esi_on "$F" "${BLOCK[2]}")
+F_TOP=1
+for i in $(seq 1 $((NUM_NODES - 1))); do
+    [ "$i" -eq "$F" ] && continue
+    m=$(max_esi_on "$i" "${BLOCK[2]}")
+    [ "$m" -gt "$F_MAX" ] && F_TOP=0
+done
+info "F's max B2 ESI on disk: $F_MAX; F holds the top range: $([ "$F_TOP" -eq 1 ] && echo yes || echo no)"
 SHA_BEFORE=$(content_hash "$SYM")
 T4=$(now_tf)
 dd if=/dev/urandom of="$SYM" bs=16 count=1 conv=notrunc status=none
@@ -761,5 +785,12 @@ ANN_A=$(drop_events Announced "$AM" | count_lines)
 read -r NF NS NO FA FP <<< "$(check_silent)"
 [ "$NS" -eq "$NF" ] && [ "$NO" -eq 0 ] && verdict 4 PASS "whole run: Silent events for F ($NS) == Fail resolutions for (B2, F) ($NF)" \
     || verdict 4 FAIL "whole run: Silent events for F $NS (+$NO elsewhere) != Fail resolutions $NF"
+# repair-i8 / repair-i10: one corruption -> one Fail; repair gives F fresh ESIs, not its old ones.
+FIRST_FAIL_LINE=$(resolved "$FD" Fail "$B2S" | head -1 | awk '{ print $2 }')
+PASS_AFTER=$(resolved "$FD" Pass "$B2S" | awk -v l="${FIRST_FAIL_LINE:-0}" '($2 + 0) > l' | count_lines)
+info "(B2, F) over the whole run: $NF Fail resolution(s), $PASS_AFTER Pass after the first Fail"
+[ "$NF" -eq 1 ] && verdict 4 PASS "whole run: exactly 1 Fail resolution for (B2, F) — no Fail->Lost->Alive loop (repair-i8, repair-i10)" \
+    || verdict 4 FAIL "whole run: $NF Fail resolutions for (B2, F), want 1 — repair re-offered F its old ESIs and the bad symbol came back as Alive (repair-i8, repair-i10)"
+[ "$F_TOP" -eq 1 ] || verdict 4 ROUGH "whole run: F's B2 range was not the top one — the Fail->Lost->Alive door (repair-i8) was not exercised, the single Fail proves nothing about it"
 
 finish

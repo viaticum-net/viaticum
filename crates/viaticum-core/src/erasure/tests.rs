@@ -667,6 +667,40 @@ fn encode_raw_is_holder_independent() {
     }
 }
 
+/// repair-i9: a plan with non-contiguous ESIs (own range + fresh numbers) is encoded with
+/// one encoder build; every symbol must equal what a per-range `encode_raw` gives.
+#[test]
+fn encode_raw_ranges_equals_encode_raw_per_range_in_range_order() {
+    let enc = encoder();
+    let size = 3 * 65_535usize;
+    let source = test_data(size);
+    let params = ErasureParams::compute(size as u64, 0.5).unwrap();
+    assert_eq!(
+        params.k, 3,
+        "fixture: ranges must span source and repair ESIs"
+    );
+    // Source ESIs (0..3) and repair ESIs (≥ 3), out of order, one empty range.
+    let ranges = [(5u32, 3u32), (1, 2), (9, 0), (0, 1)];
+
+    let together = enc.encode_raw_ranges(&source, &params, &ranges).unwrap();
+
+    let one_by_one: Vec<Symbol> = ranges
+        .iter()
+        .flat_map(|&(start, count)| enc.encode_raw(&source, &params, start, count).unwrap())
+        .collect();
+    let esis: Vec<u32> = together.iter().map(|s| s.esi).collect();
+    assert_eq!(
+        esis,
+        vec![5, 6, 7, 1, 2, 0],
+        "range order, ascending within a range"
+    );
+    assert_eq!(together.len(), one_by_one.len());
+    for (a, b) in together.iter().zip(one_by_one.iter()) {
+        assert_eq!(a.esi, b.esi);
+        assert_eq!(a.data, b.data, "ESI {} bytes differ", a.esi);
+    }
+}
+
 #[test]
 fn encode_deterministic_two_calls() {
     let enc = encoder();
@@ -842,4 +876,58 @@ fn chunk_symbols_realistic_scenario_2300_full_size_symbols() {
             b / 1024 / 1024
         );
     }
+}
+
+fn params_with_k_above_max() -> ErasureParams {
+    let k = crate::constants::RAPTORQ_MAX_SOURCE_SYMBOLS + 1;
+    ErasureParams {
+        k,
+        t: 65535,
+        overhead: 1.5,
+        n: k + 10,
+        k_eff: k + 3,
+    }
+}
+
+#[test]
+fn encode_raw_with_k_above_max_returns_err_without_allocating() {
+    // The source is 1 byte: padding it to k*t (> 3.6 GB) would allocate and the raptorq
+    // crate would panic. The guard must answer before either happens.
+    let enc = encoder();
+    let params = params_with_k_above_max();
+    let expected = ErasureError::TooManySourceSymbols {
+        k: params.k,
+        max: crate::constants::RAPTORQ_MAX_SOURCE_SYMBOLS,
+    };
+    let err = enc.encode_raw(&[1u8], &params, 0, 1).unwrap_err();
+    assert_eq!(err.to_string(), expected.to_string());
+    assert!(matches!(err, ErasureError::TooManySourceSymbols { .. }));
+    assert!(matches!(
+        enc.encode_raw_ranges(&[1u8], &params, &[(0, 1)]),
+        Err(ErasureError::TooManySourceSymbols { .. })
+    ));
+    assert!(matches!(
+        enc.encode(&[1u8], &params, 0, 1, &block_id(1), &holder(1)),
+        Err(ErasureError::TooManySourceSymbols { .. })
+    ));
+    assert!(matches!(
+        enc.generate_repair(&[1u8], &params, 0, &block_id(1), &holder(1)),
+        Err(ErasureError::TooManySourceSymbols { .. })
+    ));
+}
+
+#[test]
+fn decode_with_k_above_max_returns_err() {
+    let enc = encoder();
+    let params = params_with_k_above_max();
+    let symbols: Vec<Symbol> = (0..params.k_eff)
+        .map(|esi| Symbol {
+            esi,
+            data: vec![0u8; 1],
+        })
+        .collect();
+    assert!(matches!(
+        enc.decode(&symbols, &params),
+        Err(ErasureError::TooManySourceSymbols { .. })
+    ));
 }

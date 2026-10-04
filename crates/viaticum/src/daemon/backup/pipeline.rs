@@ -3,8 +3,8 @@
 
 use std::sync::Arc;
 
-use chacha20poly1305::aead::Aead;
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+use chacha20poly1305::aead::{Aead, AeadInPlace};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, Tag};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use viaticum_core::constants::MIN_BATCH_BYTES;
@@ -23,7 +23,9 @@ use viaticum_core::types::{
     Timestamp,
 };
 
+use super::generation::{Committed, before_commit, choose_generation, commit_block_record};
 use super::packing::build_plaintext;
+use super::source_read::{SourceReadError, read_source_bounded};
 use super::{BackupConfig, PipelineResult, QueuedFile};
 
 /// Derive the ChaCha20-Poly1305 key from an epoch key.
@@ -37,46 +39,145 @@ pub fn derive_block_key(epoch_key: &[u8; 32]) -> [u8; 32] {
     key
 }
 
-/// Derive a deterministic 12-byte nonce from epoch_key and compressed data.
+/// HKDF `info` of the nonce at generation 0: the derivation every block had before L1b.
+const NONCE_INFO: &[u8] = b"viaticum-block-nonce";
+/// HKDF `info` prefix of the nonce at generation > 0, followed by the generation (LE).
+const NONCE_INFO_GENERATION: &[u8] = b"viaticum-block-nonce/generation";
+
+/// Derive a deterministic 12-byte nonce from epoch_key, compressed data and the seal
+/// generation (N1, delete-i9).
 ///
-/// Uses HKDF-SHA256 with `blake3(compressed)` as salt and epoch_key as IKM.
-/// This is a SIV-like construction: nonce depends on message content,
-/// so the same plaintext always produces the same blob.
-fn derive_nonce(epoch_key: &[u8; 32], compressed: &[u8]) -> [u8; 12] {
+/// HKDF-SHA256 with `blake3(compressed)` as salt and epoch_key as IKM. This is a SIV-like
+/// construction: the nonce depends on the message content, so the same plaintext at the
+/// same generation always produces the same blob. Generation 0 uses the pre-L1b `info`
+/// (INV-G0: its ids do not change); a later generation uses a distinct `info` carrying the
+/// generation, so its nonce — hence its block id — is independent of every other
+/// generation's (the salt is untouched: no concatenation that two messages could share).
+pub(super) fn derive_nonce(epoch_key: &[u8; 32], compressed: &[u8], generation: u32) -> [u8; 12] {
     let hash = blake3::hash(compressed);
     let hk = Hkdf::<Sha256>::new(Some(hash.as_bytes()), epoch_key);
     let mut nonce = [0u8; 12];
-    hk.expand(b"viaticum-block-nonce", &mut nonce)
-        .expect("12 is a valid HKDF-SHA256 output length");
+    let expanded = if generation == 0 {
+        hk.expand(NONCE_INFO, &mut nonce)
+    } else {
+        hk.expand_multi_info(
+            &[NONCE_INFO_GENERATION, &generation.to_le_bytes()],
+            &mut nonce,
+        )
+    };
+    expanded.expect("12 is a valid HKDF-SHA256 output length");
     nonce
 }
 
-/// Encrypt plaintext: compress → encrypt → prepend nonce.
-///
-/// Returns `[12-byte nonce][ciphertext]`.
-/// Deterministic: same (plaintext, epoch_key) always produces same output.
-pub fn compress_and_encrypt(plaintext: &[u8], epoch_key: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
-    // zstd compress (level 3)
-    let compressed = zstd::encode_all(std::io::Cursor::new(plaintext), 3)
-        .map_err(|e| anyhow::anyhow!("zstd compress: {e}"))?;
+/// Length of the nonce in front of a stored blob, and of the AEAD tag behind it.
+const NONCE_LEN: usize = 12;
+const TAG_LEN: usize = 16;
 
-    // Derive encryption key
+/// zstd level 3. Deterministic: the same plaintext always compresses to the same bytes.
+pub fn compress_block(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+    zstd::encode_all(std::io::Cursor::new(plaintext), 3)
+        .map_err(|e| anyhow::anyhow!("zstd compress: {e}"))
+}
+
+/// The compressed bytes of `plaintext` (zstd level 3, as [`compress_block`] gives them) in
+/// the buffer that sealing turns into the stored blob in place: `[12 bytes for the
+/// nonce][compressed][room for the tag]` (F3, backup-i5: one buffer per block, not one
+/// per stage). The room of `compress_bound` is reserved up front, so the buffer never
+/// reallocates while compressing, and given back down to the tag afterwards; untouched
+/// pages of it are never resident.
+pub(crate) fn compress_framed(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let bound = zstd::zstd_safe::compress_bound(plaintext.len());
+    let mut out = Vec::with_capacity(NONCE_LEN + bound + TAG_LEN);
+    out.resize(NONCE_LEN, 0);
+    // `copy_encode` into a `Vec` is what `encode_all` does inside: the same bytes.
+    zstd::stream::copy_encode(std::io::Cursor::new(plaintext), &mut out, 3)
+        .map_err(|e| anyhow::anyhow!("zstd compress: {e}"))?;
+    out.shrink_to(out.len() + TAG_LEN);
+    Ok(out)
+}
+
+/// Seal a [`compress_framed`] buffer in place at `generation`: the compressed bytes are
+/// encrypted where they lie, the tag is appended, the nonce fills its 12 bytes in front —
+/// `[nonce][ciphertext][tag]`, the stored blob. Byte for byte what encrypting the
+/// compressed bytes and prepending the nonce gives (ChaCha20-Poly1305, empty AAD).
+pub(super) fn seal_framed(
+    buf: &mut Vec<u8>,
+    epoch_key: &[u8; 32],
+    generation: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(buf.len() >= NONCE_LEN, "framed buffer shorter than a nonce");
     let key = derive_block_key(epoch_key);
     let cipher = ChaCha20Poly1305::new(&key.into());
-
-    // Deterministic nonce derived from epoch_key + blake3(compressed)
-    let nonce_bytes = derive_nonce(epoch_key, &compressed);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(nonce, compressed.as_ref())
+    let nonce_bytes = derive_nonce(epoch_key, &buf[NONCE_LEN..], generation);
+    let tag = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(&nonce_bytes), b"", &mut buf[NONCE_LEN..])
         .map_err(|e| anyhow::anyhow!("chacha20poly1305 encrypt: {e}"))?;
+    buf.extend_from_slice(&tag);
+    buf[..NONCE_LEN].copy_from_slice(&nonce_bytes);
+    Ok(())
+}
 
-    // Stored format: [nonce (12 bytes)][ciphertext]
-    let mut stored = Vec::with_capacity(12 + ciphertext.len());
-    stored.extend_from_slice(&nonce_bytes);
-    stored.extend_from_slice(&ciphertext);
+/// The inverse of [`seal_framed`]: a sealed blob back to the framed buffer (its nonce bytes
+/// stay in front, to be overwritten by the next seal). Used when the generation chosen
+/// turns out to be taken and the next one is sealed from the same buffer.
+pub(super) fn unseal_framed(buf: &mut Vec<u8>, epoch_key: &[u8; 32]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        buf.len() >= NONCE_LEN + TAG_LEN,
+        "sealed blob shorter than nonce and tag"
+    );
+    let tag_start = buf.len() - TAG_LEN;
+    let tag = Tag::clone_from_slice(&buf[tag_start..]);
+    buf.truncate(tag_start);
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    nonce_bytes.copy_from_slice(&buf[..NONCE_LEN]);
+    let key = derive_block_key(epoch_key);
+    let cipher = ChaCha20Poly1305::new(&key.into());
+    cipher
+        .decrypt_in_place_detached(
+            Nonce::from_slice(&nonce_bytes),
+            b"",
+            &mut buf[NONCE_LEN..],
+            &tag,
+        )
+        .map_err(|e| anyhow::anyhow!("chacha20poly1305 unseal: {e}"))
+}
+
+/// Encrypt an already compressed block at `generation` → `[nonce][ciphertext]`.
+///
+/// Nonce = HKDF-SHA256(salt = blake3(compressed), ikm = epoch_key, info), info =
+/// "viaticum-block-nonce" for generation 0 (the pre-L1b derivation, INV-G0) and
+/// "viaticum-block-nonce/generation" || generation (LE) otherwise. Decryption reads the
+/// nonce from the blob, so restore and DR never need the generation.
+pub fn seal_compressed(
+    compressed: &[u8],
+    epoch_key: &[u8; 32],
+    generation: u32,
+) -> anyhow::Result<Vec<u8>> {
+    // Stored format: [nonce (12 bytes)][ciphertext][tag], built in ONE buffer.
+    let mut stored = Vec::with_capacity(NONCE_LEN + compressed.len() + TAG_LEN);
+    stored.resize(NONCE_LEN, 0);
+    stored.extend_from_slice(compressed);
+    seal_framed(&mut stored, epoch_key, generation)?;
     Ok(stored)
+}
+
+/// Compress and seal `plaintext` at `generation` with one buffer (F3): the plaintext, and
+/// the stored blob it becomes — no separate compressed copy, no separate ciphertext copy.
+pub(crate) fn seal_plaintext(
+    plaintext: &[u8],
+    epoch_key: &[u8; 32],
+    generation: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let mut framed = compress_framed(plaintext)?;
+    seal_framed(&mut framed, epoch_key, generation)?;
+    Ok(framed)
+}
+
+/// Encrypt plaintext at generation 0: compress → encrypt → prepend nonce (SystemState
+/// blocks, tests). Returns `[12-byte nonce][ciphertext]`.
+/// Deterministic: same (plaintext, epoch_key) always produces same output.
+pub fn compress_and_encrypt(plaintext: &[u8], epoch_key: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
+    seal_plaintext(plaintext, epoch_key, 0)
 }
 
 /// Decrypt and decompress a stored block (output of `compress_and_encrypt`).
@@ -130,44 +231,24 @@ pub fn run_pipeline(
 ) -> anyhow::Result<PipelineResult> {
     assert!(!files.is_empty(), "run_pipeline called with empty files");
 
-    // 1. Build plaintext
-    let plaintext = match block_type_tag {
-        BlockTypeTag::Pack => build_plaintext(files),
-        BlockTypeTag::Single => {
+    // 1-2. Build the plaintext and compress it into the buffer the seal works on in place.
+    // A Single block borrows the file bytes (F2); a pack's plaintext copy is dropped as
+    // soon as it is compressed: at most the members, that copy and the compressed bytes
+    // exist together (backup-i5).
+    let mut framed = {
+        let built;
+        let plaintext: &[u8] = match block_type_tag {
+            BlockTypeTag::Pack => {
+                built = build_plaintext(files);
+                &built
+            }
             // Large file: use raw bytes directly (no pack index)
-            files[0].1.clone()
-        }
+            BlockTypeTag::Single => &files[0].1,
+        };
+        compress_framed(plaintext)?
     };
 
-    // 2. Compress + encrypt → stored blob = [nonce][ciphertext]
-    let stored = compress_and_encrypt(&plaintext, &config.epoch_key)?;
-
-    // 3. source_block_id = blake3(stored)
-    let block_id_raw: [u8; 32] = *blake3::hash(&stored).as_bytes();
-    let block_id = SourceBlockId(block_id_raw);
-
-    // 4. Compute ErasureParams (for k, k_eff, t, overhead; n comes from dynamic solver)
-    // Guard: compress_and_encrypt always produces at least 12 bytes (nonce) + auth
-    // tag, so stored.len() > 0 in practice. The check is explicit for correctness.
-    if stored.is_empty() {
-        anyhow::bail!("compressed+encrypted block is empty — cannot compute erasure params");
-    }
-    let params = ErasureParams::compute(stored.len() as u64, pack_importance)
-        .map_err(|e| anyhow::anyhow!("ErasureParams::compute failed: {e}"))?;
-
-    // 5. (Wave 11b / A4) Backup does NOT place or deliver. It only records the
-    // SourceBlockRecord. The WorkPipeline worker is the sole creator of placements
-    // and the sole deliverer — it re-encodes from source on its next iteration and
-    // owns the ESI namespace. Backup therefore needs neither an ESI offset nor a
-    // placement allocation here. The `candidates` slice is used only to derive a
-    // principled target-based N (below) so the stored record carries a meaningful
-    // redundancy target for the worker and for future repair.
-
-    // 6. (Wave 11b) No disk writes — raw symbols are not persisted.
-    // The WorkPipeline worker re-encodes from source on its next iteration.
-    // block.bin and raw/{esi}.bin are never written after Wave 11b.
-
-    // 7. DB: upsert SourceBlockRecord
+    // 3. The block type and the redundancy target do not depend on the generation.
     let block_type = match block_type_tag {
         BlockTypeTag::Pack => {
             let entries = files
@@ -186,89 +267,148 @@ pub fn run_pipeline(
         }
         BlockTypeTag::Single => SourceBlockType::Single,
     };
-
     // Wave 9: set importance and target_reliability at creation from pack_importance.
     let target_rel = reliability::target_reliability(pack_importance);
 
-    // Effective N: principled, target-based redundancy target from the current pool.
-    // Backup no longer derives N from a phantom allocation it never delivers (A4).
-    // Instead it solves for the smallest N reaching `target_rel` using a binomial
-    // mean-survival-probability model (`solve_n_for_target`). NOTE: this is an
-    // *approximation*, not a prediction of what the worker delivers — the worker
-    // places via the holder-correlated `solve_placement_for_target` (live-or-die per
-    // holder, capped at full replicas), which diverges from the independent-binomial
-    // assumption in small / heterogeneous pools. The survival-prob bridge and `k_eff`
-    // below DO match the worker exactly; only the solver model differs. `record.n`
-    // is a redundancy target / priority heuristic (not a correctness input — repair
-    // eligibility is reliability-gated, not n-gated), so the approximation is benign.
-    // With no candidates we fall back to the static params.n.
-    let k_eff = params.k + viaticum_core::constants::DECODE_OVERHEAD; // mirror worker.rs
-    let effective_n: u32 = if candidates.is_empty() {
-        params.n
-    } else {
-        // Convert placement candidates → reliability candidates via the same
-        // commitment_to_survival_prob bridge compute_allocation_with_importance uses,
-        // so the per-holder survival probability feeding the solver matches the
-        // worker's placement model (the solver *aggregation* still differs — see above).
-        let solver_candidates: Vec<reliability::HolderCandidate> = candidates
-            .iter()
-            .map(|c| reliability::HolderCandidate {
-                survival_prob: reliability::commitment_to_survival_prob(
-                    viaticum_core::commitment::CommitmentScore::new(c.trust),
-                ),
-            })
-            .collect();
-        match reliability::solve_n_for_target(k_eff, &solver_candidates, target_rel) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!("solve_n_for_target failed ({e}); falling back to params.n");
-                params.n
+    // 4. Choose the generation, then write the record only if its id is still free (or keep
+    // the record in service) inside the write transaction (Р-4: re-check, ≤ 3 attempts).
+    for _ in 0..GENERATION_ATTEMPTS {
+        // The choice seals the buffer in place at the lowest usable generation.
+        let sealed = choose_generation(db, framed, &config.epoch_key)?;
+        let stored_len = sealed.stored.len() as u64;
+        let params = ErasureParams::compute(stored_len, pack_importance)
+            .map_err(|e| anyhow::anyhow!("ErasureParams::compute failed: {e}"))?;
+        let effective_n = effective_n(candidates, &params, target_rel);
+        let block_record = SourceBlockRecord {
+            seal_generation: sealed.generation,
+            block_id: sealed.block_id,
+            k: params.k,
+            t: params.t,
+            block_type: block_type.clone(),
+            status: SourceBlockStatus::Active,
+            created_at: Timestamp::now(),
+            encrypted_size: Some(stored_len),
+            n: Some(effective_n),
+            overhead: Some(params.overhead),
+            drop_notice_sent_at: None,
+            // Wave 9: set at creation from pack importance.
+            importance: pack_importance,
+            target_reliability: target_rel,
+            current_alive: 0,
+            current_reliability: 0.0,
+        };
+        // 5. DB: the source block record only (A4). Backup creates no placements and emits
+        // no SymbolsPlaced events — the WorkPipeline worker is their sole creator, and it
+        // re-encodes from source (Wave 11b: no symbols on disk).
+        before_commit(db, sealed.block_id);
+        let result = match commit_block_record(db, &block_record)? {
+            Committed::Changed(now) => {
+                tracing::debug!(
+                    block_id = %sealed.block_id,
+                    seal_generation = sealed.generation,
+                    now = ?now,
+                    "backup: chosen block id left service before the write; choosing again"
+                );
+                // Back to the compressed bytes, for the next choice.
+                framed = sealed.stored;
+                unseal_framed(&mut framed, &config.epoch_key)?;
+                continue;
             }
+            Committed::Written => {
+                if !sealed.skipped.is_empty() {
+                    let released: Vec<String> = sealed
+                        .skipped
+                        .iter()
+                        .map(|(id, s)| format!("{id}:{s:?}"))
+                        .collect();
+                    tracing::info!(
+                        block_id = %sealed.block_id,
+                        seal_generation = sealed.generation,
+                        released = %released.join(","),
+                        "backup: sealed as a new generation; the earlier id is being released"
+                    );
+                }
+                tracing::info!(
+                    block_id = %sealed.block_id,
+                    k = params.k,
+                    n = effective_n,
+                    importance = pack_importance,
+                    target_reliability = target_rel,
+                    seal_generation = sealed.generation,
+                    "backup: pipeline complete (block record only; worker places)"
+                );
+                PipelineResult {
+                    source_block_id: sealed.block_id,
+                    k: params.k,
+                    n: effective_n,
+                    t: params.t,
+                    stored_size: stored_len,
+                    importance: pack_importance,
+                }
+            }
+            Committed::Kept(existing) => {
+                tracing::debug!(
+                    block_id = %sealed.block_id,
+                    seal_generation = sealed.generation,
+                    "backup: block already in service; record kept"
+                );
+                PipelineResult {
+                    source_block_id: existing.block_id,
+                    k: existing.k,
+                    n: existing.n.unwrap_or(effective_n),
+                    t: existing.t,
+                    stored_size: existing.encrypted_size.unwrap_or(stored_len),
+                    importance: existing.importance,
+                }
+            }
+        };
+        return Ok(result);
+    }
+    anyhow::bail!(
+        "block generation choice changed {GENERATION_ATTEMPTS} times inside the write \
+         transaction; files stay queued"
+    )
+}
+
+/// Attempts of "choose a generation, re-check it in the write transaction" (Р-4).
+const GENERATION_ATTEMPTS: usize = 3;
+
+/// Effective N: principled, target-based redundancy target from the current pool.
+/// Backup no longer derives N from a phantom allocation it never delivers (A4).
+/// Instead it solves for the smallest N reaching `target_rel` using a binomial
+/// mean-survival-probability model (`solve_n_for_target`). NOTE: this is an
+/// *approximation*, not a prediction of what the worker delivers — the worker
+/// places via the holder-correlated `solve_placement_for_target` (live-or-die per
+/// holder, capped at full replicas), which diverges from the independent-binomial
+/// assumption in small / heterogeneous pools. The survival-prob bridge and `k_eff`
+/// below DO match the worker exactly; only the solver model differs. `record.n`
+/// is a redundancy target / priority heuristic (not a correctness input — repair
+/// eligibility is reliability-gated, not n-gated), so the approximation is benign.
+/// With no candidates we fall back to the static params.n.
+fn effective_n(candidates: &[HolderCandidate], params: &ErasureParams, target_rel: f64) -> u32 {
+    let k_eff = params.k + viaticum_core::constants::DECODE_OVERHEAD; // mirror worker.rs
+    if candidates.is_empty() {
+        return params.n;
+    }
+    // Convert placement candidates → reliability candidates via the same
+    // commitment_to_survival_prob bridge compute_allocation_with_importance uses,
+    // so the per-holder survival probability feeding the solver matches the
+    // worker's placement model (the solver *aggregation* still differs — see above).
+    let solver_candidates: Vec<reliability::HolderCandidate> = candidates
+        .iter()
+        .map(|c| reliability::HolderCandidate {
+            survival_prob: reliability::commitment_to_survival_prob(
+                viaticum_core::commitment::CommitmentScore::new(c.trust),
+            ),
+        })
+        .collect();
+    match reliability::solve_n_for_target(k_eff, &solver_candidates, target_rel) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("solve_n_for_target failed ({e}); falling back to params.n");
+            params.n
         }
-    };
-
-    let block_record = SourceBlockRecord {
-        block_id,
-        k: params.k,
-        t: params.t,
-        block_type,
-        status: SourceBlockStatus::Active,
-        created_at: Timestamp::now(),
-        encrypted_size: Some(stored.len() as u64),
-        n: Some(effective_n),
-        overhead: Some(params.overhead),
-        drop_notice_sent_at: None,
-        // Wave 9: set at creation from pack importance.
-        importance: pack_importance,
-        target_reliability: target_rel,
-        current_alive: 0,
-        current_reliability: 0.0,
-    };
-    // 8. DB: write the source block record only (A4). Backup creates no placements
-    // and emits no SymbolsPlaced events — those belong to the WorkPipeline worker,
-    // the sole creator of placements. A single write transaction keeps block-record
-    // creation atomic.
-    let mut txn = db.write_txn()?;
-    txn.upsert_source_block(&block_record)?;
-    txn.commit()?;
-
-    tracing::info!(
-        block_id = %block_id,
-        k = params.k,
-        n = effective_n,
-        importance = pack_importance,
-        target_reliability = target_rel,
-        "backup: pipeline complete (block record only; worker places)"
-    );
-
-    Ok(PipelineResult {
-        source_block_id: block_id,
-        k: params.k,
-        n: effective_n,
-        t: params.t,
-        stored_size: stored.len() as u64,
-        importance: pack_importance,
-    })
+    }
 }
 
 /// Whether this pipeline run produces a Pack or Single block.
@@ -278,14 +418,113 @@ pub enum BlockTypeTag {
     Single,
 }
 
+/// Pack one batch into a Pack block and mark its files backed up.
+///
+/// An error is returned only from before the block record is committed; the caller
+/// then requeues the batch. Once the block is committed its files are marked one by one
+/// and a file whose record cannot be updated stays pending (backup-i23): requeueing
+/// after the commit would build and commit the block again on every flush.
+fn pack_batch(
+    db: &Db,
+    config: &BackupConfig,
+    encoder: &Arc<dyn ErasureEncoder>,
+    batch: &[(QueuedFile, Vec<u8>)],
+    candidates: &[HolderCandidate],
+) -> anyhow::Result<PipelineResult> {
+    let pack_importance = batch[0].0.importance;
+    let result = run_pipeline(
+        db,
+        config,
+        encoder,
+        batch,
+        BlockTypeTag::Pack,
+        candidates,
+        &[],
+        pack_importance,
+    )?;
+    update_backed_up_at(db, batch, result.source_block_id, result.k, result.t);
+    Ok(result)
+}
+
+/// What the bytes read at flush time are, against what was queued (backup-i23).
+pub(crate) enum ReadAtFlush {
+    /// Pack these bytes; `content_hash` is theirs (it may differ from the queued one).
+    Pack {
+        bytes: Vec<u8>,
+        content_hash: [u8; 32],
+    },
+    /// Nothing to pack: the file is gone, unreadable, or now holds content that is
+    /// already in the network (its event will point the path there without traffic).
+    Skip,
+    /// The file is above the size limit now (it grew since enqueue): not read past the
+    /// limit; the caller marks the path (backup-i4). The size is the one `metadata` gave,
+    /// or `limit + 1` when the file grew during the read.
+    TooLarge(u64),
+}
+
+/// Re-read a queued (or large) file right before packing it (backup-i23).
+///
+/// Above `limit` → [`ReadAtFlush::TooLarge`], nothing read past the limit (J1). Vanished or
+/// unreadable → skipped (INFO / WARN), the rest of the batch goes on.
+/// Changed since enqueue → if the new content is already in the network
+/// (`in_network`), skipped; otherwise the bytes read are packed with their own hash,
+/// so a version is marked backed up only with the hash of the bytes in its block.
+pub(crate) fn read_at_flush(
+    path: &str,
+    queued_hash: &[u8; 32],
+    in_network: &dyn Fn(&[u8; 32]) -> bool,
+    limit: u64,
+) -> ReadAtFlush {
+    let bytes = match read_source_bounded(std::path::Path::new(path), limit, 0) {
+        Ok(b) => b,
+        Err(SourceReadError::TooLarge { size, .. }) => return ReadAtFlush::TooLarge(size),
+        Err(e) if e.is_not_found() => {
+            tracing::info!(path = %path, "flush: file vanished since enqueue; skipped");
+            return ReadAtFlush::Skip;
+        }
+        Err(e) => {
+            tracing::warn!(path = %path, error = %e, "flush: cannot read file; skipped");
+            return ReadAtFlush::Skip;
+        }
+    };
+    let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+    if &content_hash != queued_hash {
+        if in_network(&content_hash) {
+            tracing::debug!(
+                path = %path,
+                "flush: file changed to content already in the network; skipped"
+            );
+            return ReadAtFlush::Skip;
+        }
+        tracing::debug!(path = %path, "flush: file changed since enqueue; packing what was read");
+    }
+    ReadAtFlush::Pack {
+        bytes,
+        content_hash,
+    }
+}
+
 /// Flush a queue of files, grouping into batches up to source_block_size.
 ///
 /// Files must be in importance-DESC order (as produced by select_backup_batch).
 /// Flushes on EITHER size threshold OR importance change > IMPORTANCE_FLUSH_EPSILON
 /// between consecutive files.
 ///
+/// backup-i23: a file that vanished or changed since enqueue does not stop the others
+/// (see [`read_at_flush`]; `in_network` answers "is this content already backed up").
+/// An error before a block record is committed puts the batch being built and every
+/// file not yet processed back into `queued`, in order, and returns the error. After the
+/// commit nothing is requeued (see [`pack_batch`]).
+///
+/// A file above `config.max_file_size_bytes` at flush time (it grew since enqueue) is not
+/// read past the limit; it is left out of the pack and reported in `too_large` as
+/// `(path, size)` for the caller to mark. A file whose size at flush time is
+/// `config.source_block_size` or more (it grew past the pack size) is not put in a pack:
+/// it goes at once to a block of its own, and the pack in hand goes on (J9).
+///
 /// Returns pipeline results for each emitted source block.
 /// If `force=false` and total bytes < MIN_BATCH_BYTES, returns empty vec.
+#[allow(clippy::too_many_arguments)]
 pub fn flush_queue_inner(
     db: &Db,
     config: &BackupConfig,
@@ -294,6 +533,8 @@ pub fn flush_queue_inner(
     total_bytes_all_categories: u64,
     force: bool,
     candidates: &[HolderCandidate],
+    in_network: &dyn Fn(&[u8; 32]) -> bool,
+    too_large: &mut Vec<(String, u64)>,
 ) -> anyhow::Result<Vec<PipelineResult>> {
     if queued.is_empty() {
         return Ok(vec![]);
@@ -314,53 +555,84 @@ pub fn flush_queue_inner(
     let mut batch_bytes: u64 = 0;
     // Track importance of the last file added to the current batch (A9: track last-added).
     let mut prev_importance: Option<f64> = None;
-    let drained: Vec<QueuedFile> = std::mem::take(queued);
+    let mut rest = std::mem::take(queued).into_iter();
 
-    for qf in drained {
-        // Read file bytes from disk
-        let file_bytes =
-            std::fs::read(&qf.path).map_err(|e| anyhow::anyhow!("read file {}: {e}", qf.path))?;
+    // On an error before the block commit: the batch, the file in hand (if not in the
+    // batch yet) and everything not yet processed go back to the queue, in their order.
+    let requeue = |queued: &mut Vec<QueuedFile>,
+                   batch: &mut Vec<(QueuedFile, Vec<u8>)>,
+                   in_hand: Option<QueuedFile>,
+                   rest: std::vec::IntoIter<QueuedFile>| {
+        queued.extend(batch.drain(..).map(|(qf, _)| qf));
+        queued.extend(in_hand);
+        queued.extend(rest);
+    };
+
+    while let Some(mut qf) = rest.next() {
+        let file_bytes = match read_at_flush(
+            &qf.path,
+            &qf.content_hash,
+            in_network,
+            config.max_file_size_bytes,
+        ) {
+            ReadAtFlush::Pack {
+                bytes,
+                content_hash,
+            } => {
+                qf.content_hash = content_hash;
+                qf.size_bytes = bytes.len() as u64;
+                bytes
+            }
+            ReadAtFlush::Skip => continue,
+            ReadAtFlush::TooLarge(size) => {
+                too_large.push((qf.path, size));
+                continue;
+            }
+        };
 
         let file_size = file_bytes.len() as u64;
 
-        // Importance-change flush (BEFORE size-overflow check, per D2).
-        // Fires when importance changes by more than IMPORTANCE_FLUSH_EPSILON (strict).
-        if let Some(prev) = prev_importance
-            && (qf.importance - prev).abs() > IMPORTANCE_FLUSH_EPSILON
-            && !batch.is_empty()
-        {
-            let pack_importance = batch[0].0.importance;
-            let result = run_pipeline(
+        // J9: a file that is a block by itself (at least the pack size now) is not put in a
+        // pack: it goes at once to a Single block of its own. The pack in hand is untouched.
+        if file_size >= config.source_block_size {
+            let single = [(qf, file_bytes)];
+            match run_pipeline(
                 db,
                 config,
                 encoder,
-                &batch,
-                BlockTypeTag::Pack,
+                &single,
+                BlockTypeTag::Single,
                 candidates,
                 &[],
-                pack_importance,
-            )?;
-            update_backed_up_at(db, &batch, result.source_block_id, result.k, result.t)?;
-            results.push(result);
-            batch.clear();
-            batch_bytes = 0;
+                single[0].0.importance,
+            ) {
+                Ok(result) => {
+                    update_backed_up_at(db, &single, result.source_block_id, result.k, result.t);
+                    results.push(result);
+                }
+                Err(e) => {
+                    let [(qf, _)] = single;
+                    requeue(queued, &mut batch, Some(qf), rest);
+                    return Err(e);
+                }
+            }
+            continue;
         }
 
+        // Importance-change flush (BEFORE size-overflow check, per D2).
+        // Fires when importance changes by more than IMPORTANCE_FLUSH_EPSILON (strict).
         // Size-overflow flush: adding this file would push batch over the limit.
-        if !batch.is_empty() && batch_bytes + file_size > config.source_block_size {
-            let pack_importance = batch[0].0.importance;
-            let result = run_pipeline(
-                db,
-                config,
-                encoder,
-                &batch,
-                BlockTypeTag::Pack,
-                candidates,
-                &[],
-                pack_importance,
-            )?;
-            update_backed_up_at(db, &batch, result.source_block_id, result.k, result.t)?;
-            results.push(result);
+        let importance_changed = prev_importance
+            .is_some_and(|prev| (qf.importance - prev).abs() > IMPORTANCE_FLUSH_EPSILON);
+        let overflows = batch_bytes + file_size > config.source_block_size;
+        if !batch.is_empty() && (importance_changed || overflows) {
+            match pack_batch(db, config, encoder, &batch, candidates) {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    requeue(queued, &mut batch, Some(qf), rest);
+                    return Err(e);
+                }
+            }
             batch.clear();
             batch_bytes = 0;
         }
@@ -371,19 +643,13 @@ pub fn flush_queue_inner(
 
         // Immediate size flush: batch is at or over limit after adding the file.
         if batch_bytes >= config.source_block_size {
-            let pack_importance = batch[0].0.importance;
-            let result = run_pipeline(
-                db,
-                config,
-                encoder,
-                &batch,
-                BlockTypeTag::Pack,
-                candidates,
-                &[],
-                pack_importance,
-            )?;
-            update_backed_up_at(db, &batch, result.source_block_id, result.k, result.t)?;
-            results.push(result);
+            match pack_batch(db, config, encoder, &batch, candidates) {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    requeue(queued, &mut batch, None, rest);
+                    return Err(e);
+                }
+            }
             batch.clear();
             batch_bytes = 0;
             prev_importance = None;
@@ -392,57 +658,83 @@ pub fn flush_queue_inner(
 
     // Flush remaining batch
     if !batch.is_empty() {
-        let pack_importance = batch[0].0.importance;
-        let result = run_pipeline(
-            db,
-            config,
-            encoder,
-            &batch,
-            BlockTypeTag::Pack,
-            candidates,
-            &[],
-            pack_importance,
-        )?;
-        update_backed_up_at(db, &batch, result.source_block_id, result.k, result.t)?;
-        results.push(result);
+        match pack_batch(db, config, encoder, &batch, candidates) {
+            Ok(result) => results.push(result),
+            Err(e) => {
+                requeue(queued, &mut batch, None, rest);
+                return Err(e);
+            }
+        }
     }
 
     Ok(results)
 }
 
-/// Update `FileVersion.backed_up_at` for all files in a batch after successful pipeline.
+/// Mark the files of a packed, committed batch backed up (backup-i9, backup-i23).
+///
+/// For each file: the LAST version of its record, if it is pending, becomes the
+/// packed version — its `content_hash` is set to the hash of the bytes actually packed
+/// (`qf.content_hash`, set by the flush), `backed_up_at` = now, block, k, t. An older
+/// version with the same hash is never touched (a rollback to earlier content keeps
+/// that earlier version on its own block). No pending last version, or a record of
+/// another `file_id` at the path → WARN, nothing written.
+///
+/// Never fails: the block is already committed, so a file whose record cannot be read
+/// or written gets a WARN and stays pending until its next event or rescan; the other
+/// files are still marked.
 pub fn update_backed_up_at(
     db: &Db,
     batch: &[(QueuedFile, Vec<u8>)],
     block_id: SourceBlockId,
     k: u32,
     t: u16,
-) -> anyhow::Result<()> {
+) {
     let now = Timestamp::now();
     for (qf, _) in batch {
-        // Fetch current FileRecord from DB
-        if let Some(mut record) = db.get_file(&qf.path)? {
-            // Find the version with matching content_hash and update it
-            let mut updated = false;
-            for version in &mut record.versions {
-                if version.content_hash == qf.content_hash {
-                    version.backed_up_at = Some(now);
-                    version.source_block_id = block_id;
-                    version.k = k;
-                    version.t = t;
-                    updated = true;
-                    break;
-                }
-            }
-            if updated {
-                db.upsert_file(&record)?;
-            } else {
-                tracing::warn!(
-                    path = %qf.path,
-                    "backed_up_at update skipped: content_hash not found in versions (file modified between enqueue and flush?)"
-                );
-            }
+        if let Err(e) = mark_backed_up(db, qf, block_id, k, t, now) {
+            tracing::warn!(
+                path = %qf.path,
+                block_id = %block_id,
+                error = %e,
+                "backed_up_at update failed; the file stays pending until its next event or rescan"
+            );
         }
+    }
+}
+
+/// One file of [`update_backed_up_at`].
+fn mark_backed_up(
+    db: &Db,
+    qf: &QueuedFile,
+    block_id: SourceBlockId,
+    k: u32,
+    t: u16,
+    now: Timestamp,
+) -> Result<(), viaticum_core::db::DbError> {
+    let Some(mut record) = db.get_file(&qf.path)? else {
+        tracing::warn!(path = %qf.path, "backed_up_at update skipped: no catalog record");
+        return Ok(());
+    };
+    if record.file_id != qf.file_id {
+        tracing::warn!(
+            path = %qf.path,
+            "backed_up_at update skipped: the record at this path has another file_id"
+        );
+        return Ok(());
+    }
+    match record.versions.last_mut() {
+        Some(version) if version.backed_up_at.is_none() => {
+            version.content_hash = qf.content_hash;
+            version.backed_up_at = Some(now);
+            version.source_block_id = block_id;
+            version.k = k;
+            version.t = t;
+            db.upsert_file(&record)?;
+        }
+        _ => tracing::warn!(
+            path = %qf.path,
+            "backed_up_at update skipped: the last version is not pending"
+        ),
     }
     Ok(())
 }
@@ -458,28 +750,59 @@ pub fn update_backed_up_at(
 /// blob without any on-disk block.bin cache. It is also used by the restore path
 /// as a fallback when fetching symbols from holders fails.
 ///
-/// CPU-bound portion (`compress_and_encrypt`) runs inside `spawn_blocking`.
+/// The whole rebuild runs inside `spawn_blocking` ([`rebuild_blob_blocking`]).
 pub async fn rebuild_source_blob(
     db: &viaticum_core::db::Db,
     block_record: &viaticum_core::types::SourceBlockRecord,
     epoch_key: &[u8; 32],
+    scope: &super::rebuild::RebuildScope,
 ) -> anyhow::Result<Vec<u8>> {
-    let plaintext = crate::daemon::backup::packing::rebuild_plaintext_from_db(db, block_record)
-        .map_err(|e| anyhow::anyhow!("rebuild plaintext: {e}"))?;
+    let (db, block, key, scope) = (db.clone(), block_record.clone(), *epoch_key, scope.clone());
+    tokio::task::spawn_blocking(move || rebuild_blob_blocking(&db, &block, &key, &scope))
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))?
+}
 
-    let epoch_key_owned = *epoch_key;
-    let stored =
-        tokio::task::spawn_blocking(move || compress_and_encrypt(&plaintext, &epoch_key_owned))
-            .await
-            .map_err(|e| anyhow::anyhow!("spawn_blocking join: {e}"))?
-            .map_err(|e| anyhow::anyhow!("compress_and_encrypt: {e}"))?;
-
+/// Rebuild, seal and check the blob of `block_record` (blocking: reads files, compresses,
+/// encrypts). The plaintext is rebuilt by content (`rebuild::rebuild_candidate`, INV-RB);
+/// its error keeps its type under the "rebuild plaintext" context, so a caller can tell
+/// `RebuildError::SourceMissing` apart. Gone paths go to `scope.recheck`. A legacy
+/// candidate (members read unchecked, a catalog from before L1) is kept only when the
+/// sealed blob matches the block id (WARN); otherwise its `SourceMissing` is returned.
+/// The PoS issuance and the worker both come here.
+pub fn rebuild_blob_blocking(
+    db: &viaticum_core::db::Db,
+    block_record: &viaticum_core::types::SourceBlockRecord,
+    epoch_key: &[u8; 32],
+    scope: &super::rebuild::RebuildScope,
+) -> anyhow::Result<Vec<u8>> {
+    use anyhow::Context;
+    let super::rebuild::Candidate {
+        plaintext,
+        legacy_of,
+    } = super::rebuild::rebuild_candidate(db, block_record, scope).context("rebuild plaintext")?;
+    // N1: sealed at the record's generation (0 for every block before L1b). One buffer
+    // (F3), and the plaintext goes as soon as it is sealed: the blob check needs only the
+    // blob.
+    let stored = seal_plaintext(&plaintext, epoch_key, block_record.seal_generation)
+        .map_err(|e| anyhow::anyhow!("seal at generation {}: {e}", block_record.seal_generation))?;
+    drop(plaintext);
     let hash: [u8; 32] = *blake3::hash(&stored).as_bytes();
     if hash != block_record.block_id.0 {
+        if let Some(e) = legacy_of {
+            return Err(anyhow::Error::new(e).context("rebuild plaintext"));
+        }
         anyhow::bail!(
             "rebuilt blob hash {} != expected {}",
             viaticum_core::types::hex_encode(&hash),
             block_record.block_id
+        );
+    }
+    if legacy_of.is_some() {
+        tracing::warn!(
+            block_id = %block_record.block_id,
+            "rebuild: member(s) read unchecked from their own path matched the block \
+             (a catalog from before L1: version hash differs from the packed bytes)"
         );
     }
     Ok(stored)

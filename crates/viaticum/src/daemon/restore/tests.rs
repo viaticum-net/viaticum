@@ -53,7 +53,6 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         epoch_key: TEST_EPOCH_KEY,
         device_id: DeviceId([1u8; 32]),
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
@@ -62,6 +61,8 @@ fn test_backup_coord(db: Db, symbols_dir: &TempDir) -> BackupCoordinator {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     };
     BackupCoordinator::new(db, config, Arc::new(RaptorQEncoder::new()))
 }
@@ -113,6 +114,7 @@ fn make_record_with_versions(versions: Vec<FileVersion>) -> FileRecord {
         devices: vec![],
         versions,
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     }
 }
 
@@ -249,6 +251,7 @@ fn prefix_restore_finds_multiple_files() {
                 backed_up_at: Some(Timestamp(id * 2000)),
             }],
             first_seen: Timestamp(0),
+            on_disk_confirmed: true,
         }
     };
 
@@ -319,6 +322,78 @@ fn extract_from_pack_unknown_file_id_returns_none() {
 
     let result = super::pipeline::extract_from_pack(&plaintext, FileId(99)).unwrap();
     assert!(result.is_none());
+}
+
+// ─── restore-i38: a member by file_id, else by content hash (К4) ─────────────
+
+/// Pack plaintext of members `(file_id, bytes)` in order.
+fn pack_of(members: &[(u64, &[u8])]) -> Vec<u8> {
+    let mut offset = 0u64;
+    let entries: Vec<PackEntry> = members
+        .iter()
+        .map(|(id, bytes)| {
+            let e = PackEntry {
+                file_id: FileId(*id),
+                offset,
+                size: bytes.len() as u64,
+            };
+            offset += bytes.len() as u64;
+            e
+        })
+        .collect();
+    let mut plaintext = to_cbor_bytes(&entries);
+    for (_, bytes) in members {
+        plaintext.extend_from_slice(bytes);
+    }
+    plaintext
+}
+
+/// A copy or a renamed path has a fresh `file_id` that is not in the pack: its bytes
+/// are found by the version's content hash.
+#[test]
+fn extract_by_file_id_absent_falls_back_to_content_hash() {
+    let plaintext = pack_of(&[(1, b"first member"), (2, b"second member")]);
+    let h = *blake3::hash(b"second member").as_bytes();
+
+    let got = super::pipeline::extract_member(&plaintext, FileId(77), &h).unwrap();
+
+    assert_eq!(got.as_deref(), Some(&b"second member"[..]));
+}
+
+/// After a swap inside one pack, the record's own member holds the other file's
+/// content: the member whose bytes have the version's hash is returned.
+#[test]
+fn extract_by_file_id_with_wrong_bytes_falls_back_to_content_hash() {
+    let plaintext = pack_of(&[(1, b"content of d1"), (2, b"content of d2")]);
+    let h_d2 = *blake3::hash(b"content of d2").as_bytes();
+
+    let got = super::pipeline::extract_member(&plaintext, FileId(1), &h_d2).unwrap();
+
+    assert_eq!(got.as_deref(), Some(&b"content of d2"[..]));
+}
+
+/// No member has the content and none has the record's `file_id`: `None` (restore
+/// reports it as `PackIndexParseFailed`).
+#[test]
+fn extract_fails_when_no_entry_matches_hash() {
+    let plaintext = pack_of(&[(1, b"aaa"), (2, b"bbb")]);
+    let h = *blake3::hash(b"ccc").as_bytes();
+
+    let got = super::pipeline::extract_member(&plaintext, FileId(7), &h).unwrap();
+
+    assert!(got.is_none());
+}
+
+/// A catalog from before L1: the version's hash is of other bytes than those packed.
+/// No member has it, so the member packed under the record's `file_id` is returned.
+#[test]
+fn extract_falls_back_to_file_id_member_when_no_member_has_the_hash() {
+    let plaintext = pack_of(&[(1, b"bytes packed at flush"), (2, b"bbb")]);
+    let h_at_enqueue = *blake3::hash(b"bytes seen at enqueue").as_bytes();
+
+    let got = super::pipeline::extract_member(&plaintext, FileId(1), &h_at_enqueue).unwrap();
+
+    assert_eq!(got.as_deref(), Some(&b"bytes packed at flush"[..]));
 }
 
 // ─── Roundtrip tests (backup → restore) ──────────────────────────────────────
@@ -734,6 +809,7 @@ fn catalog_record(path: &str, id: u64) -> FileRecord {
         devices: vec![],
         versions: vec![make_version(Some(200))],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     }
 }
 
@@ -962,9 +1038,11 @@ async fn one_unrecoverable_block_does_not_abort_remaining_blocks() {
             backed_up_at: Some(Timestamp(200)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     })
     .unwrap();
     db.upsert_source_block(&SourceBlockRecord {
+        seal_generation: 0,
         block_id: bad_block,
         k: 2,
         t: 65_535,
@@ -1180,11 +1258,13 @@ async fn path_traversal_from_db_record_is_rejected() {
             backed_up_at: Some(Timestamp(200)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&record).unwrap();
 
     // Insert a source block record.
     let source_block = SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 2,
         t: 65_535,
@@ -1273,6 +1353,7 @@ fn extract_and_write_file_rejects_path_traversal() {
                 backed_up_at: Some(Timestamp(200)),
             }],
             first_seen: Timestamp(0),
+            on_disk_confirmed: true,
         };
         let version = record.versions[0].clone();
         let plaintext = b"malicious payload";
@@ -1542,9 +1623,14 @@ async fn place_on_fake_holders_with_status(
         .get_source_block(&version.source_block_id)
         .unwrap()
         .unwrap();
-    let blob = crate::daemon::backup::pipeline::rebuild_source_blob(db, &block, &TEST_EPOCH_KEY)
-        .await
-        .unwrap();
+    let blob = crate::daemon::backup::pipeline::rebuild_source_blob(
+        db,
+        &block,
+        &TEST_EPOCH_KEY,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
     let params = block.erasure_params();
     let enc = RaptorQEncoder::new();
     let raws = enc.encode_raw(&blob, &params, 0, params.n).unwrap();
@@ -1738,6 +1824,7 @@ fn not_backed_up_record(path: &str, id: u64) -> FileRecord {
             backed_up_at: None,
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     }
 }
 
@@ -2298,5 +2385,56 @@ async fn block_fetch_has_no_deadline_slow_holders_past_60s_still_decode() {
         t0.elapsed() >= std::time::Duration::from_secs(85),
         "30 s + 30 s + 25 s at least: {:?}",
         t0.elapsed()
+    );
+}
+
+/// backup-i5 (J1): the local tier reads no source file above this machine's size limit. The
+/// source is there and within reach, but over the limit: the block comes from the network,
+/// and no request is made in the control run, where the limit admits the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_tier_does_not_read_source_over_the_size_limit_and_goes_to_the_network() {
+    let db = Db::open_in_memory().unwrap();
+    let (symbols_dir, files_dir, staging_dir) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let content = b"the file that outgrew the limit".repeat(100);
+    let path = backup_one(&db, &symbols_dir, files_dir.path(), "big.bin", &content);
+    let holders = Arc::new(FakeHolders::default());
+    place_on_fake_holders(&db, &path, &holders).await;
+    let block = db.get_file(&path).unwrap().unwrap().versions[0].source_block_id;
+    let rec = db.get_source_block(&block).unwrap().unwrap();
+    let size = std::fs::metadata(&path).unwrap().len();
+    let decode = |limit: u64| {
+        let mut coord = coord_with_source(db.clone(), &staging_dir, Some(holders.clone()));
+        coord.config.max_source_bytes = limit;
+        let rec = rec.clone();
+        async move {
+            coord
+                .decode_block_local(
+                    &block,
+                    &rec.erasure_params(),
+                    rec.encrypted_size.unwrap(),
+                    &mut NoAnswerPauses::new(JobId::new(), 1),
+                )
+                .await
+        }
+    };
+
+    // Control: the limit admits the file, the local tier serves it, the network is not asked.
+    let plaintext = decode(size).await.unwrap();
+    assert!(plaintext.ends_with(&content));
+    assert!(
+        holders.requests.lock().unwrap().is_empty(),
+        "within the limit the source serves the block"
+    );
+
+    // One byte under the file's size: not read, the holders are asked, the bytes are right.
+    let plaintext = decode(size - 1).await.unwrap();
+    assert!(plaintext.ends_with(&content));
+    assert!(
+        !holders.requests.lock().unwrap().is_empty(),
+        "over the limit the block comes from the network"
     );
 }

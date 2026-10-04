@@ -16,6 +16,9 @@ fn make_status(peers: Vec<PeerSummary>) -> StatusData {
         blocks_needing_repair: 1,
         peers,
         effective_quota_bytes: 10_000_000,
+        quota_state: "bytes".into(),
+        quota_note: String::new(),
+        below_reserve_giving_back_bytes: None,
         used_bytes: 500,
         pos_total_challenges: 42,
         pos_total_passes: 40,
@@ -44,6 +47,9 @@ fn make_status(peers: Vec<PeerSummary>) -> StatusData {
         dr_waiting_since: 0,
         dr_waiting: String::new(),
         dr_restores_state_of: 0,
+        files_too_large: 0,
+        max_file_size_bytes: 0,
+        block_work_budget_bytes: 0,
     }
 }
 

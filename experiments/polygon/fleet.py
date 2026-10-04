@@ -536,8 +536,9 @@ class Fleet:
           3. `viaticum --data-dir <node_dir> dr --mnemonic '<phrase>' --peer <peer_addr>`
              (capture output; success iff exit 0 AND output says "restore successful"/
              "restored" — same grep local_dr_test.sh uses);
-          4. on success, re-apply the node's polygon config (dr writes a default config
-             with web_api disabled, so the CLI could not reach the daemon otherwise) and
+          4. on success, re-apply the node's polygon config (dr writes the init default
+             config: web_api enabled on the fixed 127.0.0.1:7383, which every node of the
+             fleet on this host would share — P2 wants the plan's ephemeral ports) and
              relaunch the daemon + reconnect to the seed, so the caller can then drive
              per-file `request_restore` / `find_restored` (tier-2 network fetch).
 
@@ -605,8 +606,9 @@ class Fleet:
             return False
         self.log(f"[dr] {label}: dr restore successful (metadata recovered from holders)")
 
-        # 4. dr wrote a DEFAULT config (web_api disabled) — re-apply the node's polygon
-        #    config so the CLI can reach the relaunched daemon, then relaunch + reconnect.
+        # 4. dr wrote the init DEFAULT config (web_api on the fixed 127.0.0.1:7383, shared
+        #    by every fleet node on this host) — re-apply the node's polygon config (P2:
+        #    ephemeral ports), then relaunch + reconnect.
         plan = self._plans.get(label)
         toml_text = getattr(plan, "config_toml", None) if plan is not None else None
         if toml_text:

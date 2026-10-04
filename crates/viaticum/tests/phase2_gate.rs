@@ -65,7 +65,6 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         epoch_key: EPOCH_KEY,
         device_id: DEVICE_A,
         mock_holders: test_holders(),
-        cluster_state: None,
         watch_configs: vec![],
         time_scale: 1,
         mock_offer_budget_gb: None,
@@ -74,6 +73,8 @@ fn backup_config(symbols_dir: &TempDir) -> BackupConfig {
         live_watch_configs: None,
         peer_backoff: None,
         work_event_tx: None,
+        resubmit_tx: None,
+        max_file_size_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
     }
 }
 

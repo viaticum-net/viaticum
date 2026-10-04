@@ -12,6 +12,7 @@ pub mod mailbox;
 pub mod metrics;
 pub mod network;
 pub mod peer_backoff;
+pub mod pos_memo;
 pub mod processor;
 pub mod repair;
 pub mod restart;

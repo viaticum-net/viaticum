@@ -4,10 +4,9 @@
 // (not the run() loop) to avoid real timers and network connections.
 // The PendingChallenges map is used as the primary observable output.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use viaticum_core::db::Db;
 use viaticum_core::messages::{
     MailboxFetchRequest, MailboxFetchResponse, MailboxStoreRequest, MailboxStoreResponse,
@@ -23,6 +22,23 @@ use crate::daemon::repair::RepairTrigger;
 use crate::daemon::scheduler::{
     PendingChallenges, PendingHashChallenge, Scheduler, SchedulerConfig,
 };
+
+// pos-i6/pos-i7 (СТ-0c): the pending index, the issue tick, the trust memory.
+mod pos_scale;
+// pos-i4: a stale verdict is written neither to the weekly counters nor to trust.
+mod stale_verdict;
+// pos-i7-a: the issue tick is bounded by its budget; each challenge is stamped at publish.
+mod issue_budget;
+// pos-i7-a, pos-i7-c: the order of due blocks (least recently tried first).
+mod issue_order;
+// СТ-0c round 4: the tick keeps its budget when the database or a preparation stalls.
+mod issue_stall;
+// pos-i7-d-a: a preparation cut at the deadline finishes in the background and publishes.
+mod issue_prepare;
+// The shared owner / postman set-up of the issue-tick tests.
+mod issue_support;
+// backup-i7: the load-failure WARN of a PoS block once per day.
+mod pos_load_warn;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -83,7 +99,7 @@ fn make_placement(block_id: SourceBlockId, holder_id: DeviceId) -> SymbolPlaceme
 }
 
 fn make_pending_challenges() -> PendingChallenges {
-    Arc::new(Mutex::new(HashMap::new()))
+    crate::daemon::scheduler::new_pending_challenges()
 }
 
 fn make_test_encoder() -> std::sync::Arc<dyn viaticum_core::erasure::ErasureEncoder> {
@@ -251,7 +267,7 @@ async fn check_timeouts_ignores_fresh_challenges() {
 /// PendingChallenges can be cloned and accessed concurrently from two tasks.
 #[tokio::test]
 async fn pending_challenges_shared_between_tasks() {
-    let pending: PendingChallenges = Arc::new(Mutex::new(HashMap::new()));
+    let pending: PendingChallenges = make_pending_challenges();
     let block_id = make_block_id(10);
     let holder_id = make_identity(11);
 
@@ -608,11 +624,13 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).unwrap();
 
     // Source block: Active.
     let sb = SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 100,
         t: 65535,
@@ -999,11 +1017,13 @@ async fn already_deleting_holder_is_not_republished() {
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).unwrap();
 
     // Source block: Active.
     let sb = SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 10,
         t: 65535,
@@ -1178,12 +1198,14 @@ fn make_multi_holder_file(
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     }
 }
 
 fn make_active_block(block_id: SourceBlockId) -> viaticum_core::types::SourceBlockRecord {
     use viaticum_core::types::{SourceBlockRecord, SourceBlockStatus, SourceBlockType};
     SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 10,
         t: 65535,
@@ -1582,10 +1604,12 @@ async fn delete_not_marked_sent_when_publish_zero_acks() {
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).unwrap();
 
     let sb = SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 100,
         t: 65535,
@@ -1701,7 +1725,7 @@ async fn cleanup_block_removes_db_record() {
     let data_dir = tempfile::TempDir::new().expect("tempdir");
 
     let block_id = make_block_id(0xC1);
-    let holder_id = make_identity(0xC2);
+    let holder_id = make_identity(0xB2);
     let device_id = DeviceId([0xC3u8; 32]);
 
     // File: single device, fully deleted at time 0.
@@ -1722,11 +1746,13 @@ async fn cleanup_block_removes_db_record() {
             backed_up_at: Some(Timestamp(0)),
         }],
         first_seen: Timestamp(0),
+        on_disk_confirmed: true,
     };
     db.upsert_file(&file).unwrap();
 
     // Source block: already in Deleting state.
     let sb = viaticum_core::types::SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 10,
         t: 65535,
@@ -1801,6 +1827,7 @@ fn make_block_for_hook(
     current_reliability: f64,
 ) -> viaticum_core::types::SourceBlockRecord {
     viaticum_core::types::SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: 5,
         t: 1,
@@ -2059,13 +2086,13 @@ impl MailboxNetworkSender for AckMailboxSender {
 //
 // To exercise issue_due_challenges() end-to-end we need:
 //   1. A SourceBlockRecord with valid erasure params (k, t, n, overhead).
-//   2. The block's source bytes available to `load_source_block_data`.
+//   2. The block's source bytes available to `issue::prepare::load_source_block`.
 //   3. A SymbolPlacement for a holder with known ESI ranges.
 //   4. A PeerRecord for the holder (so trust lookup doesn't panic).
 //
 // Minimal params: k=10, t=64 → block size = 640 bytes; k_eff=13, n=20, overhead=1.5.
 //
-// PL-6: the on-disk `block.bin` tier of `load_source_block_data` was removed. These
+// PL-6: the on-disk `block.bin` tier of `issue::prepare::load_source_block` was removed. These
 // tests now serve the block's bytes via the SystemState retained-blob tier
 // (`<data_dir>/system_state/<hex>.bin`, verified blake3(blob) == block_id), which is a
 // live tier. Because that tier is content-addressed, the block_id is DERIVED from the
@@ -2079,6 +2106,7 @@ fn make_source_block_record(block_id: SourceBlockId) -> viaticum_core::types::So
     let k_eff = TEST_K + viaticum_core::constants::DECODE_OVERHEAD;
     let n = (k_eff as f64 * 1.5).ceil() as u32;
     SourceBlockRecord {
+        seal_generation: 0,
         block_id,
         k: TEST_K,
         t: TEST_T,
@@ -2104,7 +2132,7 @@ fn pos_block_bytes(seed: u8) -> Vec<u8> {
 }
 
 /// Seed a content-addressed source block for PoS tests: write the block bytes as a
-/// retained blob under `data_dir` (the live tier `load_source_block_data` reads first)
+/// retained blob under `data_dir` (the live tier `issue::prepare::load_source_block` reads first)
 /// and upsert a matching `SourceBlockRecord`. Returns the derived block_id.
 ///
 /// Replaces the old `write_block_bin` (which exploited the now-removed on-disk
@@ -2307,6 +2335,87 @@ async fn pos_challenge_stored_in_mailbox_with_correct_ttl() {
     );
 }
 
+/// repair-i9 made multi-range placements normal (own range + fresh numbers). The owner's
+/// expected PoS hash for a 2-range placement (source and repair ESIs, with a gap) must be the
+/// chain hash of exactly the holder's bound symbols — the union is encoded once
+/// (`encode_raw_ranges`) and every range's symbols must be in it.
+#[tokio::test]
+async fn issue_due_challenges_for_two_range_placement_expects_hash_of_bound_symbols() {
+    use viaticum_core::erasure::ErasureEncoder;
+    use viaticum_core::pos::compute_chain_hash;
+
+    let db = Db::open_in_memory().expect("db open");
+    let data_dir = tempfile::TempDir::new().unwrap();
+    // 0xB2: a byte pattern that is a valid ed25519 key, so the mailbox router can derive a
+    // PeerId and publish (e.g. [0xC2; 32] is not — the challenge would never go out).
+    let holder_id = make_identity(0xB2);
+    let block_id = seed_retained_pos_block(data_dir.path(), &db, 0xB1);
+    let ranges = vec![(2u32, 3u32), (15, 2)];
+    let mut placement = make_placement(block_id, holder_id);
+    placement.esi_ranges = ranges.clone();
+    db.upsert_placement(&placement).unwrap();
+    db.upsert_peer(&make_peer_record(holder_id)).unwrap();
+
+    let recording_sender = Arc::new(RecordingMailboxSender::new());
+    let router = Arc::new(MailboxRouter::with_sender(
+        Arc::clone(&recording_sender) as Arc<dyn MailboxNetworkSender>,
+        db.clone(),
+    ));
+    let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
+    let pending = make_pending_challenges();
+    let scheduler = Scheduler::new(
+        db.clone(),
+        SchedulerConfig {
+            pos_interval_secs: 3600,
+            timeout_check_secs: 3600,
+            time_scale: 1,
+            event_log_retain_rows: 100_000,
+            pos_weekly_retain_weeks: viaticum_core::constants::P_WINDOW_WEEKS * 2,
+        },
+        repair_tx,
+        pending.clone(),
+        router,
+        dummy_master_pub(),
+        ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng),
+        crate::daemon::processor::make_empty_accepted_offers(),
+        make_test_encoder(),
+        TEST_EPOCH_KEY,
+        data_dir.path().to_path_buf(),
+    );
+
+    scheduler
+        .issue_due_challenges()
+        .await
+        .expect("issue_due_challenges");
+
+    let guard = pending.lock().await;
+    let issued = guard
+        .get(&(block_id, holder_id))
+        .expect("challenge issued for the 2-range placement");
+    assert_eq!(issued.esi_ranges, ranges);
+
+    // What the holder stores: each range encoded on its own, bound to the holder.
+    let encoder = RaptorQEncoder::new();
+    let blob = pos_block_bytes(0xB1);
+    let params = make_source_block_record(block_id).erasure_params();
+    let mut bound: Vec<(u32, Vec<u8>)> = ranges
+        .iter()
+        .flat_map(|&(start, count)| encoder.encode_raw(&blob, &params, start, count).unwrap())
+        .map(|raw| {
+            let s = encoder.apply_binding(raw, &block_id, &holder_id);
+            (s.esi, s.data)
+        })
+        .collect();
+    bound.sort_by_key(|(esi, _)| *esi);
+    assert_eq!(bound.len(), 5);
+    let refs: Vec<(u32, &[u8])> = bound.iter().map(|(e, d)| (*e, d.as_slice())).collect();
+    let want = compute_chain_hash(&issued.challenge_id, &refs).unwrap();
+    assert_eq!(
+        issued.expected_chain_hash, want,
+        "expected hash = chain hash of the holder's 5 bound symbols over both ranges"
+    );
+}
+
 // ─── T-6 test: PosResponse via mailbox resolves pending challenge ─────────────
 
 /// Owner side: handle_pos_response_from_mailbox resolves a pending challenge.
@@ -2319,7 +2428,7 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
 
     let db = Db::open_in_memory().expect("db open");
     let block_id = make_block_id(0xC1);
-    let holder_id = make_identity(0xC2);
+    let holder_id = make_identity(0xB2);
     let challenge_id = [0x42u8; 16];
 
     // Insert placement and peer record.

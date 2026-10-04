@@ -200,6 +200,17 @@ fn placement_key(block_id: &SourceBlockId, holder: &DeviceId) -> [u8; 64] {
     key
 }
 
+/// SYMBOL_PLACEMENTS key range of one block: keys are [block_id(32) || holder(32)], so
+/// [block_id||00..] to [block_id||FF..].
+fn placement_range(block_id: &SourceBlockId) -> ([u8; 64], [u8; 64]) {
+    let mut lo = [0u8; 64];
+    let mut hi = [0u8; 64];
+    lo[..32].copy_from_slice(&block_id.0);
+    hi[..32].copy_from_slice(&block_id.0);
+    hi[32..].fill(0xFF);
+    (lo, hi)
+}
+
 /// CONTENT_INDEX key: content_hash (32 bytes) ++ path bytes. The fixed-width hash
 /// prefix lets a range scan select all paths for a given content hash.
 fn content_index_key(content_hash: &[u8; 32], path: &str) -> Vec<u8> {
@@ -442,6 +453,8 @@ impl Db {
             tx.open_table(MAILBOX_SP_BYTES_BY_TARGET)?;
             tx.open_table(PAIR_LEDGER)?;
             tx.open_table(PAIR_LEDGER_PENDING_DROPS)?;
+            // backup-i4: too-large source marks (node-local; outside snapshot_db).
+            tx.open_table(too_large::TOO_LARGE_SOURCES)?;
             // DN-1: applied signed letters + their expiry index (outside snapshot_db, 4r-i51).
             tx.open_table(seen_signed_letters::SEEN_SIGNED_LETTERS)?;
             tx.open_table(seen_signed_letters::SEEN_SIGNED_LETTERS_BY_EXPIRY)?;
@@ -756,6 +769,34 @@ impl Db {
         Ok(())
     }
 
+    /// Test seam (backup-i23): overwrite the PEERS row of `device` with bytes that do not
+    /// decode as a `PeerRecord`, so [`Db::list_all_peers`] answers `Err` — a DB error
+    /// before any block is built (candidate selection).
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn corrupt_peer_row_for_test(&self, device: &DeviceId) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(PEERS)?;
+            table.insert(&device.0, [0xffu8, 0x00, 0x13].as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Test seam (backup-i23): overwrite the FILES row at `path` with bytes that do not
+    /// decode as a `FileRecord`, so [`Db::get_file`] answers `Err` — a DB error inside the
+    /// packing pipeline, not a missing record. CONTENT_INDEX is left as it was.
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn corrupt_file_row_for_test(&self, path: &str) -> Result<(), DbError> {
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(FILES)?;
+            table.insert(path, [0xffu8, 0x00, 0x13].as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Access hot cache for read.
     ///
     /// If the lock is poisoned (another thread panicked while holding write access),
@@ -883,35 +924,22 @@ impl Db {
         Ok(paths)
     }
 
-    /// True if any file has a backed-up version with this content hash (B-1 indexed).
-    /// Replaces an O(N) full FILES scan in the import dedup path.
-    pub fn is_content_backed_up(&self, content_hash: &[u8; 32]) -> Result<bool, DbError> {
-        for path in self.paths_for_content_hash(content_hash)? {
-            if let Some(rec) = self.get_file(&path)?
-                && rec
-                    .versions
-                    .iter()
-                    .any(|v| &v.content_hash == content_hash && v.backed_up_at.is_some())
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// First file record holding a version with this content hash (B-1 indexed).
-    pub fn find_file_by_content_hash(
+    /// Every file record holding a version with `content_hash` (B-1 indexed, via
+    /// CONTENT_INDEX), in path order. The caller decides which of them may serve as a
+    /// dedup source (backup-i9: only a backed-up version) or as a rebuild candidate.
+    pub fn files_with_content_hash(
         &self,
         content_hash: &[u8; 32],
-    ) -> Result<Option<FileRecord>, DbError> {
+    ) -> Result<Vec<FileRecord>, DbError> {
+        let mut records = Vec::new();
         for path in self.paths_for_content_hash(content_hash)? {
             if let Some(rec) = self.get_file(&path)?
                 && rec.versions.iter().any(|v| &v.content_hash == content_hash)
             {
-                return Ok(Some(rec));
+                records.push(rec);
             }
         }
-        Ok(None)
+        Ok(records)
     }
 
     /// List files with path starting with prefix.
@@ -1456,12 +1484,7 @@ impl Db {
         let tx = self.inner.begin_read()?;
         let table = tx.open_table(SYMBOL_PLACEMENTS)?;
         let mut records = Vec::new();
-        // Keys are [block_id(32) || holder(32)]. Range: [block_id||00..] to [block_id||FF..].
-        let mut lo = [0u8; 64];
-        let mut hi = [0u8; 64];
-        lo[..32].copy_from_slice(&block_id.0);
-        hi[..32].copy_from_slice(&block_id.0);
-        hi[32..].fill(0xFF);
+        let (lo, hi) = placement_range(block_id);
         for item in table.range::<&[u8; 64]>(&lo..=&hi)? {
             let (_, v) = item?;
             let record: SymbolPlacement = from_cbor_bytes(v.value())?;
@@ -3356,8 +3379,14 @@ pub mod testutil {
 /// DN-1: applied signed letters by signature (`seen_signed_letters` + expiry index).
 mod seen_signed_letters;
 
+mod serviceability;
+pub use serviceability::{Serviceability, serviceability_of};
+
 /// В-0: 4R holder state (`four_r_state`: the relay latch row).
 mod four_r_state;
+
+/// backup-i4: too-large source marks (`too_large_sources`), node-local.
+mod too_large;
 
 #[cfg(test)]
 mod tests;

@@ -106,6 +106,7 @@ fn stress_5tb_metadata_scale() {
     // 1a. Insert N_BLOCKS SourceBlockRecords.
     for (i, &block_id) in block_ids.iter().enumerate() {
         let record = SourceBlockRecord {
+            seal_generation: 0,
             block_id,
             k: K,
             t: 65_535,
@@ -197,6 +198,7 @@ fn stress_5tb_metadata_scale() {
                 backed_up_at: Some(NOW),
             }],
             first_seen: NOW,
+            on_disk_confirmed: true,
         };
         db.upsert_file(&record)
             .unwrap_or_else(|e| panic!("upsert_file[{file_idx}]: {e}"));
