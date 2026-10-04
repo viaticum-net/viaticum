@@ -241,8 +241,8 @@ async fn poll_dispatches_entries_before_a_sleeping_postman_answers() {
     );
 }
 
-/// mailbox-i63 (review B1): the poll reads answers for min(15 s, poll period) — 5 s at
-/// time_scale 720 — and then stops. A postman answering at 10 s is not waited for: its
+/// mailbox-i63 (review B1): the poll reads answers for min(15 s, max(poll period, 5 s)) —
+/// 5 s at time_scale 720 — and then stops. A postman answering at 10 s is not waited for: its
 /// record is not handled in this poll (the next poll fetches it again), and its answer
 /// still records the contact (avail, `last_seen`) from its own task.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -287,14 +287,32 @@ async fn poll_stops_reading_at_its_deadline_and_late_answer_still_updates_contac
     );
 }
 
-/// The read budget is one postman's request timeout, capped by the poll period.
+/// The read budget is one postman's request timeout, capped by the poll period, and
+/// never below `POLL_READ_FLOOR` (mailbox-i63-b: a large time_scale must not leave a
+/// postman slower than 1 s unread in every poll).
 #[test]
 fn poll_read_budget_is_the_request_timeout_capped_by_the_poll_period() {
-    use super::super::poll_read_budget;
-    assert_eq!(poll_read_budget(1), Duration::from_secs(15));
+    use super::super::{POLL_READ_FLOOR, poll_read_budget};
+    assert_eq!(POLL_READ_FLOOR, Duration::from_secs(5));
+    assert_eq!(poll_read_budget(1), Duration::from_secs(15), "production");
     assert_eq!(poll_read_budget(240), Duration::from_secs(15));
-    assert_eq!(poll_read_budget(900), Duration::from_secs(4));
-    assert_eq!(poll_read_budget(100_000), Duration::from_secs(1));
+    assert_eq!(
+        poll_read_budget(400),
+        Duration::from_secs(9),
+        "the poll period"
+    );
+    assert_eq!(poll_read_budget(720), Duration::from_secs(5));
+    assert_eq!(
+        poll_read_budget(900),
+        POLL_READ_FLOOR,
+        "period 4 s, floored"
+    );
+    assert_eq!(
+        poll_read_budget(3600),
+        POLL_READ_FLOOR,
+        "period 1 s, floored"
+    );
+    assert_eq!(poll_read_budget(100_000), POLL_READ_FLOOR);
 }
 
 /// mailbox-i69 under streaming: two postmen bring the same msg_id with different payloads

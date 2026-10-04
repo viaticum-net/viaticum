@@ -415,7 +415,7 @@ Addressee (read-fanout):
   MailboxRouter::poll_stream(my_master_pub, since_stored_at)
   → fetch from the MAILBOX_READ_FANOUT (300) closest postman peers
   → handle each postman's answer as it arrives, for at most
-    min(15 s, poll period); a late answer still counts as a contact
+    min(15 s, max(poll period, 5 s)); a late answer still counts as a contact
   → merge only byte-identical entries (msg_id, class, payload hash, sender);
     variants sharing a msg_id all reach the handlers, which check signatures
   → dispatch each entry by class

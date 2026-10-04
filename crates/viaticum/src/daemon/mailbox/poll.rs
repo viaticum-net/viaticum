@@ -52,14 +52,24 @@ pub(crate) fn poll_interval_secs(time_scale: u64) -> u64 {
     (MAILBOX_POLL_INTERVAL_SECS / time_scale.max(1)).max(1)
 }
 
+/// The least time one poll reads the postmen's answers, in real seconds (mailbox-i63-b).
+///
+/// Under a large `time_scale` the poll period floors at 1 s; a read budget that short would
+/// never read an honest postman slower than 1 s, in any poll. With the floor a poll may
+/// outlast the period: the next tick is then skipped (`MissedTickBehavior::Skip` in
+/// `run_mailbox_poll`), not queued.
+pub(crate) const POLL_READ_FLOOR: Duration = Duration::from_secs(5);
+
 /// How long one poll reads the postmen's answers (mailbox-i63): one postman's request
-/// timeout (`PEER_REQUEST_TIMEOUT`, 15 s), never longer than the poll period
-/// (`poll_interval_secs`), so a sleeping postman cannot stretch a poll into the next one.
+/// timeout (`PEER_REQUEST_TIMEOUT`, 15 s), shortened to the poll period
+/// (`poll_interval_secs`) so a sleeping postman does not stretch every poll to 15 s, but
+/// never below `POLL_READ_FLOOR` (mailbox-i63-b). Production (`time_scale` = 1): 15 s.
 /// An answer that comes later still records its contact (avail, `last_seen`) in its own
 /// fetch task (`routing::fetch`); its records stay at the postman until their TTL and come
 /// back on the next poll.
 pub(crate) fn poll_read_budget(time_scale: u64) -> Duration {
-    PEER_REQUEST_TIMEOUT.min(Duration::from_secs(poll_interval_secs(time_scale)))
+    let period = Duration::from_secs(poll_interval_secs(time_scale));
+    PEER_REQUEST_TIMEOUT.min(period.max(POLL_READ_FLOOR))
 }
 
 /// Run the periodic mailbox poll loop.
