@@ -293,31 +293,47 @@ Passed in DeviceCertExchange. The Noise channel provides integrity -- a separate
 
 ## Discovery: Kademlia DHT
 
-### Strategy: shared IPFS DHT initially, own namespace later
+### Strategy: own DHT from day one — no IPFS, no provider namespace
 
-Initially use the shared IPFS DHT (`/ipfs/kad/1.0.0`):
-- 200K+ nodes, bootstrap out of the box (IPFS bootstrap nodes)
-- No chicken-and-egg problem
-- Privacy is a minimal concern (we expose only provider queries, not data)
-- Foreign DHT traffic is negligible (tens of KiB/s routing)
+Viaticum runs its own Kademlia DHT from the first day of the network
+([ADR-003](../decisions/ADR-003-own-kademlia.md)):
 
-When the number of Viaticum nodes is sufficient (~100+) -- switch to the own namespace `/viaticum/kad/1.0.0` + own bootstrap nodes. One line in config.
+- Protocol name `/viaticum/kad/1.0.0`. A node speaking another Kademlia (IPFS's
+  `/ipfs/kad/1.0.0`) cannot query us, is not answered, and is never handed to other
+  peers: identify feeds Kademlia only from peers that announce our protocol, and
+  removes a peer whose identify does not announce it. The one boundary: a foreign
+  address a user puts into `kademlia_bootstrap_peers` gets one dial at start and is
+  dropped from the routing table after identify; it is never handed to other peers.
+- No built-in bootstrap nodes. A node enters the network through the circle's own
+  bootstrap peers (`[network] kademlia_bootstrap_peers`, e.g. a friend's always-on
+  node). The old `kademlia_disable_ipfs_bootstrap` switch is gone; a config that still
+  has it loads and ignores it.
+- No provider namespace. Discovery is FIND_NODE only: the Kademlia bootstrap plus a
+  periodic `get_closest_peers` of our own id; found peers we do not know yet are
+  dialed, and the DeviceCertExchange runs after TCP + Noise. Incoming PUT_VALUE /
+  ADD_PROVIDER are not stored, so every answer of ours is ≤ 20 closer peers with a
+  bounded address set each, so the answer is bounded and fits the default 16 KiB
+  frame with margin.
+
+An earlier plan (ε.3) started on the shared IPFS DHT with a provider record
+(`/viaticum/peers/v1`) and meant to move to an own namespace "at ~100+ nodes". It was
+dropped before any network was deployed: on the shared DHT our nodes dialed public IPFS
+infrastructure and handed IPFS records to each other, and a provider answer could
+outgrow the frame. See ADR-003 for the reasoning and the price (a circle needs a seed).
 
 ### Discovery pattern
 
 ```rust
-// Announce: "I am a Viaticum node"
-let namespace_key = Key::from(sha256(b"/viaticum/peers/v1"));
-kademlia.start_providing(namespace_key)?;
+// Enter: the circle's bootstrap peers, then a Kademlia bootstrap.
+kademlia.add_address(&seed_peer_id, seed_addr);
+kademlia.bootstrap()?;
 
-// Find Viaticum nodes:
-kademlia.get_providers(namespace_key);
-// -> list of PeerId + Multiaddr
+// Find Viaticum nodes: periodically ask for the peers closest to ourselves.
+kademlia.get_closest_peers(local_peer_id);
+// -> PeerId + Multiaddr of each; dial the ones we do not know yet
 
-// Address of a specific peer: identify + Kademlia routing table
+// Address of a specific peer: identify (fed to Kademlia, bounded) + routing table
 ```
-
-Republish every 30 min. MemoryStore with a limit of **10240 records** (default 1024 is too small for 500+ nodes).
 
 ---
 
@@ -407,7 +423,7 @@ struct ViaticumBehaviour {
 }
 ```
 
-MemoryStore: limit 10240 records. On restart -- DHT bootstrap again. A redb-backed store can be added later.
+MemoryStore: `MemoryStore::new` with its defaults, and it stays empty — we provide nothing and incoming PUT_VALUE / ADD_PROVIDER are filtered out (`StoreInserts::FilterBoth`). Only the routing table matters; on restart it is refilled by the DHT bootstrap.
 
 ---
 
@@ -560,10 +576,9 @@ Relay is enabled on all nodes by default, not configurable.
 
 ### Phase 3: Kademlia DHT
 
-- Shared IPFS DHT (`/ipfs/kad/1.0.0`)
-- Bootstrap, periodic publish (start_providing)
+- Own DHT (`/viaticum/kad/1.0.0`), no IPFS, no provider namespace (ADR-003)
+- Bootstrap from the circle's seed, periodic FIND_NODE of our own id
 - PeerRecord keyed by DeviceId
-- MemoryStore limit 10240
 
 ### Phase 4: NAT traversal
 
@@ -591,11 +606,11 @@ Relay is enabled on all nodes by default, not configurable.
 
 ## Open questions
 
-1. **DHT bootstrap from restricted-network countries.** IPFS bootstrap nodes may be unreachable. Self-hosted bootstrap as fallback. Needs testing.
+1. **Seed reachability.** A circle enters the network through its own bootstrap peers (ADR-003). A circle whose only seed is lost or unreachable cannot let new nodes in until another bootstrap address is configured. DNS-based seeds are not implemented.
 
 2. **INHERITANCE_FACTOR (0.3-0.5).** Determine experimentally. Too high -- sybil risk, too low -- slow start.
 
-3. **Switch to own DHT namespace.** At ~100+ Viaticum nodes, switch to `/viaticum/kad/1.0.0` + own bootstrap. One line in config.
+3. ~~**Switch to own DHT namespace.**~~ Done from day one: `/viaticum/kad/1.0.0`, no IPFS (ADR-003).
 
 ---
 

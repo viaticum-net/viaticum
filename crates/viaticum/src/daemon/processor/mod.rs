@@ -20,7 +20,11 @@
 //
 // ε.2 — libp2p wiring:
 //   Processor now consumes ProtocolEvent from SwarmHandle.
-//   PeerAuthenticated → upsert PeerRecord, auto-add cluster device, send PeerAnnounce.
+//   PeerAuthenticated → admission (revocation, peer_cert_map), then the PeerRecord
+//                       writer (peer_record_writer: one ordered queue, batches in one
+//                       transaction, C-DK C4 fix round 3) upserts the record and spawns
+//                       cluster auto-add + PeerAnnounce + wake after the commit.
+//   PeerIdentified    → the same writer, behind the authentication it follows.
 //   InboundRequest    → dispatch_libp2p: match Message variant, call handler, send via ResponseChannel.
 //   ConnectionClosed  → remove from peer_cert_map.
 //
@@ -61,9 +65,12 @@ mod cluster;
 pub mod mailbox;
 mod offer_shadow;
 mod peer;
+mod peer_record_writer;
 mod pos;
 mod restore;
 mod symbol;
+mod work_wake;
+use peer_record_writer::PeerRecordEvent;
 use symbol::TransferResult;
 
 // Re-export for handle/mod.rs wiring (T-6: mailbox poll → PosResponder bridge).
@@ -213,6 +220,11 @@ pub struct Processor {
     pub(crate) shadow_offer_slot: Arc<tokio::sync::Semaphore>,
     /// Offers whose shadow was skipped since the last logged offer shadow.
     pub(crate) shadow_offers_skipped: Arc<std::sync::atomic::AtomicU64>,
+    /// C-DK Р-18: the last work-pipeline wake per device.
+    work_wake: std::sync::Mutex<work_wake::WorkWakeLimiter>,
+    /// C-DK C4 fix round 3: the PeerRecord writer's queue. `run` pushes the
+    /// authentication / identify events, the writer task owns the writes.
+    peer_records: peer_record_writer::PeerRecordQueue,
 }
 
 impl Processor {
@@ -252,6 +264,8 @@ impl Processor {
             four_r: viaticum_core::four_r_holder::FourRParams::default(),
             shadow_offer_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             shadow_offers_skipped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            work_wake: std::sync::Mutex::new(work_wake::WorkWakeLimiter::default()),
+            peer_records: peer_record_writer::PeerRecordQueue::new(peer_record_writer::PENDING_MAX),
         }
     }
 
@@ -290,14 +304,28 @@ impl Processor {
 
     /// Main loop: receive ProtocolEvents from the libp2p swarm.
     ///
-    /// Dispatches each event to its handler in a new tokio::spawn task (I4 preserved).
-    /// - swarm_rx: ProtocolEvent stream from SwarmHandle (PeerAuthenticated, InboundRequest, ConnectionClosed)
+    /// Dispatches each event to its handler in a new tokio::spawn task (I4 preserved);
+    /// PeerRecord events go to the PeerRecord writer task this loop owns — the loop
+    /// never waits for the disk on them.
+    /// - swarm_rx: ProtocolEvent stream from SwarmHandle (PeerAuthenticated, PeerIdentified,
+    ///   InboundRequest, ConnectionClosed)
     pub async fn run(
         self,
         mut swarm_rx: mpsc::Receiver<ProtocolEvent>,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let this = Arc::new(self);
+        // The PeerRecord writer: stopped (after writing what is queued) when
+        // this loop ends, whichever way. Its own token, NOT a child of `cancel`:
+        // a child would stop the writer at the same moment as the loop, and the
+        // loop's `select!` may still take one more event and push it after the
+        // writer has written its last batch — that event would be lost (fix
+        // round 4, N2). Cancelled below, after the loop has ended.
+        let writer_cancel = CancellationToken::new();
+        let writer = tokio::spawn(peer_record_writer::run_writer(
+            this.clone(),
+            writer_cancel.clone(),
+        ));
 
         info!("processor running");
 
@@ -322,13 +350,23 @@ impl Processor {
                             x25519_pub,
                             listen_addrs,
                         }) => {
-                            let this2 = this.clone();
-                            tokio::spawn(async move {
-                                this2.on_peer_authenticated(
-                                    peer_id, device_id, identity_pub, device_cert, x25519_pub,
-                                    listen_addrs,
-                                ).await;
-                            });
+                            // Admission here (revocation, peer_cert_map: no write);
+                            // the PeerRecord to the writer, in the swarm's order,
+                            // without waiting for it (C-DK C4 fix round 3). The
+                            // writer spawns the after-steps once the record is
+                            // committed.
+                            let _ = peer_id;
+                            if this.admit_authenticated(device_id, identity_pub, &device_cert)
+                                && !this.peer_records.push(PeerRecordEvent::Authenticated {
+                                    device_id,
+                                    identity_pub,
+                                    device_cert: Box::new(device_cert),
+                                    x25519_pub,
+                                    listen_addrs: peer::addr_strings(&listen_addrs),
+                                })
+                            {
+                                this.swarm.note_peer_record_dropped();
+                            }
                         }
                         Some(ProtocolEvent::InboundRequest {
                             from_device,
@@ -389,16 +427,24 @@ impl Processor {
                             });
                         }
                         Some(ProtocolEvent::PeerIdentified { device_id, listen_addrs }) => {
-                            let this2 = this.clone();
-                            tokio::spawn(async move {
-                                this2.on_peer_identified(device_id, listen_addrs).await;
-                            });
+                            // To the writer, behind the authentication it follows.
+                            if !this.peer_records.push(PeerRecordEvent::Identified {
+                                device_id,
+                                listen_addrs: peer::addr_strings(&listen_addrs),
+                            }) {
+                                this.swarm.note_peer_record_dropped();
+                            }
                         }
                     }
                 }
             }
         }
 
+        // Every push of this loop is done: now the writer may write the rest and stop.
+        writer_cancel.cancel();
+        if let Err(e) = writer.await {
+            error!(err = %e, "processor: PeerRecord writer task failed");
+        }
         Ok(())
     }
 

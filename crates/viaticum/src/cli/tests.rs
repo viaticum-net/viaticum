@@ -260,6 +260,11 @@ fn make_status_zero_peers() -> StatusData {
         peer_count: 0,
         peer_count_connected: 0,
         peer_count_authenticated: 0,
+        peer_count_known: 0,
+        known_devices: None,
+        unaddressed_devices: None,
+        authenticated_devices: None,
+        conn_cache: Default::default(),
         avg_trust: 0.0,
         holding_bytes: 0,
         backed_up_files: 0,
@@ -343,6 +348,21 @@ fn status_data_without_staging_fields_deserializes_with_zero() {
     assert_eq!(back.restore_staging_jobs, 0);
     assert_eq!(back.restore_staging_bytes, None);
     assert!(!back.restore_staging_squeezes_holdings);
+}
+
+/// C-DK C4 fix round 4 (N8): `peer_record_dropped` is a top-level status field (the
+/// connection-cache block is flattened); a daemon without it reads as 0.
+#[test]
+fn status_peer_record_dropped_is_top_level_and_defaults_to_zero() {
+    let mut data = make_status_zero_peers();
+    data.conn_cache.peer_record_dropped = 7;
+    let mut v = serde_json::to_value(&data).unwrap();
+    assert_eq!(v["peer_record_dropped"], 7, "flattened into the top level");
+    let back: StatusData = serde_json::from_value(v.clone()).unwrap();
+    assert_eq!(back.conn_cache.peer_record_dropped, 7);
+    v.as_object_mut().unwrap().remove("peer_record_dropped");
+    let old: StatusData = serde_json::from_value(v).unwrap();
+    assert_eq!(old.conn_cache.peer_record_dropped, 0);
 }
 
 /// W3: right after start the byte count is not known yet: say so, never "0 B".
@@ -454,6 +474,11 @@ fn format_status_top_peers_printed() {
         peer_count: 2,
         peer_count_connected: 2,
         peer_count_authenticated: 2,
+        peer_count_known: 0,
+        known_devices: None,
+        unaddressed_devices: None,
+        authenticated_devices: None,
+        conn_cache: Default::default(),
         avg_trust: 2.09,
         holding_bytes: 0,
         backed_up_files: 0,
@@ -946,6 +971,11 @@ fn cli_response_roundtrips_cbor() {
             peer_count: 3,
             peer_count_connected: 3,
             peer_count_authenticated: 3,
+            peer_count_known: 0,
+            known_devices: None,
+            unaddressed_devices: None,
+            authenticated_devices: None,
+            conn_cache: Default::default(),
             avg_trust: 1.5,
             holding_bytes: 1_000_000,
             backed_up_files: 10,

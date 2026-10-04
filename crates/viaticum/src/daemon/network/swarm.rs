@@ -6,7 +6,8 @@
 //   - ViaticumBehaviour: composed NetworkBehaviour (viaticum + cert + identify + kad)
 //   - SwarmHandle: public API to the event loop
 //   - EventLoopState: private state machine running in a tokio task
-//   - Kademlia DHT: automatic Viaticum peer discovery via the shared IPFS DHT (ε.3)
+//   - Kademlia DHT: automatic Viaticum peer discovery over FIND_NODE (ε.3, C-DK)
+//     on our own DHT, `/viaticum/kad/1.0.0` — no IPFS (network-i17, ADR-003)
 //
 // Identity model:
 //   device_signing_key → Ed25519 keypair → PeerId (libp2p transport identity)
@@ -14,10 +15,29 @@
 //   Noise IX authenticates both ends at transport level.
 //   DeviceCertExchange adds protocol-level proof of cluster membership.
 //
-// Kademlia discovery:
-//   All Viaticum nodes publish and discover via sha256("/viaticum/peers/v1")
-//   on the shared /ipfs/kad/1.0.0 DHT. Discovery is passive: found peers are
-//   dialed; DeviceCertExchange runs automatically after TCP+Noise connects.
+// Kademlia discovery (C-DK C2, C3):
+//   Our own DHT: the protocol is KAD_PROTOCOL, the only way in is the circle's
+//   `kademlia_bootstrap_peers`, and identify feeds Kademlia only peers that
+//   announce KAD_PROTOCOL — so an IPFS (or any other) Kademlia node never
+//   enters our table and is never handed out by our lookups (network-i17). A
+//   foreign address a user put into the bootstrap list gets one dial at start
+//   and is dropped from the table after its identify.
+//   FIND_NODE only — the Kademlia bootstrap plus a periodic get_closest_peers
+//   of our own id; found peers we do not know yet are dialed, and
+//   DeviceCertExchange runs automatically after TCP+Noise connects. There is no
+//   provider namespace any more and incoming PUT_VALUE / ADD_PROVIDER are not
+//   stored, so no answer of ours carries more than ≤ 20 closer peers with a
+//   bounded address set each (network-i18, i20).
+//   Our own timer runs the discovery lookup and the Kademlia bootstrap; it slows
+//   down once the node knows enough peers (`kad_cadence`, Р-17, network-i43).
+//
+// Connections (C-DK C4):
+//   - the connection cache (`conn_lru`, network-i41) is the single owner of
+//     voluntary closes: at most `cap` peers neither busy nor infrastructure;
+//   - `send_to_device` dials a known peer it has no connection to, waits for its
+//     cert and sends (`on_demand`, SendOrDial, network-i42); `send_if_connected`
+//     never dials (the processor's PeerAnnounce);
+//   - the event-loop side of both lives in `swarm/conn_loop.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -31,12 +51,22 @@ use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport, Respons
 use libp2p::swarm::SwarmEvent;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
-use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use viaticum_core::cluster::{CertTrustPath, DeviceCertificate, verify_device_certificate};
 use viaticum_core::messages::Message;
 use viaticum_core::types::{DeviceId, IdentityPub};
+
+use super::address_book::AddressBook;
+use super::conn_lru::{ConnLru, DialOrigin};
+use super::kad_cadence::{BootstrapOrigin, KadCadence, SettleReason, bootstrap_origin};
+use super::kad_feed::{kad_dialed_addr, kad_feed_addrs, kad_replace_plan};
+use super::on_demand::OnDemand;
+
+mod conn_loop;
+mod policy;
+
+pub use policy::{ConnPolicy, ConnStats};
 
 // ─── Type aliases ────────────────────────────────────────────────────────────
 
@@ -56,22 +86,32 @@ pub const VIATICUM_PROTOCOL: StreamProtocol = StreamProtocol::new("/viaticum/1")
 /// Protocol for DeviceCertExchange (transport-level cert handshake).
 pub const CERT_PROTOCOL: StreamProtocol = StreamProtocol::new("/viaticum/cert/1");
 
+/// Kademlia protocol name: our own DHT, separate from IPFS by construction
+/// (network-i17, ADR-003). A node speaking another Kademlia (IPFS's
+/// `/ipfs/kad/1.0.0`) cannot query us, is not answered by us, and is not fed
+/// into our table by identify (`handle_identify_event`).
+pub(crate) const KAD_PROTOCOL: StreamProtocol = StreamProtocol::new("/viaticum/kad/1.0.0");
+
 /// Max message size — matches viaticum_core::constants::MAX_MESSAGE_SIZE.
 const MAX_MSG_SIZE: usize = viaticum_core::constants::MAX_MESSAGE_SIZE as usize;
 
 // ─── Kademlia constants (ε.3) ─────────────────────────────────────────────────
 
-/// Kademlia provider record republish interval: 30 minutes.
-pub const KAD_REPUBLISH_INTERVAL: Duration = Duration::from_secs(30 * 60);
-
-/// Kademlia discovery (get_providers) interval: 5 minutes.
+/// Kademlia discovery (get_closest_peers of our own id) interval: 5 minutes.
 pub const KAD_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-/// Kademlia MemoryStore record limit (10x libp2p default of 1024).
-pub const KAD_STORE_LIMIT: usize = 10240;
-
-/// Grace period after startup before first get_providers (allow bootstrap to complete).
+/// Grace period after startup before the first discovery lookup (allow the
+/// bootstrap to complete).
 pub const KAD_INITIAL_DISCOVERY_DELAY: Duration = Duration::from_secs(15);
+
+/// Kademlia frame limit, stated explicitly: the libp2p default, NOT raised
+/// (network-i20). Our largest answer is FIND_NODE (GET_PROVIDERS / GET_VALUE
+/// carry only closer peers here: nothing is provided or stored) with ≤ 20
+/// closer peers × (≈45 B + ≤ 640 B of addresses + tags) ≈ 14 KB — the address
+/// bytes per peer are bounded by `kad_feed` (network-i18, i20,
+/// `MAX_KAD_ADDR_BYTES_PER_PEER`). Raising the limit would hide a regression of
+/// that bound instead of fixing it.
+pub const KAD_MAX_PACKET_SIZE: usize = 16 * 1024;
 
 /// Scale a real-time Kademlia cadence by the daemon's `time_scale` so peer discovery keeps
 /// pace under an accelerated (`time_scale>1`) test clock. Without this, the 5-minute
@@ -89,22 +129,22 @@ pub fn scaled_kad_cadence(base: Duration, time_scale: u64) -> Duration {
     }
 }
 
-/// Select which discovered peers to dial this round. Mirrors the provider-path
-/// gating: skip entirely once we already have TARGET_PEERS authenticated peers
-/// (cold backup wants a stable small set, not unbounded growth), and cap the
-/// number of concurrent dials to MAX_CONCURRENT_DISCOVERY_DIALS to avoid bursting
-/// the cert-exchange pipeline. Peers with empty addrs are kept (dial_discovered_peer
-/// still guards self/already-connected/dialing and falls back to peerid-only dial).
+/// Discovered peers worth dialing this round (C-DK Р-5′, network-i43): those
+/// `skip` does not reject — the caller skips self, connected, being dialed,
+/// authenticated and already KNOWN peers (a PeerRecord, or met since start) —
+/// at most MAX_CONCURRENT_DISCOVERY_DIALS of them, skipped ones not counted.
+/// No gate on how many peers we already have: knowing everyone is cheap, and a
+/// known peer is reached when there is something to say, not kept connected.
+/// Peers with empty addrs are kept (`dial_discovered_peer` falls back to a
+/// peer-id-only dial).
 pub fn discovery_dial_candidates(
     peer_list: Vec<(PeerId, Vec<Multiaddr>)>,
-    auth_count: usize,
+    skip: impl Fn(&PeerId) -> bool,
 ) -> Vec<(PeerId, Vec<Multiaddr>)> {
-    use viaticum_core::constants::{MAX_CONCURRENT_DISCOVERY_DIALS, TARGET_PEERS};
-    if auth_count >= TARGET_PEERS {
-        return Vec::new();
-    }
+    use viaticum_core::constants::MAX_CONCURRENT_DISCOVERY_DIALS;
     peer_list
         .into_iter()
+        .filter(|(peer_id, _)| !skip(peer_id))
         .take(MAX_CONCURRENT_DISCOVERY_DIALS)
         .collect()
 }
@@ -249,7 +289,7 @@ impl request_response::Codec for CertCodec {
 /// - viaticum: request-response for protocol messages (/viaticum/1)
 /// - cert: request-response for DeviceCertExchange (/viaticum/cert/1)
 /// - identify: publishes/receives peer info for diagnostics and Kademlia addresses
-/// - kad: Kademlia DHT for peer discovery via /ipfs/kad/1.0.0 (ε.3)
+/// - kad: Kademlia DHT for peer discovery, FIND_NODE only (ε.3, C-DK C2)
 /// - relay_client: Circuit Relay v2 client (ε.4) — must be before dcutr
 /// - relay_server: Circuit Relay v2 server (ε.4) — all nodes accept relay requests
 /// - dcutr: Direct Connection Upgrade through Relay (ε.4) — hole punching
@@ -325,10 +365,15 @@ pub enum ProtocolEvent {
 /// Commands sent from SwarmHandle to the event loop.
 #[allow(clippy::large_enum_variant)] // Message is intentionally large; boxing would add alloc overhead.
 enum SwarmCommand {
-    SendMessage {
-        peer_id: PeerId,
+    /// v3.1 W1 (г): look the device up, send — or (`dial`, network-i42) dial
+    /// it, wait for its cert and send — in ONE event-loop turn. `addrs` are the
+    /// PeerRecord's transport addresses (read on the handle's side).
+    SendOrDial {
+        device: DeviceId,
+        addrs: Vec<Multiaddr>,
         message: Box<Message>,
         reply: oneshot::Sender<Result<Message, SwarmError>>,
+        dial: bool,
     },
     /// Send a message to the first authenticated device belonging to a given master identity.
     SendToMaster {
@@ -340,7 +385,10 @@ enum SwarmCommand {
     Dial {
         peer_id: PeerId,
         addrs: Vec<Multiaddr>,
+        origin: DialOrigin,
     },
+    /// One snapshot of the connection cache after an eviction pass (network-i41).
+    ConnStats { reply: oneshot::Sender<ConnStats> },
     ListenAddrs {
         reply: oneshot::Sender<Vec<Multiaddr>>,
     },
@@ -352,11 +400,6 @@ enum SwarmCommand {
     /// only connected (post-Noise but cert exchange in flight or never started).
     PeerSets {
         reply: oneshot::Sender<(HashSet<DeviceId>, HashSet<DeviceId>)>,
-    },
-    /// Look up the PeerId for a DeviceId (checks authenticated map).
-    LookupPeer {
-        device: DeviceId,
-        reply: oneshot::Sender<Result<PeerId, SwarmError>>,
     },
     /// Send a response on an inbound ResponseChannel (ε.2: Processor dispatch).
     SendResponse {
@@ -384,6 +427,89 @@ enum SwarmCommand {
     GetPeerAddrs {
         device: DeviceId,
         reply: oneshot::Sender<Vec<Multiaddr>>,
+    },
+    /// Test-only (`net-probe disconnect`, C-DK Р-16): close every connection to
+    /// `peer_id`. Replies whether there was one.
+    #[cfg(feature = "e2e-tools")]
+    Disconnect {
+        peer_id: PeerId,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Unit tests only: feed `peer_id`'s identify addresses to Kademlia by the
+    /// identify path (`feed_kad`) and reply with what the table holds after.
+    #[cfg(test)]
+    TestFeedKad {
+        peer_id: PeerId,
+        addrs: Vec<Multiaddr>,
+        reply: oneshot::Sender<Vec<Multiaddr>>,
+    },
+    /// Unit tests only: the addresses our Kademlia table holds for `peer_id`
+    /// (empty when the peer is not in the table).
+    #[cfg(test)]
+    TestKadAddrs {
+        peer_id: PeerId,
+        reply: oneshot::Sender<Vec<Multiaddr>>,
+    },
+    /// Unit tests only: how many times Kademlia reported `peer_id` as a NEW
+    /// entry of its table (`RoutingUpdated { is_new_peer: true }`) so far.
+    #[cfg(test)]
+    TestKadNewPeerCount {
+        peer_id: PeerId,
+        reply: oneshot::Sender<usize>,
+    },
+    /// Unit tests only: one discovery pass over `peers` as if a discovery
+    /// lookup had found them (`dial_discovery_result`, the timer's path);
+    /// replies with the peers it chose to dial.
+    #[cfg(test)]
+    TestDiscoveryPass {
+        peers: Vec<(PeerId, Vec<Multiaddr>)>,
+        reply: oneshot::Sender<Vec<PeerId>>,
+    },
+    /// Unit tests only: open one more connection to `addr` whatever is already
+    /// connected (no dial condition) and reply with its id.
+    #[cfg(test)]
+    TestDialNewConnection {
+        addr: Multiaddr,
+        reply: oneshot::Sender<Result<libp2p::swarm::ConnectionId, SwarmError>>,
+    },
+    /// Unit tests only: close one connection by id; replies whether it existed.
+    #[cfg(test)]
+    TestCloseConnection {
+        connection_id: libp2p::swarm::ConnectionId,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Unit tests only: evict `peer_id` as the cache's pass would (it moves to
+    /// `closing`); replies whether it had an entry.
+    #[cfg(test)]
+    TestEvict {
+        peer_id: PeerId,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Unit tests only: evict `peer_id`, then deliver its cert again in the
+    /// same turn (a late cert on a second connection); replies (authenticated
+    /// before, authenticated right after the late cert — same turn).
+    #[cfg(test)]
+    TestEvictLateCert {
+        peer_id: PeerId,
+        reply: oneshot::Sender<(bool, bool)>,
+    },
+    /// Unit tests only: (peer, origin) of every `lru: re-dial of evicted peer`.
+    #[cfg(test)]
+    TestRedialOrigins {
+        reply: oneshot::Sender<Vec<(PeerId, &'static str)>>,
+    },
+    /// Unit tests only: (cert_done, has app activity, in_flight + waiters) of
+    /// the cache entry of `peer_id`.
+    #[cfg(test)]
+    TestLruEntry {
+        peer_id: PeerId,
+        reply: oneshot::Sender<Option<(bool, bool, u32)>>,
+    },
+    /// Unit tests only: the Kademlia lookups started so far, in order
+    /// ("discovery", "bootstrap:<origin>"), and the cadence's settle reason.
+    #[cfg(test)]
+    TestKadLookups {
+        reply: oneshot::Sender<(Vec<String>, Option<&'static str>)>,
     },
 }
 
@@ -415,6 +541,11 @@ pub enum SwarmError {
 
     #[error("timeout")]
     Timeout,
+
+    /// An on-demand dial to a known peer failed, its cert exchange did not
+    /// finish in time, or the peer is in the negative cache (network-i42).
+    #[error("peer unreachable: {0:?}: {1}")]
+    Unreachable(DeviceId, String),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -467,14 +598,6 @@ pub struct SwarmConfig {
     /// Already parsed and validated by AppConfig::validate().
     pub kademlia_bootstrap_peers: Vec<Multiaddr>,
 
-    /// When true (the default, see `NetworkCfg`), skip built-in IPFS bootstrap
-    /// nodes: the friends' network is closed (network-i11).
-    pub kademlia_disable_ipfs_bootstrap: bool,
-
-    /// Override for KAD_REPUBLISH_INTERVAL. None = use the constant.
-    /// Used in tests to speed up the republish cycle.
-    pub kad_republish_interval_override: Option<Duration>,
-
     /// Override for KAD_DISCOVERY_INTERVAL and initial discovery delay.
     /// None = use the constants. Used in tests to speed up discovery.
     pub kad_discovery_interval_override: Option<Duration>,
@@ -485,6 +608,9 @@ pub struct SwarmConfig {
     /// flag is false (opt-in) — home NAS / laptop shouldn't relay traffic
     /// for strangers without explicit consent.
     pub enable_relay_server: bool,
+
+    /// How this node treats connections (C-DK Р-15).
+    pub conn_policy: ConnPolicy,
 }
 
 // ─── SwarmHandle ──────────────────────────────────────────────────────────────
@@ -508,6 +634,18 @@ pub struct SwarmHandle {
     /// full/closed. `respond` (try_send) can silently fail under burst; this
     /// makes those drops observable via `respond_logged` + `dropped_responses()`.
     dropped_responses: std::sync::atomic::AtomicU64,
+    /// network-i42: `send_to_device` dials a known peer it has no connection to.
+    dial_on_demand: bool,
+    /// The PeerRecord table the on-demand dial reads addresses from (on this
+    /// side, not in the event loop: A15).
+    address_book: Option<AddressBook>,
+    /// The policy's time_scale (None: tests, the DR swap).
+    time_scale: Option<u64>,
+    /// C-DK Р-18: work-pipeline wakes the processor suppressed. Kept here
+    /// because the handle is the one object both the processor and status share.
+    work_wakes_suppressed: std::sync::atomic::AtomicU64,
+    /// PeerRecord events dropped at the writer's queue cap (C-DK C4 fix round 4, N8).
+    peer_record_dropped: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for SwarmHandle {
@@ -548,27 +686,23 @@ impl SwarmHandle {
         );
 
         // ── 2. Build Kademlia behaviour ───────────────────────────────────────
-        let kad_protocol = libp2p::StreamProtocol::try_from_owned("/ipfs/kad/1.0.0".to_string())
-            .expect("valid kad protocol string");
-        let kad_cfg = libp2p::kad::Config::new(kad_protocol);
-        let kad_store = libp2p::kad::store::MemoryStore::with_config(
-            peer_id,
-            libp2p::kad::store::MemoryStoreConfig {
-                max_records: KAD_STORE_LIMIT,
-                max_provided_keys: KAD_STORE_LIMIT,
-                ..Default::default()
-            },
-        );
+        let mut kad_cfg = libp2p::kad::Config::new(KAD_PROTOCOL);
+        kad_cfg.set_max_packet_size(KAD_MAX_PACKET_SIZE);
+        // network-i20: incoming PUT_VALUE / ADD_PROVIDER become events we ignore,
+        // never records in the store. In an open network a stranger could
+        // otherwise fill it and inflate our GET_PROVIDERS / GET_VALUE answers
+        // past the frame. We provide nothing ourselves, so the store stays empty
+        // (the behaviour still needs one).
+        kad_cfg.set_record_filtering(libp2p::kad::StoreInserts::FilterBoth);
+        // Р-17 (network-i43): our own timer runs the bootstrap (it slows down
+        // once the cadence settles); libp2p's periodic one would keep 5 min.
+        kad_cfg.set_periodic_bootstrap_interval(None);
+        let kad_store = libp2p::kad::store::MemoryStore::new(peer_id);
         let mut kademlia = libp2p::kad::Behaviour::with_config(peer_id, kad_store, kad_cfg);
         kademlia.set_mode(Some(libp2p::kad::Mode::Server));
 
-        // Add IPFS bootstrap peers unless disabled (e.g. in tests).
-        if !config.kademlia_disable_ipfs_bootstrap {
-            for (bs_peer_id, addr) in ipfs_bootstrap_peers() {
-                kademlia.add_address(&bs_peer_id, addr);
-            }
-        }
-        // Add config-provided bootstrap peers.
+        // The circle's bootstrap peers are the only way into our DHT: there are
+        // no built-in bootstrap nodes (network-i17).
         for addr in &config.kademlia_bootstrap_peers {
             if let Some(bs_peer_id) = peer_id_from_multiaddr(addr) {
                 kademlia.add_address(&bs_peer_id, addr.clone());
@@ -647,6 +781,13 @@ impl SwarmHandle {
             .with_swarm_config(|cfg| {
                 cfg.with_idle_connection_timeout(std::time::Duration::from_secs(600))
             })
+            // network-i42: establishing a connection (TCP + Noise + yamux) gives
+            // up after 20 s — the builder's default is 10 s — so a black hole that
+            // accepts TCP and never answers ends the dial (and an inbound upgrade);
+            // the same number as R2's TCP timeout.
+            .with_connection_timeout(Duration::from_secs(
+                viaticum_core::constants::TRANSPORT_TIMEOUT_SECS,
+            ))
             .build();
 
         // Listen-port check (daemon-i1). libp2p-tcp sets SO_REUSEPORT on its
@@ -705,17 +846,25 @@ impl SwarmHandle {
         let (cmd_tx, cmd_rx) = mpsc::channel(4096);
         let (event_tx, event_rx) = mpsc::channel(4096);
 
-        // ── 6. Compute Kademlia namespace key ─────────────────────────────────
-        // sha2::Sha256::digest(b"/viaticum/peers/v1") — computed once, never hardcoded.
-        let viaticum_namespace_key = {
-            let hash = Sha256::digest(b"/viaticum/peers/v1");
-            libp2p::kad::RecordKey::new(&hash)
-        };
+        // ── 6. Known peers (C-DK Р-5′) ────────────────────────────────────────
+        // Discovery does not dial a peer we already know. Seeded once from the
+        // PeerRecord table; record_authenticated adds every peer of another
+        // master met from now on.
+        let known: HashSet<PeerId> = config
+            .conn_policy
+            .address_book
+            .as_ref()
+            .map(|book| book.known_peer_ids().into_iter().collect())
+            .unwrap_or_default();
+        info!(known = known.len(), "swarm: known peers loaded");
+        let mut kad_cadence = KadCadence::new(config.conn_policy.time_scale);
+        if let Some(reason) = kad_cadence.on_known(known.len()) {
+            log_cadence_settled(reason, known.len(), &kad_cadence);
+        }
 
-        // ── 7. Build Kademlia timers ──────────────────────────────────────────
-        let republish_interval = config
-            .kad_republish_interval_override
-            .unwrap_or(KAD_REPUBLISH_INTERVAL);
+        // ── 7. Build the Kademlia lookup timer (Р-17) ─────────────────────────
+        // Discovery lookup + bootstrap on every tick; the period until the
+        // cadence settles is the override (tests, time_scale > 1) or 5 min.
         let discovery_interval = config
             .kad_discovery_interval_override
             .unwrap_or(KAD_DISCOVERY_INTERVAL);
@@ -723,16 +872,47 @@ impl SwarmHandle {
             .kad_discovery_interval_override
             .unwrap_or(KAD_INITIAL_DISCOVERY_DELAY);
 
-        let kad_republish_timer = {
-            let mut t = tokio::time::interval(republish_interval);
-            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            t
-        };
-        let kad_discovery_timer = {
+        let kad_lookup_timer = {
             let start = tokio::time::Instant::now() + initial_delay;
             let mut t = tokio::time::interval_at(start, discovery_interval);
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             t
+        };
+
+        // ── 7b. Connection cache and on-demand dial (C-DK C4) ─────────────────
+        #[allow(unused_mut)]
+        let mut cap = config.conn_policy.cap;
+        #[cfg(feature = "e2e-tools")]
+        if let Some(n) = e2e_conn_cap_from_env(cap) {
+            cap = Some(n);
+            info!("e2e: connection cap {n}");
+        }
+        let lru = cap.map(|cap| {
+            ConnLru::new(
+                cap,
+                config.conn_policy.infra.clone(),
+                config.conn_policy.handshake_grace,
+                viaticum_core::constants::MAX_HANDSHAKE_PROTECTED,
+                // A connection without a cert is busy until the cert timeout.
+                Duration::from_secs(config.cert_timeout_secs),
+            )
+        });
+        let seed_role = config.conn_policy.is_seed();
+        let infra_peers = match &config.conn_policy.infra {
+            super::conn_lru::InfraRule::Peers(p) => p.clone(),
+            _ => Vec::new(),
+        };
+        let on_demand = OnDemand::new(config.conn_policy.time_scale);
+
+        // Test-only record-size amplifier (C-DK Р-10): read once, applied on the
+        // first IPv4 TCP listen address.
+        #[cfg(feature = "e2e-tools")]
+        let e2e_loopback_aliases = match super::e2e_amp::alias_count_from_env() {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(err = %e, "e2e: loopback alias amplifier disabled");
+                0
+            }
         };
 
         // ── 8. Spawn event loop ───────────────────────────────────────────────
@@ -752,12 +932,39 @@ impl SwarmHandle {
             our_x25519_pub: config.x25519_pub,
             cluster_master_pub: config.cluster_master_pub,
             cert_timeout: Duration::from_secs(config.cert_timeout_secs),
-            kad_republish_timer,
-            kad_discovery_timer,
-            viaticum_namespace_key,
+            kad_lookup_timer,
+            kad_timer_slow: false,
+            kad_cadence,
+            our_bootstraps: HashSet::new(),
+            #[cfg(test)]
+            test_kad_lookups: Vec::new(),
+            met: known.clone(),
+            known,
+            lru,
+            closing: HashMap::new(),
+            pending_close: HashMap::new(),
+            on_demand,
+            dial_on_demand: config.conn_policy.dial_on_demand,
+            dial_origin: HashMap::new(),
+            evicted_at: HashMap::new(),
+            lru_out: HashMap::new(),
+            lru_in: HashMap::new(),
+            over_cap_since: None,
+            all_busy_since: None,
+            last_all_busy_warn: None,
+            last_lru_tick: Instant::now(),
+            seed_role,
+            infra_peers,
             dialing: HashSet::new(),
             bootstrap_called: false,
+            #[cfg(test)]
+            test_kad_new_peer: HashMap::new(),
+            #[cfg(test)]
+            test_redial_origins: Vec::new(),
             relay_reservations: HashSet::new(),
+            last_empty_lookup_warn: None,
+            #[cfg(feature = "e2e-tools")]
+            e2e_loopback_aliases,
         };
         tokio::spawn(loop_state.run());
 
@@ -769,27 +976,64 @@ impl SwarmHandle {
             master_signing_key: config.master_signing_key,
             x25519_pub: config.x25519_pub,
             dropped_responses: std::sync::atomic::AtomicU64::new(0),
+            dial_on_demand: config.conn_policy.dial_on_demand,
+            address_book: config.conn_policy.address_book,
+            time_scale: config.conn_policy.time_scale,
+            work_wakes_suppressed: std::sync::atomic::AtomicU64::new(0),
+            peer_record_dropped: std::sync::atomic::AtomicU64::new(0),
         };
         Ok((handle, event_rx))
     }
 
-    /// Send a protocol Message to a device by DeviceId.
+    /// Send a protocol Message to a device by DeviceId and wait for its answer
+    /// (≤ 30 s).
     ///
-    /// Looks up the authenticated PeerId for the given DeviceId.
-    /// Blocks until a response is received or the 30s timeout expires.
-    /// Returns Err(SwarmError::PeerNotAuthenticated) if device is unknown.
+    /// network-i42: when the device is known but not authenticated and the
+    /// policy dials on demand, the swarm dials it (PeerRecord addresses ∪ what
+    /// it knows ∪ Kademlia), waits ≤ 10 s for its cert and then sends — one
+    /// command of the event loop (`SendOrDial`). `PeerNotAuthenticated` when
+    /// there is nothing to dial (or the policy does not dial); `Unreachable`
+    /// when the dial fails, the cert does not come in time or the peer is in
+    /// the negative cache.
     pub async fn send_to_device(
         &self,
         device: DeviceId,
         msg: Message,
     ) -> Result<Message, SwarmError> {
-        let peer_id = self.find_peer_id_for_device(device).await?;
+        let addrs = match (&self.address_book, self.dial_on_demand) {
+            (Some(book), true) => book.addrs_of(&device),
+            _ => Vec::new(),
+        };
+        self.send_or_dial(device, addrs, msg, self.dial_on_demand)
+            .await
+    }
+
+    /// Send only over an existing authenticated connection — never dials
+    /// (`send_to_device` before C4). The processor's PeerAnnounce goes this way:
+    /// it follows an authentication, and must not dial a peer the cache closed.
+    pub async fn send_if_connected(
+        &self,
+        device: DeviceId,
+        msg: Message,
+    ) -> Result<Message, SwarmError> {
+        self.send_or_dial(device, Vec::new(), msg, false).await
+    }
+
+    async fn send_or_dial(
+        &self,
+        device: DeviceId,
+        addrs: Vec<Multiaddr>,
+        msg: Message,
+        dial: bool,
+    ) -> Result<Message, SwarmError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
-            .send(SwarmCommand::SendMessage {
-                peer_id,
+            .send(SwarmCommand::SendOrDial {
+                device,
+                addrs,
                 message: Box::new(msg),
                 reply: reply_tx,
+                dial,
             })
             .await
             .map_err(|_| SwarmError::ChannelClosed)?;
@@ -798,6 +1042,47 @@ impl SwarmHandle {
             .await
             .map_err(|_| SwarmError::Timeout)?
             .map_err(|_| SwarmError::ChannelClosed)?
+    }
+
+    /// One snapshot of the connection cache, taken right after an eviction
+    /// pass (network-i41).
+    pub async fn conn_stats(&self) -> Result<ConnStats, SwarmError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::ConnStats { reply: reply_tx })
+            .await
+            .map_err(|_| SwarmError::ChannelClosed)?;
+        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)
+    }
+
+    /// The policy's time_scale (None: tests, the DR swap).
+    pub fn time_scale(&self) -> Option<u64> {
+        self.time_scale
+    }
+
+    /// C-DK Р-18: the processor suppressed one work-pipeline wake.
+    pub(crate) fn note_work_wake_suppressed(&self) {
+        self.work_wakes_suppressed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// C-DK Р-18: work-pipeline wakes suppressed so far (status).
+    pub fn work_wakes_suppressed(&self) -> u64 {
+        self.work_wakes_suppressed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The processor dropped one PeerRecord event at the writer's queue cap
+    /// (C-DK C4 fix round 4, N8).
+    pub(crate) fn note_peer_record_dropped(&self) {
+        self.peer_record_dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// PeerRecord events dropped at the writer's queue cap so far (status).
+    pub fn peer_record_dropped(&self) -> u64 {
+        self.peer_record_dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Initiate a connection to a peer by PeerId + Multiaddr.
@@ -818,8 +1103,24 @@ impl SwarmHandle {
         peer_id: PeerId,
         addrs: Vec<Multiaddr>,
     ) -> Result<(), SwarmError> {
+        self.dial_addrs_from(peer_id, addrs, DialOrigin::Manual)
+            .await
+    }
+
+    /// [`SwarmHandle::dial_addrs`] with the origin the log of the connection
+    /// cache names (`lru: re-dial of evicted peer origin=…`, network-i43).
+    pub(crate) async fn dial_addrs_from(
+        &self,
+        peer_id: PeerId,
+        addrs: Vec<Multiaddr>,
+        origin: DialOrigin,
+    ) -> Result<(), SwarmError> {
         self.cmd_tx
-            .send(SwarmCommand::Dial { peer_id, addrs })
+            .send(SwarmCommand::Dial {
+                peer_id,
+                addrs,
+                origin,
+            })
             .await
             .map_err(|_| SwarmError::ChannelClosed)
     }
@@ -954,17 +1255,187 @@ impl SwarmHandle {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Helper: find PeerId for a DeviceId via the event loop's device_to_peer map.
-    async fn find_peer_id_for_device(&self, device: DeviceId) -> Result<PeerId, SwarmError> {
-        let (reply_tx, reply_rx) = oneshot::channel::<Result<PeerId, SwarmError>>();
+    /// Test-only (`net-probe disconnect`, C-DK Р-16): close every connection to
+    /// `device` (the PeerId is derived from the device key, so a peer that never
+    /// authenticated can be named too). `Ok(false)` when there was none. The
+    /// usual `ConnectionClosed` handling drops the peer from `authenticated`.
+    #[cfg(feature = "e2e-tools")]
+    pub async fn disconnect_device(&self, device: DeviceId) -> Result<bool, SwarmError> {
+        let peer_id = device_id_to_peer_id(&device)?;
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
-            .send(SwarmCommand::LookupPeer {
-                device,
+            .send(SwarmCommand::Disconnect {
+                peer_id,
                 reply: reply_tx,
             })
             .await
             .map_err(|_| SwarmError::ChannelClosed)?;
-        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)?
+        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)
+    }
+
+    /// Unit tests only: feed `peer` to Kademlia exactly as an identify carrying
+    /// `addrs` would, and return the addresses the table holds for it after.
+    #[cfg(test)]
+    pub(crate) async fn test_feed_kad(
+        &self,
+        peer: PeerId,
+        addrs: Vec<Multiaddr>,
+    ) -> Vec<Multiaddr> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestFeedKad {
+                peer_id: peer,
+                addrs,
+                reply,
+            })
+            .await
+            .expect("swarm loop alive");
+        rx.await.expect("swarm loop replied")
+    }
+
+    /// Unit tests only: the addresses our Kademlia table holds for `peer`
+    /// (empty when it is not in the table).
+    #[cfg(test)]
+    pub(crate) async fn test_kad_addrs(&self, peer: PeerId) -> Vec<Multiaddr> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestKadAddrs {
+                peer_id: peer,
+                reply,
+            })
+            .await
+            .expect("swarm loop alive");
+        rx.await.expect("swarm loop replied")
+    }
+
+    /// Unit tests only: how many times Kademlia reported `peer` as a new entry
+    /// of its table so far (`RoutingUpdated { is_new_peer: true }`). Events
+    /// reach the loop after the command that caused them: wait on another
+    /// peer's later event before trusting a count.
+    #[cfg(test)]
+    pub(crate) async fn test_kad_new_peer_count(&self, peer: PeerId) -> usize {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestKadNewPeerCount {
+                peer_id: peer,
+                reply,
+            })
+            .await
+            .expect("swarm loop alive");
+        rx.await.expect("swarm loop replied")
+    }
+
+    /// Unit tests only: run one discovery pass over `peers` (what a discovery
+    /// lookup found) and return the peers it chose to dial (C-DK Р-5′).
+    #[cfg(test)]
+    pub(crate) async fn test_discovery_pass(
+        &self,
+        peers: Vec<(PeerId, Vec<Multiaddr>)>,
+    ) -> Vec<PeerId> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestDiscoveryPass { peers, reply })
+            .await
+            .expect("swarm loop alive");
+        rx.await.expect("swarm loop replied")
+    }
+
+    /// Unit tests only: open an extra connection to `addr` (a duplicate when
+    /// already connected) and return its id.
+    #[cfg(test)]
+    pub(crate) async fn test_dial_new_connection(
+        &self,
+        addr: Multiaddr,
+    ) -> Result<libp2p::swarm::ConnectionId, SwarmError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestDialNewConnection { addr, reply })
+            .await
+            .map_err(|_| SwarmError::ChannelClosed)?;
+        rx.await.map_err(|_| SwarmError::ChannelClosed)?
+    }
+
+    /// Unit tests only: close the connection `connection_id`; false when unknown.
+    #[cfg(test)]
+    pub(crate) async fn test_close_connection(
+        &self,
+        connection_id: libp2p::swarm::ConnectionId,
+    ) -> bool {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestCloseConnection {
+                connection_id,
+                reply,
+            })
+            .await
+            .expect("swarm loop alive");
+        rx.await.expect("swarm loop replied")
+    }
+
+    /// Unit tests only: evict `peer` as the cache's pass would.
+    #[cfg(test)]
+    pub(crate) async fn test_evict(&self, peer: PeerId) -> bool {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestEvict {
+                peer_id: peer,
+                reply,
+            })
+            .await
+            .expect("swarm loop alive");
+        rx.await.expect("swarm loop replied")
+    }
+
+    /// Unit tests only: (cert_done, has app activity, in_flight) of `peer`'s
+    /// cache entry; None without an entry (or without a cache).
+    #[cfg(test)]
+    pub(crate) async fn test_lru_entry(&self, peer: PeerId) -> Option<(bool, bool, u32)> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestLruEntry {
+                peer_id: peer,
+                reply,
+            })
+            .await
+            .expect("swarm loop alive");
+        rx.await.expect("swarm loop replied")
+    }
+
+    /// Unit tests only: evict `peer` and deliver its cert again (late cert).
+    #[cfg(test)]
+    pub(crate) async fn test_evict_late_cert(&self, peer: PeerId) -> (bool, bool) {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestEvictLateCert {
+                peer_id: peer,
+                reply,
+            })
+            .await
+            .expect("swarm loop alive");
+        rx.await.expect("swarm loop replied")
+    }
+
+    /// Unit tests only: (peer, origin) of every re-dial of an evicted peer.
+    #[cfg(test)]
+    pub(crate) async fn test_redial_origins(&self) -> Vec<(PeerId, &'static str)> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestRedialOrigins { reply })
+            .await
+            .expect("swarm loop alive");
+        rx.await.expect("swarm loop replied")
+    }
+
+    /// Unit tests only: the Kademlia lookups started so far and the cadence's
+    /// settle reason.
+    #[cfg(test)]
+    pub(crate) async fn test_kad_lookups(&self) -> (Vec<String>, Option<&'static str>) {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::TestKadLookups { reply })
+            .await
+            .expect("swarm loop alive");
+        rx.await.expect("swarm loop replied")
     }
 
     /// Query the Kademlia DHT for the peers closest to `key`.
@@ -1088,15 +1559,65 @@ struct EventLoopState {
 
     cert_timeout: Duration,
 
-    // ── Kademlia (ε.3) ────────────────────────────────────────────────────────
-    /// Interval for re-publishing our provider record to the DHT.
-    kad_republish_timer: tokio::time::Interval,
+    // ── Kademlia (ε.3, Р-17) ──────────────────────────────────────────────────
+    /// Our lookup timer: discovery lookup + bootstrap on every tick.
+    kad_lookup_timer: tokio::time::Interval,
+    /// The timer runs at the settled (slow) period already.
+    kad_timer_slow: bool,
+    /// When the lookups slow down (network-i43).
+    kad_cadence: KadCadence,
+    /// Bootstraps we started (start, timer); any other is libp2p's own (auto).
+    our_bootstraps: HashSet<QueryId>,
+    /// Unit tests only: the lookups started, in order.
+    #[cfg(test)]
+    test_kad_lookups: Vec<String>,
 
-    /// Interval for querying the DHT for new Viaticum peers.
-    kad_discovery_timer: tokio::time::Interval,
+    /// Peers we KNOW (C-DK Р-5′): PeerRecords of other masters at start plus
+    /// every peer of another master authenticated since. Discovery never dials
+    /// them — a known peer is reached when there is something to say — so a
+    /// peer the connection cache closes (C4) is not dialed back by discovery.
+    /// Only grows.
+    known: HashSet<PeerId>,
 
-    /// SHA-256 of b"/viaticum/peers/v1" — computed once at startup.
-    viaticum_namespace_key: libp2p::kad::RecordKey,
+    /// Peers met by a cert exchange on ANY path (siblings too) plus `known` at
+    /// start: discovery never dials them and they never make a discovery round
+    /// "not quiet" (fix round 1, WARN-3). `known` stays "other masters" for the
+    /// status and the settle threshold.
+    met: HashSet<PeerId>,
+
+    // ── Connection cache and on-demand dial (C-DK C4) ─────────────────────────
+    /// The connection cache (network-i41); None = no cache (ConnPolicy cap None).
+    lru: Option<ConnLru>,
+    /// Peers the cache evicted whose connection has not closed yet → their
+    /// device (for the processor's ConnectionClosed). Not authenticated any
+    /// more; a send to one dials after the close.
+    closing: HashMap<PeerId, Option<DeviceId>>,
+    /// Evicted peers whose connection is closed only after the linger of our
+    /// last answer → when (deferred close, fix round 2). A subset of `closing`.
+    pending_close: HashMap<PeerId, Instant>,
+    /// Waiters of `send_to_device` for peers being dialed on demand (network-i42).
+    on_demand: OnDemand,
+    /// The policy dials on demand.
+    dial_on_demand: bool,
+    /// Our outbound dials by ConnectionId → (peer, origin, start): the `origin=`
+    /// of `lru: re-dial of evicted peer`. Everything else is Kademlia's own.
+    dial_origin: HashMap<libp2p::swarm::ConnectionId, (PeerId, DialOrigin, Instant)>,
+    /// When the cache evicted a peer (kept LRU_REDIAL_WINDOW_SECS).
+    evicted_at: HashMap<PeerId, Instant>,
+    /// /viaticum/1 requests the cache counts as in flight → (peer, app traffic).
+    lru_out: HashMap<OutboundRequestId, (PeerId, bool)>,
+    lru_in: HashMap<request_response::InboundRequestId, (PeerId, bool)>,
+    /// Since when non-infra peers exceed the cap (`lru: over cap` / `under cap`).
+    over_cap_since: Option<Instant>,
+    /// Since when the overshoot has no protected / cert-pending peer behind it.
+    all_busy_since: Option<Instant>,
+    last_all_busy_warn: Option<Instant>,
+    /// The previous cache tick (`lru: tick late`).
+    last_lru_tick: Instant,
+    /// The seed role (redial floor = ∞) and a friend's infrastructure peers,
+    /// reported by ConnStats for redial.
+    seed_role: bool,
+    infra_peers: Vec<PeerId>,
 
     /// PeerIds currently being dialed (to avoid duplicate dials).
     /// Cleared when connection succeeds or fails.
@@ -1105,10 +1626,27 @@ struct EventLoopState {
     /// True once bootstrap has been called at least once.
     bootstrap_called: bool,
 
+    /// Unit tests only: `RoutingUpdated { is_new_peer: true }` per peer.
+    #[cfg(test)]
+    test_kad_new_peer: HashMap<PeerId, usize>,
+
+    /// Unit tests only: (peer, origin) of every `lru: re-dial of evicted peer`.
+    #[cfg(test)]
+    test_redial_origins: Vec<(PeerId, &'static str)>,
+
     // ── Relay (ε.4) ───────────────────────────────────────────────────────────
     /// PeerIds of relay servers for which we have an active reservation.
     /// Used for logging and diagnostics only; not required for correctness.
     relay_reservations: HashSet<PeerId>,
+
+    /// When the last WARN "kademlia lookup found no peers" was logged
+    /// (rate limit, see `kad_stats`).
+    last_empty_lookup_warn: Option<Instant>,
+
+    /// Loopback aliases still to advertise on the first IPv4 TCP listen address
+    /// (test-only amplifier, C-DK Р-10); 0 once done or when off.
+    #[cfg(feature = "e2e-tools")]
+    e2e_loopback_aliases: usize,
 }
 
 impl EventLoopState {
@@ -1122,6 +1660,15 @@ impl EventLoopState {
         // dialer never sent their request.
         let mut cert_sweep = tokio::time::interval(Duration::from_secs(600));
         cert_sweep.tick().await; // skip immediate
+
+        // The connection cache's tick (network-i41): ends the handshake grace
+        // between events and notices a stalled loop (`lru: tick late`).
+        let mut lru_tick = tokio::time::interval(Duration::from_secs(
+            viaticum_core::constants::CONN_LRU_TICK_SECS,
+        ));
+        lru_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        lru_tick.tick().await; // skip immediate
+        self.last_lru_tick = Instant::now();
 
         // Trigger Kademlia bootstrap on first iteration.
         self.do_bootstrap();
@@ -1142,15 +1689,17 @@ impl EventLoopState {
                 }
                 _ = cert_check.tick() => {
                     self.check_cert_timeouts().await;
+                    self.on_demand_expire();
+                    self.close_due();
                 }
                 _ = cert_sweep.tick() => {
                     self.sweep_unauthenticated_connected().await;
                 }
-                _ = self.kad_republish_timer.tick() => {
-                    self.do_kad_republish();
+                _ = lru_tick.tick() => {
+                    self.lru_tick();
                 }
-                _ = self.kad_discovery_timer.tick() => {
-                    self.do_kad_discovery();
+                _ = self.kad_lookup_timer.tick() => {
+                    self.kad_lookup_tick();
                 }
             }
         }
@@ -1160,13 +1709,19 @@ impl EventLoopState {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!(addr = %address, "swarm listening on new address");
+                #[cfg(feature = "e2e-tools")]
+                self.e2e_advertise_loopback_aliases(&address);
             }
             SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                endpoint,
+                connection_id,
+                ..
             } => {
                 debug!(peer_id = %peer_id, "connection established");
                 // Clear dialing set entry now that connection is established.
                 self.dialing.remove(&peer_id);
+                self.conn_established(peer_id, connection_id, endpoint.is_dialer(), Instant::now());
 
                 // Dialer sends the cert first; listener waits for inbound request.
                 // pending_cert is tracked only for the dialer side so the timeout
@@ -1188,21 +1743,56 @@ impl EventLoopState {
                     debug!(peer_id = %peer_id, "sent DeviceCertExchange as dialer (attempt 1)");
                 }
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                debug!(peer_id = %peer_id, "connection closed");
-                let device_id = self.authenticated.remove(&peer_id).map(|(did, _, _)| did);
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established,
+                cause,
+                ..
+            } => {
+                // `cause` = KeepAliveTimeout would mean libp2p's idle timeout closed a
+                // link between live nodes (C-DK v3-C expects none).
+                debug!(peer_id = %peer_id, num_established, cause = ?cause, "connection closed");
+                if num_established > 0 {
+                    // network-i19: another connection to this peer lives (a
+                    // duplicate from simultaneous dials, closed by one side), so
+                    // the peer stays authenticated and the processor hears
+                    // nothing. A cert request that left on the closed channel is
+                    // re-sent on the live one by check_cert_timeouts.
+                    return;
+                }
+                // An evicted peer left `authenticated` already; its device waits
+                // in `closing` for this event (v3.1 W1 в).
+                let closing_device = self.closing.remove(&peer_id).flatten();
+                let device_id = self
+                    .authenticated
+                    .remove(&peer_id)
+                    .map(|(did, _, _)| did)
+                    .or(closing_device);
                 if let Some(did) = device_id {
                     self.device_to_peer.remove(&did);
                 }
                 self.pending_cert.remove(&peer_id);
                 let event = ProtocolEvent::ConnectionClosed { peer_id, device_id };
                 emit_event(&self.event_tx, event);
+                self.conn_closed(peer_id, Instant::now());
             }
-            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                warn!(peer_id = ?peer_id, error = %error, "outgoing connection error");
+            SwarmEvent::OutgoingConnectionError {
+                peer_id,
+                error,
+                connection_id,
+                ..
+            } => {
                 // Clear dialing set so we can retry on next discovery cycle.
                 if let Some(pid) = peer_id {
                     self.dialing.remove(&pid);
+                }
+                let on_demand =
+                    self.outgoing_conn_error(peer_id, connection_id, &error, Instant::now());
+                if on_demand {
+                    // One INFO `swarm: on-demand dial failed` says it (v3.1 N5).
+                    debug!(peer_id = ?peer_id, error = %error, "outgoing connection error");
+                } else {
+                    warn!(peer_id = ?peer_id, error = %error, "outgoing connection error");
                 }
             }
             SwarmEvent::ExternalAddrConfirmed { address } => {
@@ -1246,18 +1836,36 @@ impl EventLoopState {
 
     fn handle_identify_event(&mut self, event: libp2p::identify::Event) {
         if let libp2p::identify::Event::Received { peer_id, info, .. } = event {
+            // network-i17: only a peer that announces OUR Kademlia is in the
+            // table. `add_address` would put any peer there, and a protocol the
+            // peer then fails to confirm only marks it, never removes it — an
+            // IPFS node connecting to us would stay in the table and be handed
+            // out by our FIND_NODE answers. A peer that got in before its
+            // identify (a foreign address in `kademlia_bootstrap_peers`: added at
+            // start, dialed once by the bootstrap) is taken out here.
+            let kad_protocol = info.protocols.contains(&KAD_PROTOCOL);
+            let kad_addrs = if kad_protocol {
+                self.feed_kad(peer_id, &info.listen_addrs)
+            } else {
+                let removed = self.swarm.behaviour_mut().kad.remove_peer(&peer_id);
+                if removed.is_some() {
+                    warn!(
+                        peer_id = %peer_id,
+                        "kad peer {peer_id} does not speak {KAD_PROTOCOL} — removed from the routing table"
+                    );
+                }
+                0
+            };
+            // Р-7 / network-i18: how many addresses the peer announced, how many
+            // its Kademlia record holds now, and whether it speaks our Kademlia.
             debug!(
                 peer_id = %peer_id,
+                addrs = info.listen_addrs.len(),
+                fed_to_kad = kad_addrs,
+                kad_protocol,
                 protocols = ?info.protocols,
                 "identify received"
             );
-            // Feed identified addresses into Kademlia routing table.
-            for addr in &info.listen_addrs {
-                self.swarm
-                    .behaviour_mut()
-                    .kad
-                    .add_address(&peer_id, addr.clone());
-            }
             // Stash addresses for use when cert exchange completes.
             if !info.listen_addrs.is_empty() {
                 self.peer_addrs.insert(peer_id, info.listen_addrs.clone());
@@ -1275,6 +1883,40 @@ impl EventLoopState {
                 }
             }
         }
+    }
+
+    /// network-i18, i20 (C-DK Р-3): replace `peer_id`'s Kademlia record with
+    /// the bounded set [`kad_feed_addrs`] picks from its identify addresses
+    /// (plus the address we dialed it on). New addresses are added BEFORE stale
+    /// ones are removed, and the dialed address is never removed (unless it is
+    /// oversized, see [`kad_dialed_addr`]), so the peer never drops out of the
+    /// table on the way. Returns how many addresses the record holds afterwards.
+    fn feed_kad(&mut self, peer_id: PeerId, identify_addrs: &[Multiaddr]) -> usize {
+        let dialed = self.dialed_addrs.get(&peer_id);
+        let want = kad_feed_addrs(peer_id, identify_addrs, dialed);
+        let keep = kad_dialed_addr(peer_id, dialed);
+        let current = self.kad_addrs_of(&peer_id);
+        let (add, remove) = kad_replace_plan(peer_id, &current, &want, keep.as_ref());
+        let kad = &mut self.swarm.behaviour_mut().kad;
+        for addr in add {
+            kad.add_address(&peer_id, addr);
+        }
+        for addr in &remove {
+            kad.remove_address(&peer_id, addr);
+        }
+        self.kad_addrs_of(&peer_id).len()
+    }
+
+    /// The addresses our Kademlia table holds for `peer_id` (empty when absent).
+    fn kad_addrs_of(&mut self, peer_id: &PeerId) -> Vec<Multiaddr> {
+        let Some(bucket) = self.swarm.behaviour_mut().kad.kbucket(*peer_id) else {
+            return Vec::new();
+        };
+        bucket
+            .iter()
+            .find(|e| e.node.key.preimage() == peer_id)
+            .map(|e| e.node.value.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     fn handle_relay_client_event(&mut self, event: libp2p::relay::client::Event) {
@@ -1409,7 +2051,10 @@ impl EventLoopState {
             request_response::Event::InboundFailure { peer, error, .. } => {
                 warn!(peer_id = %peer, error = %error, "cert inbound failure");
             }
-            request_response::Event::ResponseSent { .. } => {}
+            request_response::Event::ResponseSent { peer, .. } => {
+                // Listener side: our cert answer left (fix round 1, N-1).
+                self.cert_answer_sent(peer, Instant::now());
+            }
         }
     }
 
@@ -1450,7 +2095,7 @@ impl EventLoopState {
             return;
         }
 
-        self.record_authenticated(peer_id, request, path).await;
+        self.record_authenticated(peer_id, request, path, true);
     }
 
     async fn on_cert_response(&mut self, peer_id: PeerId, response: DeviceCertExchangeMsg) {
@@ -1469,23 +2114,44 @@ impl EventLoopState {
             }
         };
 
-        self.record_authenticated(peer_id, response, path).await;
+        self.record_authenticated(peer_id, response, path, false);
     }
 
     /// Record a successfully verified peer in the authenticated maps.
-    async fn record_authenticated(
+    /// `listener`: we answered the peer's cert request; the cache counts the
+    /// exchange as finished only once that answer is sent (`ResponseSent` of
+    /// the cert protocol), so an eviction cannot cut the answer off and leave
+    /// the knowledge one-sided (fix round 1, N-1).
+    fn record_authenticated(
         &mut self,
         peer_id: PeerId,
         msg: DeviceCertExchangeMsg,
         path: CertTrustPath,
+        listener: bool,
     ) {
         let device_id = msg.cert.device_id;
         let identity_pub = msg.cert.master_pub_key;
 
+        // Met by cert on any path (siblings too): discovery leaves it alone.
+        self.met.insert(peer_id);
+        self.pending_cert.remove(&peer_id);
+        if self.closing.contains_key(&peer_id) {
+            // A late cert on a second connection of a peer the cache just
+            // evicted: it stays closing, not authenticated (fix round 1, WARN-1).
+            debug!(peer_id = %peer_id, "cert of a closing peer ignored");
+            return;
+        }
         self.authenticated
             .insert(peer_id, (device_id, identity_pub, msg.cert.clone()));
         self.device_to_peer.insert(device_id, peer_id);
-        self.pending_cert.remove(&peer_id);
+        if matches!(path, CertTrustPath::Cross) {
+            // Another master: known from now on, discovery leaves it alone (Р-5′).
+            if self.known.insert(peer_id)
+                && let Some(reason) = self.kad_cadence.on_known(self.known.len())
+            {
+                log_cadence_settled(reason, self.known.len(), &self.kad_cadence);
+            }
+        }
 
         info!(
             peer_id = %peer_id,
@@ -1519,13 +2185,19 @@ impl EventLoopState {
                 },
             );
         }
+
+        // network-i42: requests waiting for this peer go out; network-i41: the
+        // cert exchange is done (the dialer's now, the listener's when its
+        // answer is sent), the cache's pass runs.
+        self.conn_authenticated(peer_id, Instant::now(), !listener);
     }
 
     /// All addresses we know for `peer_id`: the address we last dialed it on
     /// (first — it is known to work) ∪ its identify listen addrs. Normalized by
     /// [`normalize_peer_addrs`]. Used for every address set the swarm hands out
-    /// (PeerAuthenticated, PeerIdentified, GetPeerAddrs); Kademlia is fed the raw
-    /// identify addrs separately.
+    /// (PeerAuthenticated, PeerIdentified, GetPeerAddrs). Kademlia gets a
+    /// different, bounded set: `feed_kad` filters, ranks and caps the identify
+    /// addrs (network-i18, i20); this one is not bounded (R2, network-i2/i4).
     fn peer_known_addrs(&self, peer_id: &PeerId) -> Vec<Multiaddr> {
         let dialed = self.dialed_addrs.get(peer_id).into_iter();
         let identified = self.peer_addrs.get(peer_id).into_iter().flatten();
@@ -1538,7 +2210,9 @@ impl EventLoopState {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             } => {
@@ -1546,6 +2220,7 @@ impl EventLoopState {
                 if let Some((from_device, from_master, _)) = self.authenticated.get(&peer) {
                     let from_device = *from_device;
                     let from_master = *from_master;
+                    self.inbound_request_started(peer, request_id, &request);
                     let ev = ProtocolEvent::InboundRequest {
                         from_device,
                         from_master,
@@ -1553,6 +2228,9 @@ impl EventLoopState {
                         response_channel: channel,
                     };
                     emit_event(&self.event_tx, ev);
+                } else if self.closing.contains_key(&peer) {
+                    // Evicted, its close deferred: not answered (fix round 2).
+                    debug!(peer_id = %peer, "dropping inbound request from a closing peer");
                 } else {
                     warn!(
                         peer_id = %peer,
@@ -1570,6 +2248,7 @@ impl EventLoopState {
                     },
                 ..
             } => {
+                self.outbound_request_ended(request_id);
                 if let Some(reply) = self.pending_requests.remove(&request_id) {
                     let _ = reply.send(Ok(response));
                 } else {
@@ -1587,14 +2266,23 @@ impl EventLoopState {
                 ..
             } => {
                 warn!(peer_id = %peer, error = %error, "viaticum outbound failure");
+                self.outbound_request_ended(request_id);
                 if let Some(reply) = self.pending_requests.remove(&request_id) {
                     let _ = reply.send(Err(SwarmError::RequestFailed(error.to_string())));
                 }
             }
-            request_response::Event::InboundFailure { peer, error, .. } => {
+            request_response::Event::InboundFailure {
+                peer,
+                error,
+                request_id,
+                ..
+            } => {
                 warn!(peer_id = %peer, error = %error, "viaticum inbound failure");
+                self.inbound_request_ended(request_id);
             }
-            request_response::Event::ResponseSent { .. } => {}
+            request_response::Event::ResponseSent { request_id, .. } => {
+                self.inbound_request_ended(request_id);
+            }
         }
     }
 
@@ -1602,16 +2290,13 @@ impl EventLoopState {
 
     /// Initiate Kademlia bootstrap (FIND_NODE queries to fill the routing table).
     ///
-    /// Called once at startup. If routing table is empty (no bootstrap peers),
-    /// bootstrap returns NoKnownPeers; we log a warning and retry on the next
-    /// republish tick.
+    /// Called once at startup. If the routing table is empty (no bootstrap
+    /// peers), bootstrap returns NoKnownPeers and we log a warning; our lookup
+    /// timer (and libp2p's bootstrap on a low table) retries later.
     fn do_bootstrap(&mut self) {
         if !self.bootstrap_called {
-            match self.swarm.behaviour_mut().kad.bootstrap() {
-                Ok(query_id) => {
-                    debug!(query_id = ?query_id, "kademlia bootstrap started");
-                    self.bootstrap_called = true;
-                }
+            match self.start_bootstrap(BootstrapOrigin::Start) {
+                Ok(()) => self.bootstrap_called = true,
                 Err(e) => {
                     warn!(error = ?e, "kademlia bootstrap failed (no known peers?)");
                 }
@@ -1619,38 +2304,105 @@ impl EventLoopState {
         }
     }
 
-    /// Publish our provider record: "I am a Viaticum node."
-    ///
-    /// Called after successful bootstrap and every KAD_REPUBLISH_INTERVAL.
-    fn do_kad_republish(&mut self) {
-        let key = self.viaticum_namespace_key.clone();
-        match self.swarm.behaviour_mut().kad.start_providing(key) {
-            Ok(query_id) => {
-                debug!(query_id = ?query_id, "kademlia start_providing issued");
-            }
-            Err(e) => {
-                warn!(error = %e, "kademlia start_providing failed");
-            }
+    /// Start a Kademlia bootstrap of ours and log it (`origin=start|timer`).
+    fn start_bootstrap(
+        &mut self,
+        origin: BootstrapOrigin,
+    ) -> Result<(), libp2p::kad::NoKnownPeers> {
+        let query_id = self.swarm.behaviour_mut().kad.bootstrap()?;
+        self.our_bootstraps.insert(query_id);
+        info!(query_id = ?query_id, origin = %origin.as_str(), "kademlia bootstrap started");
+        #[cfg(test)]
+        self.test_kad_lookups
+            .push(format!("bootstrap:{}", origin.as_str()));
+        Ok(())
+    }
+
+    /// The lookup timer's tick (Р-17 v3.3, network-i43): the discovery lookup,
+    /// then the bootstrap; once the cadence has settled, the timer slows down
+    /// (a tick already scheduled is kept, the next ones come at the slow period).
+    fn kad_lookup_tick(&mut self) {
+        self.do_kad_discovery();
+        if let Err(e) = self.start_bootstrap(BootstrapOrigin::Timer) {
+            debug!(error = ?e, "kademlia bootstrap skipped (no known peers)");
+        }
+        if let Some(period) = self.kad_cadence.slow_down(self.kad_timer_slow) {
+            let start = tokio::time::Instant::now() + period;
+            let mut t = tokio::time::interval_at(start, period);
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            self.kad_lookup_timer = t;
+            self.kad_timer_slow = true;
+            info!(
+                interval_secs = period.as_secs(),
+                "kademlia lookups slowed down"
+            );
         }
     }
 
-    /// Query DHT for other Viaticum nodes.
+    /// Look for peers near our own id (C-DK: the only discovery lookup).
     ///
-    /// Called every KAD_DISCOVERY_INTERVAL, first time after KAD_INITIAL_DISCOVERY_DELAY.
+    /// get_closest_peers returns PeerInfo{peer_id, addrs}: querying our OWN id
+    /// fills our DHT neighborhood with addresses learned from the bootstrap
+    /// seed, so a star-spoke that only knows the seed can reach siblings. The
+    /// seed answers with the closest peers to our id INCLUDING their addresses
+    /// (it knows everyone who dialed it).
     fn do_kad_discovery(&mut self) {
-        let key = self.viaticum_namespace_key.clone();
-        let query_id = self.swarm.behaviour_mut().kad.get_providers(key);
-        debug!(query_id = ?query_id, "kademlia get_providers issued");
-
-        // Address-carrying discovery: get_closest_peers returns PeerInfo{peer_id, addrs},
-        // unlike get_providers (PeerIds only). Querying our OWN id fills our DHT
-        // neighborhood with addresses learned from the bootstrap seed, so a star-spoke
-        // that only knows the seed can reach siblings. The seed answers with the closest
-        // peers to our id INCLUDING their addresses (it knows everyone who dialed it).
         let self_key = self.swarm.local_peer_id().to_bytes();
         let qid = self.swarm.behaviour_mut().kad.get_closest_peers(self_key);
         self.discovery_queries.insert(qid);
-        debug!(query_id = ?qid, "kademlia get_closest_peers (discovery) issued");
+        info!(query_id = ?qid, "kademlia discovery lookup started");
+        #[cfg(test)]
+        self.test_kad_lookups.push("discovery".to_string());
+    }
+
+    /// Discovery path (C-DK Р-5′, network-i43): dial the peers a discovery
+    /// lookup (`query`) found that we do not know yet, WITH their addresses.
+    /// Returns the peers it chose to dial (`dial_discovered_peer` may still
+    /// find a dial already under way).
+    fn dial_discovery_result(
+        &mut self,
+        query: Option<QueryId>,
+        peer_list: Vec<(PeerId, Vec<Multiaddr>)>,
+    ) -> Vec<PeerId> {
+        let found = peer_list.len();
+        let local = *self.swarm.local_peer_id();
+        let dials = discovery_dial_candidates(peer_list, |p| {
+            *p == local
+                || self.known.contains(p)
+                || self.met.contains(p)
+                || self.authenticated.contains_key(p)
+                || self.dialing.contains(p)
+                || self.swarm.is_connected(p)
+        });
+        debug!(
+            query_id = ?query,
+            found,
+            count = dials.len(),
+            known = self.known.len(),
+            "dht: dialing discovered peers (address-carrying)"
+        );
+        let chosen = dials.iter().map(|(peer_id, _)| *peer_id).collect();
+        for (peer_id, addrs) in dials {
+            self.dial_discovered_peer(peer_id, addrs);
+        }
+        chosen
+    }
+
+    /// Р-17 (network-i43): a discovery round of the timer ended — a quiet one
+    /// (found peers, none unknown) counts towards settling the cadence. A
+    /// sibling met by cert is not "unknown" either.
+    fn discovery_round_done(&mut self, peer_list: &[(PeerId, Vec<Multiaddr>)]) {
+        let local = *self.swarm.local_peer_id();
+        let found_any = peer_list.iter().any(|(p, _)| *p != local);
+        let found_unknown = peer_list
+            .iter()
+            .any(|(p, _)| *p != local && !self.known.contains(p) && !self.met.contains(p));
+        if let Some(reason) = self
+            .kad_cadence
+            .on_discovery_round(found_any, found_unknown)
+        {
+            log_cadence_settled(reason, self.known.len(), &self.kad_cadence);
+        }
     }
 
     /// Dial a peer discovered via DHT if not already connected or dialing.
@@ -1677,11 +2429,13 @@ impl EventLoopState {
         } else {
             DialOpts::peer_id(peer_id).addresses(addrs).build()
         };
+        let cid = opts.connection_id();
 
         match self.swarm.dial(opts) {
             Ok(_) => {
                 info!(peer_id = %peer_id, "dht: dialing discovered peer");
                 self.dialing.insert(peer_id);
+                self.note_dial(cid, peer_id, DialOrigin::Discovery);
             }
             Err(e) => {
                 debug!(peer_id = %peer_id, error = %e, "dht: dial failed");
@@ -1695,58 +2449,29 @@ impl EventLoopState {
 
         match event {
             Event::OutboundQueryProgressed {
-                id, result, step, ..
+                id,
+                result,
+                step,
+                stats,
             } => match result {
-                QueryResult::Bootstrap(Ok(bootstrap_ok)) if bootstrap_ok.num_remaining == 0 => {
-                    info!("kademlia bootstrap complete");
-                    // Immediately start providing after successful bootstrap.
-                    self.do_kad_republish();
-                }
-                QueryResult::Bootstrap(Err(e)) => {
-                    warn!(error = ?e, "kademlia bootstrap failed");
-                }
-                QueryResult::StartProviding(Ok(ok)) => {
-                    debug!(key = ?ok.key, "kademlia: provider record published");
-                }
-                QueryResult::StartProviding(Err(e)) => {
-                    warn!(error = ?e, "kademlia: start_providing failed");
-                }
-                QueryResult::GetProviders(Ok(ok)) => {
-                    use libp2p::kad::GetProvidersOk;
-                    use viaticum_core::constants::{MAX_CONCURRENT_DISCOVERY_DIALS, TARGET_PEERS};
-                    match ok {
-                        GetProvidersOk::FoundProviders { providers, .. } => {
-                            let count = providers.len();
-                            // Skip discovery if we already have enough authenticated peers.
-                            // Cold backup needs a stable small set, not unbounded growth.
-                            let auth_count = self.authenticated.len();
-                            if auth_count >= TARGET_PEERS {
-                                debug!(
-                                    count,
-                                    auth_count,
-                                    target = TARGET_PEERS,
-                                    "dht: skipping discovery — target peer count reached"
-                                );
-                            } else {
-                                debug!(count, "dht: found providers");
-                                // Cap concurrent dials to avoid burst saturating
-                                // pending_cert / check_cert_timeouts under heavy DHT.
-                                let provider_list: Vec<PeerId> = providers
-                                    .into_iter()
-                                    .take(MAX_CONCURRENT_DISCOVERY_DIALS)
-                                    .collect();
-                                for peer_id in provider_list {
-                                    self.dial_discovered_peer(peer_id, vec![]);
-                                }
-                            }
-                        }
-                        GetProvidersOk::FinishedWithNoAdditionalRecord { .. } => {
-                            debug!("dht: get_providers query complete");
-                        }
+                QueryResult::Bootstrap(res) => {
+                    // Р-17 (NOTE д): libp2p's own bootstrap shows up only as its
+                    // first progress step; ours were logged when started.
+                    let ours = self.our_bootstraps.contains(&id);
+                    if let Some(origin) = bootstrap_origin(ours, step.count.get()) {
+                        info!(query_id = ?id, origin = %origin.as_str(), "kademlia bootstrap started");
+                        #[cfg(test)]
+                        self.test_kad_lookups
+                            .push(format!("bootstrap:{}", origin.as_str()));
                     }
-                }
-                QueryResult::GetProviders(Err(e)) => {
-                    warn!(error = ?e, "dht: get_providers failed");
+                    if step.last {
+                        self.our_bootstraps.remove(&id);
+                    }
+                    match res {
+                        Ok(ok) if ok.num_remaining == 0 => info!("kademlia bootstrap complete"),
+                        Ok(_) => {}
+                        Err(e) => warn!(error = ?e, "kademlia bootstrap failed"),
+                    }
                 }
                 // T-9a: GetClosestPeers result — fulfill the pending oneshot.
                 //
@@ -1771,17 +2496,11 @@ impl EventLoopState {
                     // Err(Timeout) carry a peer list; on Timeout we keep whatever the
                     // query collected (best-effort).
                     let peer_list: Vec<(PeerId, Vec<Multiaddr>)> = match result {
-                        Ok(ok) => {
-                            debug!(
-                                query_id = ?id,
-                                count = ok.peers.len(),
-                                "dht: get_closest_peers complete"
-                            );
-                            ok.peers
-                                .into_iter()
-                                .map(|pi| (pi.peer_id, pi.addrs))
-                                .collect()
-                        }
+                        Ok(ok) => ok
+                            .peers
+                            .into_iter()
+                            .map(|pi| (pi.peer_id, pi.addrs))
+                            .collect(),
                         Err(e) => {
                             debug!(
                                 query_id = ?id,
@@ -1795,6 +2514,7 @@ impl EventLoopState {
                             }
                         }
                     };
+                    self.log_lookup_stats(id, &stats, peer_list.len());
 
                     // Route by query origin: SwarmHandle API vs DISCOVERY.
                     if let Some(reply) = self.pending_closest_peers.remove(&id) {
@@ -1802,16 +2522,8 @@ impl EventLoopState {
                         // on the oneshot receiving exactly this list).
                         let _ = reply.send(Ok(peer_list));
                     } else if self.discovery_queries.remove(&id) {
-                        // Discovery path: dial the discovered peers WITH their addresses.
-                        let dials = discovery_dial_candidates(peer_list, self.authenticated.len());
-                        debug!(
-                            query_id = ?id,
-                            count = dials.len(),
-                            "dht: dialing discovered peers (address-carrying)"
-                        );
-                        for (peer_id, addrs) in dials {
-                            self.dial_discovered_peer(peer_id, addrs);
-                        }
+                        self.discovery_round_done(&peer_list);
+                        self.dial_discovery_result(Some(id), peer_list);
                     } else {
                         debug!(
                             query_id = ?id,
@@ -1819,10 +2531,25 @@ impl EventLoopState {
                         );
                     }
                 }
-                _ => {} // GetRecord, PutRecord, RepublishProvider — ignore
+                // GetProviders, GetRecord, PutRecord, … — we issue none.
+                _ => {}
             },
-            Event::RoutingUpdated { peer, .. } => {
-                debug!(peer_id = %peer, "kademlia routing table updated");
+            Event::RoutingUpdated {
+                peer,
+                is_new_peer,
+                addresses,
+                ..
+            } => {
+                debug!(
+                    peer_id = %peer,
+                    is_new_peer,
+                    addrs = addresses.len(),
+                    "kademlia routing table updated"
+                );
+                #[cfg(test)]
+                if is_new_peer {
+                    *self.test_kad_new_peer.entry(peer).or_default() += 1;
+                }
             }
             Event::UnroutablePeer { peer } => {
                 debug!(peer_id = %peer, "kademlia: peer is unroutable");
@@ -1831,30 +2558,73 @@ impl EventLoopState {
         }
     }
 
+    /// Р-7 (spec §2.4): the counters of every finished get_closest_peers
+    /// (DEBUG), and a rate-limited WARN when a non-empty table gave nothing —
+    /// the signature that tells an oversized answer (H1) from an overloaded seed
+    /// (H2) or an empty table (H4).
+    fn log_lookup_stats(&mut self, id: QueryId, stats: &libp2p::kad::QueryStats, found: usize) {
+        use super::kad_stats::{LookupStats, empty_lookup_warn_due};
+        let s = LookupStats::from_query(stats);
+        let table_entries: usize = self
+            .swarm
+            .behaviour_mut()
+            .kad
+            .kbuckets()
+            .map(|b| b.num_entries())
+            .sum();
+        debug!(
+            query_id = ?id,
+            count = found,
+            requests = s.requests,
+            successes = s.successes,
+            failures = s.failures,
+            duration_ms = s.duration_ms,
+            table_entries,
+            "dht: get_closest_peers complete"
+        );
+        let now = Instant::now();
+        if empty_lookup_warn_due(self.last_empty_lookup_warn, now, table_entries, found) {
+            self.last_empty_lookup_warn = Some(now);
+            warn!(
+                requests = s.requests,
+                successes = s.successes,
+                failures = s.failures,
+                duration_ms = s.duration_ms,
+                table_entries,
+                "kademlia lookup found no peers"
+            );
+        }
+    }
+
+    /// Test-only amplifier (C-DK Р-10): on the first IPv4 TCP listen address,
+    /// advertise the loopback aliases of its port as external addresses.
+    #[cfg(feature = "e2e-tools")]
+    fn e2e_advertise_loopback_aliases(&mut self, listen: &Multiaddr) {
+        if self.e2e_loopback_aliases == 0 {
+            return;
+        }
+        let aliases = super::e2e_amp::loopback_alias_addrs(listen, self.e2e_loopback_aliases);
+        if aliases.is_empty() {
+            return;
+        }
+        let n = aliases.len();
+        for alias in aliases {
+            self.swarm.add_external_address(alias);
+        }
+        self.e2e_loopback_aliases = 0;
+        info!(listen = %listen, "e2e: advertising {n} loopback aliases");
+    }
+
     fn handle_command(&mut self, cmd: SwarmCommand) {
         match cmd {
-            SwarmCommand::SendMessage {
-                peer_id,
+            SwarmCommand::SendOrDial {
+                device,
+                addrs,
                 message,
                 reply,
+                dial,
             } => {
-                if !self.authenticated.contains_key(&peer_id) {
-                    // Find device_id for error reporting (best-effort).
-                    let device_id = self
-                        .device_to_peer
-                        .iter()
-                        .find(|(_, pid)| **pid == peer_id)
-                        .map(|(did, _)| *did)
-                        .unwrap_or(DeviceId([0u8; 32]));
-                    let _ = reply.send(Err(SwarmError::PeerNotAuthenticated(device_id)));
-                    return;
-                }
-                let req_id = self
-                    .swarm
-                    .behaviour_mut()
-                    .viaticum
-                    .send_request(&peer_id, *message);
-                self.pending_requests.insert(req_id, reply);
+                self.send_or_dial(device, addrs, message, reply, dial);
             }
             SwarmCommand::SendToMaster {
                 master,
@@ -1873,29 +2643,35 @@ impl EventLoopState {
                         let _ = reply.send(Err(SwarmError::MasterNotAuthenticated(master)));
                     }
                     Some(pid) => {
-                        let req_id = self
-                            .swarm
-                            .behaviour_mut()
-                            .viaticum
-                            .send_request(&pid, *message);
-                        self.pending_requests.insert(req_id, reply);
+                        self.send_app_request(pid, message, reply);
                     }
                 }
             }
-            SwarmCommand::Dial { peer_id, addrs } => {
+            SwarmCommand::Dial {
+                peer_id,
+                addrs,
+                origin,
+            } => {
                 let dial_opts = DialOpts::peer_id(peer_id).addresses(addrs).build();
-                if let Err(e) = self.swarm.dial(dial_opts) {
-                    // "Already connected" is expected when DR re-dials bootstrap peers
-                    // before the already_auth skip check catches them all (race between
-                    // peer_sets snapshot and event-loop cert-exchange completion).
-                    // Log at DEBUG to avoid noise; other errors stay at WARN.
-                    let is_already_connected = e.to_string().contains("already connected");
-                    if is_already_connected {
-                        debug!(peer_id = %peer_id, error = %e, "dial skipped — already connected");
-                    } else {
-                        warn!(peer_id = %peer_id, error = %e, "dial failed");
+                let cid = dial_opts.connection_id();
+                match self.swarm.dial(dial_opts) {
+                    Ok(()) => self.note_dial(cid, peer_id, origin),
+                    Err(e) => {
+                        // "Already connected" is expected when DR re-dials bootstrap peers
+                        // before the already_auth skip check catches them all (race between
+                        // peer_sets snapshot and event-loop cert-exchange completion).
+                        // Log at DEBUG to avoid noise; other errors stay at WARN.
+                        let is_already_connected = e.to_string().contains("already connected");
+                        if is_already_connected {
+                            debug!(peer_id = %peer_id, error = %e, "dial skipped — already connected");
+                        } else {
+                            warn!(peer_id = %peer_id, error = %e, "dial failed");
+                        }
                     }
                 }
+            }
+            SwarmCommand::ConnStats { reply } => {
+                let _ = reply.send(self.conn_stats_snapshot());
             }
             SwarmCommand::ListenAddrs { reply } => {
                 let addrs: Vec<Multiaddr> = self.swarm.listeners().cloned().collect();
@@ -1923,14 +2699,6 @@ impl EventLoopState {
                 // `auth ⊆ conn` is preserved; "conn but not auth" simply isn't
                 // attributable to a specific master and so isn't shown per-row.
                 let _ = reply.send((auth_devices, conn_devices));
-            }
-            SwarmCommand::LookupPeer { device, reply } => {
-                let result = self
-                    .device_to_peer
-                    .get(&device)
-                    .copied()
-                    .ok_or(SwarmError::PeerNotAuthenticated(device));
-                let _ = reply.send(result);
             }
             SwarmCommand::SendResponse { channel, response } => {
                 if self
@@ -1967,6 +2735,85 @@ impl EventLoopState {
                     .map(|peer_id| self.peer_known_addrs(peer_id))
                     .unwrap_or_default();
                 let _ = reply.send(addrs);
+            }
+            #[cfg(feature = "e2e-tools")]
+            SwarmCommand::Disconnect { peer_id, reply } => {
+                let was_connected = self.swarm.disconnect_peer_id(peer_id).is_ok();
+                info!(peer_id = %peer_id, was_connected, "e2e: disconnect peer");
+                let _ = reply.send(was_connected);
+            }
+            #[cfg(test)]
+            SwarmCommand::TestFeedKad {
+                peer_id,
+                addrs,
+                reply,
+            } => {
+                self.feed_kad(peer_id, &addrs);
+                let _ = reply.send(self.kad_addrs_of(&peer_id));
+            }
+            #[cfg(test)]
+            SwarmCommand::TestKadAddrs { peer_id, reply } => {
+                let _ = reply.send(self.kad_addrs_of(&peer_id));
+            }
+            #[cfg(test)]
+            SwarmCommand::TestKadNewPeerCount { peer_id, reply } => {
+                let n = self.test_kad_new_peer.get(&peer_id).copied().unwrap_or(0);
+                let _ = reply.send(n);
+            }
+            #[cfg(test)]
+            SwarmCommand::TestDiscoveryPass { peers, reply } => {
+                let _ = reply.send(self.dial_discovery_result(None, peers));
+            }
+            #[cfg(test)]
+            SwarmCommand::TestDialNewConnection { addr, reply } => {
+                let opts = DialOpts::unknown_peer_id().address(addr).build();
+                let connection_id = opts.connection_id();
+                let result = self
+                    .swarm
+                    .dial(opts)
+                    .map(|()| connection_id)
+                    .map_err(|e| SwarmError::Transport(e.to_string()));
+                let _ = reply.send(result);
+            }
+            #[cfg(test)]
+            SwarmCommand::TestCloseConnection {
+                connection_id,
+                reply,
+            } => {
+                let _ = reply.send(self.swarm.close_connection(connection_id));
+            }
+            #[cfg(test)]
+            SwarmCommand::TestEvict { peer_id, reply } => {
+                let _ = reply.send(self.test_evict(peer_id));
+            }
+            #[cfg(test)]
+            SwarmCommand::TestEvictLateCert { peer_id, reply } => {
+                let Some((_, _, cert)) = self.authenticated.get(&peer_id).cloned() else {
+                    let _ = reply.send((false, false));
+                    return;
+                };
+                self.test_evict(peer_id);
+                let path = verify_cert_for_peer(&peer_id, &cert, &self.cluster_master_pub)
+                    .expect("a cert that authenticated before verifies again");
+                let msg = DeviceCertExchangeMsg {
+                    cert,
+                    x25519_pub: None,
+                };
+                self.record_authenticated(peer_id, msg, path, false);
+                let _ = reply.send((true, self.authenticated.contains_key(&peer_id)));
+            }
+            #[cfg(test)]
+            SwarmCommand::TestRedialOrigins { reply } => {
+                let _ = reply.send(self.test_redial_origins.clone());
+            }
+            #[cfg(test)]
+            SwarmCommand::TestLruEntry { peer_id, reply } => {
+                let _ = reply.send(self.lru.as_ref().and_then(|l| l.entry_state(&peer_id)));
+            }
+            #[cfg(test)]
+            SwarmCommand::TestKadLookups { reply } => {
+                let settled = self.kad_cadence.settled().map(|r| r.as_str());
+                let _ = reply.send((self.test_kad_lookups.clone(), settled));
             }
         }
     }
@@ -2098,6 +2945,32 @@ pub(crate) fn verify_cert_for_peer(
     }
 }
 
+/// INFO `kademlia lookup cadence settled` (Р-17, network-i43).
+fn log_cadence_settled(reason: SettleReason, known: usize, cadence: &KadCadence) {
+    info!(
+        reason = %reason.as_str(),
+        known,
+        interval_secs = cadence.settled_period().map(|d| d.as_secs()).unwrap_or(0),
+        "kademlia lookup cadence settled"
+    );
+}
+
+/// Test-only connection cap (C-DK Р-15): `VIATICUM_E2E_CONN_CAP=N` replaces the
+/// policy's cap when it has one (the DR swap stays without a cache).
+#[cfg(feature = "e2e-tools")]
+fn e2e_conn_cap_from_env(cap: Option<usize>) -> Option<usize> {
+    // Only a policy with a cache gets the test cap.
+    cap?;
+    let raw = std::env::var("VIATICUM_E2E_CONN_CAP").ok()?;
+    match raw.trim().parse::<usize>() {
+        Ok(n) => Some(n),
+        Err(e) => {
+            warn!(value = %raw, err = %e, "e2e: VIATICUM_E2E_CONN_CAP is not a number, ignored");
+            None
+        }
+    }
+}
+
 /// Emit a ProtocolEvent to the consumer channel (best-effort, non-blocking).
 ///
 /// If the channel is full (backpressure from slow consumer) or closed (daemon
@@ -2207,32 +3080,6 @@ pub fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
             None
         }
     })
-}
-
-/// Return the hardcoded IPFS DHT bootstrap nodes (PeerId + Multiaddr pairs).
-///
-/// Source: https://github.com/ipfs/go-ipfs-config/blob/master/bootstrap_peers.go
-/// These are the canonical IPFS bootstrap nodes for the /ipfs/kad/1.0.0 DHT.
-pub fn ipfs_bootstrap_peers() -> Vec<(PeerId, Multiaddr)> {
-    const BOOTSTRAP_ADDRS: &[&str] = &[
-        "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-        "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-        "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
-        "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
-        "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
-        "/ip4/104.236.179.241/tcp/4001/p2p/QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM",
-        "/ip4/128.199.219.111/tcp/4001/p2p/QmSoLSafTMBsPKadTEgaXctDQVcqN88CNLHXMkTNwMKPnu",
-        "/ip4/104.236.76.40/tcp/4001/p2p/QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64",
-    ];
-
-    BOOTSTRAP_ADDRS
-        .iter()
-        .filter_map(|addr_str| {
-            let addr: Multiaddr = addr_str.parse().ok()?;
-            let peer_id = peer_id_from_multiaddr(&addr)?;
-            Some((peer_id, addr))
-        })
-        .collect()
 }
 
 /// Convert a Viaticum DeviceId (Ed25519 pubkey bytes) to a libp2p PeerId.

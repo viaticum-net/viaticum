@@ -208,20 +208,100 @@ pub const HANDSHAKE_FRESHNESS_SECS: u64 = 300;
 /// since msg_id dedup + signature verify already prevent replay attacks.
 pub const MESSAGE_FRESHNESS_SECS: u64 = 3600;
 
-/// Target authenticated peer count.
+/// Max discovery dials per Kademlia discovery round (one `get_closest_peers`
+/// of our own id, C-DK).
 ///
-/// When `authenticated.len() >= TARGET_PEERS`, Kademlia discovery skips new
-/// dial attempts to avoid unbounded connection growth. Cold backup needs
-/// only a small stable set of holders; more peers don't improve reliability
-/// beyond redundancy targets.
-pub const TARGET_PEERS: usize = 20;
-
-/// Max concurrent discovery dials per Kademlia `GetProviders` result.
-///
-/// libp2p Kademlia can return up to K=20 providers per query, and DHT walks
-/// aggregate across multiple hops. Without a cap we burst-dial every result,
-/// blowing `pending_cert` HashMap and saturating `check_cert_timeouts` ticker.
+/// The lookup returns up to K=20 peers. Discovery dials only the ones we do not
+/// know yet (no PeerRecord, not met since start; C-DK Р-5′) and at most this
+/// many per round, so a burst does not flood `pending_cert` and the
+/// `check_cert_timeouts` ticker. There is no gate on how many peers we already
+/// have: knowing many friends is cheap, connections are bounded separately.
 pub const MAX_CONCURRENT_DISCOVERY_DIALS: usize = 5;
+
+// === Connection cache and on-demand dial (C-DK C4, network-i41..i43) ===
+
+/// Connection cache cap (network-i41): at most this many peers with a connection
+/// that is neither busy nor infrastructure. Ilya 09-29: "one connection cache of
+/// ≈ 40–50 per node, inbound and outbound together, nothing pinned; when full,
+/// close the one idle longest". 48 sits in that range; at ~50–200 KB per
+/// connection it costs ≤ 10 MB. Busy peers (a request in flight, a cert exchange
+/// under way, an on-demand dial waiting, ≤ MAX_HANDSHAKE_PROTECTED fresh Kademlia
+/// connections) are never closed, so the cap is soft by exactly that set.
+pub const CONN_CAP: usize = 48;
+
+/// Infrastructure connections outside the cap (network-i41, Ilya's Д-2 + Р-8):
+/// a seed (`relay_role = "punch"`) keeps a connection with every friend up to this
+/// many — the R2 relay-reservation limit; beyond it the cache applies as to all.
+pub const INFRA_CONN_LIMIT: usize = 1024;
+
+/// Redial keeps dialing known peers only while fewer than min(this, cap / 2) are
+/// authenticated (network-i43). Half the cap at most: one eviction per extra peer
+/// never brings the connected count below 2 × floor, so redial never dials back a
+/// peer the cache just closed (no carousel).
+pub const REDIAL_FLOOR: usize = 16;
+
+/// At most this many on-demand dials (network-i42) at once; further requests wait
+/// in a FIFO queue within their own deadline. A mailbox poll fans out to every
+/// postman in parallel: the queue turns that burst into ≤ 16 handshakes at a time.
+pub const MAX_ON_DEMAND_DIALS: usize = 16;
+
+/// An on-demand dial waits this long for the peer's DeviceCertExchange before the
+/// request fails `Unreachable` (network-i42): a localhost / LAN dial takes well
+/// under a second, a silent SYN drop or a black hole costs one such wait.
+pub const ON_DEMAND_AUTH_TIMEOUT_SECS: u64 = 10;
+
+/// Negative cache of on-demand dials (network-i42): a peer our own dial failed to
+/// reach answers `Unreachable` at once for this long, so an offline holder costs
+/// one wait per period instead of one per block of a restore.
+pub const ON_DEMAND_NEG_TTL_SECS: u64 = 60;
+
+/// Upper bound of the negative-cache period, doubled on each repeated failure.
+/// Divided by `time_scale` (but never below ON_DEMAND_NEG_TTL_SECS): an
+/// accelerated test run keeps the same proportions.
+pub const ON_DEMAND_NEG_MAX_SECS: u64 = 1800;
+
+/// The connection cache re-checks the cap on this tick (network-i41). Every event
+/// that frees a peer (a request ends, a cert exchange ends, a newer handshake-only
+/// connection arrives) runs the eviction pass at once; the tick only catches the
+/// end of the handshake grace between events.
+pub const CONN_LRU_TICK_SECS: u64 = 10;
+
+/// A connection with nothing but a handshake (cert, PeerAnnounce) is protected
+/// this long after it was established (network-i41): a Kademlia lookup opens it
+/// to ask the peer, and the lookup needs these seconds to get the answer.
+pub const CONN_HANDSHAKE_GRACE_SECS: u64 = 10;
+
+/// At most this many handshake-only connections are protected at once (the
+/// youngest). Beyond them a fresh Kademlia connection is closed right after its
+/// cert exchange — a bootstrap that opens a hundred connections does not hold a
+/// hundred (v3.2 N-6).
+pub const MAX_HANDSHAKE_PROTECTED: usize = 16;
+
+/// Establishing a connection (TCP + Noise + yamux) gives up after this long: a
+/// "black hole" that accepts TCP and never answers does not hold a dial — and an
+/// on-demand dial slot — forever. The same number as R2's TCP timeout; the libp2p
+/// SwarmBuilder's own default is 10 s, which would end such a dial together with
+/// the on-demand waiter's deadline.
+pub const TRANSPORT_TIMEOUT_SECS: u64 = 20;
+
+/// After the Kademlia cadence settles (network-i43), discovery lookups and the
+/// Kademlia bootstrap run every 30 min (divided by `time_scale`) …
+pub const KAD_DISCOVERY_SETTLED_INTERVAL_SECS: u64 = 30 * 60;
+
+/// … but never more often than this, in real time: at time_scale 1200 they would
+/// run every 1.5 s and the cap bars would measure the time scale, not a friend.
+pub const KAD_SETTLED_FLOOR_SECS: u64 = 60;
+
+/// A re-authentication wakes the work pipeline at most once per this many seconds
+/// per device (divided by `time_scale`; a new peer always wakes it). Each wake
+/// resets every cooldown, and a cache that closes and redials a peer must not turn
+/// that into a loop (C-DK Р-18).
+pub const WORK_WAKE_MIN_SECS: u64 = 600;
+
+/// An outbound connection to a peer the cache evicted less than this long ago is
+/// logged as `lru: re-dial of evicted peer` with its origin (the carousel bar of
+/// network-i43).
+pub const LRU_REDIAL_WINDOW_SECS: u64 = 600;
 
 /// Max relay hop count — drop entries with hop >= this.
 pub const MAX_RELAY_HOP: u8 = 2;

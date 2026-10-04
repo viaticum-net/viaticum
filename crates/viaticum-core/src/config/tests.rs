@@ -6,8 +6,8 @@ use std::io::Write;
 #[cfg(test)]
 use crate::config::{
     AppConfig, BackupCfg, ClusterCfg, ConfigError, DEFAULT_IMPORTANCE,
-    DEFAULT_IMPORTANCE_MULTIPLIER, FourRCfg, MetricsCfg, NetworkCfg, ReliabilityConfig, RestoreCfg,
-    StorageCfg, WatchConfig, WebApiCfg, derive_file_importance, disk_reserve_bytes,
+    DEFAULT_IMPORTANCE_MULTIPLIER, FourRCfg, MetricsCfg, NetworkCfg, RelayRole, ReliabilityConfig,
+    RestoreCfg, StorageCfg, WatchConfig, WebApiCfg, derive_file_importance, disk_reserve_bytes,
     expand_data_dir, hard_quota_bytes, soft_quota_bytes, source_block_size_bytes,
 };
 #[cfg(test)]
@@ -93,8 +93,8 @@ fn config_roundtrips_all_fields() {
             relay_url: None,
             bootstrap_peers: vec![],
             kademlia_bootstrap_peers: vec![],
-            kademlia_disable_ipfs_bootstrap: false,
             listen_port: 0,
+            relay_role: RelayRole::Off,
         },
         cluster: ClusterCfg {
             sync_batch_size: 200,
@@ -1406,18 +1406,53 @@ fn every_section_when_present_but_empty_then_equals_section_default() {
     }
 }
 
+/// network-i17: the IPFS bootstrap switch is gone. A config written before it
+/// was removed still loads, the old key changes nothing, and the keys around it
+/// are read as usual.
 #[test]
-fn network_section_without_key_keeps_ipfs_bootstrap_disabled() {
-    let f = write_toml("[network]\nlisten_port = 4001\n");
-    let cfg = AppConfig::load(f.path()).unwrap();
-    assert!(cfg.network.kademlia_disable_ipfs_bootstrap);
+fn config_network_legacy_ipfs_key_is_ignored() {
+    let f = write_toml(
+        "[network]\nkademlia_disable_ipfs_bootstrap = false\nlisten_port = 4001\n\
+         kademlia_bootstrap_peers = [\"/ip4/127.0.0.1/tcp/4002\"]\n",
+    );
+    let cfg = AppConfig::load(f.path()).expect("a legacy [network] key must not refuse the config");
+    assert_eq!(cfg.network.listen_port, 4001);
+    assert_eq!(
+        cfg.network.kademlia_bootstrap_peers,
+        vec!["/ip4/127.0.0.1/tcp/4002".to_string()]
+    );
+    let saved = toml::to_string(&cfg).expect("serialize");
+    assert!(
+        !saved.contains("ipfs"),
+        "the key is not carried over when the config is written back: {saved}"
+    );
 }
 
+/// network-i15, i41 (C-DK C4): a config written before `relay_role` existed
+/// loads as an ordinary friend (`off`); `"punch"` is the seed role.
 #[test]
-fn network_explicit_false_when_set_then_ipfs_bootstrap_enabled() {
-    let f = write_toml("[network]\nkademlia_disable_ipfs_bootstrap = false\n");
-    let cfg = AppConfig::load(f.path()).unwrap();
-    assert!(!cfg.network.kademlia_disable_ipfs_bootstrap);
+fn config_network_relay_role_defaults_to_off_and_parses_punch() {
+    let old = write_toml("[network]\nlisten_port = 4001\n");
+    let cfg = AppConfig::load(old.path()).expect("an old config without relay_role loads");
+    assert_eq!(cfg.network.relay_role, RelayRole::Off);
+
+    let seed = write_toml(
+        "[network]\nrelay_role = \"punch\"\nexternal_addrs = [\"/ip4/127.0.0.1/tcp/4001\"]\n",
+    );
+    let cfg = AppConfig::load(seed.path())
+        .expect("a seed config loads (external_addrs is ignored until R2)");
+    assert_eq!(cfg.network.relay_role, RelayRole::Punch);
+    let saved = toml::to_string(&cfg).expect("serialize");
+    assert!(
+        saved.contains("relay_role = \"punch\""),
+        "written back: {saved}"
+    );
+
+    let bad = write_toml("[network]\nrelay_role = \"relay\"\n");
+    assert!(
+        AppConfig::load(bad.path()).is_err(),
+        "an unknown role is refused"
+    );
 }
 
 #[test]

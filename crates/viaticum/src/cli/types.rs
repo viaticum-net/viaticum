@@ -40,6 +40,18 @@ pub enum CliRequest {
         /// Node address of the peer (format: <device_id_hex>@<ip>:<port>).
         addr: String,
     },
+    /// Test-only (`net-probe disconnect`, C-DK Р-16): close every connection to
+    /// the known peer whose DeviceId starts with `device_hex` (16+ hex chars).
+    #[cfg(feature = "e2e-tools")]
+    E2eDisconnect {
+        device_hex: String,
+    },
+    /// Test-only (`net-probe reach`, C-DK Р-16): send a PeerAnnounce to that
+    /// peer through `send_to_device`, the path production requests take.
+    #[cfg(feature = "e2e-tools")]
+    E2eReach {
+        device_hex: String,
+    },
 }
 
 /// Response from daemon to CLI process.
@@ -65,7 +77,60 @@ pub enum CliResponse {
         /// Hex-encoded IdentityPub of the connected peer.
         peer_id: String,
     },
+    /// Test-only: an E2eDisconnect / E2eReach succeeded.
+    #[cfg(feature = "e2e-tools")]
+    E2eProbe {
+        /// Full hex DeviceId of the peer.
+        device_hex: String,
+        /// What happened, in words.
+        detail: String,
+        /// Wall time of the operation in the daemon.
+        elapsed_ms: u64,
+    },
     Error(String),
+}
+
+/// The connection cache in `status --json` (network-i41, i42; C-DK Р-7). All
+/// from one `ConnStats` snapshot, taken right after an eviction pass, so on any
+/// status `peer_count_connected − busy_peers − infra_peers − closing_peers ≤
+/// connection_cap` and `protected_peers ≤ 16`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ConnCacheStatus {
+    /// Connected non-infrastructure peers the cache never evicts now: a cert
+    /// exchange under way, a request in flight, an on-demand waiter, protected.
+    #[serde(default)]
+    pub busy_peers: u32,
+    /// Of `busy_peers`: only a handshake, younger than 10 s, among the 16 youngest.
+    #[serde(default)]
+    pub protected_peers: u32,
+    /// Infrastructure peers, outside the cap (a friend's bootstrap peers; every
+    /// peer of a seed).
+    #[serde(default)]
+    pub infra_peers: u32,
+    /// Evicted, connection not closed yet.
+    #[serde(default)]
+    pub closing_peers: u32,
+    /// The cache cap; null = no cache.
+    #[serde(default)]
+    pub connection_cap: Option<u32>,
+    #[serde(default)]
+    pub lru_evictions_total: u64,
+    /// On-demand dials that ended in an authentication / that failed.
+    #[serde(default)]
+    pub on_demand_dials_ok: u64,
+    #[serde(default)]
+    pub on_demand_dials_failed: u64,
+    /// Peers in the on-demand negative cache now.
+    #[serde(default)]
+    pub on_demand_neg_cached: u32,
+    /// Work-pipeline wakes suppressed by the per-device rate (C-DK Р-18).
+    #[serde(default)]
+    pub work_wakes_suppressed: u64,
+    /// PeerRecord events (authentication / identify of a new device) dropped at the
+    /// PeerRecord writer's queue cap since start (C-DK C4 fix round 4, N8). Non-zero =
+    /// records or addresses lost to a flood; the daemon's ERROR log says when.
+    #[serde(default)]
+    pub peer_record_dropped: u64,
 }
 
 /// Data for the `status` subcommand.
@@ -93,6 +158,30 @@ pub struct StatusData {
     /// resets on daemon restart until cert exchange runs again.
     #[serde(default)]
     pub peer_count_authenticated: u32,
+    /// network-i14: peers this node KNOWS — PeerRecords of another master with at
+    /// least one dialable address. Knowledge, not a connection: a known peer may
+    /// be offline. PeerRecords are never deleted in production, so this does not
+    /// decrease.
+    #[serde(default)]
+    pub peer_count_known: u32,
+    /// The known peers (see `peer_count_known`): DeviceId, first 8 bytes hex,
+    /// sorted, uncapped. Shown only in --json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_devices: Option<Vec<String>>,
+    /// PeerRecords of another master WITHOUT a dialable address (the ones
+    /// `known_devices` leaves out; C-DK C4 fix round 3): DeviceId, first 8 bytes
+    /// hex, sorted, uncapped. Shown only in --json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unaddressed_devices: Option<Vec<String>>,
+    /// The devices this node is authenticated with right now: DeviceId, first 8
+    /// bytes hex, sorted, uncapped; `None` when the swarm is down. Shown only in
+    /// --json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_devices: Option<Vec<String>>,
+    /// The connection cache and the on-demand dial (network-i41, i42), one
+    /// snapshot with `peer_count_connected`; flattened into the top level.
+    #[serde(flatten)]
+    pub conn_cache: ConnCacheStatus,
     /// Average trust score across all peers (combined score).
     pub avg_trust: f64,
     /// Total bytes we are storing for others.

@@ -221,7 +221,7 @@ get_addr() {
 }
 
 # write_config IDX PORT: web API on, no disk reserve, fixed listen port (a restart keeps the
-# address unless the scenario changes it), IPFS bootstrap off.
+# address unless the scenario changes it).
 write_config() {
     cat > "$(node_dir "$1")/config.toml" << CFGEOF
 [web_api]
@@ -231,7 +231,6 @@ bind = "127.0.0.1:0"
 disk_reserve_gb = 0.0
 [network]
 listen_port = $2
-kademlia_disable_ipfs_bootstrap = true
 CFGEOF
 }
 

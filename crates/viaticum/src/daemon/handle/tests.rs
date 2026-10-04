@@ -193,7 +193,7 @@ fn write_config_with_listen_port(data_dir: &std::path::Path, port: u16) {
     std::fs::write(
         data_dir.join("config.toml"),
         format!(
-            "[network]\nlisten_port = {port}\nkademlia_disable_ipfs_bootstrap = true\n\
+            "[network]\nlisten_port = {port}\n\
              [web_api]\nenabled = true\nbind = \"127.0.0.1:0\"\n"
         ),
     )
@@ -368,7 +368,7 @@ async fn start_fails_transient_when_web_port_is_held_before_swarm_listens() {
     std::fs::write(
         dir.path().join("config.toml"),
         format!(
-            "[network]\nlisten_port = {listen_port}\nkademlia_disable_ipfs_bootstrap = true\n\
+            "[network]\nlisten_port = {listen_port}\n\
              [web_api]\nenabled = true\nbind = \"127.0.0.1:{web_port}\"\n"
         ),
     )
