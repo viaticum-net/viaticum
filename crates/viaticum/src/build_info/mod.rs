@@ -16,13 +16,49 @@ pub const BUILD_ID_ENV: &str = "VIATICUM_BUILD_ID";
 /// Suffix of a build compiled without [`BUILD_ID_ENV`].
 pub const DEV_SUFFIX: &str = "+dev";
 
+const BUILD_ID: &str = match option_env!("VIATICUM_BUILD_ID") {
+    Some(id) => id,
+    None => concat!(env!("CARGO_PKG_VERSION"), "+dev"),
+};
+
+// A set but malformed VIATICUM_BUILD_ID (empty, another version, no build part)
+// fails the compile instead of shipping a binary that misnames itself.
+const _: () = assert!(
+    is_build_id_of(BUILD_ID, env!("CARGO_PKG_VERSION")),
+    "VIATICUM_BUILD_ID must be <CARGO_PKG_VERSION>+<build>, e.g. 0.1.0-alpha.1+abc1234"
+);
+
+/// `id` is `<version>+<build>` with a non-empty `<build>` of `[0-9A-Za-z.-]`.
+pub const fn is_build_id_of(id: &str, version: &str) -> bool {
+    let (id, version) = (id.as_bytes(), version.as_bytes());
+    if id.len() <= version.len() + 1 {
+        return false;
+    }
+    let mut i = 0;
+    while i < version.len() {
+        if id[i] != version[i] {
+            return false;
+        }
+        i += 1;
+    }
+    if id[i] != b'+' {
+        return false;
+    }
+    i += 1;
+    while i < id.len() {
+        let c = id[i];
+        if !(c.is_ascii_alphanumeric() || c == b'.' || c == b'-') {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// This binary's build id: `<version>+<rev7>` for a release build, `<version>+dev`
 /// otherwise.
 pub const fn build_id() -> &'static str {
-    match option_env!("VIATICUM_BUILD_ID") {
-        Some(id) => id,
-        None => concat!(env!("CARGO_PKG_VERSION"), "+dev"),
-    }
+    BUILD_ID
 }
 
 /// Output of `viaticum build-info` (JSON). The release script compares

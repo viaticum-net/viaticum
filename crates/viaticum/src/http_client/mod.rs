@@ -5,7 +5,8 @@
 //! default provider is installed — reqwest panics with "No provider set" otherwise.
 //! Every client therefore starts from [`blocking_builder`] or [`async_builder`],
 //! which install `ring` first. Clippy's `disallowed-methods` (`clippy.toml`) refuses
-//! a direct `reqwest::…Client::builder()` / `new()` anywhere else.
+//! a direct `reqwest::…Client::builder()` / `new()` / `default()` and any named
+//! `ClientBuilder` (`disallowed-types`) anywhere else.
 //!
 //! Why not reqwest's default provider: it is aws-lc-rs, a second large C crypto
 //! library (`aws-lc-sys`) next to `ring`, which is already in the tree (snow,
@@ -26,14 +27,14 @@ pub fn install_crypto_provider() {
 }
 
 /// A blocking reqwest client builder with the crypto provider in place.
-#[allow(clippy::disallowed_methods)] // the one sanctioned construction site
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)] // the one sanctioned site
 pub fn blocking_builder() -> reqwest::blocking::ClientBuilder {
     install_crypto_provider();
     reqwest::blocking::Client::builder()
 }
 
 /// An async reqwest client builder with the crypto provider in place.
-#[allow(clippy::disallowed_methods)] // the one sanctioned construction site
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)] // the one sanctioned site
 pub fn async_builder() -> reqwest::ClientBuilder {
     install_crypto_provider();
     reqwest::Client::builder()

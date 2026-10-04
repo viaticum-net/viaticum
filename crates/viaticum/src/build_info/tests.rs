@@ -42,3 +42,28 @@ fn build_info_json_has_build_id_and_index_hash_only() {
         .expect("hash is a string");
     assert_eq!(hash.len(), 64, "hex blake3");
 }
+
+#[test]
+fn is_build_id_of_accepts_release_and_dev_ids() {
+    assert!(is_build_id_of("0.1.0-alpha.1+abc1234", "0.1.0-alpha.1"));
+    assert!(is_build_id_of("0.1.0-alpha.1+dev", "0.1.0-alpha.1"));
+    assert!(is_build_id_of(build_id(), env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn is_build_id_of_rejects_empty_foreign_version_and_bare_version() {
+    let v = "0.1.0-alpha.1";
+    for bad in [
+        "",
+        "+abc1234",
+        "0.1.0-alpha.1",
+        "0.1.0-alpha.1+",
+        "0.1.0+abc1234",
+        "0.1.0-alpha.2+abc1234",
+        "0.1.0-alpha.1-abc1234",
+        "0.1.0-alpha.1+abc 1234",
+        "0.1.0-alpha.1+abc/1234",
+    ] {
+        assert!(!is_build_id_of(bad, v), "{bad:?} must be refused");
+    }
+}

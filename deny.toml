@@ -33,6 +33,12 @@ allow = [
 # hygiene, not a license/security gate.
 multiple-versions = "warn"
 wildcards = "warn"
+# R3 Р-4′ (install-i11): rustls runs on `ring`; aws-lc is a second C crypto
+# library the release must not carry (packaging/build_release.sh checks it too).
+deny = [
+    { name = "aws-lc-sys" },
+    { name = "aws-lc-rs" },
+]
 
 [sources]
 unknown-registry = "deny"
