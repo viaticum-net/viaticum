@@ -336,7 +336,7 @@ pub fn run_command(cmd: &Command, connection: &Connection) -> Result<i32, CliErr
 }
 
 fn send_command_http(conn: &Connection, cmd: &Command) -> Result<CliResponse, CliError> {
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::http_client::blocking_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| CliError::Io(std::io::Error::other(e.to_string())))?;

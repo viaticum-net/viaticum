@@ -1,0 +1,11 @@
+# reqwest is built without a default crypto provider (rustls-no-provider, R3 Р-4′):
+# a client built before `ring` is installed panics. Build clients only through
+# `viaticum::http_client::{blocking_builder, async_builder}`.
+disallowed-methods = [
+    { path = "reqwest::Client::builder", reason = "use viaticum::http_client::async_builder (installs the ring provider)" },
+    { path = "reqwest::Client::new", reason = "use viaticum::http_client::async_builder (installs the ring provider)" },
+    { path = "reqwest::blocking::Client::builder", reason = "use viaticum::http_client::blocking_builder (installs the ring provider)" },
+    { path = "reqwest::blocking::Client::new", reason = "use viaticum::http_client::blocking_builder (installs the ring provider)" },
+    { path = "reqwest::get", reason = "builds a client without the ring provider; use viaticum::http_client" },
+    { path = "reqwest::blocking::get", reason = "builds a client without the ring provider; use viaticum::http_client" },
+]

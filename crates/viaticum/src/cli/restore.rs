@@ -341,7 +341,7 @@ fn http(
     body: Option<String>,
     timeout: Duration,
 ) -> Result<(u16, String), CliError> {
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::http_client::blocking_builder()
         .timeout(timeout)
         .build()
         .map_err(|e| CliError::Io(std::io::Error::other(e.to_string())))?;

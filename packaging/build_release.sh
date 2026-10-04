@@ -99,9 +99,19 @@ build_target() {
 }
 
 # Who pulls aws-lc-sys into the user build (Р-4′). Prints the inverted tree; empty = none.
+# A failing `cargo tree` must not pass as "none": its error goes to stderr and fails the build.
 aws_lc_report() {
     local target="$1"
-    (cd "$SRC" && cargo tree -e normal -p viaticum --target "$target" -i aws-lc-sys 2>/dev/null) || true
+    local out err
+    err="$WORK/cargo-tree.err"
+    if out="$(cd "$SRC" && cargo tree --locked -e normal -p viaticum --target "$target" -i aws-lc-sys 2>"$err")"; then
+        echo "$out"
+    elif grep -q "did not match any packages" "$err"; then
+        return 0 # not even in Cargo.lock
+    else
+        cat "$err" >&2
+        die "cargo tree failed for $target"
+    fi
 }
 
 # A static binary has no NEEDED entries in its dynamic section.
@@ -149,11 +159,10 @@ main() {
         cp "$bin" "$OUT/$arch/viaticum"
         tree="$(aws_lc_report "$target")"
         if [ -n "$tree" ]; then
-            log "WARN $target: aws-lc-sys is in the build:"
             echo "$tree" >&2
-        else
-            log "$target: no aws-lc-sys"
+            die "$target: aws-lc-sys is in the build (R3 Р-4′: rustls must use ring), see the tree above"
         fi
+        log "$target: no aws-lc-sys"
         log "$target: $(stat -c %s "$OUT/$arch/viaticum") bytes; $(file -b "$OUT/$arch/viaticum")"
     done
     echo "$BUILD_ID" >"$OUT/VERSION"
