@@ -578,7 +578,17 @@ step2b() {
     RB=$(file_block_hex 0 "$RB_FILE"); RB16=${RB:0:16}
     local tgt on
     tgt=$(file_field 0 "$RB_FILE" '.effective_status.target // 0')
-    on=$(( $(block_symbols_on 1 "$RB") + $(block_symbols_on 2 "$RB") ))
+    # "restorable" per node-00 comes while the layout of RB is still running (the 20261003-122334 run
+    # read 2560 < k_eff 3204 right then, and the restore passed later on the symbols that arrived
+    # after). Wait for the layout: the restore with node-03/04 frozen draws on node-01 AND node-02
+    # together, so the sum is what must reach k_eff. Not reached in 300 s: ROUGH blind, as before.
+    local rb_end=$(( $(date +%s) + 300 ))
+    while :; do
+        on=$(( $(block_symbols_on 1 "$RB") + $(block_symbols_on 2 "$RB") ))
+        { [ "${tgt:-0}" -gt 0 ] && [ "$on" -ge "$tgt" ]; } && break
+        [ "$(date +%s)" -ge "$rb_end" ] && break
+        sleep 2
+    done
     if [ "${tgt:-0}" -gt 0 ] && [ "$on" -ge "$tgt" ]; then pass "RB ${RB16}.. has $on >= k_eff $tgt symbols on node-01 + node-02 (the two that stay alive)"
     else rough "3b (г) blind: RB ${RB16}.. has $on symbols on node-01 + node-02, k_eff ${tgt:-?}"; fi
     local ok=0
