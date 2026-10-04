@@ -405,6 +405,8 @@ impl AnsweredChallenges {
 /// Counters of one poll, printed by `mailbox_poll: poll done`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PollCounts {
+    /// Postmen whose answer the poll read before its deadline (mailbox-i63).
+    pub responders: u32,
     /// Challenges the handler answered with a response this poll (symbols read).
     pub computed: u32,
     /// Challenges the handler gave no answer to (Nack, unauthenticated, oversized).
@@ -428,7 +430,7 @@ pub struct PollCounts {
     /// ours): dropped without a WARN (pos-i6).
     pub not_pending: u32,
     /// PosResponse entries already handed over and still pending, or a second envelope
-    /// of one challenge in this poll (pos-i6).
+    /// of one challenge in the same poll (pos-i6).
     pub in_flight: u32,
 }
 
@@ -460,8 +462,10 @@ impl PosPollState {
         }
     }
 
-    /// Start of one poll: forget what expired; returns how many entries were dropped.
+    /// Start of one poll: forget what expired (returns how many entries were dropped) and
+    /// open a new poll for the one-envelope-per-challenge rule (`ForwardedResponses`).
     pub fn begin_poll(&mut self, now_secs: u64) -> usize {
+        self.forwarded.begin_poll();
         self.answered.forget_expired(now_secs)
     }
 }

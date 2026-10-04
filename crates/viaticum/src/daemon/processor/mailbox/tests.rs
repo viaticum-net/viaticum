@@ -528,16 +528,35 @@ fn store_checks_candidate_set_against_entry_target() {
 // AC-22: postman clock (mailbox-i22)
 // ============================================================
 
+/// Expired past the transit window (mailbox-i61): the sender's clock is off.
 #[test]
 fn store_rejects_already_expired_entry() {
     let db = test_db();
     let target = make_target(19);
-    for expires_at in [NOW, NOW - 1, 0] {
-        let mut entry = make_entry(target, make_msg_id(1), 10, NOW - 10, 0);
+    for expires_at in [NOW - 60, NOW - 3600, 0] {
+        let mut entry = make_entry(target, make_msg_id(1), 10, NOW - 7200, 0);
         entry.expires_at = expires_at;
         let resp = store(&db, make_store_request(entry), NOW);
         assert!(
             is_reject(&resp, MailboxRejectReason::ClockSkew),
+            "expires_at {expires_at} vs now {NOW}: {resp:?}"
+        );
+    }
+    assert!(stored(&db, &target).is_empty());
+}
+
+/// mailbox-i61: an entry whose TTL ran out on the way (within the last minute, sealed
+/// in the postman's past) is refused as `Expired`, not as clock skew, and not stored.
+#[test]
+fn store_rejects_entry_expired_in_transit_as_expired() {
+    let db = test_db();
+    let target = make_target(21);
+    for expires_at in [NOW, NOW - 1, NOW - 59] {
+        let mut entry = make_entry(target, make_msg_id(1), 10, NOW - 7200, 0);
+        entry.expires_at = expires_at;
+        let resp = store(&db, make_store_request(entry), NOW);
+        assert!(
+            is_reject(&resp, MailboxRejectReason::Expired),
             "expires_at {expires_at} vs now {NOW}: {resp:?}"
         );
     }

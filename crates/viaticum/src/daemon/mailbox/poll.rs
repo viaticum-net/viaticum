@@ -19,7 +19,7 @@
 //   Generic/other  → ignore
 
 use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -31,7 +31,7 @@ use viaticum_core::messages::{
 };
 use viaticum_core::types::{IdentityPub, from_cbor_bytes, hex_encode};
 
-use super::routing::MailboxRouter;
+use super::routing::{MailboxRouter, PEER_REQUEST_TIMEOUT, PollSeen};
 use crate::daemon::pos_memo::{
     AnsweredChallenges, ChallengeKey, ChallengeStep, PollCounts, PosPollState,
 };
@@ -52,6 +52,26 @@ pub(crate) fn poll_interval_secs(time_scale: u64) -> u64 {
     (MAILBOX_POLL_INTERVAL_SECS / time_scale.max(1)).max(1)
 }
 
+/// The least time one poll reads the postmen's answers, in real seconds (mailbox-i63-b).
+///
+/// Under a large `time_scale` the poll period floors at 1 s; a read budget that short would
+/// never read an honest postman slower than 1 s, in any poll. With the floor a poll may
+/// outlast the period: the next tick is then skipped (`MissedTickBehavior::Skip` in
+/// `run_mailbox_poll`), not queued.
+pub(crate) const POLL_READ_FLOOR: Duration = Duration::from_secs(5);
+
+/// How long one poll reads the postmen's answers (mailbox-i63): one postman's request
+/// timeout (`PEER_REQUEST_TIMEOUT`, 15 s), shortened to the poll period
+/// (`poll_interval_secs`) so a sleeping postman does not stretch every poll to 15 s, but
+/// never below `POLL_READ_FLOOR` (mailbox-i63-b). Production (`time_scale` = 1): 15 s.
+/// An answer that comes later still records its contact (avail, `last_seen`) in its own
+/// fetch task (`routing::fetch`); its records stay at the postman until their TTL and come
+/// back on the next poll.
+pub(crate) fn poll_read_budget(time_scale: u64) -> Duration {
+    let period = Duration::from_secs(poll_interval_secs(time_scale));
+    PEER_REQUEST_TIMEOUT.min(period.max(POLL_READ_FLOOR))
+}
+
 /// Run the periodic mailbox poll loop.
 ///
 /// Polls immediately on first tick, then every `poll_interval_secs(time_scale)`.
@@ -59,7 +79,8 @@ pub(crate) fn poll_interval_secs(time_scale: u64) -> u64 {
 ///
 /// Parameters:
 /// - `router`: the MailboxRouter used to poll and publish responses
-/// - `pos_response_tx`: bounded channel (capacity 256) to scheduler for PosResponse entries
+/// - `pos_response_tx`: bounded channel (`POS_RESPONSE_CHANNEL_CAP`, see
+///   `pos_response_channel`) to the scheduler for PosResponse entries
 /// - `pending`: the owner's in-flight challenges, written by the scheduler; only responses
 ///   to these are forwarded (pos-i6)
 /// - `challenge_handler`: called with (owner_master, challenge_payload_bytes) to process a
@@ -119,10 +140,14 @@ pub async fn run_mailbox_poll(
     }
 }
 
-/// One poll of our own master box: forget expired PoS memory, fetch, forward the
-/// PosResponse entries as one batch (pos-i6), dispatch every other entry, print
-/// `mailbox_poll: poll done` (INFO when the poll had entries, DEBUG when it was empty).
-/// Returns the counters (`None` when the fetch failed).
+/// One poll of our own master box: forget expired PoS memory, then handle every
+/// postman's answer as it arrives (mailbox-i63): drop the records already seen in this
+/// poll (same bytes, `PollSeen`, mailbox-i69) or expired, forward the answer's
+/// PosResponse entries as one batch (pos-i6), dispatch its other entries one by one.
+/// A sleeping postman delays only its own records. The poll stops reading at its
+/// deadline (`poll_read_budget`): a late answer records its contact in its own task and
+/// its records come on the next poll. Then print `mailbox_poll: poll done` (INFO when the
+/// poll had entries, DEBUG when it was empty; `responders` = postmen read in time).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn poll_once(
     router: &Arc<MailboxRouter>,
@@ -135,46 +160,69 @@ pub(crate) async fn poll_once(
     my_master_pub: &IdentityPub,
     time_scale: u64,
     now_secs: u64,
-) -> Option<PollCounts> {
+) -> PollCounts {
     let started = Instant::now();
     let forgotten = pos.begin_poll(now_secs);
 
-    // Poll our own mailbox from read-fanout peers.
-    let entries = match router
-        .poll(&MailboxAddress::for_master(my_master_pub), None, None)
-        .await
-    {
-        Ok(e) => e,
-        Err(err) => {
-            warn!(err = %err, "mailbox_poll: poll failed");
-            return None;
-        }
-    };
-
-    let entry_count = entries.len();
+    // Poll our own mailbox from read-fanout peers. No watermark (`since_stored_at` =
+    // None): a holder's re-published PoS response keeps its first `stored_at` and must
+    // still come back (mailbox-i63, `pos_memo`).
+    let mut answers = router.poll_stream(&MailboxAddress::for_master(my_master_pub), None, None);
+    let deadline = tokio::time::Instant::now() + poll_read_budget(time_scale);
+    let mut seen = PollSeen::new(now_secs);
+    let mut entry_count = 0usize;
+    let mut first_entry_ms: Option<u64> = None;
     let mut counts = PollCounts::default();
-    // pos-i6: the responses go as one batch — one lock of `pending` for all of them —
-    // and first, before the challenges' publishes.
-    let (responses, others): (Vec<MailboxEntry>, Vec<MailboxEntry>) = entries
-        .into_iter()
-        .partition(|e| e.class == MailboxClass::PosResponse);
-    forward_pos_responses(pos, pos_response_tx, responses, now_secs, &mut counts).await;
-    for entry in others {
-        dispatch_entry(
-            router,
-            pos_response_tx,
-            pos,
-            &mut counts,
-            challenge_handler,
-            drop_handler,
-            delete_handler,
-            revocation_handler,
-            my_master_pub,
-            entry,
-            time_scale,
-            now_secs,
-        )
-        .await;
+    let mut responses_forwarded = false;
+
+    loop {
+        let answer = match tokio::time::timeout_at(deadline, answers.recv()).await {
+            Ok(Some((_postman, answer))) => answer,
+            // Every postman answered or timed out.
+            Ok(None) => break,
+            // The read budget is spent: stop reading (mailbox-i63).
+            Err(_) => break,
+        };
+        counts.responders += 1;
+        let entries = seen.admit(answer);
+        if entries.is_empty() {
+            continue;
+        }
+        first_entry_ms.get_or_insert(started.elapsed().as_millis() as u64);
+        entry_count += entries.len();
+        // pos-i6: the answer's responses go as one batch — one lock of `pending` for
+        // all of them — and first, before the challenges' publishes. Sequential, one
+        // entry after another: the holder's answer limit is not bypassed.
+        let (responses, others): (Vec<MailboxEntry>, Vec<MailboxEntry>) = entries
+            .into_iter()
+            .partition(|e| e.class == MailboxClass::PosResponse);
+        if !responses.is_empty() {
+            forward_pos_responses(pos, pos_response_tx, responses, now_secs, &mut counts).await;
+            responses_forwarded = true;
+        }
+        for entry in others {
+            dispatch_entry(
+                router,
+                pos_response_tx,
+                pos,
+                &mut counts,
+                challenge_handler,
+                drop_handler,
+                delete_handler,
+                revocation_handler,
+                my_master_pub,
+                entry,
+                time_scale,
+                now_secs,
+            )
+            .await;
+        }
+    }
+    // Late answers find the channel closed; their tasks have recorded the contact.
+    drop(answers);
+    if !responses_forwarded {
+        // Release the sent marks of resolved challenges even when no response came.
+        forward_pos_responses(pos, pos_response_tx, vec![], now_secs, &mut counts).await;
     }
 
     // One line per poll (pos-i5 observables): INFO with entries, DEBUG when empty.
@@ -182,9 +230,11 @@ pub(crate) async fn poll_once(
     let memo_answered = pos.answered.len();
     let memo_refused = pos.answered.refused();
     let memo_forwarded = pos.forwarded.len();
-    if entry_count > 0 {
+    if let Some(first_entry_ms) = first_entry_ms {
         info!(
             elapsed_ms,
+            first_entry_ms,
+            responders = counts.responders,
             entries = entry_count,
             computed = counts.computed,
             no_answer = counts.no_answer,
@@ -206,6 +256,7 @@ pub(crate) async fn poll_once(
     } else {
         debug!(
             elapsed_ms,
+            responders = counts.responders,
             entries = 0,
             memo_answered,
             memo_forwarded,
@@ -214,7 +265,7 @@ pub(crate) async fn poll_once(
             "mailbox_poll: poll done"
         );
     }
-    Some(counts)
+    counts
 }
 
 /// Unix seconds now.
@@ -256,8 +307,8 @@ pub(crate) async fn dispatch_entry(
             .await;
         }
         MailboxClass::PosResponse => {
-            // The poll loop batches responses (`poll_once`); a single entry takes the
-            // same path.
+            // The poll loop batches each answer's responses (`poll_once`); a single
+            // entry takes the same path.
             forward_pos_responses(pos, pos_response_tx, vec![entry], now_secs, counts).await;
         }
         MailboxClass::SelfPointer => {
@@ -318,7 +369,7 @@ async fn dispatch_pos_challenge(
     now_secs: u64,
 ) {
     // CS-ID-6 / SM-8 (defense-in-depth): we only ever poll our own mailbox
-    // (`router.poll(&my_master_pub, ...)`), so a PosChallenge that reaches dispatch
+    // (`router.poll_stream(&my_master_pub, ...)`), so a PosChallenge that reaches dispatch
     // must be addressed to us. Effects are already gated by signature verification
     // (the holding lookup keys on owner_master from `entry.sender`), but this guard
     // documents and enforces the routing invariant: a buggy or hostile postman that
@@ -571,14 +622,18 @@ pub(crate) fn pos_response_channel() -> (
     mpsc::channel(POS_RESPONSE_CHANNEL_CAP)
 }
 
-/// Hand the PosResponse entries of one poll to the scheduler (pos-i6).
+/// Hand the PosResponse entries of one postman's answer to the scheduler (pos-i6).
 ///
-/// One lock of `pending` covers the selection (no await inside it): only responses to
-/// challenges still pending, each envelope once while it is pending, one envelope per
-/// challenge per poll. Then `try_send` outside the lock: a sent envelope is marked; a
-/// full channel leaves it unmarked and the next poll sends it (the entry lives at the
-/// postmen until its TTL) — N-5 bounds the channel, nothing is dropped. Resolved,
-/// foreign and duplicate responses are dropped silently and counted in `poll done`.
+/// The poll calls it once per answer as the answers arrive (mailbox-i63). One lock of
+/// `pending` covers the selection (no await inside it): only responses to challenges
+/// still pending, each envelope once while it is pending, and one envelope per challenge
+/// per poll across all its answers (`ForwardedResponses` keeps the poll's chosen
+/// challenge_ids until `PosPollState::begin_poll`); a second envelope of a challenge is
+/// in flight and goes on a later poll if the challenge is still pending. Then `try_send`
+/// outside the lock: a sent envelope is marked; a full channel leaves it unmarked and the
+/// next poll sends it (the entry lives at the postmen until its TTL) — N-5 bounds the
+/// channel, nothing is dropped. Resolved, foreign and duplicate responses are dropped
+/// silently and counted in `poll done`.
 pub(crate) async fn forward_pos_responses(
     pos: &mut PosPollState,
     pos_response_tx: &mpsc::Sender<PosHashResponseMsg>,

@@ -1,8 +1,8 @@
 use crate::db::testutil::test_db;
 use crate::mailbox::{
-    MailboxAddress, MailboxClass, MailboxEngine, MailboxEntry, MailboxError,
-    SELF_POINTER_MAX_FUTURE_SKEW_SECS, Stored, check_entry_clock, check_pointer_sealed,
-    class_config, seal,
+    MAILBOX_TRANSIT_GRACE_SECS, MailboxAddress, MailboxClass, MailboxEngine, MailboxEntry,
+    MailboxError, SELF_POINTER_MAX_FUTURE_SKEW_SECS, Stored, check_entry_clock,
+    check_pointer_sealed, class_config, seal, transit_grace_secs,
 };
 
 // ============================================================
@@ -1104,15 +1104,17 @@ fn check_entry_clock_rejects_already_expired_entry() {
         make_msg_id(1),
         MailboxClass::PosChallenge,
         vec![],
-        now,
+        now - 3600,
         10,
     );
-    e.expires_at = now;
+    // Sealed an hour ago (not fresh) and expired past the transit window
+    // (mailbox-i61): ClockSkew.
+    e.expires_at = now - 61;
     assert!(matches!(
         check_entry_clock(&e, now),
         Err(MailboxError::ClockSkew { .. })
     ));
-    e.expires_at = now - 1;
+    e.expires_at = now - 3000;
     assert!(matches!(
         check_entry_clock(&e, now),
         Err(MailboxError::ClockSkew { .. })
@@ -1164,6 +1166,123 @@ fn check_entry_clock_accepts_old_unexpired_self_pointer() {
     let mut e = pointer(make_target(49), 1, now - four_years);
     e.expires_at = now + 365 * 24 * 3600;
     assert!(check_entry_clock(&e, now).is_ok());
+}
+
+/// A PoS response with the production TTL (7 days) sent at `stored_at`.
+fn pos_response(stored_at: u64) -> MailboxEntry {
+    make_entry(
+        make_target(51),
+        make_msg_id(1),
+        MailboxClass::PosResponse,
+        vec![],
+        stored_at,
+        7 * 24 * 3600,
+    )
+}
+
+/// mailbox-i61: an entry whose TTL ran out on the way (expired up to a minute ago by
+/// the postman's clock, sealed in the postman's past) is `Expired`, not a clock fault.
+#[test]
+fn entry_expired_within_grace_is_expired_not_clock_skew() {
+    let now = 1_800_000_000;
+    let mut e = pos_response(now - 7 * 24 * 3600);
+    assert_eq!(transit_grace_secs(&e), MAILBOX_TRANSIT_GRACE_SECS);
+    for expired_ago in [0, 1, MAILBOX_TRANSIT_GRACE_SECS - 1] {
+        e.expires_at = now - expired_ago;
+        assert!(
+            matches!(
+                check_entry_clock(&e, now),
+                Err(MailboxError::Expired { expires_at, now: n }) if expires_at == now - expired_ago && n == now
+            ),
+            "expired {expired_ago} s ago"
+        );
+    }
+    // A pointer is judged the same way.
+    let mut p = pointer(make_target(52), 1, now - 1_000);
+    p.expires_at = now - 1;
+    assert!(matches!(
+        check_entry_clock(&p, now),
+        Err(MailboxError::Expired { .. })
+    ));
+}
+
+/// mailbox-i61: past the window, or an entry "sealed" in the postman's future, is
+/// still `ClockSkew` (the sender's clock is off by about the whole TTL or more).
+#[test]
+fn entry_expired_long_ago_is_clock_skew() {
+    let now = 1_800_000_000;
+    let mut e = pos_response(now - 30 * 24 * 3600);
+    for expired_ago in [
+        MAILBOX_TRANSIT_GRACE_SECS,
+        MAILBOX_TRANSIT_GRACE_SECS + 1,
+        3600,
+    ] {
+        e.expires_at = now - expired_ago;
+        assert!(
+            matches!(
+                check_entry_clock(&e, now),
+                Err(MailboxError::ClockSkew { .. })
+            ),
+            "expired {expired_ago} s ago"
+        );
+    }
+    // stored_at ahead of the postman: not "in transit", whatever the expiry.
+    let mut ahead = pos_response(now + 10);
+    ahead.expires_at = now;
+    assert!(matches!(
+        check_entry_clock(&ahead, now),
+        Err(MailboxError::ClockSkew { .. })
+    ));
+}
+
+/// Р.3: the expiry window is a quarter of the entry's own lifetime when that is under
+/// four minutes. Judged here on entries sealed more than a minute ago, so only the
+/// expiry window decides.
+#[test]
+fn grace_shrinks_with_a_short_lived_entry() {
+    let now = 1_800_000_000;
+    let ttl = 120;
+    let mut e = pos_response(0);
+    e.stored_at = now - 140;
+    e.expires_at = e.stored_at + ttl; // expired 20 s ago
+    let grace = transit_grace_secs(&e);
+    assert_eq!(grace, ttl / 4);
+    assert!(grace < MAILBOX_TRANSIT_GRACE_SECS);
+    assert!(matches!(
+        check_entry_clock(&e, now),
+        Err(MailboxError::Expired { .. })
+    ));
+    e.stored_at = now - ttl - grace;
+    e.expires_at = e.stored_at + ttl; // expired exactly `grace` ago: out of the window
+    assert!(matches!(
+        check_entry_clock(&e, now),
+        Err(MailboxError::ClockSkew { .. })
+    ));
+    // Zero lifetime: no expiry window.
+    e.expires_at = e.stored_at;
+    assert_eq!(transit_grace_secs(&e), 0);
+}
+
+/// mailbox-i61 (E2E `mailbox_privacy` 10-04): a PoS response with a scaled lifetime
+/// of 6 s, sealed 13 s ago, reached a slow postman 7 s after expiry. Its `stored_at`
+/// is fresh, so the sender's clock is fine: `Expired`, not `ClockSkew`.
+#[test]
+fn short_lived_entry_slow_in_transit_is_expired() {
+    let now = 1_791_100_414;
+    let mut e = pos_response(0);
+    e.stored_at = 1_791_100_401;
+    e.expires_at = 1_791_100_407;
+    assert!(matches!(
+        check_entry_clock(&e, now),
+        Err(MailboxError::Expired { .. })
+    ));
+    // Sealed just over a minute ago and long expired: the clock is to blame.
+    e.stored_at = now - MAILBOX_TRANSIT_GRACE_SECS - 1;
+    e.expires_at = e.stored_at + 6;
+    assert!(matches!(
+        check_entry_clock(&e, now),
+        Err(MailboxError::ClockSkew { .. })
+    ));
 }
 
 #[test]

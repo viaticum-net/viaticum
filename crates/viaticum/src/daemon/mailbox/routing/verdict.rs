@@ -36,18 +36,30 @@ pub enum PublishVerdict {
     /// No ack; every refusal was `QuotaExceeded` (for a SelfPointer: the address has
     /// no free place — 64 installations of this phrase).
     AllSlotsFull,
-    /// No ack; refusals of different reasons.
+    /// No ack; refusals of different reasons (`Expired` counts as `other`).
     MixedRefusal {
         clock: usize,
         superseded: usize,
         slots_full: usize,
         other: usize,
     },
-    /// No ack and no refusal: nobody answered (or nobody was asked).
+    /// No ack and no refusal: nobody answered (or nobody was asked). Also when every
+    /// refusal was `Expired` (mailbox-i61: died in transit, no clock verdict).
     NoAck,
 }
 
 impl PublishOutcome {
+    /// mailbox-i61: no ack, and every postman that refused said the entry expired in
+    /// transit — nobody holds it and re-offering the same bytes cannot help.
+    pub fn all_expired(&self) -> bool {
+        self.acks.is_empty()
+            && !self.rejects.is_empty()
+            && self
+                .rejects
+                .iter()
+                .all(|(_, r)| *r == MailboxRejectReason::Expired)
+    }
+
     /// Classify the answers. "All*" = no ack, at least one refusal, and every refusal
     /// of that reason (network errors are not counted either way).
     pub fn verdict(&self) -> PublishVerdict {
@@ -60,16 +72,23 @@ impl PublishOutcome {
             return PublishVerdict::NoAck;
         }
         let (mut clock, mut superseded, mut slots_full, mut other) = (0, 0, 0, 0);
+        let mut expired = 0;
         for (_, reason) in &self.rejects {
             match reason {
                 MailboxRejectReason::ClockSkew => clock += 1,
                 MailboxRejectReason::Superseded => superseded += 1,
                 MailboxRejectReason::QuotaExceeded => slots_full += 1,
+                MailboxRejectReason::Expired => {
+                    expired += 1;
+                    other += 1;
+                }
                 _ => other += 1,
             }
         }
         let n = self.rejects.len();
-        if clock == n {
+        if expired == n {
+            PublishVerdict::NoAck
+        } else if clock == n {
             PublishVerdict::AllClockSkew
         } else if superseded == n {
             PublishVerdict::AllSuperseded

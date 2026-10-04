@@ -186,7 +186,8 @@ pub(super) fn record_contact_off_runtime(db: &Db, device_id: DeviceId, now_secs:
 /// One postman's refusal of a store: a refusal that is our own fault (`Unauthorized`,
 /// `PlaintextPayload`) is a `warn!`; `ClockSkew` / `Superseded` of a SelfPointer are
 /// `debug!` (the publisher logs the verdict); `ClockSkew` of a directed entry stays
-/// `warn!`.
+/// `warn!`. `Expired` (mailbox-i61: the entry died in transit) is `debug!` for every
+/// class — not a key or clock fault.
 fn log_store_refusal(
     device_id: DeviceId,
     target: &MailboxAddress,
@@ -200,7 +201,14 @@ fn log_store_refusal(
     );
     let directed_clock =
         class != MailboxClass::SelfPointer && matches!(reason, MailboxRejectReason::ClockSkew);
-    if ours || directed_clock {
+    if *reason == MailboxRejectReason::Expired {
+        debug!(
+            device = %device_id,
+            msg_id = %hex_encode(msg_id),
+            ?class,
+            "mailbox publish: postman refused the entry — expired in transit"
+        );
+    } else if ours || directed_clock {
         warn!(
             device = %device_id,
             target = %target,
