@@ -463,9 +463,10 @@ async fn dispatch_pos_challenge(
                 payload: response_payload,
                 expires_at: built_at + ttl_secs,
                 stored_at: built_at,
-                // CS-ID-1: stamp our (holder) master so the owner can resolve and verify
-                // the response signature. The owner does not trust this hint blindly — it
-                // verifies the payload sig against the master of its own pending.holder_id.
+                // CS-ID-1: stamp our (holder) master — a routing hint only. The owner does
+                // not use it to verify: it checks that the response names the device of its
+                // own pending (`pending.holder_id`) and is signed by that device's key
+                // (pos-i16, C-SP K1).
                 sender: Some(*my_master_pub),
             };
 

@@ -169,3 +169,33 @@ async fn mailbox_response_from_placement_device_passes() {
     assert!(f.pending.lock().await.is_empty());
     assert!(f.placement().last_verified.is_some(), "Pass");
 }
+
+// B cross-review WARN-2: garbage from a postman naming some other device, with a signature
+// that is not that device's, is logged as a signature failure — not as "another device of
+// the holder's master" — and rules nothing. Mutation: drop the signature check under
+// `response.device_id` in the `WrongDevice` branch → the "another device" WARN; reddens.
+#[tokio::test]
+async fn mailbox_response_with_foreign_device_and_bad_signature_logs_signature_failure() {
+    let f = pos_drop_fixture(0xC5, PlacementStatus::Alive, 0, 0);
+    let trust = trust_of(&f);
+    let (cid, _) = f.challenge(Timestamp::now(), 0xC5).await;
+    let sibling = sibling_of(&f, 0xCB);
+    let mut garbage = build_pos_hash_response(cid, f.block, [0xEE; 32], Timestamp::now(), &sibling);
+    garbage.sig = [0x5A; 64];
+
+    let ((), log) = logged(deliver(&f, garbage)).await;
+
+    assert_nothing_ruled(&f, cid, trust, "garbage response").await;
+    assert!(
+        !log.contains("from another device of the holder's master"),
+        "not attributed to the sibling:\n{log}"
+    );
+    let line = log
+        .lines()
+        .find(|l| l.contains("signature verification failed"))
+        .unwrap_or_else(|| panic!("the signature WARN is printed:\n{log}"));
+    assert!(
+        line.contains(&hex_encode(&cid)),
+        "with the challenge_id: {line}"
+    );
+}

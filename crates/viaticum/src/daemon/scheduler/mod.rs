@@ -394,13 +394,31 @@ impl Scheduler {
         match viaticum_core::messages::verify_pos_hash_response(&response, &holder_id) {
             Ok(()) => {}
             Err(viaticum_core::messages::MessageError::WrongDevice { expected, got }) => {
-                warn!(
-                    block_id = %block_id,
-                    holder = %expected,
-                    responder = %got,
-                    challenge_id = %hex_encode(&response.challenge_id),
-                    "scheduler: PosHashResponse from another device of the holder's master — ignored, pending left intact"
-                );
+                // Name the responder only if the response really is its (signed by `got`):
+                // a postman's garbage with some other `device_id` must not be logged as a
+                // sibling's answer.
+                match viaticum_core::messages::verify_pos_hash_response(&response, &got) {
+                    Ok(()) => {
+                        let responder_master = self.db.get_master_for_device(&got).ok().flatten();
+                        warn!(
+                            block_id = %block_id,
+                            holder = %expected,
+                            responder = %got,
+                            responder_master = ?responder_master,
+                            challenge_id = %hex_encode(&response.challenge_id),
+                            "scheduler: PosHashResponse from another device of the holder's master — ignored, pending left intact"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            block_id = %block_id,
+                            holder_id = %holder_id,
+                            challenge_id = %hex_encode(&response.challenge_id),
+                            err = %e,
+                            "scheduler: PosHashResponse signature verification failed — ignoring (forge attempt or unsigned), pending left intact"
+                        );
+                    }
+                }
                 return Ok(());
             }
             Err(e) => {
