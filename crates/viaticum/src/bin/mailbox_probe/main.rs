@@ -26,6 +26,11 @@
 //       SymbolDropNoticeBatchMsg with the master key of DIR/identity.key (a holder of
 //       the same run) and stores it as plaintext version 1 (S1 step 6c).
 //
+//   remove --data-dir D --target HEX [--msg-id HEX] [--class C]
+//       Deletes the matching entries of one address (expired included) by the same
+//       `Db::mailbox_delete` path as `inject --replace`; without `--msg-id` every entry
+//       of the class, without `--class` every class. Prints `{"removed": n}`.
+//
 //   peer-x25519 --data-dir D --device HEX --clear
 //       Clears `PeerRecord.x25519_pub` of one peer (S1 step 10, mailbox-i8).
 //
@@ -46,6 +51,7 @@ use viaticum_core::types::{DeviceId, SourceBlockId, Timestamp, hex_encode, to_cb
 
 mod audit;
 mod inject;
+mod remove;
 mod rendezvous;
 
 #[derive(Parser, Debug)]
@@ -99,6 +105,19 @@ enum Cmd {
         /// Overwrite an entry under the same (target, msg_id, class).
         #[arg(long)]
         replace: bool,
+    },
+    /// Delete the matching entries of one mailbox address.
+    Remove {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        target: String,
+        /// Only this msg_id (default: every msg_id).
+        #[arg(long)]
+        msg_id: Option<String>,
+        /// Only this class (default: every class).
+        #[arg(long)]
+        class: Option<String>,
     },
     /// Offline: the pointer box address and place slots of a recovery phrase.
     Rendezvous {
@@ -301,6 +320,20 @@ fn main() {
                     "replaced": replaced,
                 })
             );
+        }
+        Cmd::Remove {
+            data_dir,
+            target,
+            msg_id,
+            class: class_name,
+        } => {
+            let target = MailboxAddress(hex32(&target, "--target"));
+            let msg_id = msg_id.map(|m| hex16(&m, "--msg-id"));
+            let class = class_name.as_deref().map(class);
+            let db = open_db(&data_dir);
+            let removed = remove::remove_matching(&db, &target, msg_id, class)
+                .unwrap_or_else(|e| die(format!("remove: {e}")));
+            println!("{}", serde_json::json!({ "removed": removed }));
         }
         Cmd::Rendezvous {
             phrase,
