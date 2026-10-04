@@ -181,6 +181,7 @@ async fn full_channel_defers_response_to_next_poll() {
 
     // The scheduler drains the channel; the next poll sends the deferred response.
     assert_eq!(rx.try_recv().expect("filler").challenge_id, [0xEE; 16]);
+    pos.begin_poll(now + 4);
     let mut counts = PollCounts::default();
     super::forward_pos_responses(&mut pos, &tx, vec![entry], now + 4, &mut counts).await;
     assert_eq!((counts.forwarded, counts.deferred_full), (1, 0));

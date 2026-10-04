@@ -338,20 +338,36 @@ async fn poll_collapses_byte_identical_copies() {
     assert_eq!(f.delete_payloads(), vec![b"delete".to_vec()]);
 }
 
-/// mailbox-i69 + i63: the first postman to answer brings a forged PoS response under the
-/// honest msg_id, a later one the honest response. The honest one still reaches the
-/// scheduler (a first-wins dedup by msg_id would have hidden it).
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn stream_poll_forgery_from_first_postman_does_not_hide_later_honest_record() {
-    let cid = [7u8; 16];
-    let response_entry = |msg: &PosHashResponseMsg| MailboxEntry {
+/// A PosResponse entry carrying `msg` under msg_id `[5; 16]`.
+fn response_entry(msg: &PosHashResponseMsg) -> MailboxEntry {
+    MailboxEntry {
         msg_id: [5u8; 16],
         ..make_entry(
             MailboxClass::PosResponse,
             my_master(),
             to_cbor(msg).expect("encode"),
         )
-    };
+    }
+}
+
+/// What the scheduler channel holds now (signatures, in order).
+fn drain_sigs(rx: &mut mpsc::Receiver<PosHashResponseMsg>) -> Vec<[u8; 64]> {
+    let mut sigs = vec![];
+    while let Ok(r) = rx.try_recv() {
+        sigs.push(r.sig);
+    }
+    sigs
+}
+
+/// mailbox-i69 + i63 + pos-i6: the first postman to answer brings a forged PoS response
+/// under the honest msg_id, a later one the honest response. The honest one is not hidden
+/// by the poll's merge: it reaches the selection (in flight behind the forgery, one
+/// envelope per challenge per poll) and goes to the scheduler on the next poll, the
+/// scheduler having rejected the forgery (the challenge stays pending). The cost is one
+/// poll per forged envelope (the bound until pos-i6-x checks the signature first).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn stream_poll_forgery_from_first_postman_does_not_hide_later_honest_record() {
+    let cid = [7u8; 16];
     let forged = PosHashResponseMsg {
         chain_hash: [0xEE; 32],
         sig: [0xEE; 64],
@@ -368,15 +384,54 @@ async fn stream_poll_forgery_from_first_postman_does_not_hide_later_honest_recor
     let (pos_tx, mut pos_rx) = mpsc::channel::<PosHashResponseMsg>(8);
     let mut pos = PosPollState::new(pending_for(&[cid]), 1);
 
+    let first = f.poll(&mut pos, &pos_tx).await;
+    assert_eq!(
+        drain_sigs(&mut pos_rx),
+        vec![forged.sig],
+        "the forgery came first"
+    );
+    assert_eq!(
+        (first.forwarded, first.in_flight),
+        (1, 1),
+        "the honest record reached the selection, held for this poll"
+    );
+
+    let second = f.poll(&mut pos, &pos_tx).await;
+    assert_eq!(
+        drain_sigs(&mut pos_rx),
+        vec![honest.sig],
+        "the honest response goes no later than the next poll (counts {second:?})"
+    );
+}
+
+/// pos-i6 (review W1): two honest envelopes of one challenge (the holder restarted and
+/// re-computed) brought by two postmen in one poll — one goes to the scheduler, the other
+/// is in flight. Two would leave the second as an `unknown challenge_id` WARN.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn two_honest_envelopes_of_one_challenge_in_one_poll_forward_one() {
+    let cid = [7u8; 16];
+    let before_restart = PosHashResponseMsg {
+        sig: [0x11; 64],
+        ..response_to(cid)
+    };
+    let after_restart = PosHashResponseMsg {
+        timestamp: Timestamp(before_restart.timestamp.0 + 100),
+        sig: [0x22; 64],
+        ..response_to(cid)
+    };
+    let f = Fixture::new(&[
+        Reply::Answer(0, vec![response_entry(&before_restart)]),
+        Reply::Answer(1, vec![response_entry(&after_restart)]),
+    ]);
+    let (pos_tx, mut pos_rx) = mpsc::channel::<PosHashResponseMsg>(8);
+    let mut pos = PosPollState::new(pending_for(&[cid]), 1);
+
     let counts = f.poll(&mut pos, &pos_tx).await;
 
-    let mut sigs = vec![];
-    while let Ok(r) = pos_rx.try_recv() {
-        sigs.push(r.sig);
-    }
-    assert!(
-        sigs.contains(&honest.sig),
-        "the honest response reaches the scheduler (got {} responses, counts {counts:?})",
-        sigs.len()
+    assert_eq!(
+        drain_sigs(&mut pos_rx).len(),
+        1,
+        "one envelope per challenge per poll"
     );
+    assert_eq!((counts.forwarded, counts.in_flight), (1, 1));
 }

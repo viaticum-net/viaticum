@@ -430,7 +430,7 @@ pub struct PollCounts {
     /// ours): dropped without a WARN (pos-i6).
     pub not_pending: u32,
     /// PosResponse entries already handed over and still pending, or a second envelope
-    /// of one challenge in the same postman's answer (pos-i6, mailbox-i63).
+    /// of one challenge in the same poll (pos-i6).
     pub in_flight: u32,
 }
 
@@ -462,8 +462,10 @@ impl PosPollState {
         }
     }
 
-    /// Start of one poll: forget what expired; returns how many entries were dropped.
+    /// Start of one poll: forget what expired (returns how many entries were dropped) and
+    /// open a new poll for the one-envelope-per-challenge rule (`ForwardedResponses`).
     pub fn begin_poll(&mut self, now_secs: u64) -> usize {
+        self.forwarded.begin_poll();
         self.answered.forget_expired(now_secs)
     }
 }

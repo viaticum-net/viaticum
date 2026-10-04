@@ -15,6 +15,15 @@
 //! the owner): a postman's re-encoding of an honest response is the same envelope, and a
 //! forgery under the honest challenge_id (another signature) is another envelope, so a
 //! forgery forwarded first cannot lock the honest response out.
+//!
+//! One envelope per challenge_id per poll: the poll hands over each postman's answer as it
+//! arrives (mailbox-i63), so `select` runs once per answer, and the challenge_ids already
+//! chosen are kept for the whole poll (`begin_poll` clears them). Two honest envelopes of
+//! one challenge (a holder restart) brought by two postmen send one; the other is
+//! `in_flight` and goes on a later poll only if the first did not resolve the challenge
+//! (pos-i6). The cost: a forgery that arrives first holds the honest envelope back one
+//! poll per forged envelope the postman has for that challenge. Closing it needs the
+//! signature checked before the choice (pos-i6-x, a separate slice).
 
 use std::collections::{HashMap, HashSet};
 
@@ -32,8 +41,8 @@ use crate::daemon::scheduler::PendingIndex;
 /// Honest bound: one pending challenge per placement, one honest envelope per challenge
 /// (two after a holder restart), released as soon as the challenge leaves pending. A
 /// postman can add one forged envelope per pending challenge per poll (one envelope per
-/// challenge_id per postman's answer is selected, mailbox-i63), each kept until its
-/// challenge resolves or one TTL passes. ~100 B per entry ≈ 20 MB at the cap. Above the cap an envelope is not marked:
+/// challenge_id per poll is selected), each kept until its challenge resolves or one TTL
+/// passes. ~100 B per entry ≈ 20 MB at the cap. Above the cap an envelope is not marked:
 /// it is forwarded again on the next poll while its challenge is pending (the pre-pos-i6
 /// behaviour, bounded by the channel).
 pub const MAX_FORWARDED_RESPONSES: usize = 200_000;
@@ -77,7 +86,7 @@ pub struct ForwardCounts {
     /// owner restarted): dropped without a WARN.
     pub not_pending: u32,
     /// Already sent and still pending, or a second envelope of a challenge already
-    /// selected in this postman's answer.
+    /// selected in this poll (it goes on a later poll if the challenge is still pending).
     pub in_flight: u32,
     /// Did not decode as a PosHashResponseMsg.
     pub undecodable: u32,
@@ -93,6 +102,9 @@ struct Sent {
 #[derive(Debug)]
 pub struct ForwardedResponses {
     sent: HashMap<ResponseKey, Sent>,
+    /// The challenge_ids selected in the current poll (cleared by `begin_poll`; at most
+    /// one per pending challenge).
+    chosen_this_poll: HashSet<[u8; 16]>,
     ttl_secs: u64,
     max_sent: usize,
     refused: u64,
@@ -108,6 +120,7 @@ impl ForwardedResponses {
     pub(crate) fn with_cap(time_scale: u64, max_sent: usize) -> Self {
         ForwardedResponses {
             sent: HashMap::new(),
+            chosen_this_poll: HashSet::new(),
             ttl_secs: scaled_ttl_secs(POS_CHALLENGE_TTL.as_secs(), time_scale),
             max_sent,
             refused: 0,
@@ -118,10 +131,16 @@ impl ForwardedResponses {
         self.ttl_secs
     }
 
+    /// Start of one poll: every challenge may have one envelope selected again.
+    pub fn begin_poll(&mut self) {
+        self.chosen_this_poll.clear();
+    }
+
     /// Release the sent envelopes whose challenge left `pending` or whose `forget_at`
-    /// passed, then pick among `responses` (the PosResponse entries of this poll) the
-    /// ones to send: challenge pending, envelope not sent yet, one envelope per
-    /// challenge_id per call. Nothing is marked here: `mark_sent` after a successful send.
+    /// passed, then pick among `responses` (PosResponse entries of the current poll, one
+    /// postman's answer per call) the ones to send: challenge pending, envelope not sent
+    /// yet, one envelope per challenge_id per poll (since `begin_poll`). Nothing is marked
+    /// sent here: `mark_sent` after a successful send.
     pub fn select(
         &mut self,
         pending: &PendingIndex,
@@ -133,7 +152,6 @@ impl ForwardedResponses {
 
         let mut counts = ForwardCounts::default();
         let mut out = Vec::new();
-        let mut chosen: HashSet<[u8; 16]> = HashSet::new();
         for entry in responses {
             let msg = match from_cbor_bytes::<PosHashResponseMsg>(&entry.payload) {
                 Ok(m) => m,
@@ -152,7 +170,7 @@ impl ForwardedResponses {
                 continue;
             }
             let key = ResponseKey::signed(&msg);
-            if self.sent.contains_key(&key) || !chosen.insert(msg.challenge_id) {
+            if self.sent.contains_key(&key) || !self.chosen_this_poll.insert(msg.challenge_id) {
                 counts.in_flight += 1;
                 continue;
             }
