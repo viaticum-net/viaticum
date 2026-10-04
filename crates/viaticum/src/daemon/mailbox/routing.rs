@@ -303,7 +303,7 @@ impl MailboxRouter {
     /// identity); a pointer box needs a fetch proof bound to our device, and then the
     /// postman serves only SelfPointer entries.
     ///
-    /// Returns unique non-expired entries, deduped by msg_id (most-recent wins on dup).
+    /// Returns the non-expired entries merged by `merge_poll_answers` (identical bytes only).
     /// Avail observation: on successful FetchResponse, updates avail_ewma for the responding peer.
     pub async fn poll(
         &self,
@@ -476,51 +476,37 @@ fn peer_id_to_device_id_best_effort(peer_id: &PeerId) -> Option<DeviceId> {
     Some(DeviceId(ed_key.to_bytes()))
 }
 
-// ─── Pure helper: dedup entries by msg_id ────────────────────────────────────
+// ─── Pure helper: merge the postmen's answers ─────────────────────────────────
 
-/// Deduplicate a slice of entries by msg_id, keeping the one with highest stored_at.
-/// Exposed for unit testing.
 /// Merge the answers of several postmen to one poll (mailbox-i69).
 ///
-/// A postman keeps one record per `msg_id`, so from one answer only the record with the
-/// highest `stored_at` per `msg_id` is taken: a single postman cannot multiply variants.
-/// Across postmen, records merge only when they are the same bytes — same `msg_id`,
-/// class and blake3 of the payload. Records that share a `msg_id` but differ go to the
-/// handlers side by side: a postman's forgery under an honest `msg_id` must not replace
-/// the honest record (last-writer-wins did), and the handlers tell them apart by the
-/// signature. Expired records are dropped (the postman filters them; clock skew).
+/// Records merge only when they are the same bytes: same `msg_id`, class and blake3 of
+/// the payload (a postman stores per `(target, msg_id, class)`, so one `msg_id` may
+/// legitimately carry records of several classes). Records that share a `msg_id` but
+/// differ in class or payload go to the handlers side by side: a forgery a postman
+/// stores under an honest `msg_id`, in any class and with any `stored_at`, must not
+/// replace the honest record (last-writer-wins by `msg_id` did), and the handlers tell
+/// them apart by the signature. Expired records are dropped (the postman filters them;
+/// clock skew).
 pub fn merge_poll_answers(answers: Vec<Vec<MailboxEntry>>, now_secs: u64) -> Vec<MailboxEntry> {
     let mut merged: HashMap<([u8; 16], MailboxClass, [u8; 32]), MailboxEntry> = HashMap::new();
-    for answer in answers {
-        let mut per_msg_id: HashMap<[u8; 16], MailboxEntry> = HashMap::new();
-        for entry in answer {
-            if entry.expires_at <= now_secs {
-                continue;
-            }
-            per_msg_id
-                .entry(entry.msg_id)
-                .and_modify(|existing| {
-                    if entry.stored_at > existing.stored_at {
-                        *existing = entry.clone();
-                    }
-                })
-                .or_insert(entry);
+    for entry in answers.into_iter().flatten() {
+        if entry.expires_at <= now_secs {
+            continue;
         }
-        for entry in per_msg_id.into_values() {
-            let key = (
-                entry.msg_id,
-                entry.class,
-                *blake3::hash(&entry.payload).as_bytes(),
-            );
-            merged
-                .entry(key)
-                .and_modify(|existing| {
-                    if entry.stored_at > existing.stored_at {
-                        *existing = entry.clone();
-                    }
-                })
-                .or_insert(entry);
-        }
+        let key = (
+            entry.msg_id,
+            entry.class,
+            *blake3::hash(&entry.payload).as_bytes(),
+        );
+        merged
+            .entry(key)
+            .and_modify(|existing| {
+                if entry.stored_at > existing.stored_at {
+                    *existing = entry.clone();
+                }
+            })
+            .or_insert(entry);
     }
     merged.into_values().collect()
 }

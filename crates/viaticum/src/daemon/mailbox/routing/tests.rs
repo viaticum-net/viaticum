@@ -299,12 +299,37 @@ fn forged_record_with_honest_msg_id_does_not_hide_the_honest_one() {
     assert!(merged.iter().any(|e| e.payload == forged.payload));
 }
 
-/// A single postman answers with one record per msg_id (the one it keeps); extra
-/// variants in its answer do not multiply the work of the handlers.
+/// mailbox-i69 (review B1): a postman stores per (msg_id, class), so a forgery of
+/// another class under the honest msg_id, with a later stored_at, sits in the SAME
+/// honest postman's answer — it must not displace the honest record there.
 #[test]
-fn one_postman_contributes_one_variant_per_msg_id() {
+fn forgery_of_another_class_in_the_same_answer_does_not_hide_the_honest_one() {
     let target = make_identity(5);
     let msg_id = make_msg_id(5);
+    let honest = with_payload(
+        make_entry(target, msg_id, 1000, MailboxClass::PosResponse),
+        b"honest signed response",
+    );
+    let forged = with_payload(
+        make_entry(target, msg_id, 9000, MailboxClass::Generic),
+        b"junk",
+    );
+
+    let merged = merge_poll_answers(vec![vec![honest.clone(), forged]], MERGE_NOW);
+    assert!(
+        merged
+            .iter()
+            .any(|e| e.class == MailboxClass::PosResponse && e.payload == honest.payload),
+        "the honest PosResponse must reach the handlers"
+    );
+}
+
+/// Every distinct variant a postman returns reaches the handlers; nothing is decided
+/// by the postman's own ordering.
+#[test]
+fn every_distinct_variant_in_one_answer_is_kept() {
+    let target = make_identity(8);
+    let msg_id = make_msg_id(8);
     let answer: Vec<_> = (0..10u8)
         .map(|i| {
             with_payload(
@@ -313,14 +338,7 @@ fn one_postman_contributes_one_variant_per_msg_id() {
             )
         })
         .collect();
-
-    let merged = merge_poll_answers(vec![answer], MERGE_NOW);
-    assert_eq!(merged.len(), 1);
-    assert_eq!(
-        merged[0].payload,
-        vec![9u8; 8],
-        "the postman's newest record"
-    );
+    assert_eq!(merge_poll_answers(vec![answer], MERGE_NOW).len(), 10);
 }
 
 #[test]
