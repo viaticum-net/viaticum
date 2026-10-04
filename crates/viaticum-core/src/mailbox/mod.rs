@@ -453,16 +453,20 @@ pub fn check_pointer_sealed(entry: &MailboxEntry) -> Result<(), MailboxError> {
 /// ahead of the postman's clock is refused (it would freeze its slot: every honest
 /// later publication would be older and `Superseded`). No past bound.
 ///
-/// mailbox-i61: an expired entry with `stored_at <= now` whose `expires_at` passed
-/// within the last `transit_grace_secs` is `Expired` (it died on the way); any other
-/// expired entry is `ClockSkew`. Pure.
+/// mailbox-i61: an expired entry with `stored_at <= now` is `Expired` (it died on the
+/// way) when its `expires_at` passed within the last `transit_grace_secs`, or when it
+/// was sealed at most `MAILBOX_TRANSIT_GRACE_SECS` ago — a fresh `stored_at` says the
+/// sender's clock agrees with ours and only the lifetime was short (a scaled TTL of a
+/// few seconds against a slow postman). Any other expired entry is `ClockSkew`. Pure.
 pub fn check_entry_clock(entry: &MailboxEntry, now_secs: u64) -> Result<(), MailboxError> {
     let skewed_pointer = entry.class == MailboxClass::SelfPointer
         && entry.stored_at > now_secs.saturating_add(SELF_POINTER_MAX_FUTURE_SKEW_SECS);
     let expired = entry.expires_at <= now_secs;
+    let sealed_recently = now_secs - entry.stored_at.min(now_secs) <= MAILBOX_TRANSIT_GRACE_SECS;
     let in_transit = expired
         && entry.stored_at <= now_secs
-        && entry.expires_at > now_secs.saturating_sub(transit_grace_secs(entry));
+        && (sealed_recently
+            || entry.expires_at > now_secs.saturating_sub(transit_grace_secs(entry)));
     if in_transit {
         return Err(MailboxError::Expired {
             expires_at: entry.expires_at,
