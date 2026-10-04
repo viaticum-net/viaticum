@@ -15,6 +15,7 @@
 | Store-and-forward | Directed mailbox bus | NOT gossip/pubsub |
 | Wire format | CBOR + u32 BE length-prefix | `ciborium` crate |
 | ALPN | `"viaticum/1"` | byte string |
+| libp2p protocols | `/viaticum/1` (messages), `/viaticum/cert/1` (handshake), `/viaticum/kad/1.0.0` (DHT) | own Kademlia, not IPFS's `/ipfs/kad/1.0.0` (ADR-003) |
 | File encryption | ChaCha20-Poly1305 | epoch-keyed |
 | Per-holder binding | ChaCha20 XOR stream | anti-collusion |
 | Signatures | Ed25519 | identity + device certs |
@@ -82,7 +83,7 @@ pub enum Message {
 }
 ```
 
-`DeviceCertExchange` is **not** in this enum — it runs on a separate libp2p protocol (`/viaticum/cert/1`) as the connection handshake (see 1.2). `PeerDiscoveryRequest`/`PeerDiscoveryResponse` were removed in ε.2 (peers are found via the Kademlia DHT). The `BoardSync` and `SystemState{Backup,Ack,Request,Response}` variants were removed when the epidemic relay board and the push-to-all SystemState blob were replaced by the mailbox bus (see 1.5); deferred delivery now rides `MailboxStore*`/`MailboxFetch*`.
+`DeviceCertExchange` is **not** in this enum — it runs on a separate libp2p protocol (`/viaticum/cert/1`) as the connection handshake (see 1.2). `PeerDiscoveryRequest`/`PeerDiscoveryResponse` were removed in ε.2 (peers are found via the Kademlia DHT, protocol `/viaticum/kad/1.0.0`, FIND_NODE only; a peer that does not announce it is not kept in the routing table — see [ADR-003](decisions/ADR-003-own-kademlia.md)). The `BoardSync` and `SystemState{Backup,Ack,Request,Response}` variants were removed when the epidemic relay board and the push-to-all SystemState blob were replaced by the mailbox bus (see 1.5); deferred delivery now rides `MailboxStore*`/`MailboxFetch*`.
 
 ---
 

@@ -19,6 +19,7 @@ use crate::daemon::restore::staging::JobId;
 use crate::daemon::restore::{RestoreCoordinator, RestoreRequest, VersionSelector};
 
 pub mod missing_sources;
+mod net_status;
 
 #[cfg(test)]
 mod tests;
@@ -56,6 +57,16 @@ pub(crate) async fn dispatch(request: CliRequest, state: &DaemonState) -> CliRes
         }
 
         CliRequest::Connect { addr } => dispatch_connect(state, addr).await,
+
+        #[cfg(feature = "e2e-tools")]
+        CliRequest::E2eDisconnect { device_hex } => {
+            net_status::dispatch_e2e_disconnect(state, &device_hex).await
+        }
+
+        #[cfg(feature = "e2e-tools")]
+        CliRequest::E2eReach { device_hex } => {
+            net_status::dispatch_e2e_reach(state, &device_hex).await
+        }
     }
 }
 
@@ -103,11 +114,22 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
     // Snapshot of authenticated DeviceIds (heavy traffic allowed). conn-only
     // (post-Noise but pre-cert) is not attributable to a specific master, so
     // peers list shows just `auth` vs `known`.
-    let auth_devices: std::collections::HashSet<viaticum_core::types::DeviceId> =
+    // `None` = swarm down (or its command channel gone): no authenticated list.
+    let auth_snapshot: Option<std::collections::HashSet<viaticum_core::types::DeviceId>> =
         match state.swarm_handle.as_ref() {
-            Some(s) => s.peer_sets().await.map(|(a, _)| a).unwrap_or_default(),
-            None => std::collections::HashSet::new(),
+            Some(s) => s.peer_sets().await.map(|(a, _)| a).ok(),
+            None => None,
         };
+    let authenticated_devices = auth_snapshot
+        .as_ref()
+        .map(|set| net_status::devices_hex8_sorted(set.iter()));
+    let auth_devices = auth_snapshot.unwrap_or_default();
+    // network-i14: knowledge, from the PeerRecords (another master + a dialable
+    // address). "Another" = not the cluster's master, as in the swarm's known set.
+    let status_master = net_status::status_cluster_master(state);
+    let known_devices = net_status::known_devices_hex8(&peers, &status_master, &state.device_id);
+    let unaddressed_devices =
+        net_status::unaddressed_devices_hex8(&peers, &status_master, &state.device_id);
 
     // Compute peer summaries, sorted by combined trust descending (top 20).
     let mut peer_summaries: Vec<PeerSummary> = peers
@@ -249,9 +271,30 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         None => hex_encode(&state.identity_pub.0),
     };
 
-    let (peer_count_connected, peer_count_authenticated) = match state.swarm_handle.as_ref() {
-        Some(s) => s.peer_counts().await.unwrap_or((0, 0)),
-        None => (0, 0),
+    // network-i41: the cache fields and the connected / authenticated counts
+    // come from ONE ConnStats snapshot (taken after an eviction pass).
+    let (conn, work_wakes_suppressed, peer_record_dropped) = match state.swarm_handle.as_ref() {
+        Some(s) => (
+            s.conn_stats().await.ok(),
+            s.work_wakes_suppressed(),
+            s.peer_record_dropped(),
+        ),
+        None => (None, 0, 0),
+    };
+    let conn = conn.unwrap_or_default();
+    let (peer_count_connected, peer_count_authenticated) = (conn.connected, conn.authenticated);
+    let conn_cache = crate::cli::types::ConnCacheStatus {
+        busy_peers: conn.busy,
+        protected_peers: conn.protected,
+        infra_peers: conn.infra,
+        closing_peers: conn.closing,
+        connection_cap: conn.cap,
+        lru_evictions_total: conn.evictions_total,
+        on_demand_dials_ok: conn.on_demand_ok,
+        on_demand_dials_failed: conn.on_demand_failed,
+        on_demand_neg_cached: conn.on_demand_neg_cached,
+        work_wakes_suppressed,
+        peer_record_dropped,
     };
 
     let by_importance = compute_importance_buckets(&source_blocks);
@@ -309,6 +352,11 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         peer_count: peers.len() as u32,
         peer_count_connected,
         peer_count_authenticated,
+        peer_count_known: known_devices.len() as u32,
+        known_devices: Some(known_devices),
+        unaddressed_devices: Some(unaddressed_devices),
+        authenticated_devices,
+        conn_cache,
         avg_trust,
         holding_bytes: holdings_bytes,
         backed_up_files: files.len() as u32,

@@ -134,20 +134,37 @@ pub struct NetworkCfg {
     pub bootstrap_peers: Vec<String>,
 
     /// Kademlia bootstrap nodes of the circle (Multiaddr strings, with /p2p/<peer>).
-    /// The built-in IPFS bootstrap nodes are NOT used unless
-    /// `kademlia_disable_ipfs_bootstrap = false` is set explicitly (network-i11).
+    /// They are the only way into the network: our DHT is our own
+    /// (`/viaticum/kad/1.0.0`), there are no built-in bootstrap nodes and no IPFS
+    /// (network-i17, ADR-003). A legacy `kademlia_disable_ipfs_bootstrap` key is
+    /// ignored like any unknown key.
     /// Format: standard libp2p Multiaddr, e.g. "/ip4/203.0.113.7/tcp/4001/p2p/12D3Koo…"
     /// Default: [] (no bootstrap nodes).
     pub kademlia_bootstrap_peers: Vec<String>,
 
-    /// Disable IPFS built-in bootstrap nodes and use only kademlia_bootstrap_peers.
-    /// Default: true (IPFS public DHT is a separate network, not useful for Viaticum).
-    /// Set to false only if you have custom bootstrap infrastructure on the IPFS DHT.
-    pub kademlia_disable_ipfs_bootstrap: bool,
-
     /// libp2p TCP listen port. 0 = ephemeral (default). Set to a fixed value
     /// when running behind a firewall that only opens specific ports.
     pub listen_port: u16,
+
+    /// Relay role of this node: `"off"` (default) or `"punch"`. Only for a
+    /// public seed: on an ordinary friend `punch` effectively turns the
+    /// connection cache off — every connection becomes infrastructure.
+    /// Today `punch` means only that role for the connection cache and redial:
+    /// the seed keeps a connection with every friend (up to 1024) outside the
+    /// cache and redials every known peer (network-i15, i41). R2 adds the relay
+    /// itself and requires `external_addrs` with it.
+    pub relay_role: RelayRole,
+}
+
+/// `[network] relay_role` (network-i15, i41): who is infrastructure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RelayRole {
+    /// An ordinary friend.
+    #[default]
+    Off,
+    /// A public seed: its connections with friends are infrastructure.
+    Punch,
 }
 
 // ============================================================
@@ -421,8 +438,8 @@ impl Default for NetworkCfg {
             relay_url: None,
             bootstrap_peers: vec![],
             kademlia_bootstrap_peers: vec![],
-            kademlia_disable_ipfs_bootstrap: true,
             listen_port: 0,
+            relay_role: RelayRole::Off,
         }
     }
 }

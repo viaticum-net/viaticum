@@ -6,7 +6,7 @@
 //   3. relay_reservation_is_logged — after A connects to R, reservation is accepted
 //   4. dcutr_fires_after_relay_connection — DCUtR attempt fires after relay circuit
 //
-// All tests use localhost port 0. IPFS bootstrap is disabled.
+// All tests use localhost port 0.
 
 use std::time::Duration;
 

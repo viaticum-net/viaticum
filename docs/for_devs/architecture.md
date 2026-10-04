@@ -580,7 +580,7 @@ DaemonState {
 
 Deferred payloads (PoS, Delete, DropNotice, Revocation, SelfPointer) arrive as `MailboxFetchResponse` entries and are dispatched by the mailbox poll loop, not here. (PeerDiscovery messages were removed in ε.2 — peers are found via the Kademlia DHT.)
 
-**On new connection (PeerAuthenticated event):** upserts PeerRecord, sends PeerAnnounce, auto-adds cluster device.
+**On new connection (PeerAuthenticated event):** checks revocation and records the certificate, then hands the event to the PeerRecord writer (`processor/peer_record_writer`) without waiting. `PeerIdentified` goes to the same writer. The writer owns these PeerRecord writes: one ordered queue (one folded entry per device), and each batch is one write transaction (the PeerRecord plus the device-to-master mapping), so the processor loop never waits on an fsync. After the commit, the writer sends PeerAnnounce, auto-adds the cluster device, and wakes the work pipeline.
 
 ---
 

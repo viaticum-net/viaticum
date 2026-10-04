@@ -306,10 +306,16 @@ pub async fn run_periodic_sync(
                         .await
                     {
                         Ok(r) => r,
-                        Err(crate::daemon::network::swarm::SwarmError::PeerNotAuthenticated(_)) => {
+                        Err(
+                            e @ (crate::daemon::network::swarm::SwarmError::PeerNotAuthenticated(_)
+                            | crate::daemon::network::swarm::SwarmError::Unreachable(..)),
+                        ) => {
+                            // Not reachable now (no connection, or the on-demand
+                            // dial failed / is cached, network-i42): next cycle.
                             debug!(
                                 device_id = %device_id,
-                                "cluster_sync: peer not yet authenticated, skipping cycle"
+                                error = %e,
+                                "cluster_sync: peer not reachable now, skipping cycle"
                             );
                             skipped += 1;
                             continue;

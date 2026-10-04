@@ -42,7 +42,7 @@ use viaticum_core::types::{
 
 use super::{AcceptedOffer, Processor, esi_list_to_ranges, ranges_to_esi_list};
 use crate::daemon::cluster_sync::{ClusterSyncConfig, ClusterSyncManager};
-use crate::daemon::network::swarm::{SwarmConfig, SwarmHandle};
+use crate::daemon::network::swarm::{ConnPolicy, SwarmConfig, SwarmHandle};
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -120,16 +120,19 @@ async fn make_swarm() -> Arc<SwarmHandle> {
         listen_port: 0, // OS assigns port
         cert_timeout_secs: 10,
         kademlia_bootstrap_peers: vec![],
-        kademlia_disable_ipfs_bootstrap: true,
-        kad_republish_interval_override: None,
         kad_discovery_interval_override: None,
         enable_relay_server: false,
+        conn_policy: ConnPolicy::off(),
     };
     let (handle, _events) = SwarmHandle::start(cfg).await.expect("swarm start");
     Arc::new(handle)
 }
 
-async fn make_processor(db: Db, holdings_dir: &TempDir) -> Processor {
+/// Also used by the PeerRecord writer's tests (`peer_record_writer/tests.rs`).
+pub(in crate::daemon::processor) async fn make_processor(
+    db: Db,
+    holdings_dir: &TempDir,
+) -> Processor {
     make_processor_with_quota(db, holdings_dir, u64::MAX, u64::MAX).await
 }
 
@@ -4346,9 +4349,7 @@ async fn on_peer_identified_persists_addrs_for_inbound_peer() {
 
     // Simulate identify protocol delivering listen addrs for the peer.
     let addr: libp2p::Multiaddr = "/ip4/192.168.1.100/tcp/4001".parse().unwrap();
-    processor
-        .on_peer_identified(device_id, vec![addr.clone()])
-        .await;
+    processor.on_peer_identified(device_id, vec![addr.clone()]);
 
     // Verify the addrs are now persisted on the PeerRecord.
     let record = db
@@ -4671,6 +4672,8 @@ mod four_r_shadow_wedge;
 mod symbol_transfer_reply;
 // F-Q: the offer rule over the quota states (holder-i1..i3).
 mod quota_states;
+// C-DK C4 fix round 1: identify addresses survive an authentication in flight.
+mod peer_event_order;
 
 // ─── pos-i5-a: a holder answers only a fresh challenge (replay guard) ───────────
 

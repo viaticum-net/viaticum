@@ -453,11 +453,13 @@ async fn deliver_transfer_worker(
                 // so on the next build_pointer_for_placed call the HolderHint.addrs
                 // field will be populated for faster DR dialing.
                 //
-                // on_peer_identified is the primary source; this is the secondary
-                // safety net for the case where identify fires after this point.
+                // The processor's PeerRecord writer (`processor/peer_record_writer`,
+                // fed by PeerAuthenticated / PeerIdentified) is the primary source; this
+                // is the secondary safety net for the case where identify fires after
+                // this point.
                 //
-                // If addrs are empty (identify not yet done) → skip: on_peer_identified
-                // will update the record when identify completes. Empty addrs are fine:
+                // If addrs are empty (identify not yet done) → skip: the PeerRecord writer
+                // will write them when identify completes. Empty addrs are fine:
                 // DR falls back to Kademlia get_closest_peers(holder_id) per B-1.
                 persist_holder_addrs_from_swarm(db, swarm, placement.holder_id).await;
             }
@@ -528,10 +530,10 @@ async fn deliver_transfer_worker(
 ///
 /// Called after the owner receives a `SymbolStored` ack from a holder. This
 /// ensures the PeerRecord carries dialable addrs even when identify hasn't yet
-/// propagated them through `on_peer_identified`.
+/// propagated them through the processor's PeerRecord writer.
 ///
 /// If the swarm returns an empty addr list (identify not yet complete for this
-/// peer), the function is a no-op — `on_peer_identified` will update the record
+/// peer), the function is a no-op — the PeerRecord writer will write the addrs
 /// later when identify completes. Empty addrs are fine: DR uses Kademlia fallback.
 pub(crate) async fn persist_holder_addrs_from_swarm(
     db: &Db,
@@ -574,7 +576,8 @@ pub(crate) fn persist_holder_addrs_to_db(db: &Db, holder_id: DeviceId, addr_stri
             }
         }
         Ok(None) => {
-            // Peer record not yet in DB (rare: delivery happened before on_peer_authenticated).
+            // Peer record not yet in DB (rare: delivery happened before the PeerRecord
+            // writer committed the authentication).
             tracing::debug!(
                 holder = %holder_id,
                 "T-12: PeerRecord not found after SymbolStored — on_peer_identified will update later"

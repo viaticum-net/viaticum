@@ -70,7 +70,8 @@ path = "src/main.rs"
 
 [features]
 # Test / demo instruments that write straight into a node's redb (trust pre-seed,
-# postman mailbox audit + injection). Never part of a user build.
+# postman mailbox audit + injection), the peer-record size amplifier and the
+# net-probe endpoints of the discovery scenario (C-DK). Never part of a user build.
 e2e-tools = []
 
 [[bin]]
@@ -81,6 +82,13 @@ required-features = ["e2e-tools"]
 [[bin]]
 name = "mailbox-probe"
 path = "src/bin/mailbox_probe/main.rs"
+required-features = ["e2e-tools"]
+
+# Network probe of the discovery scenario (C-DK Р-16): disconnect from / reach a
+# known peer through a running daemon's web API.
+[[bin]]
+name = "net-probe"
+path = "src/bin/net_probe/main.rs"
 required-features = ["e2e-tools"]
 
 [dev-dependencies]
