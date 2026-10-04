@@ -69,7 +69,8 @@ pub(crate) fn poll_read_budget(time_scale: u64) -> Duration {
 ///
 /// Parameters:
 /// - `router`: the MailboxRouter used to poll and publish responses
-/// - `pos_response_tx`: bounded channel (capacity 256) to scheduler for PosResponse entries
+/// - `pos_response_tx`: bounded channel (`POS_RESPONSE_CHANNEL_CAP`, see
+///   `pos_response_channel`) to the scheduler for PosResponse entries
 /// - `pending`: the owner's in-flight challenges, written by the scheduler; only responses
 ///   to these are forwarded (pos-i6)
 /// - `challenge_handler`: called with (owner_master, challenge_payload_bytes) to process a
@@ -611,14 +612,18 @@ pub(crate) fn pos_response_channel() -> (
     mpsc::channel(POS_RESPONSE_CHANNEL_CAP)
 }
 
-/// Hand the PosResponse entries of one poll to the scheduler (pos-i6).
+/// Hand the PosResponse entries of one postman's answer to the scheduler (pos-i6).
 ///
-/// One lock of `pending` covers the selection (no await inside it): only responses to
-/// challenges still pending, each envelope once while it is pending, one envelope per
-/// challenge per poll. Then `try_send` outside the lock: a sent envelope is marked; a
-/// full channel leaves it unmarked and the next poll sends it (the entry lives at the
-/// postmen until its TTL) — N-5 bounds the channel, nothing is dropped. Resolved,
-/// foreign and duplicate responses are dropped silently and counted in `poll done`.
+/// The poll calls it once per answer as the answers arrive (mailbox-i63). One lock of
+/// `pending` covers the selection (no await inside it): only responses to challenges
+/// still pending, each envelope once while it is pending, and one envelope per challenge
+/// per poll across all its answers (`ForwardedResponses` keeps the poll's chosen
+/// challenge_ids until `PosPollState::begin_poll`); a second envelope of a challenge is
+/// in flight and goes on a later poll if the challenge is still pending. Then `try_send`
+/// outside the lock: a sent envelope is marked; a full channel leaves it unmarked and the
+/// next poll sends it (the entry lives at the postmen until its TTL) — N-5 bounds the
+/// channel, nothing is dropped. Resolved, foreign and duplicate responses are dropped
+/// silently and counted in `poll done`.
 pub(crate) async fn forward_pos_responses(
     pos: &mut PosPollState,
     pos_response_tx: &mpsc::Sender<PosHashResponseMsg>,
