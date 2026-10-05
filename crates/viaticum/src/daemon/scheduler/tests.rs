@@ -47,6 +47,8 @@ mod issue_batch;
 mod pos_load_warn;
 // pos-i16 (C-SP): only the placement's device key resolves its challenge.
 mod sibling_response;
+// pos-i15 (C-SP): a published challenge names the placement's device and is signed.
+mod challenge_address;
 // dr-i8: service mail is addressed by PEERS after a DR, a holder without a master is skipped.
 mod dr_master;
 
