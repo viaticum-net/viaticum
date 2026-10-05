@@ -2306,3 +2306,53 @@ async fn worker_iteration_delivers_only_recorded_offers() {
             .is_empty()
     );
 }
+
+/// repair-i8 ceiling (C-SP К1b, review W2): a block out of ESI numbers is not a pause. A
+/// (importance 1.0, `esi_high_water` = 2^24, free peers) plans `EsiExhausted`: it is parked
+/// and reported "not repairable", and the SAME iteration goes on to B, which gets its offers.
+/// Mutation: `yielded: true` in the `EsiExhausted` outcome (a pause ends the iteration and
+/// parks nothing) → reddens.
+#[tokio::test]
+async fn esi_exhausted_block_is_parked_and_the_iteration_serves_the_next_block() {
+    let data_dir = tempdir().unwrap();
+    let db = make_db();
+    let peers = [device_id(0x91), device_id(0x92)];
+    add_pool_peers(&db, &peers);
+
+    let a = block_id(0x93);
+    let mut rec_a = make_block_record(a, 1.0, 0.99999);
+    rec_a.current_reliability = 0.0;
+    rec_a.esi_high_water = viaticum_core::constants::MAX_ESI_EXCLUSIVE;
+    db.upsert_source_block(&rec_a).unwrap();
+    let rec_b = retained_block(data_dir.path(), 0x94, 0.65);
+    db.upsert_source_block(&rec_b).unwrap();
+
+    let mut config = make_config();
+    config.data_dir = data_dir.path().to_path_buf();
+    let mut pipeline = pipeline_with(&db, config, Some(lonely_swarm(0x37).await));
+    assert!(pipeline.run_iteration().await.unwrap());
+
+    let cd_a = db.block_cooldown(&a);
+    assert!(cd_a.last_attempted_at.is_some(), "A was worked first");
+    assert!(cd_a.parked, "out of ESI numbers: parked, not paused");
+    assert!(
+        db.list_placements_for_block(&a).unwrap().is_empty(),
+        "no offer for A"
+    );
+    assert_eq!(
+        pipeline.config.esi_space.exhausted_blocks(),
+        vec![a],
+        "A reported not repairable"
+    );
+    let cd_b = db.block_cooldown(&rec_b.block_id);
+    assert!(
+        cd_b.last_attempted_at.is_some(),
+        "B worked in the same iteration"
+    );
+    assert!(
+        !db.list_placements_for_block(&rec_b.block_id)
+            .unwrap()
+            .is_empty(),
+        "B's offers were recorded"
+    );
+}
