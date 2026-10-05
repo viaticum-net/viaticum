@@ -296,24 +296,50 @@ pub fn compute_chain_hash(
     challenge_id: &[u8; 16],
     symbols: &[(u32, &[u8])],
 ) -> Result<[u8; 32], PosError> {
-    if symbols.is_empty() {
-        return Err(PosError::ChainHashEmptyInput);
+    let mut hasher = ChainHasher::new(challenge_id);
+    for &(esi, data) in symbols {
+        hasher.push(esi, data);
     }
-    // Seed: h_0 = SHA256(challenge_id) — unique per challenge, defeats pre-compute caching.
-    let h0: [u8; 32] = {
+    hasher.finish()
+}
+
+/// Incremental form of [`compute_chain_hash`]: symbols are pushed one by one (ascending ESI)
+/// and need not be alive at the same time, so the owner's PoS preparation and the holder's
+/// answer hash a block's symbols without holding them all. `compute_chain_hash` is built on it,
+/// so the two sides of a challenge cannot drift apart.
+pub struct ChainHasher {
+    h: [u8; 32],
+    pushed: usize,
+}
+
+impl ChainHasher {
+    /// h_0 = SHA256(challenge_id).
+    pub fn new(challenge_id: &[u8; 16]) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(challenge_id);
-        hasher.finalize().into()
-    };
-    let mut h = h0;
-    for (_esi, data) in symbols {
-        let mut hasher = Sha256::new();
-        hasher.update(h);
-        hasher.update(data);
-        let result = hasher.finalize();
-        h.copy_from_slice(&result);
+        ChainHasher {
+            h: hasher.finalize().into(),
+            pushed: 0,
+        }
     }
-    Ok(h)
+
+    /// h_i = SHA256(h_{i-1} || data). The ESI is not hashed (it only fixes the order the
+    /// caller must follow: ascending).
+    pub fn push(&mut self, _esi: u32, data: &[u8]) {
+        let mut hasher = Sha256::new();
+        hasher.update(self.h);
+        hasher.update(data);
+        self.h.copy_from_slice(&hasher.finalize());
+        self.pushed += 1;
+    }
+
+    /// The chain hash; `Err(ChainHashEmptyInput)` if nothing was pushed.
+    pub fn finish(self) -> Result<[u8; 32], PosError> {
+        if self.pushed == 0 {
+            return Err(PosError::ChainHashEmptyInput);
+        }
+        Ok(self.h)
+    }
 }
 
 /// Verify a holder's chain hash response against the expected hash.

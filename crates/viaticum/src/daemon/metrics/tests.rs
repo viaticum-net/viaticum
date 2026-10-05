@@ -56,6 +56,9 @@ fn make_status(peers: Vec<PeerSummary>) -> StatusData {
         files_too_large: 0,
         max_file_size_bytes: 0,
         block_work_budget_bytes: 0,
+        dr_lease: None,
+        backup_paused_while_restoring: false,
+        backup_pause_overlong: false,
     }
 }
 

@@ -72,13 +72,17 @@ impl std::io::Write for LogBuf {
 
 /// Run `fut` with an INFO log capture; returns its log.
 async fn logged<F: std::future::Future>(fut: F) -> (F::Output, String) {
+    logged_at(tracing::Level::INFO, fut).await
+}
+
+async fn logged_at<F: std::future::Future>(level: tracing::Level, fut: F) -> (F::Output, String) {
     let buf = LogBuf::default();
     let writer = buf.clone();
     let dispatch = tracing::Dispatch::new(
         tracing_subscriber::fmt()
             .with_writer(move || writer.clone())
             .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
+            .with_max_level(level)
             .finish(),
     );
     let out = tracing::instrument::WithSubscriber::with_subscriber(fut, dispatch).await;
@@ -167,4 +171,37 @@ async fn stale_timeout_is_written_neither_to_weekly_nor_to_trust() {
     f.scheduler.check_timeouts().await.unwrap();
     assert_eq!(f.weekly_rows(), 1, "a held placement's timeout is counted");
     assert_ne!(f.trust(), (TRUST_P, TRUST_I), "and recalculates trust");
+}
+
+/// K-b6 (3c): the owner logs its verdict at DEBUG — `scheduler: PoS verdict block_id=… holder=…
+/// outcome=pass|fail` — for a right and for a wrong hash (the E2E reads it).
+#[tokio::test]
+async fn the_owner_logs_a_pos_verdict() {
+    for right in [true, false] {
+        let seed = 0x80 + u8::from(right);
+        let f = pos_drop_fixture(seed, PlacementStatus::Alive, 0, 0);
+        let (id, expected) = f.challenge(Timestamp::now(), seed).await;
+        let ((), log) = logged_at(tracing::Level::DEBUG, async {
+            if right {
+                f.answer_right(id, expected).await
+            } else {
+                f.answer_wrong(id).await
+            }
+        })
+        .await;
+        let want = if right {
+            "outcome=pass"
+        } else {
+            "outcome=fail"
+        };
+        let line = log
+            .lines()
+            .find(|l| l.contains("scheduler: PoS verdict"))
+            .unwrap_or_else(|| panic!("right = {right}: no verdict line; log:\n{log}"));
+        assert!(line.contains(want), "{line}");
+        assert!(line.contains("DEBUG"), "{line}");
+        assert!(line.contains(&format!("block_id={}", f.block)), "{line}");
+        assert!(line.contains(&format!("holder={}", f.holder)), "{line}");
+        assert!(!line.contains("outcome=\""), "unquoted: {line}");
+    }
 }

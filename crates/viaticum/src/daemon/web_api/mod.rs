@@ -1,11 +1,12 @@
 // Web API: axum JSON server wrapping the existing dispatch() handlers.
 
+mod budget;
 mod embedded;
 
 pub(crate) use embedded::index_html_blake3 as embedded_index_html_blake3;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 // ── Security headers middleware ───────────────────────────────────────────────
 
@@ -173,7 +174,16 @@ fn api_routes() -> Router<Arc<DaemonState>> {
             "/api/config",
             axum::routing::get(handle_config_get).put(handle_config_put),
         )
-        .route("/api/restart", axum::routing::post(handle_restart));
+        .route("/api/restart", axum::routing::post(handle_restart))
+        // К-b3 (spec v3.9a): a DR on this machine leases the memory of one SS block at a time.
+        .route(
+            "/api/budget/lease",
+            axum::routing::post(budget::handle_lease),
+        )
+        .route(
+            "/api/budget/release",
+            axum::routing::post(budget::handle_release),
+        );
     with_e2e_routes(router)
 }
 

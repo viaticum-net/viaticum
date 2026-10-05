@@ -65,6 +65,25 @@ pub fn render_status(data: &StatusData) -> String {
             data.files_too_large
         ));
     }
+    // К-b3 (spec v3.9a): a `viaticum dr` on this machine borrows this node's memory.
+    if let Some(lease) = &data.dr_lease {
+        out.push_str(&format!(
+            "  dr_lease:       {}holds_mib={} age_s={}\n",
+            if lease.revoked { "revoked " } else { "" },
+            lease.holds_mib,
+            lease.age_s
+        ));
+    }
+    // Q-V9 (a): the node's memory goes to the restore first.
+    if data.backup_paused_while_restoring {
+        out.push_str("  backup:         paused while restoring\n");
+    }
+    if data.backup_pause_overlong {
+        out.push_str(&format!(
+            "  backup:         paused for over {} h: a restore job may be stuck\n",
+            crate::daemon::work_pipeline::BACKUP_PAUSE_WARN_AFTER.as_secs() / 3600
+        ));
+    }
     out.push_str(&render_dr_readiness(data));
     // holder-i1/i2: 0 is "no room", never "unlimited"; an unread disk says so.
     let quota_str = match data.quota_state.as_str() {
@@ -265,6 +284,10 @@ pub fn render_restore_progress(job: &RestoreJob, now_unix: u64) -> String {
                     "; holders did not answer, reconnecting, {}",
                     retry_in(until, now_unix)
                 ));
+            }
+            // restore-i39: a big block of this node holds the memory this one needs.
+            if job.waiting_for_memory {
+                line.push_str("; waiting for memory (another big block is being worked on)");
             }
             line.push('\n');
             line

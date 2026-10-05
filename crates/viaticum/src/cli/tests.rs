@@ -307,6 +307,9 @@ fn make_status_zero_peers() -> StatusData {
         files_too_large: 0,
         max_file_size_bytes: 0,
         block_work_budget_bytes: 0,
+        dr_lease: None,
+        backup_paused_while_restoring: false,
+        backup_pause_overlong: false,
     }
 }
 
@@ -549,6 +552,9 @@ fn format_status_top_peers_printed() {
         files_too_large: 0,
         max_file_size_bytes: 0,
         block_work_budget_bytes: 0,
+        dr_lease: None,
+        backup_paused_while_restoring: false,
+        backup_pause_overlong: false,
     };
     let rendered = output::render_status(&data);
     assert!(rendered.contains("a1b2c3d4"), "got: {rendered}");
@@ -1020,6 +1026,9 @@ fn cli_response_roundtrips_cbor() {
             files_too_large: 0,
             max_file_size_bytes: 0,
             block_work_budget_bytes: 0,
+            dr_lease: None,
+            backup_paused_while_restoring: false,
+            backup_pause_overlong: false,
         })),
         CliResponse::DeviceList(vec![]),
         CliResponse::Error("oops".into()),
@@ -1068,6 +1077,7 @@ fn job(state: RestoreJobState, restored: u32, total: u32) -> RestoreJob {
         submitted_at: "2026-09-27T10:00:00Z".into(),
         finished_at: None,
         waiting_for_holders_until: None,
+        waiting_for_memory: false,
     }
 }
 
@@ -1744,6 +1754,7 @@ fn status_render_counts_files_without_local_source_when_positive() {
 fn waiting_job(until: &str) -> RestoreJob {
     RestoreJob {
         waiting_for_holders_until: Some(until.into()),
+        waiting_for_memory: false,
         ..job(RestoreJobState::Running, 1, 3)
     }
 }

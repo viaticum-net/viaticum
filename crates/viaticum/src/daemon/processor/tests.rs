@@ -4674,6 +4674,10 @@ mod symbol_transfer_reply;
 mod quota_states;
 // C-DK C4 fix round 1: identify addresses survive an authentication in flight.
 mod peer_event_order;
+// К-b2a⁗ (v3.12b NOTE 3, [cross:A]): the quota counts only the ESIs of a re-offer not held yet.
+mod reoffer_quota;
+// К-b4 (pos-i14): the holder's PoS answer streams the share, at most two at once.
+mod holder_pos;
 
 // ─── pos-i5-a: a holder answers only a fresh challenge (replay guard) ───────────
 

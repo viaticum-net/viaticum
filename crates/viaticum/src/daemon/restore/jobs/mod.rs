@@ -32,6 +32,11 @@ pub const MAX_FINISHED_JOBS_IN_MEMORY: usize = 32;
 pub struct RestoreJobs {
     inner: Arc<Mutex<JobsInner>>,
     staging_root: PathBuf,
+    /// Wakes the backup worker's loop when the set of unfinished jobs changes (Q-V9, spec
+    /// v3.12b). Only a wake: the gate itself is computed from the registry (`has_unfinished`).
+    gate_wake: Option<crate::daemon::work_pipeline::GateWake>,
+    /// How long the backup has been paused (the gate's reading; `status` asks it).
+    pause_watch: Arc<crate::daemon::work_pipeline::PauseWatch>,
 }
 
 #[derive(Debug, Default)]
@@ -48,12 +53,17 @@ struct Entry {
     /// Unix seconds until which the running job waits for holders to answer
     /// (restore-i26). Transient: never written to the job record on disk.
     waiting_until: Option<u64>,
+    /// The running job waits for the block work memory budget (restore-i39). Transient.
+    waiting_memory: bool,
+    /// The INFO line of that wait was written for this job (once per job).
+    memory_wait_announced: bool,
 }
 
 impl Entry {
     fn to_wire(&self, staging_root: &Path) -> RestoreJob {
         let mut wire = self.record.to_wire(staging_root);
         wire.waiting_for_holders_until = self.waiting_until.map(iso_utc);
+        wire.waiting_for_memory = self.waiting_memory;
         wire
     }
 }
@@ -68,6 +78,8 @@ impl JobsInner {
                 record,
                 seq,
                 waiting_until: None,
+                waiting_memory: false,
+                memory_wait_announced: false,
             },
         );
     }
@@ -104,6 +116,47 @@ impl RestoreJobs {
         RestoreJobs {
             inner: Arc::new(Mutex::new(JobsInner::default())),
             staging_root,
+            gate_wake: None,
+            pause_watch: crate::daemon::work_pipeline::PauseWatch::new(),
+        }
+    }
+
+    /// The watch of the backup pause: the gate built over this registry shares it.
+    pub fn pause_watch(&self) -> Arc<crate::daemon::work_pipeline::PauseWatch> {
+        Arc::clone(&self.pause_watch)
+    }
+
+    /// The pause has lasted longer than `BACKUP_PAUSE_WARN_AFTER` (`status`).
+    pub fn backup_pause_overlong(&self) -> bool {
+        crate::daemon::work_pipeline::RESTORE_PAUSES_BACKUP && self.pause_watch.overlong()
+    }
+
+    /// The notifier of the backup worker's gate: bumped at every change of the set of jobs.
+    pub fn with_gate_wake(mut self, wake: crate::daemon::work_pipeline::GateWake) -> Self {
+        self.gate_wake = Some(wake);
+        self
+    }
+
+    /// Whether a job is not finished — `Queued` or `Running` (spec v3.12b WARN-2). Computed from
+    /// the registry at every call: this is the restore half of the backup worker's gate, and no
+    /// event has to publish it.
+    pub fn has_unfinished(&self) -> bool {
+        self.lock()
+            .jobs
+            .values()
+            .any(|e| e.record.state != RestoreJobState::Finished)
+    }
+
+    /// Whether the backup worker is paused by an unfinished restore job (Q-V9 (a)): `status` says
+    /// so.
+    pub fn backup_paused(&self) -> bool {
+        crate::daemon::work_pipeline::RESTORE_PAUSES_BACKUP && self.has_unfinished()
+    }
+
+    /// The set of jobs changed: wake the worker's loop (it asks the registry again).
+    fn publish_running(&self, _inner: &JobsInner) {
+        if let Some(wake) = &self.gate_wake {
+            crate::daemon::work_pipeline::notify_gate(wake);
         }
     }
 
@@ -155,13 +208,17 @@ impl RestoreJobs {
     pub fn submit(&self, job_id: JobId, path: &str, files_total: u32) -> RestoreJob {
         let record = JobRecord::queued(job_id, path, files_total);
         let wire = record.to_wire(&self.staging_root);
-        self.lock().insert(record);
+        let mut inner = self.lock();
+        inner.insert(record);
+        self.publish_running(&inner);
         wire
     }
 
     /// Roll back a submit whose request never reached the coordinator.
     pub fn remove(&self, job_id: JobId) {
-        self.lock().jobs.remove(&job_id);
+        let mut inner = self.lock();
+        inner.jobs.remove(&job_id);
+        self.publish_running(&inner);
     }
 
     /// The coordinator took the job. `files_total` is the count it actually
@@ -176,6 +233,7 @@ impl RestoreJobs {
             r.state = RestoreJobState::Running;
             r.files_total = files_total;
         }
+        self.publish_running(&inner);
     }
 
     /// A file is visible under its own name in the job dir. Call only after that
@@ -205,6 +263,26 @@ impl RestoreJobs {
         }
     }
 
+    /// The running job waits for the block work memory budget (`true`) or got it (`false`):
+    /// the phase `waiting_for_memory` of `status` (restore-i39, restore-i4). Returns `true`
+    /// when this is the first wait of the job — the caller writes the INFO line then, once per
+    /// job. No-op for an unknown or finished job.
+    pub fn set_waiting_for_memory(&self, job_id: JobId, waiting: bool) -> bool {
+        let mut inner = self.lock();
+        let Some(e) = inner.jobs.get_mut(&job_id) else {
+            return false;
+        };
+        if e.record.state == RestoreJobState::Finished {
+            return false;
+        }
+        e.waiting_memory = waiting;
+        if waiting && !e.memory_wait_announced {
+            e.memory_wait_announced = true;
+            return true;
+        }
+        false
+    }
+
     /// Finish the job: outcome from its counts, `interrupted` when the daemon
     /// stopped it. Returns the final record (the coordinator writes it to the job
     /// dir). A job already finished is returned unchanged; unknown → `None`.
@@ -212,6 +290,7 @@ impl RestoreJobs {
         let mut inner = self.lock();
         let entry = inner.jobs.get_mut(&job_id)?;
         entry.waiting_until = None;
+        entry.waiting_memory = false;
         let r = &mut entry.record;
         if r.state != RestoreJobState::Finished {
             r.state = RestoreJobState::Finished;
@@ -225,6 +304,7 @@ impl RestoreJobs {
         }
         let done = r.clone();
         inner.evict_finished();
+        self.publish_running(&inner);
         Some(done)
     }
 

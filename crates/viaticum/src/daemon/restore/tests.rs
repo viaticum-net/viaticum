@@ -303,10 +303,10 @@ fn extract_from_pack_finds_file_by_id() {
     plaintext.extend_from_slice(file2);
 
     let result1 = super::pipeline::extract_from_pack(&plaintext, FileId(1)).unwrap();
-    assert_eq!(result1, Some(b"hello".to_vec()));
+    assert_eq!(result1, Some(&b"hello"[..]));
 
     let result2 = super::pipeline::extract_from_pack(&plaintext, FileId(2)).unwrap();
-    assert_eq!(result2, Some(b"world!!!".to_vec()));
+    assert_eq!(result2, Some(&b"world!!!"[..]));
 }
 
 #[test]
@@ -357,7 +357,7 @@ fn extract_by_file_id_absent_falls_back_to_content_hash() {
 
     let got = super::pipeline::extract_member(&plaintext, FileId(77), &h).unwrap();
 
-    assert_eq!(got.as_deref(), Some(&b"second member"[..]));
+    assert_eq!(got, Some(&b"second member"[..]));
 }
 
 /// After a swap inside one pack, the record's own member holds the other file's
@@ -369,7 +369,7 @@ fn extract_by_file_id_with_wrong_bytes_falls_back_to_content_hash() {
 
     let got = super::pipeline::extract_member(&plaintext, FileId(1), &h_d2).unwrap();
 
-    assert_eq!(got.as_deref(), Some(&b"content of d2"[..]));
+    assert_eq!(got, Some(&b"content of d2"[..]));
 }
 
 /// No member has the content and none has the record's `file_id`: `None` (restore
@@ -393,7 +393,7 @@ fn extract_falls_back_to_file_id_member_when_no_member_has_the_hash() {
 
     let got = super::pipeline::extract_member(&plaintext, FileId(1), &h_at_enqueue).unwrap();
 
-    assert_eq!(got.as_deref(), Some(&b"bytes packed at flush"[..]));
+    assert_eq!(got, Some(&b"bytes packed at flush"[..]));
 }
 
 // ─── Roundtrip tests (backup → restore) ──────────────────────────────────────

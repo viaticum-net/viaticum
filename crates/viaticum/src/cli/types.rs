@@ -313,9 +313,31 @@ pub struct StatusData {
     /// backup-i4: this machine's file size limit in bytes.
     #[serde(default)]
     pub max_file_size_bytes: u64,
-    /// backup-i24: this machine's block work budget in bytes; 0 until R1-d-b sets one.
+    /// backup-i24: this machine's block work budget in bytes; 0 from a daemon older than R1-d-b.
     #[serde(default)]
     pub block_work_budget_bytes: u64,
+    /// К-b3 (spec v3.9a): the memory a `viaticum dr` on this machine holds on this node now;
+    /// absent when no DR does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dr_lease: Option<DrLeaseStatus>,
+    /// A restore job runs and the backup worker starts no new iteration (Q-V9 (a), spec v3.12a):
+    /// «backup paused while restoring». Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backup_paused_while_restoring: bool,
+    /// The pause has lasted longer than `BACKUP_PAUSE_WARN_AFTER` (6 h): a restore job may be
+    /// stuck (spec v3.12b NOTE 2). Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backup_pause_overlong: bool,
+}
+
+/// The lease a `viaticum dr` holds on this node's block work budget (`status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DrLeaseStatus {
+    pub holds_mib: u64,
+    pub age_s: u64,
+    /// The node took the lease back at its ceiling; the DR's connection is still open.
+    #[serde(default)]
+    pub revoked: bool,
 }
 
 /// Peer summary shown in `viaticum status`.
@@ -393,6 +415,10 @@ pub struct RestoreJob {
     /// answer (redialed, retried at this time, restore-i26); absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_for_holders_until: Option<String>,
+    /// The running job waits for the node's block work memory (restore-i39, К-b3): another
+    /// big block holds it. Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_memory: bool,
 }
 
 /// Lifecycle of a restore job. `Queued` exists only in the daemon's memory; the

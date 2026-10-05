@@ -104,6 +104,13 @@ pub(super) struct Owner {
     _data_dir: tempfile::TempDir,
 }
 
+impl Owner {
+    /// The data dir the owner's retained blocks live in.
+    pub(super) fn data_dir(&self) -> &Path {
+        self._data_dir.path()
+    }
+}
+
 /// An owner whose placements `seed` writes (it gets the db and the data dir for the
 /// retained blocks), publishing through `postman`, its one known peer (a real Ed25519
 /// id). Holders are no peers (medium trust): one store per publish.

@@ -92,19 +92,19 @@ fn make_db() -> Db {
     Db::open(&path).unwrap()
 }
 
-fn device_id(byte: u8) -> DeviceId {
+pub(super) fn device_id(byte: u8) -> DeviceId {
     let mut b = [0u8; 32];
     b[0] = byte;
     DeviceId(b)
 }
 
-fn block_id(byte: u8) -> SourceBlockId {
+pub(super) fn block_id(byte: u8) -> SourceBlockId {
     let mut b = [0u8; 32];
     b[0] = byte;
     SourceBlockId(b)
 }
 
-fn make_block_record(
+pub(super) fn make_block_record(
     bid: SourceBlockId,
     importance: f64,
     target_reliability: f64,
@@ -128,7 +128,7 @@ fn make_block_record(
     }
 }
 
-fn make_config() -> WorkPipelineConfig {
+pub(super) fn make_config() -> WorkPipelineConfig {
     WorkPipelineConfig {
         cooldown: Duration::from_secs(30),
         tick_interval: Duration::from_secs(60),
@@ -140,6 +140,10 @@ fn make_config() -> WorkPipelineConfig {
         min_pool_size: 2,
         recheck_tx: None,
         max_source_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
+        // A budget no test of the old behaviour can exhaust; budget tests set their own.
+        mem_budget: crate::daemon::mem_budget::MemBudget::new(64 << 30),
+        chunk_budget_bytes: viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,
+        restore_pauses_backup: super::RESTORE_PAUSES_BACKUP,
     }
 }
 
@@ -1787,7 +1791,7 @@ fn resolve_primary_file_id_single_block_without_placements_reverse_looks_up_file
 
 // ─── R1-e: harness for worker tests that need a (peerless) swarm ───────────────
 
-fn placement(
+pub(super) fn placement(
     bid: SourceBlockId,
     holder: DeviceId,
     status: viaticum_core::types::PlacementStatus,
@@ -1808,7 +1812,7 @@ fn placement(
 
 /// A started swarm with no peers: `send_to_device` fails at once (peer not
 /// authenticated), `peer_sets` is empty so `snapshot_pool` falls back to the DB peers.
-async fn lonely_swarm(seed: u8) -> Arc<crate::daemon::network::swarm::SwarmHandle> {
+pub(super) async fn lonely_swarm(seed: u8) -> Arc<crate::daemon::network::swarm::SwarmHandle> {
     let cfg = crate::daemon::network::swarm_test_helpers::make_swarm_config(seed);
     let (handle, events) = crate::daemon::network::swarm::SwarmHandle::start(cfg)
         .await
@@ -1819,14 +1823,14 @@ async fn lonely_swarm(seed: u8) -> Arc<crate::daemon::network::swarm::SwarmHandl
     Arc::new(handle)
 }
 
-fn add_pool_peers(db: &Db, peers: &[DeviceId]) {
+pub(super) fn add_pool_peers(db: &Db, peers: &[DeviceId]) {
     for (i, &p) in peers.iter().enumerate() {
         db.upsert_peer(&make_peer_with_master(p, master_pub(0x40 + i as u8)))
             .unwrap();
     }
 }
 
-fn pipeline_with(
+pub(super) fn pipeline_with(
     db: &Db,
     config: WorkPipelineConfig,
     swarm: Option<Arc<crate::daemon::network::swarm::SwarmHandle>>,
@@ -1839,7 +1843,11 @@ fn pipeline_with(
 
 /// A below-target block whose blob is retained under `data_dir/system_state` (the
 /// SystemState path), so the worker can encode it without source files.
-fn retained_block(data_dir: &std::path::Path, seed: u8, importance: f64) -> SourceBlockRecord {
+pub(super) fn retained_block(
+    data_dir: &std::path::Path,
+    seed: u8,
+    importance: f64,
+) -> SourceBlockRecord {
     let blob: Vec<u8> = (0..3000u32).map(|i| (i as u8) ^ seed).collect();
     let bid = SourceBlockId(*blake3::hash(&blob).as_bytes());
     crate::daemon::system_state::block::store_retained_block(data_dir, &bid, &blob).unwrap();
@@ -1890,6 +1898,9 @@ async fn worker_iteration_does_not_overwrite_uncertain_placement() {
         None,
         &rec,
         &pool,
+        0,
+        &mut super::worker::TurnMemory::default(),
+        None,
     )
     .await
     .unwrap();
@@ -1940,6 +1951,9 @@ async fn worker_does_not_read_source_when_no_candidates() {
         None,
         &rec,
         &pool,
+        0,
+        &mut super::worker::TurnMemory::default(),
+        None,
     )
     .await
     .expect("no candidates must not touch the source");
@@ -1992,6 +2006,43 @@ async fn worker_parks_block_when_source_is_unreadable() {
         db.list_placements_for_block(&bid).unwrap().is_empty(),
         "no Offered record without symbols to send"
     );
+}
+
+/// v3.5a NOTE 3: a block parked by an iteration error loses the memory of its turns (the yield
+/// count and the marks of its holders), like one parked for any other reason.
+#[tokio::test]
+async fn parking_by_an_iteration_error_clears_the_turn_memory() {
+    let db = make_db();
+    let peers = [device_id(0xA1), device_id(0xA2)];
+    add_pool_peers(&db, &peers);
+    let bid = block_id(0xA3);
+    let mut rec = make_block_record(bid, 1.0, 0.99999);
+    rec.current_reliability = 0.0;
+    db.upsert_source_block(&rec).unwrap();
+
+    let mut pipeline = pipeline_with(&db, make_config(), Some(lonely_swarm(0x3b).await));
+    pipeline.yields.insert(bid, 2);
+    pipeline.last_attempt.insert(
+        bid,
+        super::worker::TurnMemory {
+            turns: 3,
+            holders: std::collections::HashMap::from([(
+                peers[0],
+                super::worker::HolderDelivery {
+                    acked: vec![(0, 2)],
+                    state: super::worker::HolderState::Failed(2),
+                },
+            )]),
+        },
+    );
+    assert!(pipeline.run_iteration().await.unwrap());
+
+    assert!(
+        db.block_cooldown(&bid).parked,
+        "the unreadable source parks it"
+    );
+    assert!(!pipeline.yields.contains_key(&bid), "the yield count goes");
+    assert!(!pipeline.last_attempt.contains_key(&bid), "the marks go");
 }
 
 #[tokio::test]
@@ -2137,7 +2188,7 @@ fn bind_placement_symbols_with_non_contiguous_ranges_binds_each_esi_to_its_own_s
     // BIND_NS+4..BIND_NS+10 is not encoded.
     let raw = raw_for_ranges(&[(BIND_NS, 4), (BIND_NS + 10, 2), (BIND_NS + 20, 3)]);
 
-    let bound = bind_placement_symbols(&encoder, &placement.source_block_id, &placement, &raw)
+    let bound = bind_placement_symbols(&encoder, &placement.source_block_id, &placement, &[], &raw)
         .expect("every placement ESI is in the raw symbols");
 
     let want_esis: Vec<u32> = (BIND_NS..BIND_NS + 4)
@@ -2167,7 +2218,8 @@ fn bind_placement_symbols_when_a_placement_esi_is_missing_returns_error() {
     // BIND_NS+11 was not encoded.
     let raw = raw_for_ranges(&[(BIND_NS, 4), (BIND_NS + 10, 1)]);
 
-    let result = bind_placement_symbols(&encoder, &placement.source_block_id, &placement, &raw);
+    let result =
+        bind_placement_symbols(&encoder, &placement.source_block_id, &placement, &[], &raw);
 
     assert!(
         result.is_err(),
@@ -2206,7 +2258,18 @@ async fn worker_iteration_delivers_only_recorded_offers() {
         let (db, config, encoder, swarm, pool) = (&db, &config, &encoder, &swarm, &pool);
         async move {
             super::worker::run_block_iteration(
-                db, config, encoder, swarm, None, None, None, &rec, pool,
+                db,
+                config,
+                encoder,
+                swarm,
+                None,
+                None,
+                None,
+                &rec,
+                pool,
+                0,
+                &mut super::worker::TurnMemory::default(),
+                None,
             )
             .await
             .unwrap()
