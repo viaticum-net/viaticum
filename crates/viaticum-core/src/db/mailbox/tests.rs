@@ -207,6 +207,46 @@ fn master_for_holder_ignores_zero_placeholder_master() {
     assert_eq!(db.master_for_holder(&DeviceId([1; 32])).unwrap(), Some(m));
 }
 
+#[test]
+fn holder_devices_of_master_finds_peers_devices_when_device_to_master_is_empty() {
+    // dr-i8-b: after DR only PEERS (from the SS) knows the holder's devices.
+    let db = test_db();
+    let m = IdentityPub([0x11; 32]);
+    db.upsert_peer(&peer(2, m, None, 100)).unwrap();
+    db.upsert_peer(&peer(1, m, None, 100)).unwrap();
+    db.upsert_peer(&peer(3, IdentityPub([0x22; 32]), None, 100))
+        .unwrap();
+    assert!(db.get_devices_for_master(&m).unwrap().is_empty());
+    assert_eq!(
+        db.holder_devices_of_master(&m).unwrap(),
+        vec![DeviceId([1; 32]), DeviceId([2; 32])]
+    );
+}
+
+#[test]
+fn holder_devices_of_master_unites_both_tables_once_each() {
+    let db = test_db();
+    let m = IdentityPub([0x11; 32]);
+    db.upsert_peer(&peer(1, m, None, 100)).unwrap();
+    db.set_master_for_device(&DeviceId([1; 32]), &m).unwrap();
+    db.set_master_for_device(&DeviceId([4; 32]), &m).unwrap();
+    db.set_master_for_device(&DeviceId([5; 32]), &IdentityPub([0x22; 32]))
+        .unwrap();
+    assert_eq!(
+        db.holder_devices_of_master(&m).unwrap(),
+        vec![DeviceId([1; 32]), DeviceId([4; 32])]
+    );
+}
+
+#[test]
+fn holder_devices_of_master_is_empty_for_zero_placeholder() {
+    let db = test_db();
+    let zero = IdentityPub([0u8; 32]);
+    db.upsert_peer(&peer(1, zero, None, 100)).unwrap();
+    db.set_master_for_device(&DeviceId([2; 32]), &zero).unwrap();
+    assert!(db.holder_devices_of_master(&zero).unwrap().is_empty());
+}
+
 // ─── Pointer slots (CROWN-1 C3a, AC-29, mailbox-i40/i50) ─────────────────────
 
 use crate::db::{SelfPointerStore, read_only_mailbox_raw_entries};

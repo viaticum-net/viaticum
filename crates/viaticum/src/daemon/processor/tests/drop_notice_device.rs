@@ -5,13 +5,17 @@
 // mailbox. Such a notice is ignored: no `Lost`, no seen row, no repair wake. A notice naming
 // no ESI (holder cleanup) applies only when exactly one placement of the master can change.
 // Child of `processor/tests.rs` (reuses `drop_fixture` and the two-device helpers of
-// `drop_notice_dedup.rs`).
+// `drop_notice_dedup.rs`). Also dr-i8-b: the holder device found through PEERS after DR.
 
 use tokio::sync::mpsc;
+use viaticum_core::cluster::master_identity;
 use viaticum_core::messages::build_signed_symbol_drop_notice;
 use viaticum_core::types::{PlacementStatus, Timestamp};
 
-use super::{DropFixture, drop_fixture};
+use super::{
+    DropFixture, drop_fixture, make_block_id, make_device_id, make_peer_record, make_signing_key,
+    make_source_block, make_symbol_placement,
+};
 use crate::daemon::mailbox::poll::DropNoticeHandler;
 use crate::daemon::repair::RepairTrigger;
 
@@ -116,4 +120,47 @@ async fn empty_range_notice_with_one_candidate_applies() {
     assert_eq!(f.status(), PlacementStatus::Lost);
     assert_eq!(f.status_of(d2), PlacementStatus::Lost);
     assert_eq!(f.seen_rows(), 1);
+}
+
+/// dr-i8-b. After the owner's DR `device_to_master` is empty (it is not in the SS); the
+/// holder's PeerRecord (from the SS) carries its master. The holder's letter applies to its
+/// placement at once, without waiting for re-authentication. Mutation: the bare
+/// `get_devices_for_master` back → "unknown master", nothing applied; this test reddens.
+#[tokio::test]
+async fn drop_notice_after_owner_dr_finds_holder_device_through_peers() {
+    let db = viaticum_core::db::Db::open_in_memory().unwrap();
+    let key = make_signing_key(0x8F);
+    let signer = master_identity(&key);
+    let device = make_device_id(0x8F);
+    let block = make_block_id(0x90);
+    let placed_at = Timestamp(Timestamp::now().0 - 3600);
+    let mut peer = make_peer_record(device);
+    peer.master_identity = signer;
+    db.upsert_peer(&peer).unwrap();
+    db.upsert_source_block(&make_source_block(block)).unwrap();
+    let mut p = make_symbol_placement(block, device, vec![(0, 10)], PlacementStatus::Alive);
+    p.placed_at = placed_at;
+    db.upsert_placement(&p).unwrap();
+    assert!(
+        db.get_devices_for_master(&signer).unwrap().is_empty(),
+        "premise: device_to_master is empty, as after DR"
+    );
+    let f = DropFixture {
+        db,
+        key,
+        signer,
+        ledger_master: signer,
+        device,
+        block,
+        placed_at,
+    };
+
+    assert!(
+        f.apply(f.fresh_notice(10)),
+        "applied without re-authentication"
+    );
+
+    assert_eq!(f.status(), PlacementStatus::Lost);
+    assert_eq!(f.seen_rows(), 1);
+    assert_eq!(f.announced_for(signer), 1);
 }
