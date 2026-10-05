@@ -27,7 +27,10 @@ use super::issue_mem::{
 use super::issue_stall::StallingEncoder;
 use super::issue_support::{SlowPostman, owner_with_encoder};
 use super::pos_scale::field;
-use super::{TEST_K, make_identity, make_placement, make_test_encoder, seed_retained_pos_block};
+use super::{
+    TEST_K, make_identity, make_placement, make_test_encoder, seed_holder_peer,
+    seed_retained_pos_block,
+};
 use crate::daemon::mem_budget::{
     HolderKind, MemBudget, MemPermit, PriorityKind, estimate_pos_issue,
 };
@@ -209,6 +212,7 @@ async fn one_batch_serves_all_ripe_marks_under_one_permit_sized_by_the_largest()
             .db
             .upsert_placement(&make_placement(sized_block_id(seed, t), holder))
             .unwrap();
+        seed_holder_peer(&owner.db, holder);
     }
     let hold = hold_all(&budget);
     let mut in_flight = InFlight::default();
@@ -266,6 +270,7 @@ async fn batch_shrinks_to_the_largest_remaining_need_after_each_member() {
             .db
             .upsert_placement(&make_placement(b, holder))
             .unwrap();
+        seed_holder_peer(&owner.db, holder);
     }
     let seen: Arc<Mutex<Vec<u64>>> = Arc::default();
     let (probe, record) = (Arc::clone(&budget), Arc::clone(&seen));
@@ -353,6 +358,7 @@ async fn at_most_one_overdue_waits_in_the_budget_queue() {
         .db
         .upsert_placement(&make_placement(c, make_identity(0x80)))
         .unwrap();
+    seed_holder_peer(&owner.db, make_identity(0x80));
     tick(&owner, &mut in_flight).await;
     assert_eq!(deferred_tick_of(&owner, &c), Some(3));
     tick(&owner, &mut in_flight).await;
@@ -389,6 +395,7 @@ async fn at_most_one_batch_in_flight_and_only_at_tick_start() {
         .db
         .upsert_placement(&make_placement(c, make_identity(0x80)))
         .unwrap();
+    seed_holder_peer(&owner.db, make_identity(0x80));
     tick(&owner, &mut in_flight).await; // C marked on tick 3
     // Tick 4: C is ripe, the first batch is still waiting for memory — no second one forms.
     tick(&owner, &mut in_flight).await;
@@ -1060,6 +1067,7 @@ async fn batch_member_with_missing_sources_fails_at_once_with_load_failed_for_a_
         .db
         .upsert_placement(&make_placement(doomed, make_identity(0x80)))
         .unwrap();
+    seed_holder_peer(&owner.db, make_identity(0x80));
     let hold = hold_all(&budget);
     let mut in_flight = InFlight::default();
 

@@ -43,13 +43,24 @@ pub(crate) fn should_warn(
     block: SourceBlockId,
     now: Instant,
 ) -> bool {
-    if let Some(last) = map.get(&block)
-        && now.saturating_duration_since(*last) < POS_LOAD_WARN_INTERVAL
+    should_warn_every(map, block, now, POS_LOAD_WARN_INTERVAL)
+}
+
+/// [`should_warn`] for any key and period: the first call for `key` and then one per
+/// `interval` return true (dr-i8: one WARN per holder per PoS period).
+pub(crate) fn should_warn_every<K: std::hash::Hash + Eq>(
+    map: &mut HashMap<K, Instant>,
+    key: K,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    if let Some(last) = map.get(&key)
+        && now.saturating_duration_since(*last) < interval
     {
         return false;
     }
-    map.retain(|_, at| now.saturating_duration_since(*at) < POS_LOAD_WARN_INTERVAL);
-    map.insert(block, now);
+    map.retain(|_, at| now.saturating_duration_since(*at) < interval);
+    map.insert(key, now);
     true
 }
 
@@ -628,13 +639,29 @@ impl Hashed {
                             hook();
                         }
                     }
-                    let holder_master = prep
-                        .db
-                        .get_master_for_device(&holder.holder_id)
-                        .ok()
-                        .flatten()
-                        .map(|m| IdentityPub(m.0))
-                        .unwrap_or_else(|| IdentityPub(holder.holder_id.0));
+                    // dr-i8: PEERS first, device_to_master as fallback; no master, no challenge
+                    // (never a box addressed by the device id: nobody reads it). The scan already
+                    // dropped such holders and warned; a master that vanished between the scan
+                    // and here is skipped quietly, the holder is due again next tick.
+                    let holder_master = match prep.db.master_for_holder(&holder.holder_id) {
+                        Ok(Some(m)) => m,
+                        Ok(None) => {
+                            debug!(
+                                holder = %holder.holder_id,
+                                block_id = %block_id,
+                                "pos: holder master unknown, challenge skipped"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            error!(
+                                holder = %holder.holder_id,
+                                block_id = %block_id,
+                                "pos: holder master lookup failed, challenge skipped: {e}"
+                            );
+                            continue;
+                        }
+                    };
                     results.push(PreparedChallenge {
                         holder_id: holder.holder_id,
                         challenge_id: holder.challenge_id,

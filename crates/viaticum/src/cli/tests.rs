@@ -777,14 +777,21 @@ fn format_device_added_short_id_not_truncated() {
 #[test]
 fn format_device_revoked_truncates_long_id() {
     let id = "01".repeat(16);
-    let rendered = output::render_device_revoked(&id);
+    let rendered = output::render_device_revoked(&id, 0);
     assert!(rendered.contains("device revoked:"), "got: {rendered}");
     assert!(rendered.contains("0101010101010101..."), "got: {rendered}");
 }
 
 #[test]
+fn format_device_revoked_prints_skipped_holders_only_when_positive() {
+    assert!(!output::render_device_revoked("abcdef", 0).contains("not sent"));
+    let rendered = output::render_device_revoked("abcdef", 2);
+    assert!(rendered.contains("not sent to 2 holder"), "got: {rendered}");
+}
+
+#[test]
 fn format_device_revoked_short_id_shown_in_full() {
-    let rendered = output::render_device_revoked("abcdef");
+    let rendered = output::render_device_revoked("abcdef", 0);
     assert!(
         rendered.contains("device revoked: abcdef"),
         "got: {rendered}"
@@ -1037,6 +1044,7 @@ fn cli_response_roundtrips_cbor() {
         CliResponse::RestoreRejected(RestoreRejection::Busy { active: 3 }),
         CliResponse::DeviceRevoked {
             device_id_hex: "01".repeat(16),
+            holders_skipped: 3,
         },
         CliResponse::Files(vec![]),
         CliResponse::Versions(vec![]),

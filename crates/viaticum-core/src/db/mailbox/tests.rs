@@ -160,6 +160,53 @@ fn master_for_peer_device_resolves_from_peers() {
     assert_eq!(db.master_for_peer_device(&DeviceId([3; 32])).unwrap(), None);
 }
 
+#[test]
+fn master_for_holder_falls_back_to_peers_after_dr() {
+    // After DR device_to_master is empty; the PeerRecord (from the SS) carries the master.
+    let db = test_db();
+    let m = IdentityPub([0x11; 32]);
+    db.upsert_peer(&peer(1, m, None, 100)).unwrap();
+    assert_eq!(db.get_master_for_device(&DeviceId([1; 32])).unwrap(), None);
+    assert_eq!(db.master_for_holder(&DeviceId([1; 32])).unwrap(), Some(m));
+    // Unknown anywhere: None, never the device id.
+    assert_eq!(db.master_for_holder(&DeviceId([9; 32])).unwrap(), None);
+}
+
+#[test]
+fn master_for_holder_prefers_peers_over_device_to_master() {
+    let db = test_db();
+    let from_peer = IdentityPub([0x11; 32]);
+    let from_map = IdentityPub([0x22; 32]);
+    db.upsert_peer(&peer(1, from_peer, None, 100)).unwrap();
+    db.set_master_for_device(&DeviceId([1; 32]), &from_map)
+        .unwrap();
+    assert_eq!(
+        db.master_for_holder(&DeviceId([1; 32])).unwrap(),
+        Some(from_peer)
+    );
+    // No PeerRecord: device_to_master is the fallback.
+    db.set_master_for_device(&DeviceId([2; 32]), &from_map)
+        .unwrap();
+    assert_eq!(
+        db.master_for_holder(&DeviceId([2; 32])).unwrap(),
+        Some(from_map)
+    );
+}
+
+#[test]
+fn master_for_holder_ignores_zero_placeholder_master() {
+    let db = test_db();
+    let zero = IdentityPub([0u8; 32]);
+    db.upsert_peer(&peer(1, zero, None, 100)).unwrap();
+    db.set_master_for_device(&DeviceId([2; 32]), &zero).unwrap();
+    assert_eq!(db.master_for_holder(&DeviceId([1; 32])).unwrap(), None);
+    assert_eq!(db.master_for_holder(&DeviceId([2; 32])).unwrap(), None);
+    // Zero in PEERS must not hide a real master in device_to_master.
+    let m = IdentityPub([0x33; 32]);
+    db.set_master_for_device(&DeviceId([1; 32]), &m).unwrap();
+    assert_eq!(db.master_for_holder(&DeviceId([1; 32])).unwrap(), Some(m));
+}
+
 // ─── Pointer slots (CROWN-1 C3a, AC-29, mailbox-i40/i50) ─────────────────────
 
 use crate::db::{SelfPointerStore, read_only_mailbox_raw_entries};

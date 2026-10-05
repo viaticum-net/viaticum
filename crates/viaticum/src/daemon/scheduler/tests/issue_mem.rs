@@ -23,7 +23,7 @@ use super::issue_support::{Owner, SlowPostman, owner_with_encoder, seed_due};
 use super::pos_scale::{LogBuf, field};
 use super::{
     TEST_K, TEST_T, make_identity, make_placement, make_source_block_record, make_test_encoder,
-    pos_block_bytes, seed_retained_pos_block,
+    pos_block_bytes, seed_holder_peer, seed_retained_pos_block,
 };
 use crate::daemon::mem_budget::{
     HolderKind, MemBudget, MemPermit, PriorityKind, estimate_pos_issue,
@@ -328,6 +328,7 @@ async fn waiting_for_memory_preparations_do_not_take_k_slots() {
             .db
             .upsert_placement(&make_placement(c, make_identity(0x80)))
             .unwrap();
+        seed_holder_peer(&owner.db, make_identity(0x80));
 
         tick(&owner, &mut in_flight).await; // A and B wait; C is a new block
     })
@@ -400,6 +401,7 @@ async fn memory_deferred_block_does_not_stop_the_tick() {
             .db
             .upsert_placement(&make_placement(b, holder))
             .unwrap();
+        seed_holder_peer(&owner.db, holder);
     }
     // The big one first in the order.
     owner

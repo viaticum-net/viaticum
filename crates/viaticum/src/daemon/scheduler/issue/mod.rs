@@ -49,6 +49,7 @@ pub(crate) use in_flight::{Ended, InFlight};
 pub(crate) use prepare::PrepOutcome;
 #[cfg(test)]
 pub(crate) use prepare::load_failed_until;
+pub(crate) use prepare::should_warn_every;
 #[cfg(test)]
 pub(crate) use prepare::{POS_LOAD_WARN_INTERVAL, log_load_failure, should_warn};
 use preparing::BatchPlan;
@@ -131,6 +132,9 @@ struct IssueTick {
     /// Due placements of the blocks the memory budget deferred in this tick (R1-d-b): they wait
     /// for memory as overdue ones from the next tick.
     deferred_mem: usize,
+    /// Due placements dropped by the scan because their holder's master is known nowhere
+    /// (dr-i8): no challenge can be addressed, no block is prepared for them.
+    no_master: usize,
     /// Blocks whose preparation was still running at the deadline: the tick stopped
     /// waiting for it and left it to `InFlight::preparing` (pos-i7-d-a).
     cut_blocks: usize,
@@ -309,6 +313,8 @@ impl Scheduler {
     /// holder's trust is read once per tick. A tick with due challenges ends with one
     /// INFO line `scheduler: PoS issue tick`: due, issued, blocks, skipped_pending,
     /// deferred, deferred_mem (placements of the blocks the memory budget deferred, pos-i13),
+    /// no_master (due placements whose holder's master is unknown, dropped before any
+    /// preparation, dr-i8),
     /// budget_closed (1 while a DR keeps the budget closed, pos-i13),
     /// cut_blocks, preparing (preparations running past their ticks, and overdue ones running),
     /// waiting_mem (overdue blocks waiting for memory), oldest_prep_s (age of the oldest running
@@ -394,7 +400,7 @@ impl Scheduler {
         // tick, not once per placement.
         let trust = holder_trust_map(&challengeable, |h| self.holder_trust(h));
 
-        let due = due_challenges(
+        let mut due = due_challenges(
             &challengeable,
             &last_verified,
             tick_now,
@@ -402,7 +408,40 @@ impl Scheduler {
             self.config.time_scale,
         );
 
-        if due.is_empty() {
+        // dr-i8: a holder whose master is known nowhere (after DR: not in PEERS yet, no direct
+        // connection) cannot be addressed. Drop its entries BEFORE any block is ordered for
+        // preparation — otherwise its blocks would be loaded and encoded under a memory permit
+        // on every tick for a challenge that is never sent. One lookup per holder per tick (as
+        // the trust). `Hashed::finish` stays authoritative and skips on `None` as well.
+        let mut no_master = 0usize;
+        if !due.is_empty() {
+            // Per holder: Some(true) known, Some(false) master unknown, None db error (a db
+            // error is not "no master": it is logged, rate-limited, and not counted).
+            let mut known: HashMap<DeviceId, Option<bool>> = HashMap::new();
+            due.retain(|e| {
+                let state = *known.entry(e.holder_id).or_insert_with(|| {
+                    match self.db.master_for_holder(&e.holder_id) {
+                        Ok(Some(_)) => Some(true),
+                        Ok(None) => {
+                            self.warn_holder_master_unknown(&e.holder_id, "pos");
+                            Some(false)
+                        }
+                        Err(err) => {
+                            self.error_holder_master_lookup(&e.holder_id, "pos", &err);
+                            None
+                        }
+                    }
+                });
+                if state == Some(false) {
+                    no_master += 1;
+                }
+                state == Some(true)
+            });
+        }
+
+        // With holders dropped for want of a master the tick still ends with its INFO line
+        // (`no_master`), so the operator sees why nothing is issued.
+        if due.is_empty() && no_master == 0 {
             debug!("scheduler: no challenges due at this interval");
             let preparing = in_flight.preparing.blocks();
             self.retain_mem_deferred(|b| preparing.contains(b));
@@ -410,6 +449,7 @@ impl Scheduler {
         }
         let mut tick = IssueTick {
             due: due.len(),
+            no_master,
             cpw_min: due.iter().map(|e| e.cpw).min().unwrap_or(0),
             cpw_max: due.iter().map(|e| e.cpw).max().unwrap_or(0),
             ..IssueTick::default()
@@ -613,6 +653,7 @@ impl Scheduler {
             skipped_pending = tick.skipped_pending,
             deferred = tick.deferred,
             deferred_mem = tick.deferred_mem,
+            no_master = tick.no_master,
             // pos-i13: 1 while the budget is closed because a DR runs on this machine (v3.9a
             // item 4) — the deferrals of such a tick are not a shortage of memory.
             budget_closed = u8::from(self.mem_budget.is_closed()),
