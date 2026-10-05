@@ -898,6 +898,8 @@ pub(crate) enum TransferNotStored {
     OfferExpired,
     EsiOutsideOffer,
     OversizedSymbol,
+    /// Overwriting held symbols with larger ones would grow the held bytes past the quota.
+    QuotaFull,
     Empty,
 }
 
@@ -908,6 +910,9 @@ pub(crate) enum TransferResult {
     NotStored(TransferNotStored),
 }
 
+/// Counter for unique temp names of symbol writes.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Processor {
     /// Store received symbols on disk and record a HoldingRecord in the DB.
     ///
@@ -915,7 +920,7 @@ impl Processor {
     ///
     /// Returns `Stored` only if EVERY ESI of the chunk is on disk afterwards: written now, or
     /// already held (in the owner's Active `HoldingRecord` for this block AND `{esi}.bin` exists
-    /// with the chunk symbol's length) — a resend of a chunk whose reply was lost is answered
+    /// with the chunk symbol's bytes) — a resend of a chunk whose reply was lost is answered
     /// truthfully (backup-i19).
     ///
     /// ESIs not already held require an accepted offer for `(from_device, block_id)`. The
@@ -966,7 +971,7 @@ impl Processor {
         let block_dir = self.holdings_dir.join(&block_hex);
 
         // ── Already held: in the owner's ACTIVE record AND the file exists with the chunk's
-        // length (a truncated file is rewritten through the offer) ───────────────────────────
+        // bytes (a truncated or different file is rewritten through the offer) ───────────────────────────
         // A record in any other status is on its way out (MarkedForDelete is swept after the
         // cooldown; Silent is never set by the daemon): its symbols are not "held", the chunk
         // goes through the offer path and the merge below makes the record Active again.
@@ -979,12 +984,17 @@ impl Processor {
             if !held_esis.contains(&symbol.esi) {
                 continue;
             }
-            let on_disk =
-                match tokio::fs::metadata(block_dir.join(format!("{}.bin", symbol.esi))).await {
-                    Ok(m) => m.len() == symbol.data.len() as u64,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(e) => return Err(e.into()),
-                };
+            // Length AND bytes: a same-length file with other bytes (bit rot, a PoS `Fail` that
+            // left bad bytes) is not held — the chunk goes through the offer path and the file
+            // is rewritten. One read of <= SYMBOL_SIZE per held symbol of a resend. Resends are
+            // not rare after R1-d-b (an owner restart resends everything it has not seen
+            // acked), so this is a read per resent symbol, not an exception path.
+            let on_disk = match tokio::fs::read(block_dir.join(format!("{}.bin", symbol.esi))).await
+            {
+                Ok(bytes) => bytes == symbol.data,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e.into()),
+            };
             if on_disk {
                 already_held.push(symbol.esi);
             }
@@ -1047,7 +1057,9 @@ impl Processor {
         // transfer and drop the offer.
         for symbol in &transfer.symbols {
             let esi = symbol.esi;
-            let in_range = already_held.contains(&esi)
+            // A held ESI (owner's Active record) is in range even when its bytes differ and it
+            // is rewritten: the rewrite adds no new symbol, the offer need not cover it.
+            let in_range = held_esis.contains(&esi)
                 || accepted_esi_ranges
                     .iter()
                     .any(|&(start, count)| esi >= start && esi < start + count);
@@ -1065,6 +1077,45 @@ impl Processor {
             }
         }
 
+        // ── Size delta of what is overwritten ─────────────────────────────────
+        // The record counts bytes per symbol (`total_bytes`, the source of `used_bytes`). An
+        // ESI the record already has (any status) and that is written again changes the total
+        // by `new_len - old_len`, not by 0: otherwise "1-byte symbols, then the same ESIs at full
+        // size" grows the disk use without the record or the quota seeing it. Growth is asked of
+        // the quota like a new offer (the symbol size is not fixed per block in the wire format,
+        // and the existing tests send short symbols, so a size check would be wrong here).
+        let record_esis: Vec<u32> = match self.db.get_holding(&block_id, &owner_id)? {
+            Some(rec) => ranges_to_esi_list(&rec.esi_ranges),
+            None => Vec::new(),
+        };
+        let mut growth: u64 = 0;
+        for symbol in &transfer.symbols {
+            if already_held.contains(&symbol.esi) {
+                continue;
+            }
+            let old_len =
+                match tokio::fs::metadata(block_dir.join(format!("{}.bin", symbol.esi))).await {
+                    Ok(m) => m.len(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(e) => return Err(e.into()),
+                };
+            if record_esis.contains(&symbol.esi) {
+                growth += (symbol.data.len() as u64).saturating_sub(old_len);
+            }
+        }
+        if growth > 0 {
+            let snap = self.offer_snapshot()?;
+            if !self.decide_symbol_offer_on(growth, &snap) {
+                warn!(
+                    block_id = %block_id,
+                    owner = %owner_id,
+                    growth,
+                    "processor: SymbolTransfer rejected — overwrite would exceed the quota"
+                );
+                return Ok(TransferResult::NotStored(TransferNotStored::QuotaFull));
+            }
+        }
+
         // ── Write symbols to disk ─────────────────────────────────────────────
         tokio::fs::create_dir_all(&block_dir).await?;
 
@@ -1076,13 +1127,51 @@ impl Processor {
                 continue;
             }
             let sym_path = block_dir.join(format!("{}.bin", symbol.esi));
-            tokio::fs::write(&sym_path, &symbol.data).await?;
+            // Every write goes aside, then rename: a PoS read (`pos.rs` reads a file whatever
+            // its record status) and a crash see the old or the new file, never half of one,
+            // also for a file under a MarkedForDelete record. The tmp name is unique per write;
+            // `SymbolTransfer` is dispatched inline in `Processor::run` (one at a time), so two
+            // writers of one ESI do not meet today, and the name keeps it true if that changes.
+            let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp_path = block_dir.join(format!(
+                "{}.bin.tmp.{}.{}",
+                symbol.esi,
+                std::process::id(),
+                seq
+            ));
+            tokio::fs::write(&tmp_path, &symbol.data).await?;
+            if let Err(e) = tokio::fs::rename(&tmp_path, &sym_path).await {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(e.into());
+            }
             received_esis.push(symbol.esi);
             total_bytes += symbol.data.len() as u64;
         }
 
         received_esis.sort_unstable();
         let new_ranges = esi_list_to_ranges(&received_esis);
+
+        // An overwrite (a received ESI the record already has) changes the size of a file the
+        // record counted: the total is then taken from the files of the merged record, so it
+        // follows the disk in both directions (a file shrunk behind our back included).
+        let is_overwrite = received_esis.iter().any(|e| record_esis.contains(e));
+        let overwritten_total: Option<u64> = if is_overwrite {
+            let mut all: Vec<u32> = record_esis.clone();
+            all.extend(received_esis.iter().copied());
+            all.sort_unstable();
+            all.dedup();
+            let mut total = 0u64;
+            for esi in all {
+                match tokio::fs::metadata(block_dir.join(format!("{esi}.bin"))).await {
+                    Ok(m) => total += m.len(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Some(total)
+        } else {
+            None
+        };
 
         // Merge with existing HoldingRecord if any.
         let record = match self.db.get_holding(&block_id, &owner_id)? {
@@ -1100,7 +1189,10 @@ impl Processor {
                 }
                 all_esis.sort_unstable();
                 existing.esi_ranges = esi_list_to_ranges(&all_esis);
-                existing.total_bytes += new_bytes;
+                existing.total_bytes = match overwritten_total {
+                    Some(total) => total,
+                    None => existing.total_bytes + new_bytes,
+                };
                 existing.status = HoldingStatus::Active;
                 existing.delete_requested_at = None;
                 // importance: keep existing value (BR-7). New offer may have different
