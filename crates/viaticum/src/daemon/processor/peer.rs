@@ -3,7 +3,7 @@
 use libp2p::PeerId;
 use tracing::{debug, info, warn};
 use viaticum_core::cluster::DeviceCertificate;
-use viaticum_core::constants::{AVAIL_EWMA_ALPHA, INITIAL_TRUST_P, MESSAGE_FRESHNESS_SECS};
+use viaticum_core::constants::{AVAIL_EWMA_ALPHA, MESSAGE_FRESHNESS_SECS};
 use viaticum_core::messages::{PeerAnnounceMsg, verify_peer_announce};
 use viaticum_core::types::{DeviceId, IdentityPub, Timestamp, ewma_contact_observed};
 
@@ -322,9 +322,6 @@ impl Processor {
                 existing.last_seen = now;
                 if msg.x25519_pub.is_some() {
                     existing.x25519_pub = msg.x25519_pub;
-                }
-                if existing.trust_p == 0.0 && existing.trust_i == 0.0 {
-                    existing.trust_p = INITIAL_TRUST_P;
                 }
                 existing.avail_ewma = ewma_contact_observed(existing.avail_ewma, AVAIL_EWMA_ALPHA);
                 existing.last_avail_sample = now_secs;

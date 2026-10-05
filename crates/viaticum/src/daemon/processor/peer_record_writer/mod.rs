@@ -412,9 +412,6 @@ fn write_entry(
             if auth.x25519_pub.is_some() {
                 existing.x25519_pub = auth.x25519_pub;
             }
-            if existing.trust_p == 0.0 && existing.trust_i == 0.0 {
-                existing.trust_p = INITIAL_TRUST_P;
-            }
             for _ in 0..auth.contacts {
                 existing.avail_ewma = ewma_contact_observed(existing.avail_ewma, AVAIL_EWMA_ALPHA);
             }

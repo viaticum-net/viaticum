@@ -395,3 +395,56 @@ async fn start_fails_transient_when_web_port_is_held_before_swarm_listens() {
     );
     drop(web_blocker);
 }
+
+/// pos-i21: a restart does not touch stored trust. A peer that failed every check
+/// (p = 0, i = 0) and a row below the prior with no I (the old 0.1 prior) both keep their
+/// values; the start used to lift both to the prior. The held port refuses the start
+/// after the database steps, so the test needs no live network.
+#[tokio::test(start_paused = true)]
+async fn start_keeps_the_stored_trust_of_every_peer() {
+    use viaticum_core::db::Db;
+    use viaticum_core::types::{DeviceId, IdentityPub, PeerRecord, Timestamp};
+
+    let dir = tempdir().expect("tempdir");
+    init_identity(dir.path()).expect("init_identity");
+    let peer = |n: u8, trust_p: f64| PeerRecord {
+        device_id: DeviceId([n; 32]),
+        master_identity: IdentityPub([n; 32]),
+        trust_p,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: Timestamp::now(),
+        last_seen: Timestamp::now(),
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
+    };
+    {
+        let db = Db::open(&dir.path().join("db.redb")).expect("db");
+        db.upsert_peer(&peer(0x31, 0.0)).unwrap();
+        db.upsert_peer(&peer(0x32, 0.1)).unwrap();
+    }
+    let blocker = std::net::TcpListener::bind("0.0.0.0:0").expect("bind blocker");
+    write_config_with_listen_port(dir.path(), blocker.local_addr().unwrap().port());
+
+    let err = match DaemonHandle::start(cfg_for(dir.path())).await {
+        Ok(_) => panic!("held port must still refuse the start"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind, StartFailureKind::Transient, "{err}");
+
+    let db = Db::open(&dir.path().join("db.redb")).expect("reopen db");
+    for (n, trust_p) in [(0x31u8, 0.0), (0x32, 0.1)] {
+        let r = db.get_peer(&DeviceId([n; 32])).unwrap().expect("record");
+        assert_eq!(
+            (r.trust_p, r.trust_i),
+            (trust_p, 0.0),
+            "start must not rewrite the trust of peer {n:#x}"
+        );
+    }
+    drop(blocker);
+}

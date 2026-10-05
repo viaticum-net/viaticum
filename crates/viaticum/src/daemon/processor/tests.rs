@@ -4886,3 +4886,53 @@ async fn undecodable_payload_through_the_mailbox_handler_is_no_answer() {
         crate::daemon::mailbox::poll::PosChallengeAnswer::NoAnswer
     );
 }
+
+/// pos-i21: a PeerAnnounce does not reset the trust of a peer that failed every check.
+#[tokio::test]
+async fn peer_announce_keeps_the_zero_trust_of_a_peer_that_failed_every_check() {
+    use viaticum_core::messages::build_peer_announce;
+    use viaticum_core::types::PeerRecord;
+
+    let db = Db::open_in_memory().unwrap();
+    let holdings_dir = TempDir::new().unwrap();
+    let processor = make_processor(db.clone(), &holdings_dir).await;
+
+    let (sk, identity) = make_signing_identity(22);
+    let now = Timestamp::now();
+    let device_id = DeviceId(identity.0);
+    db.upsert_peer(&PeerRecord {
+        device_id,
+        master_identity: identity,
+        trust_p: 0.0,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: now,
+        last_seen: now,
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
+    })
+    .unwrap();
+    db.set_master_for_device(&device_id, &identity).unwrap();
+
+    let announce = build_peer_announce(identity, Timestamp::now(), &sk, None);
+    processor
+        .handle_peer_announce(announce)
+        .await
+        .expect("handle_peer_announce failed");
+
+    let updated = db.get_peer(&device_id).unwrap().unwrap();
+    assert_eq!(
+        (updated.trust_p, updated.trust_i),
+        (0.0, 0.0),
+        "an announce must not turn a peer that failed every check into a newcomer"
+    );
+    assert!(
+        updated.last_avail_sample > 0,
+        "the announce itself is still applied"
+    );
+}
