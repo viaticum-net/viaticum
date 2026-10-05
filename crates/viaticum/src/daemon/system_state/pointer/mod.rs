@@ -7,7 +7,8 @@
 //   2. a new envelope is needed when the running base is not the one in `current`
 //      (compaction or restart → a NEW base), when the pointer changed structurally,
 //      when the refresh interval (30 d / time_scale) elapsed, or when the last attempt
-//      was refused by every postman as clock skew and nobody holds it;
+//      was refused by every postman as clock skew (or as expired in transit,
+//      mailbox-i61) and nobody holds it;
 //      - the same base → the same place (`current.place`);
 //      - a new base → `place_for_new_base` (empty / unconfirmed / weaker base; never
 //        by generation); the record it displaces goes to the new record's `to_retire`;
@@ -280,16 +281,12 @@ impl PointerPublisher<'_> {
         let changed = c.generation != pointer.generation || c.diffs != diffs;
         let refresh_due = now_secs.saturating_sub(c.created_at.0)
             >= pointer_refresh_interval_secs(self.time_scale);
-        // Nobody holds an envelope every postman refused as clock skew: re-seal it with
-        // the (possibly corrected) clock instead of re-offering it forever.
+        // Nobody holds an envelope every postman refused as clock skew, or as expired in
+        // transit (mailbox-i61): re-seal it with the (possibly corrected) clock instead
+        // of re-offering it forever.
         let clock_refused = c.acks.is_empty()
-            && matches!(
-                c.last_refusal,
-                Some(PointerRefusal {
-                    kind: RefusalKind::ClockSkew,
-                    ..
-                })
-            );
+            && c.last_refusal
+                .is_some_and(|r| r.expired || r.kind == RefusalKind::ClockSkew);
         changed || refresh_due || clock_refused
     }
 
@@ -539,8 +536,11 @@ pub(crate) fn absorb(record: &mut PlacePublication, outcome: &PublishOutcome, no
             record.acks.push(*a);
         }
     }
-    record.last_refusal =
-        refusal_of(outcome.verdict()).map(|kind| PointerRefusal { at: now_secs, kind });
+    record.last_refusal = refusal_of(outcome.verdict()).map(|kind| PointerRefusal {
+        at: now_secs,
+        kind,
+        expired: outcome.all_expired(),
+    });
 }
 
 fn refusal_of(verdict: PublishVerdict) -> Option<RefusalKind> {

@@ -81,8 +81,20 @@ fn honest(cid: [u8; 16]) -> MailboxEntry {
     entry_of(&response_msg(cid, &holder_key(), T0), cid[0])
 }
 
-/// Select, then "send" everything selected (a channel with room).
+/// One poll with one answer: select, then "send" everything selected (a channel with
+/// room).
 fn poll_and_send(
+    memo: &mut ForwardedResponses,
+    pending: &PendingIndex,
+    entries: Vec<MailboxEntry>,
+    now: u64,
+) -> (Vec<[u8; 16]>, ForwardCounts) {
+    memo.begin_poll();
+    answer_and_send(memo, pending, entries, now)
+}
+
+/// One more postman's answer in the current poll: select, then "send" what was selected.
+fn answer_and_send(
     memo: &mut ForwardedResponses,
     pending: &PendingIndex,
     entries: Vec<MailboxEntry>,
@@ -190,6 +202,7 @@ fn forged_response_does_not_lock_out_the_honest_one() {
     // Both orders of one poll: the honest one is never shadowed by a sent forgery.
     let mut memo = ForwardedResponses::new(TS);
     poll_and_send(&mut memo, &pending, vec![forged.clone()], T0);
+    memo.begin_poll();
     let (out, _) = memo.select(&pending, vec![honest(C1), forged], T0 + 4);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].msg, response_msg(C1, &holder_key(), T0));
@@ -245,6 +258,48 @@ fn recomputed_response_after_holder_restart_is_forwarded() {
     assert_eq!(memo.len(), 2);
 }
 
+/// pos-i6 under mailbox-i63 (review W1): the poll selects once per postman's answer, but
+/// one envelope per challenge_id per POLL goes to the scheduler. Two honest envelopes of
+/// one challenge (a holder restart) in two answers of one poll: the second is in flight;
+/// it goes on the next poll, the challenge being still pending.
+#[test]
+fn second_envelope_of_a_challenge_in_a_later_answer_of_the_same_poll_is_in_flight() {
+    let pending = pending_with(&[C1]);
+    let mut memo = ForwardedResponses::new(TS);
+    let recomputed = entry_of(&response_msg(C1, &holder_key(), T0 + 100), 1);
+
+    let (first, _) = poll_and_send(&mut memo, &pending, vec![honest(C1)], T0);
+    assert_eq!(first, vec![C1]);
+    let (second, counts) = answer_and_send(&mut memo, &pending, vec![recomputed.clone()], T0);
+    assert!(second.is_empty(), "one envelope per challenge per poll");
+    assert_eq!((counts.selected, counts.in_flight), (0, 1));
+
+    let (next_poll, counts) =
+        poll_and_send(&mut memo, &pending, vec![honest(C1), recomputed], T0 + 4);
+    assert_eq!(
+        next_poll,
+        vec![C1],
+        "the other envelope goes on the next poll"
+    );
+    assert_eq!(counts.in_flight, 1, "the first one is in flight");
+}
+
+/// An envelope selected but not sent (full channel) still counts as this poll's choice:
+/// a second envelope of its challenge later in the poll does not overtake it.
+#[test]
+fn deferred_choice_still_holds_the_challenge_for_the_poll() {
+    let pending = pending_with(&[C1]);
+    let mut memo = ForwardedResponses::new(TS);
+    memo.begin_poll();
+    let (out, _) = memo.select(&pending, vec![honest(C1)], T0);
+    assert_eq!(out.len(), 1);
+    // try_send failed (Full): no mark_sent.
+    let recomputed = entry_of(&response_msg(C1, &holder_key(), T0 + 100), 1);
+    let (out, counts) = memo.select(&pending, vec![recomputed], T0);
+    assert!(out.is_empty());
+    assert_eq!(counts.in_flight, 1);
+}
+
 /// N-5 / K0-5: a full channel loses nothing — `select` marks nothing by itself, so an
 /// envelope that was not sent is selected again on the next poll.
 #[test]
@@ -255,6 +310,7 @@ fn unsent_after_full_channel_is_selected_again() {
     assert_eq!(out.len(), 1);
     // try_send failed (Full): no mark_sent.
     assert!(memo.is_empty());
+    memo.begin_poll();
     let (again, counts) = memo.select(&pending, vec![honest(C1)], T0 + 4);
     assert_eq!(again.len(), 1, "selected again on the next poll");
     assert_eq!(counts.selected, 1);

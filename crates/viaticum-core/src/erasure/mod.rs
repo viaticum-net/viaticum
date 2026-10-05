@@ -3,12 +3,19 @@ use chacha20::cipher::{KeyIvInit, StreamCipher};
 use hkdf::Hkdf;
 use raptorq::{
     EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockDecoder,
-    SourceBlockEncoder,
+    SourceBlockEncoder, SourceBlockEncodingPlan,
 };
 use sha2::Sha256;
+use std::borrow::Cow;
 
 use crate::constants::{MAX_ESI_EXCLUSIVE, RAPTORQ_MAX_SOURCE_SYMBOLS};
 use crate::types::{DeviceId, ErasureParams, SourceBlockId};
+
+mod raptorq_table;
+pub use raptorq_table::{
+    PLAN_BYTES_PER_SOURCE_SYMBOL, POS_SYMBOL_BUFFERS, encoder_bytes, intermediate_symbols,
+    table_row,
+};
 
 /// One encoding symbol: ESI (which symbol) + T bytes of data.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -56,6 +63,9 @@ pub fn chunk_symbols_by_size(symbols: Vec<Symbol>, budget_bytes: usize) -> Vec<V
     out
 }
 
+/// Receiver of one raw symbol (ESI, bytes) in `encode_raw_ranges_each`.
+pub type SymbolSink<'a> = dyn FnMut(u32, &[u8]) -> Result<(), ErasureError> + 'a;
+
 /// Errors from encoding/decoding.
 #[derive(Debug, thiserror::Error)]
 pub enum ErasureError {
@@ -91,6 +101,10 @@ pub enum ErasureError {
     /// panic on it (CS-ERA-6).
     #[error("ESI range {start}+{count} reaches the ESI limit {max}")]
     EsiOutOfRange { start: u32, count: u32, max: u32 },
+
+    /// `encode_raw_ranges_each` needs ranges in ascending order without overlap.
+    #[error("ranges are not ascending and disjoint")]
+    RangesNotAscending,
 }
 
 /// Every range ends at or below `MAX_ESI_EXCLUSIVE` (checked addition, CS-ERA-6).
@@ -108,6 +122,20 @@ fn check_esi_ranges(ranges: &[(u32, u32)]) -> Result<(), ErasureError> {
         }
     }
     Ok(())
+}
+
+/// Pad a stored blob in place to `k * t` bytes for encoding (no second copy).
+///
+/// The block id must be checked BEFORE padding: the padding changes the bytes the id is
+/// taken over. Reserves exactly the missing tail, so the worst case is one transient
+/// reallocation (2x the blob, before the encoder is built), not a permanent second copy.
+/// A blob already `k * t` long or longer is left as is.
+pub fn pad_for_encoding(blob: &mut Vec<u8>, params: &ErasureParams) {
+    let padded_len = params.k as usize * params.t as usize;
+    if blob.len() < padded_len {
+        blob.reserve_exact(padded_len - blob.len());
+        blob.resize(padded_len, 0u8);
+    }
 }
 
 /// Erasure coding abstraction. Stateless — all inputs explicit.
@@ -173,6 +201,19 @@ pub trait ErasureEncoder: Send + Sync {
         ranges: &[(u32, u32)],
     ) -> Result<Vec<Symbol>, ErasureError>;
 
+    /// Like `encode_raw_ranges`, but each raw symbol goes to `f` and is dropped: nothing
+    /// accumulates, so the peak does not grow with the number of symbols. ONE encoder build.
+    ///
+    /// `ranges` must be ascending and disjoint (`RangesNotAscending` otherwise); `f` is called
+    /// in ascending ESI order. `f` returning `Err` stops the walk and is returned as is.
+    fn encode_raw_ranges_each(
+        &self,
+        source_block: &[u8],
+        params: &ErasureParams,
+        ranges: &[(u32, u32)],
+        f: &mut SymbolSink<'_>,
+    ) -> Result<(), ErasureError>;
+
     /// Apply per-holder binding to a raw symbol.
     /// XORs the symbol data with the binding keystream derived from (block_id, holder_id, esi).
     fn apply_binding(
@@ -203,14 +244,73 @@ impl RaptorQEncoder {
         )
     }
 
-    fn make_block_encoder(source_block: &[u8], params: &ErasureParams) -> SourceBlockEncoder {
+    /// Build the encoder over `source_block` padded to `k * t`.
+    ///
+    /// A block already `k * t` long is used as is, without a copy (F5); a shorter one is
+    /// copied and zero-padded (callers that can pad in place use `pad_for_encoding`). The
+    /// encoding plan is generated here and dropped with the operation: raptorq's own
+    /// constructor would park it in a process-wide cache for good (W2).
+    fn make_block_encoder<'a>(
+        source_block: &'a [u8],
+        params: &ErasureParams,
+    ) -> (SourceBlockEncoder, Cow<'a, [u8]>) {
         let config = Self::make_config(params);
-        let k = params.k as usize;
+        let padded_len = params.k as usize * params.t as usize;
+        let input: Cow<[u8]> = if source_block.len() >= padded_len {
+            Cow::Borrowed(&source_block[..padded_len])
+        } else {
+            let mut padded = Vec::with_capacity(padded_len);
+            padded.extend_from_slice(source_block);
+            padded.resize(padded_len, 0u8);
+            Cow::Owned(padded)
+        };
+        let plan = SourceBlockEncodingPlan::generate(params.k as u16);
+        let encoder = SourceBlockEncoder::with_encoding_plan(0, &config, &input, &plan);
+        (encoder, input)
+    }
+
+    /// Walk `ranges` in the given order over one encoder; every raw symbol goes to `f`.
+    /// Source ESIs are slices of the padded input (with one sub-block a symbol IS the chunk,
+    /// F6); repair ESIs come from the encoder one at a time.
+    fn walk_ranges(
+        source_block: &[u8],
+        params: &ErasureParams,
+        ranges: &[(u32, u32)],
+        f: &mut SymbolSink<'_>,
+    ) -> Result<(), ErasureError> {
+        check_source_symbol_limit(params)?;
+        check_esi_ranges(ranges)?;
+        if source_block.is_empty() {
+            return Err(ErasureError::EmptyBlock);
+        }
+        let (encoder, input) = Self::make_block_encoder(source_block, params);
+        let k = params.k;
         let t = params.t as usize;
-        let padded_len = k * t;
-        let mut padded = source_block.to_vec();
-        padded.resize(padded_len, 0u8);
-        SourceBlockEncoder::new(0, &config, &padded)
+        for &(start_esi, count) in ranges {
+            for i in 0..count {
+                // Below 2^24: `check_esi_ranges` above.
+                let esi = start_esi + i;
+                if esi < k {
+                    let from = esi as usize * t;
+                    f(esi, &input[from..from + t])?;
+                } else {
+                    let packet = encoder
+                        .repair_packets(esi - k, 1)
+                        .into_iter()
+                        .next()
+                        .ok_or(ErasureError::RepairPacketMissing { esi })?;
+                    let (_, data) = packet.split();
+                    if data.len() != t {
+                        return Err(ErasureError::SymbolSizeMismatch {
+                            expected: t,
+                            got: data.len(),
+                        });
+                    }
+                    f(esi, &data)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -231,6 +331,8 @@ impl Default for RaptorQEncoder {
     }
 }
 
+// The implementation calls its own entry points; the daemon goes through `mem_budget`.
+#[allow(clippy::disallowed_methods)]
 impl ErasureEncoder for RaptorQEncoder {
     fn encode(
         &self,
@@ -307,63 +409,33 @@ impl ErasureEncoder for RaptorQEncoder {
         params: &ErasureParams,
         ranges: &[(u32, u32)],
     ) -> Result<Vec<Symbol>, ErasureError> {
-        check_source_symbol_limit(params)?;
-        check_esi_ranges(ranges)?;
-        if source_block.is_empty() {
-            return Err(ErasureError::EmptyBlock);
-        }
-
-        let encoder = Self::make_block_encoder(source_block, params);
-        let k = params.k;
-        let t = params.t as usize;
-
-        // Fetch source packets once (only if we need any source-range ESIs).
-        let source_packets: Option<Vec<EncodingPacket>> =
-            if ranges.iter().any(|&(start, count)| count > 0 && start < k) {
-                Some(encoder.source_packets())
-            } else {
-                None
-            };
-
         let total: usize = ranges.iter().map(|&(_, count)| count as usize).sum();
         let mut symbols = Vec::with_capacity(total);
-        for &(start_esi, count) in ranges {
-            for i in 0..count {
-                // Below 2^24: `check_esi_ranges` above.
-                let esi = start_esi + i;
-                let raw_data: Vec<u8> = if esi < k {
-                    source_packets
-                        .as_ref()
-                        .and_then(|v| v.get(esi as usize))
-                        .ok_or(ErasureError::SourcePacketMissing { esi })?
-                        .data()
-                        .to_vec()
-                } else {
-                    let repair_offset = esi - k;
-                    let packets = encoder.repair_packets(repair_offset, 1);
-                    packets
-                        .into_iter()
-                        .next()
-                        .ok_or(ErasureError::RepairPacketMissing { esi })?
-                        .data()
-                        .to_vec()
-                };
-
-                if raw_data.len() != t {
-                    return Err(ErasureError::SymbolSizeMismatch {
-                        expected: t,
-                        got: raw_data.len(),
-                    });
-                }
-
-                symbols.push(Symbol {
-                    esi,
-                    data: raw_data,
-                });
-            }
-        }
-
+        Self::walk_ranges(source_block, params, ranges, &mut |esi, data| {
+            symbols.push(Symbol {
+                esi,
+                data: data.to_vec(),
+            });
+            Ok(())
+        })?;
         Ok(symbols)
+    }
+
+    fn encode_raw_ranges_each(
+        &self,
+        source_block: &[u8],
+        params: &ErasureParams,
+        ranges: &[(u32, u32)],
+        f: &mut SymbolSink<'_>,
+    ) -> Result<(), ErasureError> {
+        let mut next_free: u64 = 0;
+        for &(start, count) in ranges {
+            if (start as u64) < next_free {
+                return Err(ErasureError::RangesNotAscending);
+            }
+            next_free = start as u64 + count as u64;
+        }
+        Self::walk_ranges(source_block, params, ranges, f)
     }
 
     fn apply_binding(

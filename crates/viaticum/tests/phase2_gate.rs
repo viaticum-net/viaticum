@@ -10,6 +10,9 @@
 //
 // GATE CRITERIA: tests 1, 2, 4, 6 pass → Phase 2 is complete.
 // Test 3 (QUIC symbol transfer) was iroh-era; libp2p equivalent in swarm_tests.rs.
+
+// Exercises the erasure entry points directly.
+#![allow(clippy::disallowed_methods)]
 // Test 5 (relay board) removed: the relay board was retired by the A2 mailbox bus.
 
 use std::sync::Arc;

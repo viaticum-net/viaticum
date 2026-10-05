@@ -551,6 +551,21 @@ impl Db {
             .map(|p| p.master_identity)
             .filter(|m| m.0 != [0u8; 32]))
     }
+
+    /// Master of a holder device for addressing service mail (PoS challenge, Delete,
+    /// revoke): PEERS first (`master_for_peer_device`, they travel in the SS, so they
+    /// survive DR), `device_to_master` as a fallback (filled only by a direct
+    /// certificate exchange, empty after DR). Zero placeholder is filtered in both
+    /// branches. `None` = unknown anywhere: the caller sends nothing (dr-i8). The pair
+    /// ledger keeps using `master_for_peer_device` alone (rule Д-M).
+    pub fn master_for_holder(&self, device: &DeviceId) -> Result<Option<IdentityPub>, DbError> {
+        if let Some(m) = self.master_for_peer_device(device)? {
+            return Ok(Some(m));
+        }
+        Ok(self
+            .get_master_for_device(device)?
+            .filter(|m| m.0 != [0u8; 32]))
+    }
 }
 
 #[cfg(test)]

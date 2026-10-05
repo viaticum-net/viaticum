@@ -1,8 +1,10 @@
 // PoS handlers: holder responds to hash challenge, owner verifies hash response or receives nack.
 
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 use viaticum_core::cluster::ClusterState;
 use viaticum_core::db::Db;
@@ -10,7 +12,7 @@ use viaticum_core::messages::{
     Message, PosHashChallengeMsg, build_pos_hash_nack, build_pos_hash_response,
     verify_pos_hash_challenge,
 };
-use viaticum_core::pos::compute_chain_hash;
+use viaticum_core::pos::ChainHasher;
 use viaticum_core::types::from_cbor_bytes;
 use viaticum_core::types::{DeviceId, IdentityPub, Timestamp, hex_encode};
 
@@ -45,6 +47,32 @@ pub struct PosResponder {
     cluster_state: Option<Arc<Mutex<ClusterState>>>,
     /// Scales the freshness window (`challenge_max_age_secs`); 1 = production.
     time_scale: u64,
+    /// How many answers read a share at once (K-b4, pos-i14): `HOLDER_POS_CONCURRENCY`
+    /// permits, shared by the direct path (`Processor`) and the mailbox path.
+    pos_slots: Arc<Semaphore>,
+    /// Test seam (always `None` in production): called on the blocking thread before each
+    /// symbol file is opened.
+    read_hook: Option<ReadHook>,
+}
+
+/// Holder-side PoS answers that may read a share at the same time (pos-i14). Each holds one
+/// symbol buffer (T) and a thread of the blocking pool for the whole read, so a hung data
+/// directory (a NAS) takes at most this many threads, however many challenges arrive; the
+/// rest wait as async tasks without a thread.
+pub(crate) const HOLDER_POS_CONCURRENCY: usize = 2;
+
+/// The semaphore of the holder's PoS answers: one per node, shared by every `PosResponder`.
+pub(crate) fn new_pos_slots() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(HOLDER_POS_CONCURRENCY))
+}
+
+pub(crate) type ReadHook = Arc<dyn Fn(u32) + Send + Sync>;
+
+/// What the blocking read-and-hash task ends with.
+enum Answered {
+    Hash([u8; 32]),
+    /// The symbol file is gone; no hash of the rest goes out.
+    Missing(u32),
 }
 
 /// Clock skew allowed between an owner's and a holder's clock when a challenge's age is
@@ -82,7 +110,21 @@ impl PosResponder {
             own_master,
             cluster_state,
             time_scale: 1,
+            pos_slots: new_pos_slots(),
+            read_hook: None,
         }
+    }
+
+    /// Share the node's answer semaphore (`new_pos_slots`) with the other responders.
+    pub(crate) fn with_pos_slots(mut self, pos_slots: Arc<Semaphore>) -> Self {
+        self.pos_slots = pos_slots;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_read_hook(mut self, hook: ReadHook) -> Self {
+        self.read_hook = Some(hook);
+        self
     }
 
     /// Set the run's time_scale (the freshness window shrinks with it).
@@ -270,52 +312,52 @@ impl PosResponder {
             });
         }
 
-        // Expand ESI ranges to a sorted ESI list — now bounded by `symbol_count()` (small,
-        // real). The legit path (requested <= held) is unchanged: it expands exactly the
-        // requested ESIs and the per-ESI file-read + Nack-on-missing logic below is untouched,
-        // so chain-hash matching for honest holders is preserved.
-        let mut esis: Vec<u32> = challenge
-            .esi_ranges
-            .iter()
-            .flat_map(|&(start, count)| start..start + count)
-            .collect();
+        // K-b4 (pos-i14): the share is read ONE symbol at a time into one reused buffer, hashed
+        // on the spot, on a thread of the blocking pool — never the runtime's. At most
+        // `HOLDER_POS_CONCURRENCY` answers read at once: the rest wait here, as async tasks
+        // without a thread. The permit lives to the end of the blocking task.
+        let permit = Arc::clone(&self.pos_slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| ProcessorError::Join("PoS answer semaphore closed".into()))?;
+
+        // Expand ESI ranges to a sorted ESI list — bounded by `symbol_count()` (SM-1), so
+        // `requested` is the exact size. Duplicates stay, as at the owner (`fold.rs`): a
+        // duplicate is hashed once per occurrence (NOTE 1 v3.3).
+        let mut esis: Vec<u32> = Vec::with_capacity(requested as usize);
+        for &(start, count) in &challenge.esi_ranges {
+            esis.extend(start..start + count);
+        }
         esis.sort_unstable();
 
-        // Read all symbol files.
-        let block_hex = hex_encode(&block_id.0);
-        let block_dir = self.holdings_dir.join(&block_hex);
-        let mut symbol_data: Vec<(u32, Vec<u8>)> = Vec::with_capacity(esis.len());
-
-        for &esi in &esis {
-            let sym_path = block_dir.join(format!("{esi}.bin"));
-            match tokio::fs::read(&sym_path).await {
-                Ok(data) => symbol_data.push((esi, data)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    warn!(
-                        block_id = %block_id,
-                        esi,
-                        challenge_id = %hex_encode(&challenge.challenge_id),
-                        "processor: PosHashChallenge — symbol missing, sending nack"
-                    );
-                    return Ok(Message::PosHashNack(build_pos_hash_nack(
-                        challenge.challenge_id,
-                        block_id,
-                        esi,
-                        Timestamp::now(),
-                        &self.device_signing_key,
-                    )));
-                }
-                Err(e) => return Err(ProcessorError::Io(e)),
+        let block_dir = self.holdings_dir.join(hex_encode(&block_id.0));
+        let challenge_id = challenge.challenge_id;
+        let hook = self.read_hook.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            hash_share(&block_dir, &challenge_id, &esis, hook)
+        });
+        let answered = task
+            .await
+            .map_err(|e| ProcessorError::Join(format!("PoS answer task: {e}")))??;
+        let chain_hash = match answered {
+            Answered::Hash(hash) => hash,
+            Answered::Missing(esi) => {
+                warn!(
+                    block_id = %block_id,
+                    esi,
+                    challenge_id = %hex_encode(&challenge.challenge_id),
+                    "processor: PosHashChallenge — symbol missing, sending nack"
+                );
+                return Ok(Message::PosHashNack(build_pos_hash_nack(
+                    challenge.challenge_id,
+                    block_id,
+                    esi,
+                    Timestamp::now(),
+                    &self.device_signing_key,
+                )));
             }
-        }
-
-        // Compute chain hash over bound symbol data.
-        let refs: Vec<(u32, &[u8])> = symbol_data
-            .iter()
-            .map(|(esi, data)| (*esi, data.as_slice()))
-            .collect();
-        let chain_hash = compute_chain_hash(&challenge.challenge_id, &refs)
-            .map_err(ProcessorError::PosVerify)?;
+        };
 
         // pos-i5: on the mailbox path this line comes once per challenge (the poll keeps
         // the answer in memory); the scenario counts it per `challenge_id`.
@@ -338,6 +380,52 @@ impl PosResponder {
     }
 }
 
+/// Read a symbol file into `buf`, at most T bytes: a longer file is a corrupted local file
+/// (an error with a plain text, not a Nack: the holder does not claim to have lost it).
+fn read_symbol(file: std::fs::File, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+    let cap = u64::from(viaticum_core::constants::SYMBOL_SIZE);
+    let n = file.take(cap + 1).read_to_end(buf)?;
+    if n as u64 > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("symbol file is longer than the symbol size ({cap} bytes)"),
+        ));
+    }
+    Ok(n)
+}
+
+/// The chain hash over `esis` (ascending, duplicates kept): each symbol file is read into
+/// `buf` (cleared between symbols, so its capacity is T) and pushed into the hasher before the
+/// next one is read. A missing file anywhere ends it `Missing`; any other IO error is `Err`.
+fn hash_share(
+    block_dir: &Path,
+    challenge_id: &[u8; 16],
+    esis: &[u32],
+    hook: Option<ReadHook>,
+) -> Result<Answered, ProcessorError> {
+    let mut hasher = ChainHasher::new(challenge_id);
+    let mut buf: Vec<u8> = Vec::new();
+    for &esi in esis {
+        if let Some(hook) = &hook {
+            hook(esi);
+        }
+        buf.clear();
+        let read = std::fs::File::open(block_dir.join(format!("{esi}.bin")))
+            .and_then(|file| read_symbol(file, &mut buf));
+        match read {
+            Ok(_) => hasher.push(esi, &buf),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Answered::Missing(esi));
+            }
+            Err(e) => return Err(ProcessorError::Io(e)),
+        }
+    }
+    hasher
+        .finish()
+        .map(Answered::Hash)
+        .map_err(ProcessorError::PosVerify)
+}
+
 impl Processor {
     // ─── Hash-based PoS handlers ─────────────────────────────────────────────
 
@@ -358,7 +446,8 @@ impl Processor {
             self.device_signing_key.clone(),
             self.own_identity,
             self.cluster_state.clone(),
-        );
+        )
+        .with_pos_slots(Arc::clone(&self.pos_slots));
         responder.compute_response(owner_id, challenge).await
     }
 }

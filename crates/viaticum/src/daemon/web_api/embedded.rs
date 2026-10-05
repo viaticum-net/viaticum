@@ -37,3 +37,9 @@ pub(super) async fn handle_embedded(uri: Uri) -> Response {
         }
     }
 }
+
+/// Hex blake3 of the embedded `index.html`; `None` if none is embedded
+/// (`viaticum build-info`, R3 N8: the release compares it with a fresh `dist`).
+pub(crate) fn index_html_blake3() -> Option<String> {
+    WebUiAssets::get("index.html").map(|f| blake3::hash(&f.data).to_hex().to_string())
+}

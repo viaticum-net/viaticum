@@ -254,6 +254,7 @@ fn format_bytes_gigabytes() {
 
 fn make_status_zero_peers() -> StatusData {
     StatusData {
+        daemon_version: String::new(),
         node_identity: "0000000000000000".into(),
         device_id: "0000000000000000".into(),
         node_addr: String::new(),
@@ -307,6 +308,9 @@ fn make_status_zero_peers() -> StatusData {
         max_file_size_bytes: 0,
         block_work_budget_bytes: 0,
         blocks_esi_exhausted: 0,
+        dr_lease: None,
+        backup_paused_while_restoring: false,
+        backup_pause_overlong: false,
     }
 }
 
@@ -469,6 +473,7 @@ fn format_status_unknown_quota_names_the_path() {
 #[test]
 fn format_status_top_peers_printed() {
     let data = StatusData {
+        daemon_version: String::new(),
         node_identity: "a1b2c3d4e5f60708".into(),
         device_id: "a1b2c3d4e5f60708".into(),
         node_addr: String::new(),
@@ -549,6 +554,9 @@ fn format_status_top_peers_printed() {
         max_file_size_bytes: 0,
         block_work_budget_bytes: 0,
         blocks_esi_exhausted: 0,
+        dr_lease: None,
+        backup_paused_while_restoring: false,
+        backup_pause_overlong: false,
     };
     let rendered = output::render_status(&data);
     assert!(rendered.contains("a1b2c3d4"), "got: {rendered}");
@@ -771,14 +779,21 @@ fn format_device_added_short_id_not_truncated() {
 #[test]
 fn format_device_revoked_truncates_long_id() {
     let id = "01".repeat(16);
-    let rendered = output::render_device_revoked(&id);
+    let rendered = output::render_device_revoked(&id, 0);
     assert!(rendered.contains("device revoked:"), "got: {rendered}");
     assert!(rendered.contains("0101010101010101..."), "got: {rendered}");
 }
 
 #[test]
+fn format_device_revoked_prints_skipped_holders_only_when_positive() {
+    assert!(!output::render_device_revoked("abcdef", 0).contains("not sent"));
+    let rendered = output::render_device_revoked("abcdef", 2);
+    assert!(rendered.contains("not sent to 2 holder"), "got: {rendered}");
+}
+
+#[test]
 fn format_device_revoked_short_id_shown_in_full() {
-    let rendered = output::render_device_revoked("abcdef");
+    let rendered = output::render_device_revoked("abcdef", 0);
     assert!(
         rendered.contains("device revoked: abcdef"),
         "got: {rendered}"
@@ -967,6 +982,7 @@ fn cli_response_roundtrips_cbor() {
 
     let responses = vec![
         CliResponse::Status(Box::new(StatusData {
+            daemon_version: String::new(),
             node_identity: "aabbccdd11223344".into(),
             device_id: "aabbccdd11223344".into(),
             node_addr: String::new(),
@@ -1020,6 +1036,9 @@ fn cli_response_roundtrips_cbor() {
             max_file_size_bytes: 0,
             block_work_budget_bytes: 0,
             blocks_esi_exhausted: 0,
+            dr_lease: None,
+            backup_paused_while_restoring: false,
+            backup_pause_overlong: false,
         })),
         CliResponse::DeviceList(vec![]),
         CliResponse::Error("oops".into()),
@@ -1028,6 +1047,7 @@ fn cli_response_roundtrips_cbor() {
         CliResponse::RestoreRejected(RestoreRejection::Busy { active: 3 }),
         CliResponse::DeviceRevoked {
             device_id_hex: "01".repeat(16),
+            holders_skipped: 3,
         },
         CliResponse::Files(vec![]),
         CliResponse::Versions(vec![]),
@@ -1068,6 +1088,7 @@ fn job(state: RestoreJobState, restored: u32, total: u32) -> RestoreJob {
         submitted_at: "2026-09-27T10:00:00Z".into(),
         finished_at: None,
         waiting_for_holders_until: None,
+        waiting_for_memory: false,
     }
 }
 
@@ -1744,6 +1765,7 @@ fn status_render_counts_files_without_local_source_when_positive() {
 fn waiting_job(until: &str) -> RestoreJob {
     RestoreJob {
         waiting_for_holders_until: Some(until.into()),
+        waiting_for_memory: false,
         ..job(RestoreJobState::Running, 1, 3)
     }
 }
@@ -1902,4 +1924,61 @@ fn render_status_reports_too_large_files_and_the_limit() {
         ),
         "got: {rendered}"
     );
+}
+
+// ============================================================
+// Version and build-info (install-i11)
+// ============================================================
+
+#[test]
+fn version_flag_prints_build_id() {
+    let err = Cli::try_parse_from(["viaticum", "--version"]).expect_err("--version exits");
+    assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+    assert_eq!(
+        err.to_string(),
+        format!("viaticum {}\n", crate::build_info::build_id())
+    );
+}
+
+#[test]
+fn build_info_command_parses_and_is_hidden_from_help() {
+    assert!(matches!(
+        parse(&["viaticum", "build-info"]),
+        Command::BuildInfo
+    ));
+    let help = <Cli as clap::CommandFactory>::command()
+        .render_help()
+        .to_string();
+    assert!(
+        !help.contains("build-info"),
+        "hidden command in help:\n{help}"
+    );
+}
+
+#[test]
+fn render_build_info_is_one_json_line_of_build_info() {
+    let line = super::render_build_info();
+    assert!(!line.contains('\n'));
+    let parsed: crate::build_info::BuildInfo = serde_json::from_str(&line).expect("JSON");
+    assert_eq!(parsed, crate::build_info::build_info());
+}
+
+#[test]
+fn render_status_shows_daemon_version() {
+    let mut data = make_status_zero_peers();
+    data.daemon_version = "0.1.0-alpha.1+abc1234".into();
+    let rendered = output::render_status(&data);
+    assert!(
+        rendered.contains("  version:        0.1.0-alpha.1+abc1234\n"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn status_json_without_daemon_version_decodes_as_empty() {
+    // An older daemon's status has no daemon_version: the CLI still decodes it.
+    let mut v = serde_json::to_value(make_status_zero_peers()).expect("serialize");
+    v.as_object_mut().expect("object").remove("daemon_version");
+    let data: StatusData = serde_json::from_value(v).expect("decode without the field");
+    assert_eq!(data.daemon_version, "");
 }

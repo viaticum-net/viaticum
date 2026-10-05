@@ -523,14 +523,20 @@ async fn try_dial_holder_via_kademlia(
 
 // ─── SS block fetch ───────────────────────────────────────────────────────────
 
-/// Fetch one SystemState block (base or diff) from its holder hints and return the
-/// decrypted plaintext.
-pub(super) async fn fetch_ss_block(
+/// Fetch one SystemState block (base or diff) from its holder hints and return it parsed.
+///
+/// The memory of the decode is DR's one permit for this block (`memory`, К-b3): the symbols are
+/// fetched first, outside the budget; then the decode, the decryption and the parse of the CBOR
+/// straight from the decompression stream run on the blocking pool under the permit (there is no
+/// plaintext buffer of the block, spec v3.9b (6)); the permit goes back before the next fetch. The
+/// parsed value is outside the budget.
+pub(super) async fn fetch_ss_block<T: serde::de::DeserializeOwned + Send + 'static>(
     swarm: &Arc<SwarmHandle>,
     encoder: &Arc<dyn viaticum_core::erasure::ErasureEncoder>,
     bref: &BlockRef,
     dr_key: &[u8; 32],
-) -> anyhow::Result<Vec<u8>> {
+    memory: &mut super::memory::Memory,
+) -> anyhow::Result<T> {
     use viaticum_core::types::{ErasureParams, FileId, PlacementStatus, SymbolPlacement};
 
     let importance = crate::daemon::system_state::block::SYSTEM_STATE_IMPORTANCE;
@@ -564,17 +570,48 @@ pub(super) async fn fetch_ss_block(
     .await
     .map_err(|e| anyhow::anyhow!("fetch_unbound_symbols: {e}"))?;
 
-    let padded = encoder
-        .decode(&symbols, &params)
-        .map_err(|e| anyhow::anyhow!("decode SS block: {e}"))?;
-    let size = bref.encrypted_size as usize;
-    if padded.len() < size {
-        anyhow::bail!(
-            "decoded SS block ({} bytes) smaller than encrypted_size ({size})",
-            padded.len()
-        );
-    }
-    let stored = &padded[..size];
-    crate::daemon::backup::pipeline::decrypt_and_decompress(stored, dr_key)
-        .map_err(|e| anyhow::anyhow!("decrypt SS block: {e}"))
+    decode_ss_block(
+        memory,
+        encoder,
+        symbols,
+        &bref.block_id,
+        bref.encrypted_size,
+        &params,
+        dr_key,
+    )
+    .await
+}
+
+/// The memory half of an SS block's fetch (К-b3): a permit for the decode (DR's own budget, or a
+/// lease from the node on this machine), the decode, the decryption and the parse on the blocking
+/// pool under it, and the permit back before the next fetch.
+pub(super) async fn decode_ss_block<T: serde::de::DeserializeOwned + Send + 'static>(
+    memory: &mut super::memory::Memory,
+    encoder: &Arc<dyn viaticum_core::erasure::ErasureEncoder>,
+    symbols: Vec<viaticum_core::erasure::Symbol>,
+    block: &viaticum_core::types::SourceBlockId,
+    encrypted_size: u64,
+    params: &viaticum_core::types::ErasureParams,
+    dr_key: &[u8; 32],
+) -> anyhow::Result<T> {
+    let held = memory.acquire(block, encrypted_size, params).await?;
+    let decoder = Arc::clone(encoder);
+    let (key, block, params) = (*dr_key, *block, *params);
+    let (parsed, held) = tokio::task::spawn_blocking(move || {
+        let r = crate::daemon::restore::decode_parse_stage::<T>(
+            held.permit(),
+            decoder.as_ref(),
+            symbols,
+            &params,
+            encrypted_size,
+            &key,
+            &block,
+        )
+        .map_err(|e| anyhow::anyhow!("decode SS block: {e}"));
+        (r, held)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("decode SS block task failed: {e}"))?;
+    held.release().await;
+    parsed
 }

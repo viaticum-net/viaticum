@@ -21,7 +21,7 @@ use crate::daemon::restore::jobs::RestoreJobs;
 use crate::daemon::restore::staging::JobId;
 use crate::daemon::web_auth::AuthState;
 
-const TOKEN: &str = "test-token";
+pub(crate) const TOKEN: &str = "test-token";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -78,6 +78,8 @@ fn state_with(db: Db, jobs: RestoreJobs) -> (Arc<DaemonState>, mpsc::Receiver<Re
         missing_sources: Default::default(),
         max_file_size_bytes: 0,
         esi_space: Default::default(),
+        block_work_budget_bytes: 0,
+        dr_leases: None,
     });
     (state, restore_rx)
 }
@@ -441,4 +443,187 @@ async fn restore_job_outlives_the_client_that_submitted_it() {
         std::fs::read(staged).unwrap(),
         b"the job is not the client's"
     );
+}
+
+// ─── The DR's lease of the node's memory (К-b3, spec v3.9a) ───────────────────────────────────────
+
+/// The routes of a node whose DR leases are `leases`: the node's side of `viaticum dr`
+/// (also served over a socket by the DR tests).
+pub(crate) fn lease_app(leases: Arc<crate::daemon::mem_budget::DrLeases>) -> axum::Router {
+    let (mut state, _rx) = test_state();
+    Arc::get_mut(&mut state).expect("a fresh state").dr_leases = Some(leases);
+    app(state)
+}
+
+fn post_json(uri: &str, body: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn lease_body(size: u64) -> serde_json::Value {
+    serde_json::json!({ "block_id": "11".repeat(32), "encrypted_size": size })
+}
+
+async fn until(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !cond() {
+        assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+fn leases_of(
+    budget: &Arc<crate::daemon::mem_budget::MemBudget>,
+) -> Arc<crate::daemon::mem_budget::DrLeases> {
+    crate::daemon::mem_budget::DrLeases::with_keepalive(
+        Arc::clone(budget),
+        std::time::Duration::from_secs(3600),
+        std::time::Duration::from_millis(20),
+    )
+}
+
+/// The first line the response of a lease request sends (blank keepalive lines skipped).
+async fn first_line(
+    stream: &mut (impl futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Unpin),
+) -> String {
+    use futures::StreamExt;
+    loop {
+        let chunk = stream
+            .next()
+            .await
+            .expect("the stream goes on")
+            .expect("a chunk");
+        let text = String::from_utf8(chunk.to_vec()).unwrap();
+        if !text.trim().is_empty() {
+            return text.trim().to_string();
+        }
+    }
+}
+
+/// M67: the response of a lease request owns the lease; when the client drops the connection the
+/// bytes go back to the budget.
+#[tokio::test]
+async fn budget_lease_is_released_when_the_connection_drops() {
+    let budget = crate::daemon::mem_budget::MemBudget::new(256 << 20);
+    let leases = leases_of(&budget);
+    let response = lease_app(Arc::clone(&leases))
+        .oneshot(post_json("/api/budget/lease", lease_body(1_000_000)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let line = first_line(&mut stream).await;
+    assert!(line.contains("\"lease\":\"granted\""), "{line}");
+    assert!(budget.outstanding_bytes() > 0, "the lease holds memory");
+    assert!(leases.status().is_some());
+
+    drop(stream);
+
+    until("the dropped connection releases the lease", || {
+        budget.outstanding_bytes() == 0
+    })
+    .await;
+    assert!(leases.status().is_none());
+}
+
+/// The explicit end: `release` answers `released`, then `unknown`; the held lease is gone.
+#[tokio::test]
+async fn budget_release_answers_released_then_unknown() {
+    let budget = crate::daemon::mem_budget::MemBudget::new(256 << 20);
+    let leases = leases_of(&budget);
+    let app = lease_app(Arc::clone(&leases));
+    let response = app
+        .clone()
+        .oneshot(post_json("/api/budget/lease", lease_body(1_000_000)))
+        .await
+        .unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    let line = first_line(&mut stream).await;
+    let id = serde_json::from_str::<serde_json::Value>(&line).unwrap()["id"]
+        .as_u64()
+        .unwrap();
+
+    let released = app
+        .clone()
+        .oneshot(post_json(
+            "/api/budget/release",
+            serde_json::json!({ "id": id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(json_of(released).await["status"], "released");
+    assert_eq!(budget.outstanding_bytes(), 0);
+    let again = app
+        .oneshot(post_json(
+            "/api/budget/release",
+            serde_json::json!({ "id": id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(json_of(again).await["status"], "unknown");
+}
+
+/// A request the node cannot size is answered with a line, and nothing is granted.
+#[tokio::test]
+async fn budget_lease_of_an_impossible_block_is_refused_with_a_line() {
+    let budget = crate::daemon::mem_budget::MemBudget::new(256 << 20);
+    let leases = leases_of(&budget);
+    let response = lease_app(leases)
+        .oneshot(post_json("/api/budget/lease", lease_body(100 << 30)))
+        .await
+        .unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    let line = first_line(&mut stream).await;
+    assert!(line.contains("\"lease\":\"error\""), "{line}");
+    assert_eq!(budget.outstanding_bytes(), 0);
+}
+
+#[tokio::test]
+async fn budget_lease_needs_the_token_and_a_block_id() {
+    let budget = crate::daemon::mem_budget::MemBudget::new(256 << 20);
+    let app = lease_app(leases_of(&budget));
+    let no_token = Request::builder()
+        .method("POST")
+        .uri("/api/budget/lease")
+        .header("content-type", "application/json")
+        .body(Body::from(lease_body(1000).to_string()))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(no_token).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let bad = serde_json::json!({ "block_id": "xyz", "encrypted_size": 1000 });
+    assert_eq!(
+        app.oneshot(post_json("/api/budget/lease", bad))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+// ─── Device revoke (dr-i8) ────────────────────────────────────────────────────
+
+/// DELETE /api/devices/{id} answers 200 + JSON carrying `holders_skipped`, so the CLI can warn
+/// about holders whose master is unknown (not 204, which would drop the count).
+#[tokio::test]
+async fn device_revoke_returns_holders_skipped() {
+    let (state, revoked_hex, _h1_master, _h2, _sender) =
+        crate::daemon::dispatch::tests::after_dr_revoke_fixture();
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/devices/{revoked_hex}"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_of(response).await;
+    assert_eq!(body["device_id_hex"], revoked_hex);
+    assert_eq!(body["holders_skipped"], 1, "H2 is unknown anywhere: {body}");
 }

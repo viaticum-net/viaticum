@@ -18,13 +18,15 @@ use viaticum_core::mailbox::MailboxEntry;
 use viaticum_core::types::hex_encode;
 
 use super::super::{PendingHashChallenge, PendingKey, Scheduler};
-use super::preparing::{PrepDone, Preparing};
+use super::preparing::{Done, PrepDone, Preparing};
 use crate::daemon::mailbox::routing::MailboxRouter;
 
-/// What ended in `InFlight`: a publish, or a block preparation that outlived its tick.
+/// What ended in `InFlight`: a publish, a block preparation that outlived its tick, or a batch of
+/// overdue preparations (its members' results, all ready, its permit already given back).
 pub(crate) enum Ended {
     Published(Result<Published, JoinError>),
     Prepared(PrepDone),
+    Batch(Vec<PrepDone>),
 }
 
 /// A challenge publish that ended: what goes into pending on an Ack.
@@ -51,7 +53,7 @@ pub(crate) struct InFlight {
     set: JoinSet<Published>,
     keys: HashMap<Id, PendingKey>,
     /// Block preparations that outlived their tick (pos-i7-d-a).
-    pub(super) preparing: Preparing,
+    pub(in crate::daemon::scheduler) preparing: Preparing,
     pub(crate) settled: SettleStats,
 }
 
@@ -94,7 +96,10 @@ impl InFlight {
     /// The next publish or preparation to end (None when none is in flight).
     pub(crate) async fn join_next_any(&mut self) -> Option<Ended> {
         tokio::select! {
-            Some(prepared) = self.preparing.join_next() => Some(Ended::Prepared(prepared)),
+            Some(prepared) = self.preparing.join_next() => Some(match prepared {
+                Done::One(one) => Ended::Prepared(one),
+                Done::Batch(many) => Ended::Batch(many),
+            }),
             Some(done) = self.set.join_next_with_id() => Some(Ended::Published(self.forget(done))),
             else => None,
         }

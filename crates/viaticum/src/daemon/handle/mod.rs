@@ -125,6 +125,11 @@ pub struct DaemonState {
     pub max_file_size_bytes: u64,
     /// Blocks the worker found out of ESI numbers (repair-i8 ceiling), for `status`.
     pub esi_space: std::sync::Arc<crate::daemon::work_pipeline::EsiSpace>,
+    /// backup-i24: this machine's block work budget in bytes (`status`).
+    pub block_work_budget_bytes: u64,
+    /// К-b3 (spec v3.9a): the leases a `viaticum dr` on this machine holds on the budget, one SS
+    /// block at a time. `None` in tests that do not wire a budget.
+    pub dr_leases: Option<Arc<crate::daemon::mem_budget::DrLeases>>,
 }
 
 /// Web API pieces prepared before the swarm starts (see step 9.4 of `start`).
@@ -409,7 +414,11 @@ impl DaemonHandle {
         // restore-i14: every job dir in staging is a known job before the web API
         // answers `--status <id>`; leftover temp files of jobs the previous run did
         // not finish are removed (nothing runs yet, restore-i24).
-        let restore_jobs = crate::daemon::restore::jobs::RestoreJobs::new(staging_root.clone());
+        // The notifier of the backup worker's restore gate (Q-V9 (a), spec v3.12b): the registry of
+        // jobs and the DR's session on the budget bump it, the gate reads their state.
+        let gate_wake = crate::daemon::work_pipeline::new_gate_wake();
+        let restore_jobs = crate::daemon::restore::jobs::RestoreJobs::new(staging_root.clone())
+            .with_gate_wake(Arc::clone(&gate_wake));
         let seeded = restore_jobs.seed_from_staging();
         if seeded > 0 {
             tracing::info!(jobs = seeded, "restore: job dirs registered from staging");
@@ -555,7 +564,32 @@ impl DaemonHandle {
             app_config.backup.max_file_size_mb,
             viaticum_core::config::source_block_size_bytes(&app_config),
         );
-        size_limits.log_start();
+        // backup-i24: the one budget of block work (encode/decode), shared by the worker today and
+        // by the scheduler and restore in R1-d-b's later commits.
+        // К-b3 (spec v3.9a #4): the machine's lock for block work. Free → this node takes it;
+        // a `viaticum dr` holds it → the budget starts closed and opens when the DR is done.
+        let machine_lock_dir = crate::daemon::mem_budget::machine_lock::machine_lock_dir();
+        let machine_lock_record =
+            crate::daemon::mem_budget::machine_lock::LockRecord::daemon(&cfg.data_dir);
+        let (mem_budget, machine_lock_startup) =
+            crate::daemon::mem_budget::machine_lock::start_daemon_budget(
+                crate::daemon::mem_budget::resolve_block_work_budget(
+                    size_limits.ram_bytes,
+                    std::env::var(crate::daemon::mem_budget::TEST_BUDGET_ENV)
+                        .ok()
+                        .as_deref(),
+                ),
+                &machine_lock_dir,
+                &machine_lock_record,
+            );
+        let dr_leases = crate::daemon::mem_budget::DrLeases::with_gate_wake(
+            Arc::clone(&mem_budget),
+            crate::daemon::mem_budget::lease_ceiling(std::time::Duration::from_secs(
+                crate::daemon::scheduler::scaled_timer_secs(3600, cfg.time_scale.max(1)),
+            )),
+            Arc::clone(&gate_wake),
+        );
+        size_limits.log_start(mem_budget.total_bytes());
         let source_block_size = size_limits.pack_size;
         let max_file_size_bytes = size_limits.max_file_size;
 
@@ -672,6 +706,16 @@ impl DaemonHandle {
         // Created before the restore coordinator: a running restore job stops on it
         // and is recorded `interrupted` within the drain (T10).
         let cancel = CancellationToken::new();
+        // К-b3: the node keeps the machine's block work lock for its life (and takes it when a DR
+        // that held it is done).
+        crate::daemon::mem_budget::machine_lock::spawn_keeper(
+            machine_lock_startup,
+            machine_lock_dir,
+            machine_lock_record,
+            Arc::clone(&mem_budget),
+            cancel.clone(),
+            crate::daemon::mem_budget::machine_lock::RETRY_EVERY,
+        );
 
         let restore = RestoreCoordinator::new(
             db.clone(),
@@ -696,6 +740,8 @@ impl DaemonHandle {
                 }),
                 time_scale: cfg.time_scale.max(1),
                 max_source_bytes: max_file_size_bytes,
+                // restore-i39: one permit per block, as a priority waiter of the budget.
+                mem_budget: Arc::clone(&mem_budget),
             },
             encoder.clone(),
         );
@@ -771,6 +817,8 @@ impl DaemonHandle {
             missing_sources: Default::default(),
             max_file_size_bytes,
             esi_space: Default::default(),
+            block_work_budget_bytes: mem_budget.total_bytes(),
+            dr_leases: Some(Arc::clone(&dr_leases)),
         });
 
         // Clone state for web API and metrics pusher.
@@ -979,6 +1027,9 @@ impl DaemonHandle {
         // resolves mailbox PoS responses against them), read by the mailbox poll loop
         // (it forwards only responses to pending challenges, pos-i6). Wired below.
         let pending_challenges: PendingChallenges = new_pending_challenges();
+        // K-b4 (pos-i14): the mailbox path's responder, built from the Processor so that both
+        // paths wait on ONE semaphore of PoS answers (`Processor::pos_responder`).
+        let pos_responder;
 
         // Raw quota values from config. 0 = "not configured" (use disk-based limit).
         // Processor and holder_cleanup compute effective_quota from disk_free at runtime.
@@ -1018,6 +1069,19 @@ impl DaemonHandle {
             // Wire WorkPipeline event channel to Processor so on_peer_authenticated
             // sends WorkEvent::PeerAuthenticated to wake the worker.
             processor.set_work_event_tx(work_event_tx.clone());
+            // pos-i15/i16: the responder answers only challenges addressed to this device
+            // and signs with the device key; siblings come from the device→master table
+            // and the cluster state.
+            pos_responder = processor.pos_responder(
+                crate::daemon::processor::PosResponder::new(
+                    db.clone(),
+                    holdings_dir.clone(),
+                    device_key.clone(),
+                    identity_pub,
+                    Some(cluster_state.clone()),
+                )
+                .with_time_scale(time_scale),
+            );
             // В-0b: the [four_r] dials drive the 4R offer shadow (logs only, off the reply path).
             processor.set_four_r(viaticum_core::four_r_holder::FourRParams::from_cfg(
                 &app_config.four_r,
@@ -1039,6 +1103,10 @@ impl DaemonHandle {
                     recheck_tx: Some(recheck_tx.clone()),
                     max_source_bytes: max_file_size_bytes,
                     esi_space: Arc::clone(&state.esi_space),
+                    mem_budget: Arc::clone(&mem_budget),
+                    chunk_budget_bytes:
+                        viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,
+                    restore_pauses_backup: crate::daemon::work_pipeline::RESTORE_PAUSES_BACKUP,
                 };
                 let worker = crate::daemon::work_pipeline::WorkPipeline::new(
                     db.clone(),
@@ -1049,7 +1117,12 @@ impl DaemonHandle {
                     Some(Arc::clone(&peer_backoff)),
                     Some(cluster_state.clone()),
                     work_event_rx,
-                );
+                )
+                .with_restore_gate(crate::daemon::work_pipeline::restore_gate(
+                    &restore_jobs,
+                    &dr_leases,
+                    &gate_wake,
+                ));
                 tasks.push((
                     "work_pipeline",
                     tokio::spawn(async move { worker.run().await }),
@@ -1168,6 +1241,9 @@ impl DaemonHandle {
             epoch_key_bytes,
             cfg.data_dir.clone(),
         );
+        // backup-i24: PoS preparations share the block work memory budget with the worker and
+        // restore (R1-d-b): one permit per preparation, given back before publishing.
+        scheduler.set_mem_budget(Arc::clone(&mem_budget));
         // К2b: the PoS rebuild reads this device's records and reports gone paths.
         scheduler.set_rebuild_scope(
             crate::daemon::backup::rebuild::RebuildScope::new(device_id, Some(recheck_tx.clone()))
@@ -1192,24 +1268,12 @@ impl DaemonHandle {
         {
             use crate::daemon::mailbox::poll::run_mailbox_poll;
             use crate::daemon::processor::{
-                PosResponder, ProcessorDeleteHandler, ProcessorDropHandler, ProcessorPosHandler,
+                ProcessorDeleteHandler, ProcessorDropHandler, ProcessorPosHandler,
                 ProcessorRevocationHandler,
             };
 
             // pos-i5-a: the freshness window of an answered challenge scales with the run.
-            // pos-i15/i16: the responder answers only challenges addressed to this device
-            // and signs with the device key; siblings come from the device→master table
-            // and the cluster state.
-            let pos_handler = ProcessorPosHandler::new(
-                PosResponder::new(
-                    db.clone(),
-                    holdings_dir.clone(),
-                    device_key.clone(),
-                    identity_pub,
-                    Some(cluster_state.clone()),
-                )
-                .with_time_scale(time_scale),
-            );
+            let pos_handler = ProcessorPosHandler::new(pos_responder);
 
             // T-13a: pass repair_tx so ProcessorDropHandler can wake the repair worker
             // for immediate-drop DropNotice entries (deadline ≈ now).

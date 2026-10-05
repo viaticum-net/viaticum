@@ -805,6 +805,45 @@ async fn clock_refused_envelope_is_resealed_not_reoffered() {
     assert_eq!(cur.acks.len(), 3);
 }
 
+/// mailbox-i61: an envelope that every postman refused as expired in transit is not a
+/// clock verdict (status must not say "this computer's clock looks wrong"), and it is
+/// sealed anew next tick like a clock-skew refusal, not re-offered as is.
+#[tokio::test]
+async fn publisher_does_not_blame_clock_for_expired() {
+    use viaticum_core::mailbox::class_config;
+    let f = fx(3);
+    let b1 = f.block(1, 3);
+    let ttl = class_config::SELF_POINTER_TTL.as_secs();
+    // The envelope's 5-year life ends 10 s before the postmen's now: inside the
+    // transit window (60 s), so every postman answers `Expired`.
+    let p = now() - ttl - 10;
+    f.tick(1, &b1, &[], p).await;
+    let cur = f.meta().current.unwrap();
+    assert!(cur.acks.is_empty());
+    let refusal = cur.last_refusal.expect("refused");
+    assert_ne!(
+        refusal.kind,
+        RefusalKind::ClockSkew,
+        "the clock is not blamed"
+    );
+    assert_eq!(refusal.kind, RefusalKind::NoAck);
+    assert!(refusal.expired);
+    let first = cur.entry_cbor.clone();
+    let n = f.sent().len();
+    // Next tick, nothing changed and no refresh due: a new envelope, not a re-offer.
+    f.tick(1, &b1, &[], p + 1).await;
+    let cur = f.meta().current.unwrap();
+    assert_ne!(cur.entry_cbor, first, "sealed anew");
+    assert_eq!(cur.created_at.0, p + 1);
+    assert!(
+        f.sent()
+            .iter()
+            .skip(n)
+            .all(|(_, e)| to_cbor_bytes(e) != first),
+        "the dead envelope is not re-offered"
+    );
+}
+
 /// mailbox-i62: two changes of the pointer within one second (a burst of ticks after
 /// SIGCONT) must not put two different envelopes with one `stored_at` into a place —
 /// the postmen keep the first and refuse the second as `Superseded` (equal time), the

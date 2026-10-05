@@ -366,8 +366,9 @@ pub enum MailboxRejectReason {
     /// CROWN-1 C2: a SelfPointer store without a valid `target_sig` (signature by
     /// the secret key of `entry.target`).
     Unauthorized,
-    /// CROWN-1 (mailbox-i42): `expires_at <= now`, or a SelfPointer whose `stored_at`
-    /// is more than `SELF_POINTER_MAX_FUTURE_SKEW_SECS` ahead of the postman's clock.
+    /// CROWN-1 (mailbox-i42): `expires_at <= now` beyond the transit grace (mailbox-i61:
+    /// within it the entry is `Expired`), or a SelfPointer whose `stored_at` is more than
+    /// `SELF_POINTER_MAX_FUTURE_SKEW_SECS` ahead of the postman's clock.
     ClockSkew,
     /// Review N5: the request's wire version `v` is not `MAILBOX_WIRE_VERSION`.
     UnsupportedWireVersion,
@@ -376,6 +377,10 @@ pub enum MailboxRejectReason {
     /// CROWN-1 C3a (mailbox-i42): the postman holds a pointer in this slot that is
     /// newer, or as new with another payload.
     Superseded,
+    /// mailbox-i61: the entry expired in transit — `expires_at` passed within the
+    /// last `transit_grace_secs` of the postman's clock and `stored_at` is not ahead
+    /// of it. Not a clock verdict: the sender's clock is not blamed.
+    Expired,
 }
 
 // ============================================================
@@ -407,6 +412,8 @@ pub enum MailboxError {
     PlaintextPayload(u8),
     #[error("superseded: slot holds stored_at {held}, incoming {incoming}")]
     Superseded { held: u64, incoming: u64 },
+    #[error("expired in transit: expires_at {expires_at}, postman now {now}")]
+    Expired { expires_at: u64, now: u64 },
 }
 
 /// A SelfPointer may be at most this far AHEAD of the postman's clock. Bounds how long
@@ -414,6 +421,18 @@ pub enum MailboxError {
 /// (mailbox-i42). There is no past bound: an old but unexpired pointer is harmless,
 /// the slot ordering handles it.
 pub const SELF_POINTER_MAX_FUTURE_SKEW_SECS: u64 = 24 * 3600;
+
+/// Upper bound of the "expired in transit" window (mailbox-i61), real seconds.
+pub const MAILBOX_TRANSIT_GRACE_SECS: u64 = 60;
+
+/// mailbox-i61: how long past `expires_at` a postman still reads an entry as expired
+/// in transit rather than as a wrong sender clock — `min(60 s, lifetime / 4)`. Taken
+/// from the entry's own lifetime, so a short scaled TTL (E2E time_scale) gets a short
+/// window and is not swallowed whole. Pure.
+pub fn transit_grace_secs(entry: &MailboxEntry) -> u64 {
+    let lifetime = entry.expires_at.saturating_sub(entry.stored_at);
+    MAILBOX_TRANSIT_GRACE_SECS.min(lifetime / 4)
+}
 
 /// Postman plaintext rule for the pointer box (CROWN-1 §7.5 п.1, C3a): a SelfPointer
 /// must be sealed (`payload_version` ≥ `seal::SEALED_PAYLOAD_VERSION`). Directed
@@ -432,11 +451,29 @@ pub fn check_pointer_sealed(entry: &MailboxEntry) -> Result<(), MailboxError> {
 /// would tell the sender "stored" while the entry is invisible at once), and a
 /// SelfPointer whose `stored_at` is more than `SELF_POINTER_MAX_FUTURE_SKEW_SECS`
 /// ahead of the postman's clock is refused (it would freeze its slot: every honest
-/// later publication would be older and `Superseded`). No past bound. Pure.
+/// later publication would be older and `Superseded`). No past bound.
+///
+/// mailbox-i61: an expired entry with `stored_at <= now` is `Expired` (it died on the
+/// way) when its `expires_at` passed within the last `transit_grace_secs`, or when it
+/// was sealed at most `MAILBOX_TRANSIT_GRACE_SECS` ago — a fresh `stored_at` says the
+/// sender's clock agrees with ours and only the lifetime was short (a scaled TTL of a
+/// few seconds against a slow postman). Any other expired entry is `ClockSkew`. Pure.
 pub fn check_entry_clock(entry: &MailboxEntry, now_secs: u64) -> Result<(), MailboxError> {
     let skewed_pointer = entry.class == MailboxClass::SelfPointer
         && entry.stored_at > now_secs.saturating_add(SELF_POINTER_MAX_FUTURE_SKEW_SECS);
-    if entry.expires_at <= now_secs || skewed_pointer {
+    let expired = entry.expires_at <= now_secs;
+    let sealed_recently = now_secs - entry.stored_at.min(now_secs) <= MAILBOX_TRANSIT_GRACE_SECS;
+    let in_transit = expired
+        && entry.stored_at <= now_secs
+        && (sealed_recently
+            || entry.expires_at > now_secs.saturating_sub(transit_grace_secs(entry)));
+    if in_transit {
+        return Err(MailboxError::Expired {
+            expires_at: entry.expires_at,
+            now: now_secs,
+        });
+    }
+    if expired || skewed_pointer {
         return Err(MailboxError::ClockSkew {
             expires_at: entry.expires_at,
             stored_at: entry.stored_at,

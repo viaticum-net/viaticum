@@ -20,19 +20,44 @@ use viaticum_core::db::Db;
 use viaticum_core::erasure::ErasureEncoder;
 use viaticum_core::types::{DeviceId, SourceBlockId, SourceBlockRecord, Timestamp};
 
+use crate::daemon::mem_budget::MemBudget;
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
 
 mod esi_space;
+mod gate;
 mod offer_plan;
 mod pool;
 mod worker;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_budget;
 
 pub use esi_space::EsiSpace;
+pub use gate::{
+    BACKUP_PAUSE_WARN_AFTER, GateWake, PauseWatch, RestoreGate, new_gate_wake, notify_gate,
+    restore_gate,
+};
 pub use pool::{PoolSnapshot, pool_signature, snapshot_pool};
+
+// ─── Q-V9: restore or backup first ────────────────────────────────────────────
+
+/// Q-V9 (spec v3.12a): the decision of Ilya, 2026-10-01 — (a), restore first. The value is final;
+/// the constant stays so that the pause is one switch and has its mutation (M92).
+///
+/// `true` (a): while the gate is up (an unfinished restore job, or a DR session, spec v3.12b) the
+/// worker starts no new iteration (`status`: «backup paused while restoring», one INFO line per
+/// pause); an iteration already running sees the gate too (it is in its `Turn`): it gives the
+/// permit back right after it got it, before the rebuild and the encode, and in the delivery it
+/// stops at the chunk boundary after its first attempt. PoS is not affected.
+/// `false` (b), kept as the minimal variant behind the switch: the worker works on and gives the
+/// budget to a waiting restore at a chunk boundary (after the turn's first attempt, before every
+/// next send), then takes it again and re-encodes the rest — restore-i39's bound per block is then
+/// the encode of the backup block plus 60 s. Switching is this constant alone; the daemon passes
+/// it to `WorkPipelineConfig::restore_pauses_backup`.
+pub const RESTORE_PAUSES_BACKUP: bool = true;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -80,8 +105,22 @@ pub struct WorkPipelineConfig {
     pub max_source_bytes: u64,
     /// Blocks out of ESI numbers (repair-i8 ceiling), shared with `status`.
     pub esi_space: Arc<EsiSpace>,
+    /// The block work budget (backup-i24): the worker takes one permit per iteration. The daemon
+    /// passes the one shared with the scheduler and restore (`handle`).
+    pub mem_budget: Arc<MemBudget>,
+    /// Bytes of symbols in one `SymbolTransfer` chunk. The production value is
+    /// `SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES`; tests shrink it to get several chunks out of a
+    /// small block (the worker yields between chunks).
+    pub chunk_budget_bytes: usize,
+    /// `RESTORE_PAUSES_BACKUP` (Q-V9): no new iteration, and the running one stops, while the
+    /// restore gate is up. A field, so the tests can run both variants; the daemon passes the
+    /// constant.
+    pub restore_pauses_backup: bool,
 }
 
+// Only tests build a config this way (`..Default::default()`): the daemon sets every field, and
+// no production path is left with an unbounded budget (N2).
+#[cfg(test)]
 impl Default for WorkPipelineConfig {
     fn default() -> Self {
         WorkPipelineConfig {
@@ -96,6 +135,9 @@ impl Default for WorkPipelineConfig {
             recheck_tx: None,
             max_source_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
             esi_space: Arc::default(),
+            mem_budget: MemBudget::new(u64::MAX),
+            chunk_budget_bytes: viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,
+            restore_pauses_backup: RESTORE_PAUSES_BACKUP,
         }
     }
 }
@@ -147,7 +189,51 @@ enum BlockAttempt {
     /// The block left service before its offers were written (repair-i16); parked; the
     /// next block may do better.
     LeftService,
+    /// The turn stopped before it offered anything: the restore gate went up while it waited for
+    /// its permit or while it encoded (spec v3.12b WARN-1). Not parked, no cooldown: the block is picked again when
+    /// the gate comes down; the iteration ends.
+    Paused,
 }
+
+/// Forget a block's turn memory: the yield count and the delivery memory of its holders (v3.5a
+/// NOTE 3, v3.12 item 5).
+fn clear_turn_memory(
+    yields: &mut std::collections::HashMap<SourceBlockId, u32>,
+    last_attempt: &mut std::collections::HashMap<SourceBlockId, TurnMemory>,
+    block_id: SourceBlockId,
+) {
+    yields.remove(&block_id);
+    last_attempt.remove(&block_id);
+}
+
+/// The yield counter of one block after a turn, and with it the turn memory of its holders
+/// (`last_attempt`; both RAM only, backup-i24-a): a yield counts; a delivery in full starts the
+/// count afresh; a block that left service (or was parked: nobody to offer to) without a full
+/// delivery loses both — the memory of a block that is no longer served must not live on
+/// (spec v3.5a NOTE 3, v3.12 item 5); anything else leaves them.
+fn count_yields(
+    yields: &mut std::collections::HashMap<SourceBlockId, u32>,
+    last_attempt: &mut std::collections::HashMap<SourceBlockId, TurnMemory>,
+    block_id: SourceBlockId,
+    outcome: &worker::WorkOutcome,
+) {
+    let delivered_in_full =
+        outcome.failed == 0 && outcome.offered > 0 && outcome.acked == outcome.offered;
+    if outcome.yielded {
+        *yields.entry(block_id).or_insert(0) += 1;
+    } else if delivered_in_full || outcome.left_service || outcome.offered == 0 {
+        clear_turn_memory(yields, last_attempt, block_id);
+    }
+    // The turn left no holder in the memory: nothing to keep.
+    if last_attempt
+        .get(&block_id)
+        .is_some_and(|m| m.holders.is_empty())
+    {
+        last_attempt.remove(&block_id);
+    }
+}
+
+use worker::TurnMemory;
 
 // ─── WorkPipeline ─────────────────────────────────────────────────────────────
 
@@ -164,6 +250,34 @@ pub struct WorkPipeline {
     peer_backoff: Option<Arc<PeerBackoff>>,
     cluster_state: Option<Arc<Mutex<ClusterState>>>,
     event_rx: mpsc::Receiver<WorkEvent>,
+    /// How many times the worker gave the budget away on each block since it last delivered the
+    /// block in full (RAM only; the `yields_for_block` of the yield line, backup-i24-a).
+    yields: std::collections::HashMap<SourceBlockId, u32>,
+    /// Per block: the turns it has had and, per holder, the turn in which the holder was last
+    /// attempted (RAM only; cleared together with `yields`). The next turn goes through the
+    /// holders by it, the longest ago first (LRU, backup-i24-a).
+    last_attempt: std::collections::HashMap<SourceBlockId, TurnMemory>,
+    /// The restore gate (Q-V9, spec v3.12b): an unfinished restore job or a DR session, computed
+    /// from their state at every reading. With `config.restore_pauses_backup` the worker starts
+    /// no iteration while it is up, and a running turn stops at its boundaries.
+    restore_gate: Option<RestoreGate>,
+    /// The INFO line «paused» was written for the pause that is on now (once per pause).
+    pause_announced: bool,
+}
+
+/// Resolves when a source of the restore gate changed; never while there is no gate (or its
+/// sender is gone, in which case the gate is dropped: a closed channel must not spin the loop).
+async fn restore_gate_changed(gate: &mut Option<tokio::sync::watch::Receiver<u64>>) -> bool {
+    match gate {
+        Some(rx) => match rx.changed().await {
+            Ok(()) => true,
+            Err(_) => {
+                *gate = None;
+                false
+            }
+        },
+        None => std::future::pending().await,
+    }
 }
 
 impl WorkPipeline {
@@ -188,6 +302,64 @@ impl WorkPipeline {
             peer_backoff,
             cluster_state,
             event_rx,
+            yields: std::collections::HashMap::new(),
+            last_attempt: std::collections::HashMap::new(),
+            restore_gate: None,
+            pause_announced: false,
+        }
+    }
+
+    /// Give the worker the restore gate. A change of its sources wakes the worker, so it starts
+    /// again when the last job ends or the DR session runs out (Q-V9 (a)).
+    pub fn with_restore_gate(mut self, gate: RestoreGate) -> Self {
+        self.restore_gate = Some(gate);
+        self
+    }
+
+    /// The gate for a running turn: `Some` only when the constant says restore comes first.
+    fn turn_gate(&self) -> Option<&RestoreGate> {
+        self.restore_gate
+            .as_ref()
+            .filter(|_| self.config.restore_pauses_backup)
+    }
+
+    /// Q-V9 (a): the gate is up and the constant says restore comes first — no new iteration.
+    /// One INFO line per pause.
+    fn paused_for_restore(&mut self) -> bool {
+        let Some(gate) = self.turn_gate().filter(|g| g.is_up()) else {
+            self.pause_announced = false;
+            return false;
+        };
+        if let Some(held) = gate.take_overlong_warning() {
+            tracing::warn!(
+                paused_for_h = held.as_secs() / 3600,
+                "work_pipeline: the backup has been paused for over {} h — a restore job or a DR \
+                 session still holds the gate (a restore job whose coordinator died holds it \
+                 until the node restarts)",
+                BACKUP_PAUSE_WARN_AFTER.as_secs() / 3600
+            );
+        }
+        if !self.pause_announced {
+            self.pause_announced = true;
+            tracing::info!(
+                "work_pipeline: paused while a restore job runs or a DR session leases memory"
+            );
+        }
+        true
+    }
+
+    /// Forget the turn memory of blocks that left service while nobody looked (v3.12 item 5):
+    /// the memory of a block that is no longer served must not live on.
+    fn forget_blocks_out_of_service(&mut self) {
+        let gone: Vec<SourceBlockId> = self
+            .yields
+            .keys()
+            .chain(self.last_attempt.keys())
+            .copied()
+            .filter(|b| matches!(self.db.block_serviceability(b), Ok(s) if !s.is_serviceable()))
+            .collect();
+        for block_id in gone {
+            clear_turn_memory(&mut self.yields, &mut self.last_attempt, block_id);
         }
     }
 
@@ -201,9 +373,18 @@ impl WorkPipeline {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         tracing::info!("work_pipeline: started (tick={}s)", tick_secs);
+        // Its own receiver for the wake-up (the one in `self` is read by `run_iteration`).
+        let mut gate = self.restore_gate.as_ref().map(RestoreGate::subscribe);
 
         loop {
             tokio::select! {
+                open = restore_gate_changed(&mut gate) => {
+                    // A restore job started or ended. Ended: the worker starts again at once
+                    // (a started one only makes `run_iteration` say it is paused).
+                    if open && let Err(e) = self.run_iteration().await {
+                        tracing::error!(error = %e, "work_pipeline: post-restore iteration failed");
+                    }
+                }
                 _ = tick.tick() => {
                     tracing::debug!("work_pipeline: periodic tick");
                     // CS-SCH-10: surface DbErrors from run_iteration (via next_work_item)
@@ -261,6 +442,11 @@ impl WorkPipeline {
     ///
     /// `pub` for testability — called from `run()` and from tests directly.
     pub async fn run_iteration(&mut self) -> anyhow::Result<bool> {
+        // Q-V9 (a): a restore job runs — the memory is its, the worker starts nothing.
+        if self.paused_for_restore() {
+            return Ok(false);
+        }
+        self.forget_blocks_out_of_service();
         let now = Timestamp::now();
         // cooldown is already pre-scaled by handle/mod.rs. See note in `run()`.
         let cooldown = self.config.cooldown;
@@ -297,6 +483,10 @@ impl WorkPipeline {
                     break;
                 }
             };
+            // A restore job may have started while the previous block was worked.
+            if picked_any && self.paused_for_restore() {
+                break;
+            }
             // With pool signature 0 `next_work_item` ignores cooldowns and would hand the
             // same block back; never work one block twice in an iteration.
             if !tried.insert(block.block_id) {
@@ -318,7 +508,7 @@ impl WorkPipeline {
     /// One attempt on one block: log the pick, run the encode+deliver cycle, record
     /// the cooldown (parked when nobody could take symbols).
     async fn work_on_block(
-        &self,
+        &mut self,
         block: &SourceBlockRecord,
         pool: &PoolSnapshot,
         now: Timestamp,
@@ -341,7 +531,7 @@ impl WorkPipeline {
                 min = self.config.min_pool_size,
                 "work_pipeline: pool_too_small — parking block, no encode"
             );
-            self.update_block_cooldown(block, pool, now, Some(ParkReason::PoolTooSmall));
+            self.park_clearing_memory(block, pool, now, ParkReason::PoolTooSmall);
             return Ok(BlockAttempt::PoolUnusable);
         }
 
@@ -350,7 +540,7 @@ impl WorkPipeline {
             Some(s) => s,
             None => {
                 tracing::debug!("work_pipeline: no swarm, parking block");
-                self.update_block_cooldown(block, pool, now, Some(ParkReason::NoSwarm));
+                self.park_clearing_memory(block, pool, now, ParkReason::NoSwarm);
                 return Ok(BlockAttempt::PoolUnusable);
             }
         };
@@ -365,6 +555,11 @@ impl WorkPipeline {
             self.cluster_state.as_ref(),
             block,
             pool,
+            self.yields.get(&block.block_id).copied().unwrap_or(0),
+            self.last_attempt.entry(block.block_id).or_default(),
+            self.restore_gate
+                .as_ref()
+                .filter(|_| self.config.restore_pauses_backup),
         )
         .await;
 
@@ -377,11 +572,22 @@ impl WorkPipeline {
                     failed = wo.failed,
                     encoded = wo.encoded,
                     offered = wo.offered,
+                    yielded = wo.yielded,
                     "work_pipeline: iteration complete"
+                );
+                count_yields(
+                    &mut self.yields,
+                    &mut self.last_attempt,
+                    block.block_id,
+                    &wo,
                 );
                 if wo.left_service {
                     self.update_block_cooldown(block, pool, now, Some(ParkReason::LeftService));
                     Ok(BlockAttempt::LeftService)
+                } else if wo.yielded && wo.offered == 0 {
+                    // Stopped by the gate before any offer (before the encode, or after it: the
+                    // job started while the encoder ran): nothing was tried, nothing parked.
+                    Ok(BlockAttempt::Paused)
                 } else if wo.offered > 0 {
                     // Offers went out (accepted or not): retry after the normal
                     // cooldown — a network failure is not "nobody can take it".
@@ -400,10 +606,22 @@ impl WorkPipeline {
                     error = %e,
                     "work_pipeline: iteration error — parking block"
                 );
-                self.update_block_cooldown(block, pool, now, Some(ParkReason::IterationError));
+                self.park_clearing_memory(block, pool, now, ParkReason::IterationError);
                 Ok(BlockAttempt::Error)
             }
         }
+    }
+
+    /// Park a block and forget its turn memory with it (v3.5a NOTE 3).
+    fn park_clearing_memory(
+        &mut self,
+        block: &SourceBlockRecord,
+        pool: &PoolSnapshot,
+        now: Timestamp,
+        reason: ParkReason,
+    ) {
+        clear_turn_memory(&mut self.yields, &mut self.last_attempt, block.block_id);
+        self.update_block_cooldown(block, pool, now, Some(reason));
     }
 
     /// Reset cooldowns on all blocks. Called on `PeerAuthenticated` to force

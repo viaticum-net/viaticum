@@ -100,6 +100,7 @@ impl JobRecord {
             submitted_at: iso_utc(self.submitted_at),
             finished_at: self.finished_at.map(iso_utc),
             waiting_for_holders_until: None,
+            waiting_for_memory: false,
         }
     }
 }

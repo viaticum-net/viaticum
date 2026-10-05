@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use viaticum_core::erasure::{ErasureEncoder, ErasureError, RaptorQEncoder, Symbol};
+use viaticum_core::erasure::{ErasureEncoder, ErasureError, RaptorQEncoder, Symbol, SymbolSink};
 use viaticum_core::types::{DeviceId, ErasureParams, SourceBlockId};
 
 use super::issue_support::{SlowPostman, owner_with_due, owner_with_encoder, seed_due};
@@ -68,7 +68,7 @@ async fn issue_tick_keeps_its_budget_while_a_commit_holds_the_database() {
     );
 }
 
-/// An encoder that sleeps in `encode_raw_ranges` in its calls `stall_from..stall_upto`
+/// An encoder that sleeps in `encode_raw_ranges_each` in its calls `stall_from..stall_upto`
 /// (a block whose preparation is held up by the disk or the CPU), counting the calls and
 /// the most calls running at once.
 pub(super) struct StallingEncoder {
@@ -79,7 +79,13 @@ pub(super) struct StallingEncoder {
     stall_from: usize,
     stall_upto: usize,
     stall: Duration,
+    /// Runs at the start of every `encode_raw_ranges_each` with the call's index (tests: advance
+    /// a fake clock, read the budget, panic).
+    hook: std::sync::Mutex<Option<CallHook>>,
 }
+
+/// What a test runs at the start of each preparation's encode.
+pub(super) type CallHook = Arc<dyn Fn(usize) + Send + Sync>;
 
 impl StallingEncoder {
     pub(super) fn new(stall_from: usize, stall_upto: usize, stall: Duration) -> Arc<Self> {
@@ -91,7 +97,13 @@ impl StallingEncoder {
             stall_from,
             stall_upto,
             stall,
+            hook: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Run `hook(call_index)` at the start of every encode from now on.
+    pub(super) fn set_hook(&self, hook: impl Fn(usize) + Send + Sync + 'static) {
+        *self.hook.lock().unwrap() = Some(Arc::new(hook));
     }
 }
 
@@ -141,13 +153,30 @@ impl ErasureEncoder for StallingEncoder {
         params: &ErasureParams,
         ranges: &[(u32, u32)],
     ) -> Result<Vec<Symbol>, ErasureError> {
+        self.inner.encode_raw_ranges(source_block, params, ranges)
+    }
+    /// The PoS preparation's entry point (F8'): counted, and stalled when its call is in the
+    /// stall window.
+    fn encode_raw_ranges_each(
+        &self,
+        source_block: &[u8],
+        params: &ErasureParams,
+        ranges: &[(u32, u32)],
+        f: &mut SymbolSink<'_>,
+    ) -> Result<(), ErasureError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let hook = self.hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(call);
+        }
         let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(now, Ordering::SeqCst);
         if (self.stall_from..self.stall_upto).contains(&call) {
             std::thread::sleep(self.stall);
         }
-        let out = self.inner.encode_raw_ranges(source_block, params, ranges);
+        let out = self
+            .inner
+            .encode_raw_ranges_each(source_block, params, ranges, f);
         self.running.fetch_sub(1, Ordering::SeqCst);
         out
     }

@@ -15,7 +15,7 @@ use viaticum_core::types::DeviceId;
 
 use super::{
     TEST_EPOCH_KEY, dummy_master_pub, make_identity, make_peer_record, make_pending_challenges,
-    make_placement, make_test_encoder, seed_retained_pos_block,
+    make_placement, make_test_encoder, seed_holder_peer, seed_retained_pos_block,
 };
 use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter};
 use crate::daemon::repair::RepairTrigger;
@@ -104,6 +104,13 @@ pub(super) struct Owner {
     _data_dir: tempfile::TempDir,
 }
 
+impl Owner {
+    /// The data dir the owner's retained blocks live in.
+    pub(super) fn data_dir(&self) -> &Path {
+        self._data_dir.path()
+    }
+}
+
 /// An owner whose placements `seed` writes (it gets the db and the data dir for the
 /// retained blocks), publishing through `postman`, its one known peer (a real Ed25519
 /// id). Holders are no peers (medium trust): one store per publish.
@@ -170,6 +177,7 @@ pub(super) fn seed_due(db: &Db, dir: &Path, blocks: u8, holders: u8) {
         let block_id = seed_retained_pos_block(dir, db, b);
         for h in &holder_ids {
             db.upsert_placement(&make_placement(block_id, *h)).unwrap();
+            seed_holder_peer(db, *h);
         }
     }
 }

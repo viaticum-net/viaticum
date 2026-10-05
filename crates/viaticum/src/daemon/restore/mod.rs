@@ -40,6 +40,10 @@ use crate::daemon::symbol_fetch::RestoreSource;
 
 pub mod cleanup;
 mod decode;
+pub use decode::{
+    DecryptedBlock, decode_decrypt_stage, decode_parse_stage, local_plaintext, member_bytes,
+    plaintext_stage,
+};
 pub mod jobs;
 mod no_answer;
 pub mod pipeline;
@@ -47,6 +51,8 @@ pub mod staging;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_budget;
 
 // ─── Error type ───────────────────────────────────────────────────────────────
 
@@ -211,6 +217,10 @@ pub struct RestoreConfig {
     /// The size limit of this machine: the local tier's rebuild reads no source file above
     /// it (J1, backup-i5). Default: the RaptorQ ceiling; the daemon sets the limit in force.
     pub max_source_bytes: u64,
+    /// The block work memory budget shared with the worker and the PoS preparations: a restore
+    /// takes one permit per block, as a priority waiter (restore-i39). `RestoreConfig::new` gives
+    /// an unbounded one (tests); the daemon sets its own.
+    pub mem_budget: Arc<crate::daemon::mem_budget::MemBudget>,
 }
 
 impl RestoreConfig {
@@ -227,6 +237,7 @@ impl RestoreConfig {
             pressure: None,
             time_scale: 1,
             max_source_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
+            mem_budget: crate::daemon::mem_budget::MemBudget::new(u64::MAX),
         }
     }
 }
@@ -238,6 +249,9 @@ pub struct RestoreCoordinator {
     db: Db,
     config: RestoreConfig,
     encoder: Arc<dyn ErasureEncoder>,
+    /// Test seam: runs before a file is written to staging (the permit must be gone by then).
+    #[cfg(test)]
+    pub(crate) write_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl RestoreCoordinator {
@@ -247,6 +261,15 @@ impl RestoreCoordinator {
             db,
             config,
             encoder,
+            #[cfg(test)]
+            write_hook: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn before_write(&self) {
+        if let Some(hook) = self.write_hook.lock().unwrap().as_ref() {
+            hook();
         }
     }
 

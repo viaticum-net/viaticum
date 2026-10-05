@@ -18,6 +18,10 @@
 // pointer publisher can name a refusal (CROWN-1 V.3, V.15.3). It returns at the needed
 // number of acks, not after the slowest postman (mailbox-i60, submodule `fanout`).
 //
+// poll_stream: each postman's answer reaches the caller as it arrives, not after the
+// slowest postman (mailbox-i63, submodule `fetch`); the reader merges them with `PollSeen`
+// (identical bytes only, mailbox-i69).
+//
 // Avail observation wiring (T-4a §5):
 // Successful MailboxStoreAck / MailboxFetchResponse → positive observation:
 //   record.avail_ewma = ewma_contact_observed(record.avail_ewma, AVAIL_EWMA_ALPHA)
@@ -31,6 +35,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use libp2p::PeerId;
+use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
 use viaticum_core::constants::{
@@ -50,18 +55,21 @@ use crate::daemon::network::swarm::{SwarmHandle, device_id_to_peer_id};
 
 mod dr_walk;
 mod fanout;
+mod fetch;
 mod verdict;
 
-use fanout::{record_avail_contact, record_contact_off_runtime, store_fanout, unix_now};
+use fanout::{record_avail_contact, store_fanout, unix_now};
+use fetch::fetch_fanout;
 
 pub use dr_walk::DrWalk;
+pub use fetch::PollSeen;
 pub use verdict::{PublishOutcome, PublishVerdict};
 
 // ─── Per-request network timeout ─────────────────────────────────────────────
 
 /// Per-peer request timeout. Mailbox operations are best-effort and parallelized;
 /// a slow peer must not stall the whole fanout.
-const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ============================================================
 // MailboxNetworkSender — test seam
@@ -297,91 +305,44 @@ impl MailboxRouter {
         Ok(self.publish_detailed(entry, target_sig, 1).await.acks.len())
     }
 
-    /// Poll the box `target` from read-fanout (300) candidates.
+    /// Poll the box `target` from read-fanout (300) candidates, answer by answer
+    /// (mailbox-i63).
     ///
     /// `proof` is `None` for our own master box (the postman checks the transport
     /// identity); a pointer box needs a fetch proof bound to our device, and then the
     /// postman serves only SelfPointer entries.
     ///
-    /// Returns unique non-expired entries, deduped by msg_id (most-recent wins on dup).
-    /// Avail observation: on successful FetchResponse, updates avail_ewma for the responding peer.
-    pub async fn poll(
+    /// Every postman's answer `(postman, entries)` comes out of the channel as soon as it
+    /// arrives, raw: the reader drops expired records and merges by `poll_entry_key`
+    /// (`PollSeen`). A sleeping postman holds only its own answer (≤ 15 s), not the
+    /// others'. The channel closes when every postman answered or timed out.
+    /// Avail observation: every successful FetchResponse, a late one included, updates
+    /// avail_ewma and `last_seen` of the responding peer.
+    pub fn poll_stream(
         &self,
         target: &MailboxAddress,
         proof: Option<[u8; 64]>,
         since_stored_at: Option<u64>,
-    ) -> anyhow::Result<Vec<MailboxEntry>> {
-        let now_secs = unix_now();
+    ) -> mpsc::Receiver<(DeviceId, Vec<MailboxEntry>)> {
         let ranked = self.build_ranked_candidates(target);
-
         // Read-fanout: top-300 closest peers.
         let read_peers: Vec<DeviceId> = ranked
             .iter()
             .take(self.read_fanout)
             .map(|(d, _)| *d)
             .collect();
-
         let req = MailboxFetchRequest {
             v: MAILBOX_WIRE_VERSION,
             target: *target,
             since_stored_at,
             target_proof: proof,
         };
-
-        // Send in parallel to all read-fanout peers.
-        let mut handles = Vec::with_capacity(read_peers.len());
-        for device_id in &read_peers {
-            let sender = Arc::clone(&self.sender);
-            let req_clone = req.clone();
-            let dev = *device_id;
-            handles.push(tokio::spawn(async move {
-                (dev, sender.send_fetch(dev, req_clone).await)
-            }));
-        }
-
-        // Collect all responses; dedup by msg_id.
-        // Last writer (by stored_at) wins on duplicate msg_id from different peers.
-        let mut by_msg_id: HashMap<[u8; 16], MailboxEntry> = HashMap::new();
-
-        for handle in handles {
-            match handle.await {
-                Ok((device_id, Ok(resp))) => {
-                    record_contact_off_runtime(&self.db, device_id, now_secs);
-                    for entry in resp.entries {
-                        // Skip expired entries (should not happen; postman filters them,
-                        // but be defensive against clock skew).
-                        if entry.expires_at <= now_secs {
-                            continue;
-                        }
-                        // Dedup: keep highest stored_at per msg_id.
-                        by_msg_id
-                            .entry(entry.msg_id)
-                            .and_modify(|existing| {
-                                if entry.stored_at > existing.stored_at {
-                                    *existing = entry.clone();
-                                }
-                            })
-                            .or_insert(entry);
-                    }
-                }
-                Ok((device_id, Err(e))) => {
-                    debug!(device = %device_id, err = %e, "mailbox poll: fetch failed");
-                }
-                Err(join_err) => {
-                    warn!("mailbox poll: task panicked: {join_err}");
-                }
-            }
-        }
-
-        let entries: Vec<_> = by_msg_id.into_values().collect();
         debug!(
             target = %target,
-            entry_count = entries.len(),
             peers_tried = read_peers.len(),
-            "mailbox poll: collected entries"
+            "mailbox poll: fetching"
         );
-
-        Ok(entries)
+        fetch_fanout(&self.sender, &self.db, read_peers, req)
     }
 
     // ─── Peer selection ───────────────────────────────────────────────────────
@@ -490,25 +451,6 @@ fn peer_id_to_device_id_best_effort(peer_id: &PeerId) -> Option<DeviceId> {
     let pub_key = PublicKey::try_decode_protobuf(multihash.digest()).ok()?;
     let ed_key = pub_key.try_into_ed25519().ok()?;
     Some(DeviceId(ed_key.to_bytes()))
-}
-
-// ─── Pure helper: dedup entries by msg_id ────────────────────────────────────
-
-/// Deduplicate a slice of entries by msg_id, keeping the one with highest stored_at.
-/// Exposed for unit testing.
-pub fn dedup_entries(entries: Vec<MailboxEntry>) -> Vec<MailboxEntry> {
-    let mut by_msg_id: HashMap<[u8; 16], MailboxEntry> = HashMap::new();
-    for entry in entries {
-        by_msg_id
-            .entry(entry.msg_id)
-            .and_modify(|existing| {
-                if entry.stored_at > existing.stored_at {
-                    *existing = entry.clone();
-                }
-            })
-            .or_insert(entry);
-    }
-    by_msg_id.into_values().collect()
 }
 
 #[cfg(test)]

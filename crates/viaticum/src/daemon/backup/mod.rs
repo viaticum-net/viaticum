@@ -59,6 +59,8 @@ mod tests_current;
 #[cfg(test)]
 mod tests_gone;
 #[cfg(test)]
+mod tests_precheck;
+#[cfg(test)]
 mod tests_rebuild;
 #[cfg(test)]
 mod tests_reconcile;

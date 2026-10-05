@@ -10,7 +10,7 @@
 #               from the network and puts them back one by one.
 # Intent:       dr-i1, dr-i2, dr-i3, dr-i4, dr-i5, dr-i9, dr-i10, dr-i64 (step 8), dr-i11,
 #               dr-i18, dr-i19, dr-i22,
-#               restore-i1 (after DR), dr-i8 (step 9, skeleton: filled by CROWN-1 C4);
+#               restore-i1 (after DR), dr-i8 (step 9, with the unit tests);
 #               CROWN-1 C3a: mailbox-i39, i40 (pointer only in the rendezvous box, never in
 #               the master box), mailbox-i56 (a restart's new base takes a place by
 #               strength; two places), V.16.4 (SS blobs outside META retired), dr-i41 /
@@ -122,7 +122,8 @@
 #     dr-i18); DR's "Catalog: X (… restored from Y)": X != Y, Y == L_OWNER, and status
 #     .catalog_lineage == X (a new history, dr-i15);
 #     node-01's log has a NEW "peer authenticated" line (after the daemon start) for node-00's
-#     new device, != D_old (dr-i22). Start 02-04 → wait_auth_peers 0 ≥ 3. files_without_source
+#     new device, != D_old (dr-i22). Start the other two of 02-04 (H stays down, dr-i8) →
+#     wait_auth_peers 0 ≥ 2. files_without_source
 #     == 3; restore each journal file → sha256 match, holders log RestoreResponse; after the
 #     restores files_without_source is still 3 (dr-i1, dr-i11, restore-i1)
 #     — check: FILES_N, grep, api_get .peers link with deadline, log_since grep on node-01,
@@ -132,7 +133,7 @@
 #     step needs a faster clock: it is checked in step 8.) Then poll ≤ 300 s for the recovered
 #     node's first accepted pointer: its log line "SelfPointer published via mailbox" carries
 #     lineage=X, status .catalog_lineage is still X — check: status_num, grep
-#  8. dr-i10 + dr-i19 with a positive control. Restart ALL 5 daemons at --time-scale 20000
+#  8. dr-i10 + dr-i19 with a positive control. Restart daemons 00, 01, 02, 04 at --time-scale 20000 (H is started after the first challenge to it, dr-i8)
 #     (owner and holder delete cooldowns ≈ 121 s each). Record BLOCK1/BLOCK3 symbols on nodes
 #     01-04. Delete f1 at its original path. Poll every 5 s until DEADLINE ≈ 370 s:
 #       FAIL at once if a holder logs "holding marked for deletion" for BLOCK3, node-00 logs
@@ -147,8 +148,16 @@
 #     path=…/f3.bin" (else the negative is blind), and the loop then runs at least to
 #     recheck + W + 20 (the unconfirmed record must survive it).
 #     — check: block_symbols_on, delete_marks_for, grep -c with block prefix, deadline loop
-#  9. (C4) holder node-03 offline during DR → a PoS challenge from node-00 lands in node-03's box
-#     by its MASTER (dr-i8). SKELETON ONLY: not implemented until CROWN-1 C4.
+#  9. dr-i8: H (chosen in step 1 among nodes 02-04: holds f2 symbols, rest restorable without it; stopped BEFORE the DR) is NOT started in step 6 (after DR the recovered node has no direct
+#     link to it, device_to_master for H is empty) and is started in step 8 right after node-00's
+#     first "PoS hash challenge issued via mailbox … holder_id=H" line (H is picked in step 1: the
+#     blocks of f1..f3 are recoverable without it). Oracle at node-00: a challenge
+#     X issued to H BEFORE the first "peer authenticated" line for H after the DR, and a
+#     "mailbox PosResponse resolved … challenge_id=X … outcome=Pass". That is exactly "the call
+#     left while the master of H was known only from PEERS". Bonus: if H holds BLOCK1, it marks it
+#     for deletion after the Delete of f1 (a weak oracle: once H has authenticated, the
+#     device-to-master table is filled by the cert exchange, so the unit tests carry the Delete
+#     mutation). Mutation: fallback to the device-id box → X never resolves → step red.
 # 10. move restored f3 back → poll files_without_source == 0 (f1 deleted = not live)
 #     (dr-i11) — check: status_num
 # 11. no honest node logged "store rejected — plaintext payload" or "SelfPointer in the
@@ -385,6 +394,41 @@ else
     fail "setup: blocks not pairwise different (f1=${BLOCK[f1]:0:16} f2=${BLOCK[f2]:0:16} f3=${BLOCK[f3]:0:16}): the delete oracle would be blind"
     exit 1
 fi
+# dr-i8 (step 9): pick H, the holder that stays down through the DR and steps 6-8. Candidates are
+# nodes 02-04 (01 is the DR seed, 00 the owner). H must (a) hold >= 1 symbol of f2's block (else
+# no challenge to H appears and the oracle is blind), (b) leave every block restorable from the
+# other holders alone: their symbols >= k_eff of each of f1..f3. The layout is random, so the
+# choice is made here and not hard-coded.
+declare -A KEFF
+for f in f1 f2 f3; do KEFF[$f]=$(file_field 0 "$FILES_DIR/$f.bin" '.effective_status.target'); done
+HN=""
+H_REPORT=""
+for cand in 2 3 4; do
+    reason=""
+    [ "$(block_symbols_on "$cand" "${BLOCK[f2]}")" -ge 1 ] || reason="holds no symbol of f2's block"
+    if [ -z "$reason" ]; then
+        for f in f1 f2 f3; do
+            without=0
+            for i in "${HOLDERS[@]}"; do
+                [ "$i" -eq "$cand" ] && continue
+                without=$(( without + $(block_symbols_on "$i" "${BLOCK[$f]}") ))
+            done
+            if [ -z "${KEFF[$f]}" ] || [ "$without" -lt "${KEFF[$f]}" ]; then
+                reason="$f has $without symbols on the other holders < k_eff '${KEFF[$f]}'"; break
+            fi
+        done
+    fi
+    if [ -z "$reason" ]; then HN="$cand"; break; fi
+    H_REPORT="$H_REPORT node-0$cand: $reason;"
+done
+if [ -n "$HN" ]; then
+    H_UP=()
+    for i in 2 3 4; do [ "$i" -ne "$HN" ] && H_UP+=("$i"); done
+    pass "H = node-0$HN: holds f2 symbols, and f1..f3 stay restorable from the other holders (k_eff f1 ${KEFF[f1]}, f2 ${KEFF[f2]}, f3 ${KEFF[f3]})"
+else
+    fail "setup: no suitable H among nodes 02-04 for the random layout ($H_REPORT): step 9 cannot test dr-i8 on this run (not a product failure; rerun)"
+    exit 1
+fi
 JOURNAL_FILES=3
 
 # ── STEP 2: DR READINESS IN STATUS ───────────────────────────────
@@ -597,6 +641,10 @@ else
     fail "node-01 move: old='$ADDR_01_OLD' new='$ADDR_01' auth=$(status_num 1 peer_count_authenticated)"
 fi
 DEV01=$(api_get 1 /api/status | jq -r '.device_id')
+# dr-i8: the holder that stays down through the DR and the first PoS challenges after it.
+DEVH=$(api_get "$HN" /api/status | jq -r '.device_id')
+H16="${DEVH:0:16}"
+[ ${#H16} -eq 16 ] || { fail "cannot read node-0$HN's (H) device id (got '$DEVH')"; exit 1; }
 
 # ── STEP 4: FOREIGN PHRASE, THEN THE RIGHT ONE, INTO Y ────────────
 echo ""
@@ -690,6 +738,9 @@ assert_delete_window "$TIME_SCALE"
 rm -rf "$X_DIR" "$Y_DIR"
 rm -rf "${OLD:?}"/* "$OLD"/.[!.]* 2>/dev/null || true
 for f in f1 f2 f3; do [ -e "$FILES_DIR/$f.bin" ] && fail "wipe left $f in place"; done
+# dr-i8: H is stopped BEFORE the DR, so its master can come into PEERS only from the cluster's
+# stored state, not from a live contact of the DR network.
+stop_daemon "$HN"
 run_dr 6 "$OLD" "$M" --peer "$ADDR_01"
 if [ "$DR_RC" -eq 0 ] && [ "${FILES_N:-0}" -eq "$JOURNAL_FILES" ]; then
     pass "DR on the wiped machine: Files == $FILES_N (journal $JOURNAL_FILES)"
@@ -710,7 +761,7 @@ else
     fail "DR output lacks the 'not re-protected' paragraph"
 fi
 write_config 0 $((PORT_BASE + 60))
-for i in 2 3 4; do stop_daemon "$i"; done
+for i in "${H_UP[@]}"; do stop_daemon "$i"; done
 L01=$(log_line_count 1)
 start_daemon 0 "$TIME_SCALE"
 wait_daemon 0 || { fail "post-DR daemon did not start"; exit 1; }
@@ -740,11 +791,12 @@ if [ -n "$DEV00_NEW" ] && [ "$DEV00_NEW" != "${D_OLD:0:16}" ] \
 else
     fail "node-01 has no new 'peer authenticated' line for device '${DEV00_NEW}' (lost ${D_OLD:0:16}) — dr-i22, mechanism R1-b of line C"
 fi
-for i in 2 3 4; do start_daemon "$i" "$TIME_SCALE"; done
-if wait_auth_peers 0 3 120; then
-    pass "recovered node authenticated with $(status_num 0 peer_count_authenticated) peers"
+# dr-i8: H is not started here (it is the holder with no direct link after the DR).
+for i in "${H_UP[@]}"; do start_daemon "$i" "$TIME_SCALE"; done
+if wait_auth_peers 0 2 120; then
+    pass "recovered node authenticated with $(status_num 0 peer_count_authenticated) peers (H node-0$HN down)"
 else
-    fail "recovered node has $(status_num 0 peer_count_authenticated) authenticated peers after 120 s"
+    fail "recovered node has $(status_num 0 peer_count_authenticated) authenticated peers after 120 s (H node-0$HN down)"
 fi
 FWS=$(status_num 0 files_without_source)
 if [ "$FWS" -eq 3 ]; then pass "files_without_source == 3 after DR"; else fail "files_without_source == $FWS after DR (want 3)"; fi
@@ -796,8 +848,9 @@ echo "=== Step 8: dr-i10 + dr-i19: missing f3 is not deleted, deleted f1 is (tim
 for i in 0 1 2 3 4; do stop_daemon "$i"; done
 L00=$(log_line_count 0)
 start_daemon 0 "$TIME_SCALE_DELETE" "info,viaticum::daemon::scheduler=debug"
-for i in "${HOLDERS[@]}"; do start_daemon "$i" "$TIME_SCALE_DELETE"; done
-for i in 0 "${HOLDERS[@]}"; do wait_daemon "$i" || fail "node-0$i did not restart"; done
+# dr-i8: H stays down until node-00 has issued its first challenge to it.
+for i in 1 "${H_UP[@]}"; do start_daemon "$i" "$TIME_SCALE_DELETE"; done
+for i in 0 1 "${H_UP[@]}"; do wait_daemon "$i" || fail "node-0$i did not restart"; done
 wait_auth_peers 0 3 90 || fail "after restart node-00 has $(status_num 0 peer_count_authenticated) peers"
 B1_ON=$(sum_symbols "${BLOCK[f1]}")
 declare -A B3_ON
@@ -807,10 +860,23 @@ echo "  BLOCK1 symbols on holders: $B1_ON; BLOCK3: $B3_TOTAL"
 if [ "$B1_ON" -eq 0 ] || [ "$B3_TOTAL" -eq 0 ]; then
     fail "holders hold nothing of BLOCK1/BLOCK3: the check would be blind"
 fi
+B1_ON_H=$(block_symbols_on "$HN" "${BLOCK[f1]}")
 MARKS3_BEFORE=$(delete_marks_for "${BLOCK[f3]}" "${HOLDERS[@]}")
 MARKS1_BEFORE=$(delete_marks_for "${BLOCK[f1]}" "${HOLDERS[@]}")
 rm "$FILES_DIR/f1.bin"
 T8=$(date +%s)
+# dr-i8: wait for the first challenge issued to H while it is down, then start it at once (at
+# this time scale a challenge lives ~30 s).
+H_ISSUED=0
+for _ in $(seq 1 120); do
+    if log_since 0 "$L00" | grep -a "PoS hash challenge issued via mailbox" | grep -aq "holder_id=$H16"; then
+        H_ISSUED=1; break
+    fi
+    sleep 1
+done
+echo "  first challenge to H ($H16) issued: $H_ISSUED ($(( $(date +%s) - T8 ))s after the delete of f1)"
+start_daemon "$HN" "$TIME_SCALE_DELETE"
+wait_daemon "$HN" || fail "node-0$HN (H) did not start"
 DEADLINE=370
 # dr-i64 (L0): the missing f3 now reaches the watcher through the recheck (the PoS rebuild
 # of BLOCK3 does not find f3.bin → Recheck → the record is unconfirmed after DR → kept).
@@ -883,10 +949,47 @@ else
     fail "dr-i11: no PoS response for f2's block resolved Pass at node-00 within the deadline"
 fi
 
-# ── STEP 9: SKELETON (CROWN-1 C4) ────────────────────────────────
+# ── STEP 9: SERVICE MAIL REACHES A HOLDER KNOWN ONLY FROM PEERS (dr-i8) ──
 echo ""
-echo "=== Step 9: dr-i8 (mail by master after DR) — skeleton, filled by CROWN-1 C4 ==="
-info "not checked in this slice: needs CROWN-1 C4"
+echo "=== Step 9: dr-i8: a challenge issued before H ever authenticated resolves Pass ==="
+# X = a challenge to H issued (node-00 log, step 8's instance) on a line BEFORE the first
+# "peer authenticated" line for H: at that moment device_to_master had nothing for H, so the
+# address came from PEERS. Pass = the response of H to the same challenge_id was resolved.
+H_X=""; H_X_BEFORE=0; H_AUTH_LN=""; H_PASS=0
+for _ in $(seq 1 60); do
+    H_X_BEFORE=0
+    LOG0=$(log_since 0 "$L00")
+    H_AUTH_LN=$(echo "$LOG0" | grep -an "peer authenticated" | grep -a "device_id=$H16" | head -1 | cut -d: -f1 || true)
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        ln="${line%%:*}"
+        if [ -n "$H_AUTH_LN" ] && [ "$ln" -ge "$H_AUTH_LN" ]; then continue; fi
+        x=$(echo "$line" | grep -oE 'challenge_id=[0-9a-f]+' | head -1 | cut -d= -f2 || true)
+        [ -n "$x" ] || continue
+        H_X_BEFORE=$((H_X_BEFORE + 1))
+        if echo "$LOG0" | grep -a "mailbox PosResponse resolved" | grep -a "challenge_id=$x" | grep -aq "outcome=Pass"; then
+            H_X="$x"; H_PASS=1; break
+        fi
+    done < <(echo "$LOG0" | grep -an "PoS hash challenge issued via mailbox" | grep -a "holder_id=$H16" || true)
+    [ "$H_PASS" -eq 1 ] && break
+    sleep 2
+done
+if [ "$H_PASS" -eq 1 ]; then
+    pass "dr-i8: challenge ${H_X:0:8}… to H ($H16) was issued before H's first authentication (line ${H_AUTH_LN:-none}) and resolved Pass"
+else
+    fail "dr-i8: no challenge to H issued before its first authentication resolved Pass (issued before auth: $H_X_BEFORE, first auth line '${H_AUTH_LN:-none}', first issue seen: $H_ISSUED)"
+fi
+if [ "${B1_ON_H:-0}" -gt 0 ]; then
+    DEL_H=0
+    for _ in $(seq 1 60); do
+        [ "$(delete_marks_for "${BLOCK[f1]}" "$HN")" -gt 0 ] && { DEL_H=1; break; }
+        sleep 2
+    done
+    if [ "$DEL_H" -eq 1 ]; then pass "dr-i8: H marked BLOCK1 (deleted f1) for deletion"
+    else fail "dr-i8: H holds $B1_ON_H symbols of BLOCK1 but never marked it for deletion"; fi
+else
+    info "H holds nothing of BLOCK1: the Delete bonus is skipped"
+fi
 
 # ── STEP 10: f3 BACK ─────────────────────────────────────────────
 echo ""

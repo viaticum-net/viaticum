@@ -17,8 +17,9 @@ pub use crate::daemon::backup::pipeline::decrypt_and_decompress;
 /// Extract bytes for one file from a decoded pack plaintext.
 ///
 /// The plaintext starts with `CBOR(Vec<PackEntry>)` followed by raw file bytes.
-/// Returns `Ok(Some(bytes))` if found, `Ok(None)` if `file_id` not in pack.
-pub fn extract_from_pack(plaintext: &[u8], file_id: FileId) -> anyhow::Result<Option<Vec<u8>>> {
+/// Returns `Ok(Some(bytes))` if found, `Ok(None)` if `file_id` not in pack. The bytes are a
+/// slice of `plaintext` (К-b3: no copy of the member).
+pub fn extract_from_pack(plaintext: &[u8], file_id: FileId) -> anyhow::Result<Option<&[u8]>> {
     crate::daemon::backup::packing::extract_file_from_pack(plaintext, file_id)
 }
 
@@ -31,11 +32,11 @@ pub fn extract_from_pack(plaintext: &[u8], file_id: FileId) -> anyhow::Result<Op
 /// catalog from before L1 may record the hash of the file at enqueue while the pack holds
 /// the bytes of the flush (restore-i38 boundary; the block itself is already verified).
 /// `Ok(None)`: neither.
-pub fn extract_member(
-    plaintext: &[u8],
+pub fn extract_member<'a>(
+    plaintext: &'a [u8],
     file_id: FileId,
     content_hash: &[u8; 32],
-) -> anyhow::Result<Option<Vec<u8>>> {
+) -> anyhow::Result<Option<&'a [u8]>> {
     let own = extract_from_pack(plaintext, file_id)?;
     if let Some(bytes) = &own
         && blake3::hash(bytes).as_bytes() == content_hash

@@ -80,8 +80,8 @@ where
     P: FnMut(&RestoreJob),
 {
     let mut last_known: Option<RestoreJob> = None;
-    // State, counts, and whether the job waits for holders (restore-i26).
-    let mut last_reported: Option<(RestoreJobState, u32, usize, bool)> = None;
+    // State, counts, and whether the job waits for holders (restore-i26) or for memory (i39).
+    let mut last_reported: Option<(RestoreJobState, u32, usize, bool, bool)> = None;
     let mut since_report = policy.progress_every;
     let mut silence = Duration::ZERO;
     loop {
@@ -96,6 +96,7 @@ where
                     job.files_restored,
                     job.failures.len(),
                     job.waiting_for_holders_until.is_some(),
+                    job.waiting_for_memory,
                 );
                 if last_reported != Some(key) && since_report >= policy.progress_every {
                     on_progress(&job);
@@ -341,7 +342,7 @@ fn http(
     body: Option<String>,
     timeout: Duration,
 ) -> Result<(u16, String), CliError> {
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::http_client::blocking_builder()
         .timeout(timeout)
         .build()
         .map_err(|e| CliError::Io(std::io::Error::other(e.to_string())))?;

@@ -11,7 +11,7 @@ use viaticum_core::pos::ChallengeScheduleEntry;
 use viaticum_core::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp, from_cbor_bytes};
 
 use super::issue_support::{SlowPostman, owner_with};
-use super::{make_identity, make_placement, seed_retained_pos_block};
+use super::{make_identity, make_placement, seed_holder_peer, seed_retained_pos_block};
 use crate::daemon::scheduler::issue::{
     ISSUE_PUBLISH_CONCURRENCY, blocks_least_recently_tried_first,
 };
@@ -64,6 +64,7 @@ async fn the_tick_publishes_the_least_recently_verified_blocks_first() {
         for b in 0..20 {
             let id = seed_retained_pos_block(dir, db, b);
             db.upsert_placement(&make_placement(id, holder)).unwrap();
+            seed_holder_peer(db, holder);
         }
     });
     let listed = owner.db.list_all_placements().expect("list");
@@ -128,12 +129,14 @@ async fn unservable_blocks_at_the_head_do_not_starve_the_rest() {
         for b in 0..UNSERVABLE {
             let id = seed_retained_pos_block(dir, db, b);
             db.upsert_placement(&make_placement(id, bad)).unwrap();
+            seed_holder_peer(db, bad);
         }
         for b in UNSERVABLE..UNSERVABLE + SERVABLE {
             let id = seed_retained_pos_block(dir, db, b);
             let mut p = make_placement(id, good);
             p.last_verified = Some(Timestamp(1));
             db.upsert_placement(&p).unwrap();
+            seed_holder_peer(db, good);
         }
     });
 

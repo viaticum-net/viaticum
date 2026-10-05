@@ -53,9 +53,12 @@
 #                    the laptop does not keep up"; T_up = NOTE (4r-i113, pos-i5);
 #                    rchar per online window = NOTE (pos-i5-c, the price of a restart)
 #               7b. W3: H8 SIGSTOP 66 s / SIGCONT 30 s, 7 cycles: issue tick elapsed_ms p95 <= 800;
-#                    ledger gap <= 12 s; 0 timeouts to H8. Known: `poll done` elapsed_ms ~15000
-#                    on every node while H8 is stopped -> ROUGH "known: poll waits for the slowest
-#                    postman", not FAIL (pos-i7, mailbox-i60)
+#                    ledger gap <= 12 s; 0 timeouts to H8; over the nodes other than H8:
+#                    `poll done` first_entry_ms p95 < 1000 (the first record is handled while
+#                    H8 sleeps) and elapsed_ms p95 <= 8000 (the read budget
+#                    min(15 s, max(poll period 4 s, floor 5 s)) = 5 s at time_scale 900, plus
+#                    3 s of handling; without the read deadline ≈ 15 000)
+#                    (pos-i7, mailbox-i60, mailbox-i63, mailbox-i63-b)
 #               5.  W4 + 60 s: H1 SIGTERM, 10 s, start: challenges alive through the restart are
 #                    computed exactly twice, the others once; rchar growth over the first poll
 #                    with entries <= 1.5 x sum(bytes of the blocks of H1's live challenges) +
@@ -74,8 +77,12 @@
 #
 # Pre-registered on the current code (СТ-0a and СТ-0c in, with its rounds 2 and 3: the
 # budgeted issue tick, publishes settled by the run loop, blocks least recently tried first):
-#   every step GREEN, except 7b's poll bar: ROUGH "known: poll waits for the slowest postman"
-#   (routing poll, line B's Р-5), not a FAIL. Step 4 is the СТ-0c proof (the owner forwards
+#   every step GREEN. 7b's poll bar was pre-registered ROUGH "known: poll waits for the
+#   slowest postman" (routing poll, line B's Р-5): before line B's mailbox-i63 slice every
+#   poll waited 15 s for the stopped H8. That slice handles each answer as it arrives and
+#   ends the read at its budget (5 s here, mailbox-i63-b floor), so 7b's poll bars
+#   (first_entry_ms < 1000, elapsed_ms <= 8000, nodes other than H8) are expected GREEN;
+#   the elapsed_ms p95 over all nodes is a NOTE. Step 4 is the СТ-0c proof (the owner forwards
 #   only answers to pending challenges, once: no WARN unknown challenge_id; deferred_full
 #   = NOTE), step 8 its burst door (O back after about a scaled week), step 2 the issue-tick
 #   line.
@@ -275,6 +282,14 @@ MIN_FREE_GIB=20
 BAR_TICK_MS=800
 BAR_LEDGER_GAP=12
 BAR_POLL_MS=4000
+# Step 7b, a stopped postman notwithstanding. The read budget at time_scale 900 is
+# min(15 s, max(3600 / 900 = 4 s, floor 5 s)) = 5 s (mailbox-i63-b).
+# The first record of a poll is handled within BAR_FIRST_ENTRY_MS: a fifth of the budget,
+# so the deadline alone cannot meet it; an awake postman on localhost answers in tens of ms.
+BAR_FIRST_ENTRY_MS=1000
+# A whole poll ends within BAR_POLL_DEADLINE_MS: the 5 s budget plus 3 s of handling the
+# records read; a poll that waits for the stopped postman's 15 s timeout fails it.
+BAR_POLL_DEADLINE_MS=8000
 BAR_MEMO_RATIO=1.5
 FIRST_CACHED_MARGIN=200
 ALIVE_MARGIN=60
@@ -462,6 +477,9 @@ h_zero_acks() {
       events_grep "$(node_log "$1")" "PosResponse publish failed" challenge_id; } | sort -n
 }
 h_polls() { events_grep "$(node_log "$1")" "mailbox_poll: poll done" elapsed_ms entries deferred_full memo_answered; }
+# Fields: $3 first_entry_ms $4 elapsed_ms $5 responders (only polls with entries carry
+# first_entry_ms; step 7b).
+h_poll_first() { events_grep "$(node_log "$1")" "mailbox_poll: poll done" first_entry_ms elapsed_ms responders; }
 
 count_in() { in_window "$1" "$2" | awk 'NF' | wc -l | tr -d ' '; }
 
@@ -879,14 +897,33 @@ awk -v g="$GAP" -v b="$BAR_LEDGER_GAP" 'BEGIN { exit !(g <= b) }' \
     && pass "ledger accrual gap max = ${GAP} s" || fail "ledger accrual gap max = ${GAP} s > ${BAR_LEDGER_GAP} s"
 TO8=$(o_timeouts | in_window "$T_W3" "$T_W4" | awk -v h="${DEV[8]}" '$4 == h' | awk 'NF' | wc -l | tr -d ' ')
 [ "$TO8" -eq 0 ] && pass "0 timeouts to H8" || fail "$TO8 timeouts to H8"
+# mailbox-i63: the pollers other than H8 (H8's own polls freeze with it).
+FIRST95=$(for i in $(seq 0 $((NUM_NODES - 1))); do
+    [ "$i" -eq 8 ] && continue
+    h_poll_first "$i" | in_window "$T_W3" "$T_W4" | awk '$3 != "-" { print $3 }'
+done | p95)
+if [ -z "$FIRST95" ]; then
+    fail "no 'mailbox_poll: poll done' line with first_entry_ms in W3 on the nodes other than H8"
+elif [ "$FIRST95" -lt "$BAR_FIRST_ENTRY_MS" ]; then
+    pass "poll done first_entry_ms p95 = $FIRST95 with a stopped postman (nodes other than H8, mailbox-i63)"
+else
+    fail "poll done first_entry_ms p95 = $FIRST95 >= $BAR_FIRST_ENTRY_MS with a stopped postman (nodes other than H8, mailbox-i63)"
+fi
+ELAPSED95=$(for i in $(seq 0 $((NUM_NODES - 1))); do
+    [ "$i" -eq 8 ] && continue
+    h_polls "$i" | in_window "$T_W3" "$T_W4" | awk '$3 != "-" { print $3 }'
+done | p95)
+if [ -z "$ELAPSED95" ]; then
+    fail "no 'mailbox_poll: poll done' line with elapsed_ms in W3 on the nodes other than H8"
+elif [ "$ELAPSED95" -le "$BAR_POLL_DEADLINE_MS" ]; then
+    pass "poll done elapsed_ms p95 = $ELAPSED95 <= $BAR_POLL_DEADLINE_MS with a stopped postman (nodes other than H8, mailbox-i63)"
+else
+    fail "poll done elapsed_ms p95 = $ELAPSED95 > $BAR_POLL_DEADLINE_MS with a stopped postman: the poll waits past its read budget (nodes other than H8, mailbox-i63)"
+fi
 ALL_POLL95=$(for i in $(seq 0 $((NUM_NODES - 1))); do
     h_polls "$i" | in_window "$T_W3" "$T_W4" | awk '$3 != "-" { print $3 }'
 done | p95)
-if [ -n "$ALL_POLL95" ] && [ "$ALL_POLL95" -ge "$BAR_POLL_MS" ]; then
-    rough "known: poll waits for the slowest postman (routing.rs poll, 15 s per stopped peer): poll done elapsed_ms p95 over all nodes = $ALL_POLL95"
-else
-    info "poll done elapsed_ms p95 over all nodes = ${ALL_POLL95:-none}"
-fi
+note "poll done elapsed_ms p95 over all nodes incl. H8 = ${ALL_POLL95:-none} (read budget 5000 ms)"
 stop_point 7b
 
 # ── STEP 6: DR readiness held over W1..W3 ──────────────────────────────────

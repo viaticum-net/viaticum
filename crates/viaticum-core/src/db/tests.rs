@@ -4529,6 +4529,7 @@ fn pointer_publications_roundtrip() {
                 slots_full: 0,
                 other: 1,
             },
+            expired: true,
         }),
         to_retire: vec![RetiredPointer {
             base: SourceBlockId([4; 32]),

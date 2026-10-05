@@ -27,6 +27,9 @@ pub fn format_bytes(bytes: u64) -> String {
 pub fn render_status(data: &StatusData) -> String {
     let mut out = String::new();
     out.push_str("viaticum status\n");
+    if !data.daemon_version.is_empty() {
+        out.push_str(&format!("  version:        {}\n", data.daemon_version));
+    }
     out.push_str(&format!("  identity:       {}\n", data.node_identity));
     if !data.node_addr.is_empty() {
         out.push_str(&format!("  addr:           {}\n", data.node_addr));
@@ -67,6 +70,25 @@ pub fn render_status(data: &StatusData) -> String {
         out.push_str(&format!(
             "  too large:      {} file(s) above the limit: not supported yet, not backed up\n",
             data.files_too_large
+        ));
+    }
+    // К-b3 (spec v3.9a): a `viaticum dr` on this machine borrows this node's memory.
+    if let Some(lease) = &data.dr_lease {
+        out.push_str(&format!(
+            "  dr_lease:       {}holds_mib={} age_s={}\n",
+            if lease.revoked { "revoked " } else { "" },
+            lease.holds_mib,
+            lease.age_s
+        ));
+    }
+    // Q-V9 (a): the node's memory goes to the restore first.
+    if data.backup_paused_while_restoring {
+        out.push_str("  backup:         paused while restoring\n");
+    }
+    if data.backup_pause_overlong {
+        out.push_str(&format!(
+            "  backup:         paused for over {} h: a restore job may be stuck\n",
+            crate::daemon::work_pipeline::BACKUP_PAUSE_WARN_AFTER.as_secs() / 3600
         ));
     }
     out.push_str(&render_dr_readiness(data));
@@ -269,6 +291,10 @@ pub fn render_restore_progress(job: &RestoreJob, now_unix: u64) -> String {
                     "; holders did not answer, reconnecting, {}",
                     retry_in(until, now_unix)
                 ));
+            }
+            // restore-i39: a big block of this node holds the memory this one needs.
+            if job.waiting_for_memory {
+                line.push_str("; waiting for memory (another big block is being worked on)");
             }
             line.push('\n');
             line
@@ -511,18 +537,24 @@ pub fn format_device_added(device: &DeviceEntry) {
 }
 
 /// Render a device revocation confirmation to a String.
-pub fn render_device_revoked(device_id_hex: &str) -> String {
+pub fn render_device_revoked(device_id_hex: &str, holders_skipped: u32) -> String {
     let short = if device_id_hex.len() > 16 {
         format!("{}...", &device_id_hex[..16])
     } else {
         device_id_hex.to_string()
     };
-    format!("device revoked: {short}\n")
+    let mut out = format!("device revoked: {short}\n");
+    if holders_skipped > 0 {
+        out.push_str(&format!(
+            "revocation not sent to {holders_skipped} holder device(s): master unknown until they reconnect\n"
+        ));
+    }
+    out
 }
 
 /// Format and print a device revocation confirmation to stdout.
-pub fn format_device_revoked(device_id_hex: &str) {
-    print!("{}", render_device_revoked(device_id_hex));
+pub fn format_device_revoked(device_id_hex: &str, holders_skipped: u32) {
+    print!("{}", render_device_revoked(device_id_hex, holders_skipped));
 }
 
 /// Render a list of FileEntry to a String.

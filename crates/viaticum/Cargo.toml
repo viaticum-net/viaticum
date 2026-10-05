@@ -40,6 +40,8 @@ libc = { workspace = true }
 # Start-failure classification matches on redb error variants (daemon-i1).
 redb = { workspace = true }
 reqwest = { workspace = true }
+# Only to install the `ring` provider for reqwest (http_client, R3 Р-4′).
+rustls = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
 toml_edit = "0.22"
@@ -59,7 +61,7 @@ tikv-jemallocator = "0.6"
 # renameat2(RENAME_NOREPLACE) / renameatx_np(RENAME_EXCL) for restore staging
 # (restore-i19). Already in the tree through cap-std; safe API, no new crate.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 mimalloc = { version = "0.1", default-features = false }

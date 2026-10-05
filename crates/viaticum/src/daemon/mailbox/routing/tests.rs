@@ -1,7 +1,8 @@
 // T-4 test scenarios (spec §2.5).
 //
 // Test strategy:
-//   - Pure functions (select_write_peers ranking, dedup_entries): unit tests, no network.
+//   - Pure functions (select_write_peers ranking, the poll merge `PollSeen`): unit tests,
+//     no network.
 //   - Integration scenarios (publish, poll, dr_walk): inject MockSender to stub network.
 //     No real SwarmHandle needed — all I/O goes through the MailboxNetworkSender trait.
 //
@@ -12,9 +13,8 @@
 //
 // Additional unit tests:
 //   select_write_peers_orders_by_combined_trust_times_avail_ewma
-//   dedup_entries_keeps_highest_stored_at
-//   dedup_entries_single_entry_unchanged
-//   dedup_entries_empty_is_empty
+//   merge_* / forged_record_with_honest_msg_id_does_not_hide_the_honest_one (mailbox-i69),
+//   on `PollSeen` (the poll's one merge rule)
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -35,7 +35,7 @@ use viaticum_core::types::{
     DeviceId, IdentityPub, PeerRecord, SourceBlockId, Timestamp, ewma_contact_observed,
 };
 
-use super::{MailboxNetworkSender, MailboxRouter, PublishOutcome, PublishVerdict, dedup_entries};
+use super::{MailboxNetworkSender, MailboxRouter, PollSeen, PublishOutcome, PublishVerdict};
 use crate::daemon::network::swarm::device_id_to_peer_id;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
@@ -217,45 +217,82 @@ fn build_router_with_peers(n: usize, sender: Arc<MockSender>) -> (MailboxRouter,
 // Pure unit tests
 // ============================================================
 
+/// `make_entry` sets `expires_at` from `stored_at` + the class TTL; every entry below is
+/// live at this moment.
+const MERGE_NOW: u64 = 1;
+
+fn with_payload(mut e: MailboxEntry, payload: &[u8]) -> MailboxEntry {
+    e.payload = payload.to_vec();
+    e
+}
+
+/// The postmen's answers of one poll, in arrival order, merged as `poll_once` merges
+/// them (`PollSeen`): what reaches the handlers.
+fn merge_poll_answers(answers: Vec<Vec<MailboxEntry>>, now_secs: u64) -> Vec<MailboxEntry> {
+    let mut seen = PollSeen::new(now_secs);
+    answers
+        .into_iter()
+        .flat_map(|answer| seen.admit(answer))
+        .collect()
+}
+
+/// Drain one whole poll of `target` through `PollSeen` (what `poll_once` reads, without
+/// its deadline).
+async fn poll_all(
+    router: &MailboxRouter,
+    target: &MailboxAddress,
+    proof: Option<[u8; 64]>,
+) -> Vec<MailboxEntry> {
+    let mut rx = router.poll_stream(target, proof, None);
+    let mut seen = PollSeen::new(Timestamp::now().0);
+    let mut out = vec![];
+    while let Some((_, answer)) = rx.recv().await {
+        out.extend(seen.admit(answer));
+    }
+    out
+}
+
 #[test]
-fn dedup_entries_keeps_highest_stored_at() {
+fn merge_keeps_one_record_of_identical_bytes_whatever_the_stored_at() {
     let target = make_identity(1);
     let msg_id = make_msg_id(1);
+    let older = make_entry(target, msg_id, 1000, MailboxClass::PosChallenge);
+    let newer = make_entry(target, msg_id, 2000, MailboxClass::PosChallenge);
+    assert_eq!(older.payload, newer.payload);
 
-    // Same msg_id, different stored_at.
-    let older = {
-        let mut e = make_entry(target, msg_id, 1000, MailboxClass::PosChallenge);
-        e.stored_at = 1000;
-        e
-    };
-    let newer = {
-        let mut e = make_entry(target, msg_id, 2000, MailboxClass::PosChallenge);
-        e.stored_at = 2000;
-        e
-    };
-
-    let deduped = dedup_entries(vec![older, newer]);
-    assert_eq!(deduped.len(), 1);
-    assert_eq!(deduped[0].stored_at, 2000, "must keep highest stored_at");
+    let merged = merge_poll_answers(vec![vec![older], vec![newer]], MERGE_NOW);
+    assert_eq!(
+        merged.len(),
+        1,
+        "same bytes from two postmen are one record"
+    );
+    assert_eq!(
+        merged[0].stored_at, 1000,
+        "the first copy to arrive is handled"
+    );
 }
 
 #[test]
-fn dedup_entries_single_entry_unchanged() {
-    let target = make_identity(2);
-    let entry = make_entry(target, make_msg_id(2), 1000, MailboxClass::PosChallenge);
-    let deduped = dedup_entries(vec![entry.clone()]);
-    assert_eq!(deduped.len(), 1);
-    assert_eq!(deduped[0].msg_id, entry.msg_id);
+fn merge_single_entry_unchanged() {
+    let entry = make_entry(
+        make_identity(2),
+        make_msg_id(2),
+        1000,
+        MailboxClass::PosChallenge,
+    );
+    let merged = merge_poll_answers(vec![vec![entry.clone()]], MERGE_NOW);
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].msg_id, entry.msg_id);
 }
 
 #[test]
-fn dedup_entries_empty_is_empty() {
-    let deduped = dedup_entries(vec![]);
-    assert!(deduped.is_empty());
+fn merge_of_no_answers_is_empty() {
+    assert!(merge_poll_answers(vec![], MERGE_NOW).is_empty());
+    assert!(merge_poll_answers(vec![vec![], vec![]], MERGE_NOW).is_empty());
 }
 
 #[test]
-fn dedup_entries_distinct_msg_ids_all_kept() {
+fn merge_keeps_all_distinct_msg_ids() {
     let target = make_identity(3);
     let entries: Vec<_> = (0..5u8)
         .map(|i| {
@@ -267,8 +304,100 @@ fn dedup_entries_distinct_msg_ids_all_kept() {
             )
         })
         .collect();
-    let deduped = dedup_entries(entries);
-    assert_eq!(deduped.len(), 5, "all distinct msg_ids must be kept");
+    assert_eq!(merge_poll_answers(vec![entries], MERGE_NOW).len(), 5);
+}
+
+/// mailbox-i69: a postman's forgery under the honest msg_id, stored later, does not
+/// replace the honest record from another postman — both reach the handlers.
+#[test]
+fn forged_record_with_honest_msg_id_does_not_hide_the_honest_one() {
+    let target = make_identity(4);
+    let msg_id = make_msg_id(4);
+    let honest = with_payload(
+        make_entry(target, msg_id, 1000, MailboxClass::PosResponse),
+        b"honest signed response",
+    );
+    let forged = with_payload(
+        make_entry(target, msg_id, 9000, MailboxClass::PosResponse),
+        b"forged response",
+    );
+
+    let merged = merge_poll_answers(vec![vec![honest.clone()], vec![forged.clone()]], MERGE_NOW);
+    assert_eq!(merged.len(), 2, "both variants go to the handlers");
+    assert!(merged.iter().any(|e| e.payload == honest.payload));
+    assert!(merged.iter().any(|e| e.payload == forged.payload));
+}
+
+/// mailbox-i69 (review B1): a postman stores per (msg_id, class), so a forgery of
+/// another class under the honest msg_id, with a later stored_at, sits in the SAME
+/// honest postman's answer — it must not displace the honest record there.
+#[test]
+fn forgery_of_another_class_in_the_same_answer_does_not_hide_the_honest_one() {
+    let target = make_identity(5);
+    let msg_id = make_msg_id(5);
+    let honest = with_payload(
+        make_entry(target, msg_id, 1000, MailboxClass::PosResponse),
+        b"honest signed response",
+    );
+    let forged = with_payload(
+        make_entry(target, msg_id, 9000, MailboxClass::Generic),
+        b"junk",
+    );
+
+    let merged = merge_poll_answers(vec![vec![honest.clone(), forged]], MERGE_NOW);
+    assert!(
+        merged
+            .iter()
+            .any(|e| e.class == MailboxClass::PosResponse && e.payload == honest.payload),
+        "the honest PosResponse must reach the handlers"
+    );
+}
+
+/// Every distinct variant a postman returns reaches the handlers; nothing is decided
+/// by the postman's own ordering.
+#[test]
+fn every_distinct_variant_in_one_answer_is_kept() {
+    let target = make_identity(8);
+    let msg_id = make_msg_id(8);
+    let answer: Vec<_> = (0..10u8)
+        .map(|i| {
+            with_payload(
+                make_entry(target, msg_id, 1000 + i as u64, MailboxClass::PosResponse),
+                &[i; 8],
+            )
+        })
+        .collect();
+    assert_eq!(merge_poll_answers(vec![answer], MERGE_NOW).len(), 10);
+}
+
+#[test]
+fn same_msg_id_in_another_class_is_another_record() {
+    let target = make_identity(6);
+    let msg_id = make_msg_id(6);
+    let a = with_payload(
+        make_entry(target, msg_id, 1000, MailboxClass::PosChallenge),
+        b"x",
+    );
+    let b = with_payload(
+        make_entry(target, msg_id, 1000, MailboxClass::DropNotice),
+        b"x",
+    );
+    assert_eq!(
+        merge_poll_answers(vec![vec![a], vec![b]], MERGE_NOW).len(),
+        2
+    );
+}
+
+#[test]
+fn merge_drops_expired_records() {
+    let mut e = make_entry(
+        make_identity(7),
+        make_msg_id(7),
+        1000,
+        MailboxClass::PosChallenge,
+    );
+    e.expires_at = 500;
+    assert!(merge_poll_answers(vec![vec![e]], 500).is_empty());
 }
 
 #[test]
@@ -459,10 +588,7 @@ async fn poll_returns_deduplicated_entries_from_read_fanout() {
     let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
     let router = MailboxRouter::with_sender(sender, db);
 
-    let entries = router
-        .poll(&MailboxAddress::for_master(&my_master), None, None)
-        .await
-        .unwrap();
+    let entries = poll_all(&router, &MailboxAddress::for_master(&my_master), None).await;
 
     assert_eq!(
         entries.len(),
@@ -530,10 +656,7 @@ async fn poll_records_avail_on_successful_fetch() {
     let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
     let router = MailboxRouter::with_sender(sender, db.clone());
 
-    let _entries = router
-        .poll(&MailboxAddress::for_master(&my_master), None, None)
-        .await
-        .unwrap();
+    let _entries = poll_all(&router, &MailboxAddress::for_master(&my_master), None).await;
 
     // Check avail_ewma was updated.
     let updated = db.get_peer(&device_id).unwrap().unwrap();
@@ -549,7 +672,7 @@ async fn poll_records_avail_on_successful_fetch() {
 
 #[tokio::test]
 async fn poll_filters_expired_entries_from_response() {
-    // poll() must drop entries where expires_at <= now_secs, even when the postman
+    // The poll must drop entries where expires_at <= now_secs, even when the postman
     // returns them (defensive against clock skew).
     //
     // Setup: one peer returns two entries — one expired (expires_at in the past),
@@ -590,10 +713,7 @@ async fn poll_filters_expired_entries_from_response() {
     let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
     let router = MailboxRouter::with_sender(sender, db);
 
-    let entries = router
-        .poll(&MailboxAddress::for_master(&my_master), None, None)
-        .await
-        .unwrap();
+    let entries = poll_all(&router, &MailboxAddress::for_master(&my_master), None).await;
 
     assert_eq!(
         entries.len(),
@@ -673,8 +793,7 @@ async fn contact_on_ack_refreshes_last_seen() {
 }
 
 /// dr-i50 / pos-i8: a postman's answer to our poll's fetch is a contact too — its
-/// `last_seen` moves to now inside `MailboxRouter::poll`, before the entries are
-/// returned, whatever the poll loop then does with them (the PoS memory of pos-i5
+/// `last_seen` moves to now in the fetch task, before the entries are handed over, whatever the poll loop then does with them (the PoS memory of pos-i5
 /// skips most of them).
 #[tokio::test]
 async fn poll_fetch_contact_refreshes_last_seen() {
@@ -698,10 +817,7 @@ async fn poll_fetch_contact_refreshes_last_seen() {
     let sender = Arc::new(MockSender::new().with_fetch_responses(responses));
     let router = MailboxRouter::with_sender(sender, db.clone());
 
-    let entries = router
-        .poll(&MailboxAddress::for_master(&my_master), None, None)
-        .await
-        .unwrap();
+    let entries = poll_all(&router, &MailboxAddress::for_master(&my_master), None).await;
 
     assert_eq!(entries.len(), 1);
     assert!(
@@ -1185,6 +1301,29 @@ fn publish_verdict_mixed_refusal() {
     );
 }
 
+/// mailbox-i61: "expired in transit" is no clock verdict — all of them is `NoAck`,
+/// among other refusals it counts as `other`; `RefusalKind` is not extended.
+#[test]
+fn publish_verdict_expired_is_no_ack_or_other_never_clock() {
+    use MailboxRejectReason::{ClockSkew, Expired};
+    let all = outcome(0, &[Expired, Expired], 1);
+    assert_eq!(all.verdict(), PublishVerdict::NoAck);
+    assert!(all.all_expired());
+    let mixed = outcome(0, &[Expired, ClockSkew], 0);
+    assert_eq!(
+        mixed.verdict(),
+        PublishVerdict::MixedRefusal {
+            clock: 1,
+            superseded: 0,
+            slots_full: 0,
+            other: 1
+        }
+    );
+    assert!(!mixed.all_expired());
+    assert!(!outcome(1, &[Expired], 0).all_expired(), "an ack stores it");
+    assert!(!outcome(0, &[], 2).all_expired(), "nobody answered");
+}
+
 #[test]
 fn publish_verdict_one_reject_among_acks_is_stored() {
     assert_eq!(
@@ -1349,14 +1488,14 @@ async fn rendezvous_poll_through_real_postmen_needs_proof_and_returns_only_point
         );
     }
 
-    let without = router.poll(&rv.address, None, None).await.unwrap();
+    let without = poll_all(&router, &rv.address, None).await;
     assert!(
         without.is_empty(),
         "no proof, not the master of the box: nothing"
     );
 
     let proof = rv.fetch_proof(&requester_device);
-    let with = router.poll(&rv.address, Some(proof), None).await.unwrap();
+    let with = poll_all(&router, &rv.address, Some(proof)).await;
     assert_eq!(
         with.len(),
         1,

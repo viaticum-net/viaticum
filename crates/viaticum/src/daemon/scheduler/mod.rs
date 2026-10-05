@@ -38,6 +38,9 @@ use crate::daemon::mailbox::routing::MailboxRouter;
 use crate::daemon::repair::RepairTrigger;
 
 mod issue;
+// Public only for the allocation-peak test binary `tests/block_prep_alloc_peak.rs`.
+#[doc(hidden)]
+pub use issue::fold::{FoldHolder, hash_holders};
 mod pending;
 #[cfg(test)]
 mod tests;
@@ -119,7 +122,34 @@ pub struct Scheduler {
     /// block whose source outgrew the size limit fails every tick; the log must not.
     /// Shared with the preparation task, which runs on the blocking pool.
     pos_load_warned: Arc<std::sync::Mutex<HashMap<SourceBlockId, std::time::Instant>>>,
+    /// When the WARN "holder master unknown" was last written per (holder, "pos" | "delete")
+    /// (dr-i8): once per PoS period, not on every tick.
+    master_warned: std::sync::Mutex<HashMap<(DeviceId, &'static str), std::time::Instant>>,
+    /// The block work memory budget (backup-i24): PoS preparations take their permits from it.
+    /// The daemon sets the real one (`set_mem_budget`); the default is effectively unbounded.
+    mem_budget: Arc<crate::daemon::mem_budget::MemBudget>,
+    /// Number of the last issue tick (pos-i13): +1 at the start of every tick.
+    issue_seq: std::sync::atomic::AtomicU64,
+    /// The tick on which each block was first deferred by the memory budget (pos-i13, J11): from
+    /// the next tick it waits for memory as an overdue preparation. In RAM only.
+    mem_deferred_at: std::sync::Mutex<HashMap<SourceBlockId, u64>>,
+    /// Until when a block whose last load failed stays out of the overdue queue (NOTE 7,
+    /// backup-i7): such a block is tried only through `try_acquire`. Shared with the
+    /// preparation task, which sets and clears it on the blocking pool.
+    load_failed: Arc<std::sync::Mutex<HashMap<SourceBlockId, std::time::Instant>>>,
+    /// The clock of the batch of overdue PoS checks (its work limit and hard stop, spec v3.7a):
+    /// the real one, replaced in tests.
+    batch_clock: BatchClock,
+    /// Runs before a holder's master is looked up in a preparation (tests: no permit is held).
+    #[cfg(test)]
+    master_lookup_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs at the start of a batch member's sources check (tests: a hung `metadata`).
+    #[cfg(test)]
+    precheck_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
+
+/// A source of "now" for the batch of overdue PoS checks.
+pub(crate) type BatchClock = Arc<dyn Fn() -> std::time::Instant + Send + Sync>;
 
 impl Scheduler {
     /// Create a new Scheduler.
@@ -152,7 +182,29 @@ impl Scheduler {
             last_attempted: std::sync::Mutex::new(HashMap::new()),
             rebuild_scope: Default::default(),
             pos_load_warned: Arc::default(),
+            master_warned: std::sync::Mutex::new(HashMap::new()),
+            mem_budget: crate::daemon::mem_budget::MemBudget::new(1 << 50),
+            issue_seq: std::sync::atomic::AtomicU64::new(0),
+            mem_deferred_at: std::sync::Mutex::new(HashMap::new()),
+            load_failed: Arc::default(),
+            batch_clock: Arc::new(std::time::Instant::now),
+            #[cfg(test)]
+            master_lookup_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            precheck_hook: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Replace the clock of the batch of overdue PoS checks (tests).
+    #[cfg(test)]
+    pub(crate) fn set_batch_clock(&mut self, clock: BatchClock) {
+        self.batch_clock = clock;
+    }
+
+    /// Set the block work memory budget the PoS preparations share with the worker and restore
+    /// (backup-i24). Without it a preparation runs under a budget nobody else uses.
+    pub fn set_mem_budget(&mut self, budget: Arc<crate::daemon::mem_budget::MemBudget>) {
+        self.mem_budget = budget;
     }
 
     /// Set whose records the PoS rebuild reads and where gone paths go (К2b).
@@ -467,6 +519,13 @@ impl Scheduler {
             &pending.expected_chain_hash,
             first_esi,
         );
+        // The owner's verdict, for the E2E (bigfile_limit 3c reads it): log only.
+        debug!(
+            block_id = %block_id,
+            holder = %holder_id,
+            outcome = %if matches!(outcome, viaticum_core::pos::VerifyOutcome::Pass) { "pass" } else { "fail" },
+            "scheduler: PoS verdict"
+        );
 
         // Apply outcome to DB.
         let placement = match self.db.get_placement(&block_id, &holder_id)? {
@@ -573,6 +632,60 @@ impl Scheduler {
         }
 
         Ok(())
+    }
+
+    /// WARN that the master of `holder` is known nowhere (not in PEERS, not in
+    /// `device_to_master`), so no `kind` ("pos" | "delete") mail is sent to it; at most once
+    /// per PoS period per holder and kind (dr-i8).
+    fn warn_holder_master_unknown(&self, holder: &DeviceId, kind: &'static str) {
+        let period = Duration::from_secs(scaled_timer_secs(
+            self.config.pos_interval_secs,
+            self.config.time_scale,
+        ));
+        let loud = {
+            let mut map = self.master_warned.lock().unwrap_or_else(|p| p.into_inner());
+            issue::should_warn_every(&mut map, (*holder, kind), std::time::Instant::now(), period)
+        };
+        if loud {
+            warn!(
+                holder = %holder,
+                kind,
+                "{kind}: holder master unknown, mail to this holder not sent"
+            );
+        }
+    }
+
+    /// A db error on the holder-master lookup: one ERROR per holder and `kind` per PoS period
+    /// (the same limiter as [`Self::warn_holder_master_unknown`], its own key space), the rest
+    /// DEBUG.
+    fn error_holder_master_lookup(
+        &self,
+        holder: &DeviceId,
+        kind: &'static str,
+        err: &dyn std::fmt::Display,
+    ) {
+        let period = Duration::from_secs(scaled_timer_secs(
+            self.config.pos_interval_secs,
+            self.config.time_scale,
+        ));
+        let loud = {
+            let mut map = self.master_warned.lock().unwrap_or_else(|p| p.into_inner());
+            issue::should_warn_every(
+                &mut map,
+                (*holder, if kind == "pos" { "pos-db" } else { "delete-db" }),
+                std::time::Instant::now(),
+                period,
+            )
+        };
+        if loud {
+            error!(
+                holder = %holder,
+                kind,
+                "{kind}: holder master lookup failed, holder skipped: {err}"
+            );
+        } else {
+            debug!(holder = %holder, kind, "{kind}: holder master lookup failed again: {err}");
+        }
     }
 
     /// Trust of one holder for its challenge rate: the two-level trust (device and
@@ -773,12 +886,21 @@ impl Scheduler {
                         now,
                         &self.signing_key,
                     );
-                    let holder_master = self
-                        .db
-                        .get_master_for_device(&holder_id)
-                        .ok()
-                        .flatten()
-                        .unwrap_or(IdentityPub(holder_id.0));
+                    // dr-i8: PEERS first, device_to_master as fallback. Unknown anywhere (or a
+                    // db error): nothing is published and the placement stays as it is, the
+                    // engine emits the notice again on the next deletion tick.
+                    let holder_master = match self.db.master_for_holder(&holder_id) {
+                        Ok(Some(m)) => m,
+                        Ok(None) => {
+                            self.warn_holder_master_unknown(&holder_id, "delete");
+                            continue;
+                        }
+                        Err(e) => {
+                            // Retried on the next deletion tick; the log is rate-limited.
+                            self.error_holder_master_lookup(&holder_id, "delete", &e);
+                            continue;
+                        }
+                    };
                     let delete_payload = DeleteRequestPayload::Delete(delete_msg);
                     // Publish FIRST, then gate the per-holder state-change txn on delivery
                     // success. mailbox publish is REMOTE (unlike the relay-era guaranteed

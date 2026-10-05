@@ -607,3 +607,61 @@ fn compress_framed_and_in_place_seal_match_the_two_step_form_at_every_generation
         assert_eq!(&buf[12..], compressed.as_slice(), "unsealed back");
     }
 }
+
+/// The window of a zstd frame, from its header (RFC 8878 §3.1.1.1): the window descriptor, or the
+/// content size of a single-segment frame.
+fn frame_window_bytes(frame: &[u8]) -> u64 {
+    assert_eq!(frame[..4], [0x28, 0xB5, 0x2F, 0xFD], "a zstd frame");
+    let descriptor = frame[4];
+    let single_segment = descriptor & 0x20 != 0;
+    if single_segment {
+        return match descriptor >> 6 {
+            0 => frame[5] as u64,
+            1 => u16::from_le_bytes([frame[5], frame[6]]) as u64 + 256,
+            2 => u32::from_le_bytes(frame[5..9].try_into().unwrap()) as u64,
+            _ => u64::from_le_bytes(frame[5..13].try_into().unwrap()),
+        };
+    }
+    let window = frame[5];
+    let log = 10 + (window >> 3) as u32;
+    let base = 1u64 << log;
+    base + base / 8 * (window & 7) as u64
+}
+
+/// W4 (spec v3.9b): the frames the backup writes have `windowLog` at most 21 (a window of 2 MiB),
+/// whatever the size of the block — the restore's estimate holds `ZSTD_WINDOW_BYTES` (the window
+/// and a block of 128 KiB) for the decompression of them. Both ways to compress: `compress_block`
+/// and `compress_framed` (the nonce in front is skipped).
+#[test]
+fn backup_frames_have_window_log_at_most_21() {
+    let inputs: Vec<(&str, Vec<u8>)> = vec![
+        ("empty", vec![]),
+        ("one byte", vec![0x5a]),
+        ("100 KiB random", pseudo_random(100 << 10, 11)),
+        ("1 MiB zeros", vec![0u8; 1 << 20]),
+        ("5 MiB random", pseudo_random(5 << 20, 12)),
+        (
+            "24 MiB mixed",
+            [pseudo_random(1 << 20, 13), vec![7u8; 23 << 20]].concat(),
+        ),
+    ];
+    for (name, plaintext) in inputs {
+        let block = compress_block(&plaintext).unwrap();
+        let framed = compress_framed(&plaintext).unwrap();
+        for (how, frame) in [
+            ("compress_block", &block[..]),
+            ("compress_framed", &framed[12..]),
+        ] {
+            let window = frame_window_bytes(frame);
+            assert!(
+                window <= 1 << 21,
+                "{name}, {how}: window {window} B is above 2 MiB (windowLog 21)"
+            );
+            assert!(
+                window + 128 * 1024 <= crate::daemon::mem_budget::ZSTD_WINDOW_BYTES,
+                "{name}, {how}: the estimate holds {} B",
+                crate::daemon::mem_budget::ZSTD_WINDOW_BYTES
+            );
+        }
+    }
+}

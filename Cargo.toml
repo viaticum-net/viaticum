@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 rust-version = "1.89"
@@ -109,8 +109,11 @@ ignore = "0.4"
 # System
 libc = "0.2"
 
-# HTTP client (metrics push)
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "json"] }
+# HTTP client (CLI `--server`, metrics push). rustls WITHOUT reqwest's default
+# provider (aws-lc-rs, a second C crypto library next to `ring`; R3 Р-4′: no
+# `aws-lc-sys` in the release); `viaticum::http_client` installs `ring` first.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "blocking", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 # HTTP server (web API)
 axum = "0.8"
@@ -134,3 +137,12 @@ opt-level = 2
 
 [profile.dev.package.viaticum-sim]
 opt-level = 3
+
+# raptorq's debug assertions make its encoding-plan generation cubic in K (K = 1024: 9 s,
+# K = 2048: 35-70 s; release: 4 ms at 1024). The plan tests of R1-d-b (K = 4096, 16384) need it
+# as fast as in production. Only raptorq's `debug_assert!`s go: its `assert!`s stay (among them
+# K <= 56 403 in `systematic_constants.rs`, A1), and our own `check_source_symbol_limit` refuses
+# such a K before raptorq is called, so the guard does not depend on them.
+[profile.dev.package.raptorq]
+opt-level = 3
+debug-assertions = false

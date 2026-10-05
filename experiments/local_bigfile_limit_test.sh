@@ -3,7 +3,7 @@
 # Local processes on one machine (no Docker).
 #
 # Scenario:     5 nodes, independent masters, star on node-00, time_scale 20000. node-00 (owner)
-#               runs with max_file_size_mb = 256 (PHASE b: a 2 GiB block-work budget via test env,
+#               runs with max_file_size_mb = 256 (PHASE b: a 1792 MiB block-work budget via test env,
 #               glibc mmap threshold 64 KiB on all nodes). PHASE a: a sparse 4 GiB file, normal
 #               files, a protected file in an importance-0 folder that grows over and shrinks
 #               under the limit, a limit raise across a restart with a marked file removed while
@@ -37,9 +37,13 @@
 #               after a fresh GB answer, a PoS of another block in flight is not excluded.
 # Steps:        private/beta-planning/tasks/r1_bigfile_refusal.md §0.3
 #
-# Implemented here: PHASE=a (R1-d-a: steps 0a, 1, 1b, 2a, 4, 5, 6, 7, 8, 9). The steps of
-# PHASE b (0b, 2b, 3, 3b, 3c) are stubs that print a NOTE ("R1-d-b, not implemented yet"):
-# they never FAIL. PHASE=all currently = a + the stubs.
+# Implemented here: PHASE=a (R1-d-a: steps 0a, 1, 1b, 2a, 4, 5, 6, 7, 8, 9) and PHASE=b (R1-d-b,
+# K-b6, spec v3.11 + v3.11a: 0 (anchors in the binary), 0b, 2b-before, 3, 2b, 3b, 3c, 9).
+# PHASE=all = a's steps 0a..2a, then b's 2b/3/3b/3c (step 3 is only printed, never judged: the
+# blocks of PHASE a dirty its window), then a's steps 4..8, then 9.
+# STOP_AFTER=<0b|3|2b|3b|3c> (PHASE b / all): end the run after that step (mutation runs); the
+# whole-log checks and the shutdown still run.
+# PHASE b order: 0, 0b, 2b-before (doc.txt), 3 (near.bin, fresh process), 2b (r.bin), 3b, 3c, 9.
 #
 # Verdicts:     PASS / ROUGH / FAIL; exit 0 / 3 / 1. tmpfs dir ($T) is removed on PASS only.
 #
@@ -54,6 +58,11 @@ case "$PHASE" in
     a | b | all) ;;
     *) echo "ERROR: PHASE must be a, b or all (got '$PHASE')"; exit 2 ;;
 esac
+case "${STOP_AFTER:-}" in
+    "" | 0b | 3 | 2b | 3b | 3c) ;;
+    *) echo "ERROR: STOP_AFTER must be 0b, 3, 2b, 3b or 3c (got '$STOP_AFTER')"; exit 2 ;;
+esac
+if [ -n "${STOP_AFTER:-}" ] && [ "$PHASE" = a ]; then echo "ERROR: STOP_AFTER needs PHASE b or all"; exit 2; fi
 run_a() { [ "$PHASE" = a ] || [ "$PHASE" = all ]; }
 run_b() { [ "$PHASE" = b ] || [ "$PHASE" = all ]; }
 
@@ -79,7 +88,6 @@ pass() { echo "  PASS: $1"; ((PASS++)) || true; }
 fail() { echo "  FAIL: $1"; ((FAIL++)) || true; }
 rough() { echo "  ROUGH: $1"; ((ROUGH++)) || true; }
 note() { echo "  NOTE: $1"; }
-stub_b() { run_b && note "R1-d-b, not implemented yet: $1" || true; }
 
 node_dir() { echo "$T/node-$(printf '%02d' "$1")"; }
 node_log() { echo "$(node_dir "$1")/daemon.log"; }
@@ -118,15 +126,17 @@ declare -A DPID
 # VmHWM measures the work (step 3, PHASE b). Harmless in PHASE a.
 # node-00: debug for the backup / scheduler / restore modules (the refusal, the mark and the
 # source rebuild lines). Holders: the PoS answer line is DEBUG (processor/pos.rs).
-# PHASE b adds the block-work budget of 2 GiB via the test-only env.
+# PHASE b adds the block-work budget of 1792 MiB via the test-only env (v3.11 §1) and the
+# mem_budget / work_pipeline DEBUG lines on node-00. All nodes: VIATICUM_TEST_MACHINE_LOCK_DIR
+# (exported by e2e_lib.sh).
 start_node() {
     local i="$1" dir; dir=$(node_dir "$i")
     local bw=()
-    if run_b; then bw=(VIATICUM_TEST_BLOCK_WORK_BUDGET_MB=2048); fi
+    if run_b; then bw=(VIATICUM_TEST_BLOCK_WORK_BUDGET_MB=1792); fi
     if [ "$i" -eq 0 ]; then
         # node-00's folders come from config.toml ([[watch]] files/ and bulk/).
         env MALLOC_MMAP_THRESHOLD_=65536 "${bw[@]}" \
-            RUST_LOG=info,viaticum::daemon::backup=debug,viaticum::daemon::scheduler=debug,viaticum::daemon::restore=debug \
+            RUST_LOG=info,viaticum::daemon::backup=debug,viaticum::daemon::scheduler=debug,viaticum::daemon::restore=debug,viaticum::daemon::mem_budget=debug,viaticum::daemon::work_pipeline=debug \
             "$BINARY" --data-dir "$dir" daemon --time-scale "$TIME_SCALE" \
             >> "$(node_log "$i")" 2>&1 &
     else
@@ -170,6 +180,41 @@ if [ ! -x "$BINARY" ] && ! command -v "$BINARY" &>/dev/null; then
     exit 1
 fi
 BINARY="$(realpath "$(command -v "$BINARY" || echo "$BINARY")")"
+
+# ── Step 0 (b): the log anchors must exist in the binary (v3.11a WARN-1) ─────────────────────
+# A text that does not match shows here, not as "gate not exercised" ten minutes later. Format
+# strings with {…} are checked in pieces (before and after the substitution).
+if run_b; then
+    ANCHORS=(
+        "memory: block work budget set by " " (test only)"
+        "mem_budget: granted" "mem_budget: released" "mem_budget: released (shrunk)"
+        "mem_budget: written off a stuck holder"
+        "pos: block deferred, memory budget busy" "pos: blocks marked, memory queue busy"
+        "scheduler: marked blocks now wait for memory as a batch"
+        "pos: overdue batch waiting for memory" "pos: overdue batch ended early"
+        "half a period of work" "nine tenths of the period" "a restore does not fit beside it"
+        "pos: a batch member panicked" "scheduler: PoS late preparation published"
+        "scheduler: PoS preparation still running" "scheduler: PoS verdict"
+        "work_pipeline: encoded raw symbols" "work_pipeline: chunk sent"
+        "work_pipeline: yielding memory to overdue PoS" "work_pipeline: yielding memory to restore"
+        "work_pipeline: symbols confirmed stored, placement Offered→Alive"
+        "work_pipeline: iteration complete"
+        "work_pipeline: paused while a restore job runs or a DR session leases memory"
+        "restore: waiting for memory budget" "restore: regrant for plaintext"
+        "processor: PosHashChallenge — responding with chain hash"
+        "processor: sending RestoreResponse"
+    )
+    MISSING=""
+    for a in "${ANCHORS[@]}"; do
+        grep -aqF -- "$a" "$BINARY" || MISSING="$MISSING [$a]"
+    done
+    if [ -n "$MISSING" ]; then
+        fail "anchor missing:$MISSING"
+        echo "  (the log text the scenario reads is not in $BINARY: fix the scenario or the build)"
+        exit 1
+    fi
+    echo "  anchors: all ${#ANCHORS[@]} log texts are in the binary"
+fi
 
 # Log times are read from the logs' own RFC 3339 stamps: T_BASE = 0 -> unix seconds.
 T_BASE=0
@@ -315,11 +360,619 @@ write_config() {
             echo "source_block_size_mb = $PACK_MB_0"
             echo '[[watch]]'
             echo "path = \"$FILES\""
+            # PHASE b: a *.bin file is class Unknown (importance 0.05, target reliability 0.708,
+            # R = 4/3 over 4 holders). The spec's dials assume R = 4 (a holder carries about k
+            # symbols; v3.3, v3.11 §1): the multiplier 20 lifts importance to 1.0 (target 0.99999).
+            run_b && echo 'importance_multiplier = 20.0'
             echo '[[watch]]'
             echo "path = \"$BULK\""
             echo 'importance_multiplier = 0.0'   # importance 0 -> reliability target 0.5
         fi
     } > "$(node_dir "$i")/config.toml"
+}
+
+# ── PHASE b: helpers ─────────────────────────────────────────────
+# (K-b6, spec v3.11 / v3.11a: private/beta-planning/tasks/r1_bigfile_refusal.md)
+
+BUDGET_MB_0=1792               # node-00's block work budget via the test env (v3.11 §1)
+NEAR_MB=240; RB_MB=200; B2_MB=200
+SYMBOL_BYTES=65535             # T (SYMBOL_SIZE): E = k * T
+STOPPED=0
+PROC_BOUNDS=""                 # log line counts at which node-00 was restarted (a new process starts)
+
+# stop_after STEP: true (and STOPPED=1) when STOP_AFTER names this step; the caller returns.
+stop_after() {
+    [ "${STOP_AFTER:-}" = "$1" ] || return 1
+    STOPPED=1; note "STOP_AFTER=$1: the run ends after step $1 (shutdown and the whole-log checks still run)"
+    return 0
+}
+
+# clog IDX [FROM [TO]]: node IDX's log lines FROM..TO (1-based, inclusive), ANSI colours stripped.
+clog() {
+    local f; f=$(node_log "$1")
+    [ -f "$f" ] || return 0
+    sed 's/\x1b\[[0-9;]*m//g' "$f" | sed -n "${2:-1},${3:-\$}p"
+}
+
+# ev IDX FROM PATTERN KEY...: "<t> <n> <KEY values...>" for the lines of node IDX's log (from line
+# FROM on) that contain PATTERN (`events`: t = unix seconds of the log's own stamp).
+ev() {
+    local idx="$1" from="$2" pat="$3"; shift 3
+    events <(clog "$idx" "$from" | grep -aF -- "$pat" || true) "$pat" "$@"
+}
+
+# ids of the node as the logs print them (first 16 hex of the device id).
+dev_id() { api_get "$1" /api/status | jq -r '.device_id // empty' 2>/dev/null || true; }
+
+# held_trace IDX FROM TO: replays the mem_budget grants/releases of the log lines FROM..TO.
+# Prints "max=<peak sum of held bytes> end=<space-separated kind|block still held at TO>".
+held_trace() {
+    clog "$1" "$2" "$3" | awk '
+        function kv(name,   s) {
+            if (match($0, "[ ]" name "=[^ ]+")) { s = substr($0, RSTART + 2 + length(name), RLENGTH - 2 - length(name)); return s }
+            return ""
+        }
+        /mem_budget: granted/ { k = kv("kind") "|" kv("block"); n = kv("bytes") + 0; cnt[k]++; sum += n; if (sum > max) max = sum }
+        /mem_budget: released kind=/ || /mem_budget: released \(written off\)/ {
+            k = kv("kind") "|" kv("block"); n = kv("bytes") + 0; cnt[k]--; sum -= n }
+        /mem_budget: released \(shrunk\)/ { sum -= kv("bytes") + 0 }
+        END { out = ""; for (k in cnt) if (cnt[k] > 0) out = out " " k; printf "max=%d end=%s\n", max, out }'
+}
+
+# foreign_granted_bytes IDX FROM TO BLOCK16: bytes of the grants in the log lines FROM..TO that are
+# not the worker's grants for BLOCK16.
+foreign_granted_bytes() {
+    clog "$1" "$2" "$3" | grep -aF "mem_budget: granted" | awk -v nb="$4" '
+        function kv(name) { if (match($0, "[ ]" name "=[^ ]+")) return substr($0, RSTART + 2 + length(name), RLENGTH - 2 - length(name)); return "" }
+        !(kv("kind") == "worker" && kv("block") == nb) { s += kv("bytes") + 0 }
+        END { printf "%d\n", s }'
+}
+
+# holder_answers HEX16 FROM TO: PoS answers for HEX16 by node-01/02 with a log time in [FROM, TO].
+holder_answers() {
+    local n=0 i c
+    for i in 1 2; do
+        c=$(events "$(node_log "$i")" "responding with chain hash" block_id \
+            | awk -v a="$2" -v b="$3" -v h="$1" '$1 >= a && $1 <= b && $3 == h' | wc -l)
+        n=$((n + c))
+    done
+    echo "$n"
+}
+
+fnum() { awk -v x="$1" 'BEGIN { printf "%.2f", x }'; }
+fle()  { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a <= b) }'; }   # a <= b (floats)
+now_f() { date +%s.%N | cut -c1-14; }
+
+# Step-3 verdicts are notes in PHASE=all (the blocks of PHASE a dirty the window, v3.3 B3).
+s3_pass()  { if [ "$PHASE" = all ]; then note "step 3 (PHASE=all, not judged) would PASS: $1"; else pass "$1"; fi; }
+s3_rough() { if [ "$PHASE" = all ]; then note "step 3 (PHASE=all, not judged) would be ROUGH: $1"; else rough "$1"; fi; }
+s3_fail()  { if [ "$PHASE" = all ]; then note "step 3 (PHASE=all, not judged) would FAIL: $1"; else fail "$1"; fi; }
+
+# restart_node0: SIGTERM node-00 (exit 0), start a fresh process, wait for 4 authenticated peers.
+# Sets RS_L0 = the log line count before the new process.
+restart_node0() {
+    kill -TERM "${DPID[0]}"
+    if wait_pid_exit "${DPID[0]}" 60 && [ "$EXIT_RC" = 0 ]; then pass "node-00 stopped with exit 0 (fresh process for the measurement)"
+    else fail "node-00 did not exit 0 within 60s (rc=${EXIT_RC:-running})"; fi
+    unset "DPID[0]"
+    RS_L0=$(log_line_count 0)
+    PROC_BOUNDS="$PROC_BOUNDS $RS_L0"
+    start_node 0
+    wait_daemon 0 || { fail "node-00 did not come back after the restart"; exit 1; }
+    wait_auth_peers 0 $((NUM_NODES-1)) 90 \
+        || { fail "after the restart only $(status_num 0 peer_count_authenticated)/$((NUM_NODES-1)) authenticated peers after 90s"; exit 1; }
+}
+
+# s3_attempt NAME: step 3 on a fresh process with the file NAME. Sets S3_* (see the end).
+s3_attempt() {
+    local name="$1" path="$FILES/$1" Lreset Lend found="" end_t line ob fb
+    restart_node0
+    S3_L0=$RS_L0
+    hwm_reset "${DPID[0]}" || { fail "setup: VmHWM reset failed"; exit 1; }
+    S3_RSS0=$HWM_RSS0_KB
+    Lreset=$(log_line_count 0)
+    make_random "$path" $((NEAR_MB * MIB))
+    end_t=$(( $(date +%s) + 420 ))
+    while [ "$(date +%s)" -lt "$end_t" ]; do
+        found=$(tail -n +$((Lreset + 1)) "$(node_log 0)" | grep -aF -m1 "work_pipeline: encoded raw symbols" || true)
+        [ -n "$found" ] && break
+        sleep 0.2
+    done
+    # The end of the window is THIS read, not the line ("released (shrunk)" is printed before it).
+    S3_HWM=$(hwm_kb "${DPID[0]}"); S3_RSS=$(rss_kb "${DPID[0]}")
+    Lend=$(log_line_count 0)
+    if [ -z "$found" ]; then
+        S3_OK=0; fail "step 3: no 'work_pipeline: encoded raw symbols' for $name within 420s"; return 0
+    fi
+    S3_OK=1
+    line=$(sed 's/\x1b\[[0-9;]*m//g' <<< "$found")
+    S3_NB=$(grep -oE 'block_id=[0-9a-f]+' <<< "$line" | head -1 | cut -d= -f2)
+    S3_N=$(log_field "$line" symbols)
+    S3_NAME=$name
+    # k from the version: size_bytes = k * T.
+    local sz=0
+    for _ in $(seq 1 60); do
+        sz=$(api_get 0 "/api/versions?path=$(urlencode "$path")" | jq -r '.[-1].size_bytes // 0' 2>/dev/null || echo 0)
+        [ "${sz:-0}" -gt 0 ] && break
+        sleep 1
+    done
+    S3_K=$(( ${sz:-0} / SYMBOL_BYTES ))
+    # t_encode: granted kind=worker block=NB -> encoded raw symbols block_id=NB.
+    local tg te
+    tg=$(ev 0 $((Lreset + 1)) "mem_budget: granted" kind block | awk -v nb="$S3_NB" '$3 == "worker" && $4 == nb { if (!_d++) print $1 }')
+    te=$(ev 0 $((Lreset + 1)) "work_pipeline: encoded raw symbols" block_id | awk -v nb="$S3_NB" '$3 == nb { if (!_d++) print $1 }')
+    S3_TENC=""
+    [ -n "$tg" ] && [ -n "$te" ] && S3_TENC=$(awk -v a="$tg" -v b="$te" 'BEGIN { printf "%.1f", b - a }')
+    # Cleanliness (a): every grant paired with a release at the reset; (b): foreign grants <= 16 MiB.
+    local ht; ht=$(held_trace 0 $((S3_L0 + 1)) "$Lreset")
+    S3_OPEN=$(sed 's/^max=[0-9]* end=//' <<< "$ht")
+    fb=$(foreign_granted_bytes 0 $((Lreset + 1)) "$Lend" "$S3_NB")
+    S3_FOREIGN=$fb
+    S3_DIRTY=0
+    if [ -n "${S3_OPEN// /}" ] || [ "$fb" -gt $((16 * MIB)) ]; then S3_DIRTY=1; fi
+    S3_DIRTY_WHY="grants open at the reset: [${S3_OPEN# }]; foreign grants in the window: $((fb / MIB)) MiB (limit 16)"
+    S3_L_END=$Lend
+}
+
+# step3: the peak of the worker on a fresh process (spec v3.11 §2 "3").
+step3() {
+    echo ""
+    echo "=== Step 3: worker peak of a $NEAR_MB MiB block on a fresh process ==="
+    [ "$PHASE" = all ] && note "PHASE=all: step 3 is measured and printed, never judged (the blocks of PHASE a dirty the window)"
+    s3_attempt near.bin
+    if [ "$S3_OK" -eq 1 ] && [ "$S3_DIRTY" -eq 1 ]; then
+        info "step 3 is dirty ($S3_DIRTY_WHY): one repeat with a restart and near2.bin"
+        s3_attempt near2.bin
+    fi
+    if [ "$S3_OK" -ne 1 ]; then return 0; fi
+    NB=$S3_NB
+    local p r model hi lo d
+    d=$(( S3_HWM - S3_RSS0 ))
+    r=$(awk -v n="$S3_N" -v k="$S3_K" 'BEGIN { if (k > 0) printf "%.3f", n / k; else print 0 }')
+    p=$(awk -v d="$d" -v k="$S3_K" -v t="$SYMBOL_BYTES" 'BEGIN { if (k > 0) printf "%.3f", d * 1024 / (k * t); else print 0 }')
+    model=$(awk -v r="$r" 'BEGIN { printf "%.3f", 3.047 + r }')
+    info "step 3: file $S3_NAME NB=$NB k=$S3_K N=$S3_N R=$r t_encode=${S3_TENC:-?}s"
+    info "step 3: VmHWM-RSS0 = $((d / 1024)) MiB, E = $((S3_K * SYMBOL_BYTES / MIB)) MiB, p = $p; model 3.047 + R = $model (bar 3.1 + R + 1.0 = $(awk -v r="$r" 'BEGIN { printf "%.2f", 4.1 + r }'), ROUGH below 3.1 + R - 2 = $(awk -v r="$r" 'BEGIN { printf "%.2f", 1.1 + r }'))"
+    S3_P=$p; S3_R=$r
+    if [ "$S3_K" -le 0 ] || [ -z "${S3_TENC:-}" ]; then
+        fail "step 3: cannot read k ($S3_K) or t_encode (${S3_TENC:-none}) — the check would be blind"; return 0
+    fi
+    local fb_hex; fb_hex=$(file_block_hex 0 "$FILES/$S3_NAME")
+    if [ -n "$fb_hex" ] && [ "${fb_hex:0:16}" != "$NB" ]; then
+        info "step 3: the catalog block of $S3_NAME is ${fb_hex:0:16}.., the encoded block_id is $NB"
+    fi
+    if [ "$S3_DIRTY" -eq 1 ]; then
+        s3_rough "step 3 contaminated by a concurrent preparation ($S3_DIRTY_WHY), twice"
+    elif awk -v p="$p" -v r="$r" 'BEGIN { exit !(p > 3.1 + r + 1.0) }'; then
+        s3_fail "step 3: p = $p > 3.1 + R + 1.0 = $(awk -v r="$r" 'BEGIN { printf "%.2f", 4.1 + r }') (R = $r): the model is wrong; constants stay, STOP"
+        [ "$PHASE" = all ] || exit 1
+    elif awk -v p="$p" -v r="$r" 'BEGIN { exit !(p < 3.1 + r - 2) }'; then
+        s3_rough "step 3: p = $p < 3.1 + R - 2 = $(awk -v r="$r" 'BEGIN { printf "%.2f", 1.1 + r }') (R = $r): the model is much too high"
+    else
+        s3_pass "step 3: worker peak p = $p <= 3.1 + R + 1.0 (R = $r, model $model, t_encode ${S3_TENC}s)"
+    fi
+    sleep 30
+    local rss30; rss30=$(rss_kb "${DPID[0]}")
+    info "step 3: VmRSS - RSS0 after 30 s = $(( (${rss30:-0} - S3_RSS0) / 1024 )) MiB (retention)"
+}
+
+# nb_alive_on IDX...: NB is Alive (symbols confirmed stored) on every listed holder, per node-00's log.
+nb_alive_on() {
+    local i d
+    for i in "$@"; do
+        d=$(dev_id "$i"); [ -n "$d" ] || return 1
+        [ -n "$(ev 0 "${NB_L0:-1}" "work_pipeline: symbols confirmed stored" block_id holder \
+            | awk -v nb="$NB" -v d="$d" '$3 == nb && $4 == d { if (!_d++) print }')" ] || return 1
+    done
+}
+
+# step2b: r.bin 200 MiB restorable, RB on node-01/02, NB Alive on node-01/02.
+step2b() {
+    echo ""
+    echo "=== Step 2b: r.bin $RB_MB MiB (RB) restorable; NB Alive on node-01 and node-02 ==="
+    RB_FILE="$FILES/r.bin"
+    make_random "$RB_FILE" $((RB_MB * MIB))
+    if wait_file_restorable 0 "$RB_FILE" 600; then pass "r.bin restorable per node-00"
+    else fail "step 2b: r.bin not restorable per node-00 after 600s"; exit 1; fi
+    RB_HASH=$(content_hash "$RB_FILE")
+    RB=$(file_block_hex 0 "$RB_FILE"); RB16=${RB:0:16}
+    local tgt on
+    tgt=$(file_field 0 "$RB_FILE" '.effective_status.target // 0')
+    # "restorable" per node-00 comes while the layout of RB is still running (the 20261003-122334 run
+    # read 2560 < k_eff 3204 right then, and the restore passed later on the symbols that arrived
+    # after). Wait for the layout: the restore with node-03/04 frozen draws on node-01 AND node-02
+    # together, so the sum is what must reach k_eff. Not reached in 300 s: ROUGH blind, as before.
+    local rb_end=$(( $(date +%s) + 300 ))
+    while :; do
+        on=$(( $(block_symbols_on 1 "$RB") + $(block_symbols_on 2 "$RB") ))
+        { [ "${tgt:-0}" -gt 0 ] && [ "$on" -ge "$tgt" ]; } && break
+        [ "$(date +%s)" -ge "$rb_end" ] && break
+        sleep 2
+    done
+    if [ "${tgt:-0}" -gt 0 ] && [ "$on" -ge "$tgt" ]; then pass "RB ${RB16}.. has $on >= k_eff $tgt symbols on node-01 + node-02 (the two that stay alive)"
+    else rough "3b (г) blind: RB ${RB16}.. has $on symbols on node-01 + node-02, k_eff ${tgt:-?}"; fi
+    local ok=0
+    for _ in $(seq 1 300); do nb_alive_on 1 2 && { ok=1; break; }; sleep 1; done
+    if [ "$ok" -eq 1 ]; then pass "NB $NB: placements Offered→Alive on node-01 and node-02"
+    else rough "3b (в) blind: NB $NB is not Alive on both node-01 and node-02 after 300s"; fi
+    DP=$(file_block_hex 0 "$DOC"); DP16=${DP:0:16}
+    [ -n "$DP16" ] && info "DP (doc.txt pack) = $DP16, NB = $NB, RB = $RB16" \
+        || { fail "setup: doc.txt has no block (DP)"; exit 1; }
+}
+
+# restore_bg: the restore of r.bin in the background; sets RST_PID, RST_T0 (unix s), files in $T.
+restore_bg() {
+    RST_OUT="$T/restore.out"; RST_ERR="$T/restore.err"
+    : > "$RST_OUT"; : > "$RST_ERR"
+    RST_T0=$(now_f)
+    timeout 300 "$BINARY" --data-dir "$(node_dir 0)" restore "$RB_FILE" --json > "$RST_OUT" 2> "$RST_ERR" &
+    RST_PID=$!
+}
+
+# step3b: the adversarial budget run (spec v3.11 §2 "3b").
+step3b() {
+    echo ""
+    echo "=== Step 3b: ADVERSARIAL budget under load: node-03/04 stopped, r.bin removed, big2.bin delivered, restore of r.bin ==="
+    mkdir -p "$T/stash"
+    mv "$RB_FILE" "$T/stash/"
+    hwm_reset "${DPID[0]}" || { fail "setup: VmHWM reset failed"; exit 1; }
+    L3B=$(log_line_count 0); T3B=$(date +%s)
+    B2_FILE="$FILES/big2.bin"
+    make_random "$B2_FILE" $((B2_MB * MIB))
+    B2=""; RST_PID=""; T_CONT=""; RST_DONE=0
+    # v3.12c: node-03/04 are stopped only after the worker's first grant for B2 (the step checks the
+    # memory budget, not the pick order: a small block with dead holders can outrank B2, repair-i5).
+    local gend=$(( $(date +%s) + 120 ))
+    while [ "$(date +%s)" -lt "$gend" ]; do
+        B2=$(ev 0 "$((L3B + 1))" "mem_budget: granted" kind block bytes | awk -v nb="$NB" -v rb="$RB16" '$3 == "worker" && $4 != nb && $4 != rb && $5 + 0 >= 1000 * 1048576 { if (!_d++) print $4 }')
+        [ -n "$B2" ] && break
+        sleep 0.5
+    done
+    # The offer order is random: if a holder to be stopped is first, stopping right at the grant makes
+    # the first offer time out and the worker yields to PoS and never returns to B2 in the window
+    # (repair-i5 hole, v3.12c). So the stop waits for the first chunk of B2 that reached a holder.
+    if [ -n "$B2" ]; then
+        local cend=$(( $(date +%s) + 90 ))
+        while [ "$(date +%s)" -lt "$cend" ]; do
+            clog 0 "$L3B" | grep -aF "work_pipeline: chunk sent" | grep -aqF "block_id=$B2" && break
+            sleep 0.5
+        done
+    fi
+    kill -STOP "${DPID[3]}" "${DPID[4]}"
+    if [ -n "$B2" ]; then info "step 3b: worker granted for B2 = $B2, first chunk delivered; at +$(( $(date +%s) - T3B )) s node-03/04 stopped"
+    else
+        rough "3b: B2 never picked within 120 s of big2.bin (node-03/04 stopped anyway); picks in the window: $(clog 0 "$((L3B + 1))" | grep -aF 'picked block for work' | grep -ao 'block_id=[0-9a-f]*' | sort | uniq -c | tr '\n' ' ')"
+    fi
+    local now line tend restore_deadline=0
+    while :; do
+        now=$(date +%s)
+        if [ -z "$B2" ]; then
+            B2=$(ev 0 "$L3B" "mem_budget: granted" kind block bytes | awk -v nb="$NB" -v rb="$RB16" '$3 == "worker" && $4 != nb && $4 != rb && $5 + 0 >= 1000 * 1048576 { if (!_d++) print $4 }')
+        fi
+        if [ -n "$B2" ] && [ -z "$RST_PID" ]; then
+            line=$(clog 0 "$L3B" | grep -aF "work_pipeline: chunk sent" | grep -aF "block_id=$B2" | head -1 || true)
+            if [ -n "$line" ]; then
+                info "step 3b: B2 = $B2, first chunk sent at +$((now - T3B)) s: restore of r.bin starts"
+                restore_bg; restore_deadline=$((now + 300))
+            fi
+        fi
+        if [ -z "$T_CONT" ] && [ "$now" -ge $((T3B + 240)) ]; then
+            kill -CONT "${DPID[3]}" "${DPID[4]}" 2>/dev/null || true
+            T_CONT=$now
+            if [ -z "$RST_PID" ]; then
+                fail "step 3b: no 'chunk sent' for B2 (${B2:-unknown}) in 240 s: the restore starts late, the window did not hold"
+                restore_bg; restore_deadline=$((now + 300))
+            fi
+        fi
+        if [ -n "$RST_PID" ] && [ "$RST_DONE" -eq 0 ] && ! kill -0 "$RST_PID" 2>/dev/null; then
+            RST_DONE=1; wait "$RST_PID" 2>/dev/null && RST_RC=0 || RST_RC=$?
+            RST_TEND=$(now_f)
+        fi
+        # (г): the restore is awaited with its own deadline (300 s from the command), not at the window end.
+        if [ -n "$T_CONT" ] && { [ "$RST_DONE" -eq 1 ] || [ "$now" -ge "$restore_deadline" ]; }; then break; fi
+        sleep 1
+    done
+    if [ "$RST_DONE" -eq 0 ]; then
+        RST_TEND=$(now_f); kill "$RST_PID" 2>/dev/null || true; wait "$RST_PID" 2>/dev/null || true; RST_RC=124
+    fi
+    S3B_HWMD=$(hwm_delta_kb "${DPID[0]}")
+    L3B_END=$(log_line_count 0); T3B_END=$(now_f)
+    info "step 3b: window and restore over: restore rc=$RST_RC after $(awk -v a="$RST_T0" -v b="$RST_TEND" 'BEGIN { printf "%.0f", b - a }') s; node-03/04 resumed at +$((T_CONT - T3B)) s"
+    step3b_judge
+    b2_settle
+}
+
+# b2_settle: by the end of 3b (after the resume and the restore) B2 is Alive on node-01 and node-02
+# (symbols confirmed stored), else FAIL "B2 never completes under overdue PoS" (v3.12 §4, backup-i24-a).
+# The poll runs <= 180 s from the later of the resume and the end of the restore job (the worker is
+# paused while the job runs, v3.12a: the 180 s count from when it may work again).
+b2_settle() {
+    local d1 d2 t0 end_t ok1="" ok2=""
+    d1=$(dev_id 1); d2=$(dev_id 2)
+    t0=$T_CONT; [ "$(date +%s)" -gt "$t0" ] && t0=$(date +%s)
+    end_t=$(( t0 + 180 ))
+    while :; do
+        ok1=$(ev 0 "$((L3B + 1))" "work_pipeline: symbols confirmed stored" block_id holder | awk -v b="$B2" -v d="$d1" '$3 == b && $4 == d { if (!_d++) print }')
+        ok2=$(ev 0 "$((L3B + 1))" "work_pipeline: symbols confirmed stored" block_id holder | awk -v b="$B2" -v d="$d2" '$3 == b && $4 == d { if (!_d++) print }')
+        [ -n "$ok1" ] && [ -n "$ok2" ] && break
+        [ "$(date +%s)" -ge "$end_t" ] && break
+        sleep 3
+    done
+    if [ -n "$ok1" ] && [ -n "$ok2" ]; then pass "3b: B2 Alive on node-01 and node-02 by the end of the step"
+    else fail "3b: B2 never completes under overdue PoS: Alive on node-01: ${ok1:+yes}${ok1:-NO}, node-02: ${ok2:+yes}${ok2:-NO} (180 s after the resume and the end of the restore)"; fi
+}
+
+step3b_judge() {
+    local F=$((L3B + 1)) NBL=$NB
+    # ---- (a) the gate is entered
+    local def defnb inrange marked batched
+    def=$(ev 0 "$F" "pos: block deferred, memory budget busy" block need_mib queued)
+    defnb=$(awk -v nb="$NB" '$3 == nb' <<< "$def")
+    inrange=$(awk -v nb="$NB" '$3 == nb && $5 == 0 && $4 >= 743 && $4 <= 745' <<< "$def")
+    marked=$(ev 0 "$F" "pos: blocks marked, memory queue busy" marked queued)
+    batched=$(ev 0 "$F" "scheduler: marked blocks now wait for memory as a batch" batched)
+    info "3b (a): deferred lines for NB: $(count_lines "$defnb") (queued=0 and need_mib in [743,745]: $(count_lines "$inrange")); 'blocks marked': $(count_lines "$marked"); 'batch': $(count_lines "$batched")"
+    if [ -n "$(awk '$5 == 0' <<< "$defnb")" ] && [ -z "$inrange" ]; then
+        fail "3b (a): NB deferred at queued=0 with need_mib outside [743, 745]: $(awk '$5 == 0 { print $4 }' <<< "$defnb" | sort -u | tr '\n' ' ')"
+    elif [ -n "$inrange" ]; then
+        pass "3b (a): pos: block deferred, memory budget busy block=NB queued=0 need_mib=$(head -1 <<< "$inrange" | awk '{ print $4 }') (in [743, 745])"
+    elif [ -n "$marked" ] && [ -n "$batched" ]; then
+        pass "3b (a): blocks marked at a busy queue, then 'marked blocks now wait for memory as a batch'"
+    else
+        local ht mx; ht=$(held_trace 0 "$((L3B + 1))" "$L3B_END"); mx=$(sed -E 's/^max=([0-9]+).*/\1/' <<< "$ht")
+        if [ "$mx" -gt $((BUDGET_MB_0 * MIB)) ]; then
+            fail "3b (a): budget does not hold: max sum of held = $((mx / MIB)) MiB > $BUDGET_MB_0 MiB, and NB was neither deferred nor marked"
+        else
+            rough "3b (a): dials do not exercise the gate (R = ${S3_R:-?}): no deferral / mark of NB; max held $((mx / MIB)) MiB (no big3.bin repeat made)"
+        fi
+    fi
+    # ---- (b) bytes, not a mutex
+    local tg tend2 g w
+    g=$(ev 0 "$F" "mem_budget: granted" kind block | awk -v b="$B2" '$3 == "worker" && $4 == b { if (!_d++) print $1 }')
+    tend2=$( { ev 0 "$F" "mem_budget: released kind=" kind block | awk -v b="$B2" -v g="${g:-0}" '$3 == "worker" && $4 == b && $1 >= g { print $1 }'
+               ev 0 "$F" "work_pipeline: yielding memory to" block | awk -v b="$B2" -v g="${g:-0}" '$3 == b && $1 >= g { print $1 }'; } | sort -n | head -1)
+    if [ -z "$g" ]; then
+        rough "3b (b) not exercised: no 'granted kind=worker block=B2' (B2 = ${B2:-unknown})"
+    else
+        [ -n "$tend2" ] || tend2=$(awk -v a="$T3B_END" 'BEGIN { print a }')
+        local ans bad
+        ans=$(holder_answers "$DP16" "$g" "$tend2")
+        bad=$(awk -v dp="$DP16" -v a="$g" -v b="$tend2" '$3 == dp && $5 == 0 && $1 >= a && $1 <= b' <<< "$def")
+        info "3b (b): B2 holds the budget from $(awk -v a="$T3B" -v b="$g" 'BEGIN { printf "%.0f", b - a }') s to +$(awk -v a="$T3B" -v b="$tend2" 'BEGIN { printf "%.0f", b - a }') s; PoS answers for DP on node-01/02 in it: $ans; DP deferred at queued=0 in it: $(count_lines "$bad")"
+        if [ -n "$bad" ]; then fail "3b (b): pos: block deferred, memory budget busy block=DP queued=0 inside the B2 holding window (the pack was refused at an empty queue: a mutex, not bytes)"
+        elif [ "$ans" -ge 1 ]; then pass "3b (b): $ans PoS answer(s) for the small pack DP while B2 held the budget"
+        else rough "3b (b) not exercised: no due DP at an empty queue inside the B2 holding window"; fi
+    fi
+    # ---- (c) the overdue NB is served after the worker yields
+    local A B C D E tA tB tC tD tEB2 lim
+    A=$(ev 0 "$F" "pos: overdue batch waiting for memory" blocks need_mib | awk -v nb="$NB" 'index($3, nb) { if (!_d++) print }')
+    tA=$(awk '{ print $1 }' <<< "$A")
+    if [ -n "$tA" ]; then
+        tB=$(ev 0 "$F" "work_pipeline: yielding memory to overdue PoS" block | awk -v b="$B2" -v a="$tA" '$3 == b && $1 >= a { if (!_d++) print $1 }')
+        [ -n "$tB" ] && tC=$(ev 0 "$F" "mem_budget: granted" kind waited_ms | awk -v a="$tB" '$3 == "pos" && $1 >= a { if (!_d++) print $1 }')
+        [ -n "${tC:-}" ] && tD=$(ev 0 "$F" "scheduler: PoS late preparation published" block_id | awk -v nb="$NB" -v a="$tC" '$3 == nb && $1 >= a { if (!_d++) print $1 }')
+    fi
+    if [ -n "${tD:-}" ]; then
+        E=$(holder_answers "$NB" "$tD" 9999999999)
+        info "3b (c): batch waits at +$(awk -v a="$T3B" -v b="$tA" 'BEGIN { printf "%.1f", b - a }') s ($(awk '{ print "need_mib=" $4 }' <<< "$A")), yield at +$(awk -v a="$T3B" -v b="$tB" 'BEGIN { printf "%.1f", b - a }') s, pos grant +$(awk -v a="$T3B" -v b="$tC" 'BEGIN { printf "%.1f", b - a }') s, published +$(awk -v a="$T3B" -v b="$tD" 'BEGIN { printf "%.1f", b - a }') s; NB answers after: $E"
+        tEB2=$(ev 0 "$F" "work_pipeline: encoded raw symbols" block_id | awk -v b="$B2" '$3 == b { if (!_d++) print $1 }')
+        if [ -n "$tEB2" ] && fle "$tEB2" "$tA"; then lim=65
+        elif [ -n "$tEB2" ]; then lim=$(awk -v e="$tEB2" -v a="$tA" 'BEGIN { printf "%.1f", e - a + 65 }')
+        else lim=65; fi
+        local dl; dl=$(awk -v a="$tA" -v b="$tB" 'BEGIN { printf "%.1f", b - a }')
+        if [ "$E" -lt 1 ]; then fail "3b (c): NB was published (+$(awk -v a="$T3B" -v b="$tD" 'BEGIN { printf "%.0f", b - a }') s) but no holder answered PoS for NB after it"
+        elif fle "$dl" "$lim"; then pass "3b (c): overdue NB served after the yield: batch wait -> yielding to overdue PoS B2 in ${dl} s (limit ${lim} s), grant kind=pos, published, $E answer(s)"
+        else fail "3b (c): batch wait -> yielding took ${dl} s > ${lim} s (batch line at $tA, encoded B2 at ${tEB2:-none}, yield at $tB)"; fi
+    else
+        fail "3b (c): not all four lines in order: batch wait for NB ${tA:+yes}${tA:-NO}; yield to overdue PoS for B2 ${tB:+yes}${tB:-NO}; grant kind=pos ${tC:+yes}${tC:-NO}; late preparation published for NB ${tD:+yes}${tD:-NO}"
+    fi
+    # ---- (d) the restore waits for memory and gets through
+    local W G1 tW tG shr reg rel tres sha_ok="" outcome sp f got
+    tW=$(ev 0 "$F" "restore: waiting for memory budget" block tier need_mib queued_ahead | awk -v b="$RB16" '$3 == b { if (!_d++) print $1 " " $5 " " $6 " " $4 }')
+    G1=$(ev 0 "$F" "mem_budget: granted" kind block | awk -v b="$RB16" '$3 == "restore" && $4 == b { print $1 }')
+    tG=$(awk 'NR == 1 { print }' <<< "$G1")
+    shr=$(ev 0 "$F" "mem_budget: released (shrunk)" kind block | awk -v b="$RB16" '$3 == "restore" && $4 == b { if (!_d++) print $1 }')
+    reg=$(ev 0 "$F" "restore: regrant for plaintext" block | awk -v b="$RB16" '$3 == b { if (!_d++) print $1 }')
+    rel=$(ev 0 "$F" "mem_budget: released kind=" kind block | awk -v b="$RB16" '$3 == "restore" && $4 == b { t = $1 } END { print t }')
+    tres=$(ev 0 "$F" "restored path=" path | awk '$3 ~ /r\.bin$/ { if (!_d++) print $1 }')
+    info "3b (d): waiting line: ${tW:-none} (t need_mib queued_ahead tier); granted restore RB: $(count_lines "$G1")x; shrunk: ${shr:-none}; regrant: ${reg:-none}; last release: ${rel:-none}; restored line: ${tres:-none}"
+    # v3.12a/b + Q-V9 (a): a running restore job pauses the backup (the worker yields at a portion
+    # boundary and the gate holds it), and the restore asks for memory only after it fetched the
+    # symbols. So the INFO 'waiting' line is not guaranteed any more: without it the worker must have
+    # given way to the restore before the grant (checked below), otherwise FAIL.
+    # The worker gives way in one of three logged forms (portion boundary, gate after the permit
+    # (K-b2a^5 step 5b), pause line); all are grep'd by prefix "restore gate is up" / "yielding memory to restore".
+    local gave_way
+    gave_way=$({ ev 0 "$F" "work_pipeline: yielding memory to restore" block | awk -v b="$B2" '$3 == b { print $1 }'; \
+                 ev 0 "$F" "restore gate is up after the permit was granted" block | awk -v b="$B2" '$3 == b { print $1 }'; } | head -1)
+    if [ -z "$tW" ] && [ -z "$gave_way" ]; then
+        fail "3b (d): no INFO 'restore: waiting for memory budget ... block=RB' and no 'yielding memory to restore' by the worker (the restore neither waited nor was given the budget)"
+    else
+        [ -n "$tW" ] || note "3b (d): no 'waiting for memory budget' line: the worker paused the backup for the restore first (Q-V9 (a)), the grant came without a wait"
+        local tw_t; tw_t=${tW%% *}
+        [ -n "$tG" ] || fail "3b (d): no DEBUG 'mem_budget: granted kind=restore block=RB'"
+        if [ -n "$tG" ]; then
+            local ok=1
+            if [ -n "$shr" ] || { [ -n "$reg" ] && [ "$(count_lines "$G1")" -ge 2 ]; }; then :; else
+                ok=0; fail "3b (d): after the grant neither 'released (shrunk) kind=restore' nor a regrant with a second grant for RB"; fi
+            [ -n "$rel" ] && [ -n "$tres" ] && fle "$rel" "$tres" && [ "$ok" -eq 1 ] \
+                && pass "3b (d): released kind=restore block=RB ($rel) is not later than 'restored' ($tres)" \
+                || { [ "$ok" -eq 1 ] && fail "3b (d): released kind=restore (${rel:-none}) not earlier than 'restored' (${tres:-none})"; }
+            # yield of the worker to the restore: before the grant
+            local y1 y2
+            y1=$(ev 0 "$F" "work_pipeline: yielding memory to restore" block | awk -v b="$B2" -v g="$tG" '$3 == b && $1 <= g { if (!_d++) print $1 }')
+            y2=$(ev 0 "$F" "mem_budget: released kind=" kind block | awk -v b="$B2" -v g="$tG" '$3 == "worker" && $4 == b && $1 <= g { if (!_d++) print $1 }')
+            if [ -n "$y1" ] || [ -n "$y2" ]; then pass "3b (d): the worker gave way to the restore (${y1:+yielding memory to restore at $y1}${y1:+ }${y2:+released kind=worker block=B2 at $y2}) before the restore's grant"
+            else fail "3b (d): no 'yielding memory to restore' / 'released kind=worker block=B2' before 'granted kind=restore block=RB'"; fi
+            local wt; wt=$(awk -v a="$tw_t" -v b="$tG" 'BEGIN { printf "%.1f", b - a }')
+            local lim2; lim2=$(awk -v t="${S3_TENC:-0}" 'BEGIN { printf "%.1f", t + 90 }')
+            if [ -z "$tW" ]; then :
+            elif fle "$wt" "$lim2"; then pass "3b (d): the restore waited ${wt} s for memory (limit t_encode ${S3_TENC}s + 90 = ${lim2} s)"
+            else rough "3b (d): restore waited past one holder attempt: ${wt} s > t_encode + 90 = ${lim2} s"; fi
+        fi
+    fi
+    # content: the finished job, hash
+    outcome=$(tail -n 1 "$RST_OUT" 2>/dev/null | jq -r '.outcome // "none"' 2>/dev/null || echo none)
+    if [ "${RST_RC:-1}" -eq 0 ] && [ "$outcome" = complete ]; then
+        sp=$(tail -n 1 "$RST_OUT" | jq -r '.staging_path')
+        f="$sp/${RB_FILE#/}"
+        if [ -f "$f" ]; then
+            got=$(content_hash "$f")
+            [ "$got" = "$RB_HASH" ] && pass "3b (d): restored r.bin sha256 matches the original ($(file_size "$f") bytes)" \
+                || fail "3b (d): sha256 MISMATCH: want $RB_HASH got $got at $f"
+        else fail "3b (d): the job claims complete, but $f does not exist"; fi
+    else
+        fail "3b (d): the restore did not complete: rc=${RST_RC:-?} outcome=$outcome (124 = still running 300 s after the command); stderr: $(head -c 300 "$RST_ERR" 2>/dev/null); last: $(tail -n 1 "$RST_OUT" 2>/dev/null | head -c 400)"
+    fi
+    local rr; rr=$(restore_responses_for "$RB16" 1 2)
+    [ "$rr" -ge 1 ] && pass "3b (d): node-01/02 logged $rr 'sending RestoreResponse' for RB (the network was used)" \
+        || fail "3b (d): no 'sending RestoreResponse' for RB at node-01/02"
+    # ---- v3.12 §4: progress between the yields of the worker for B2
+    local ys cs ws nys gap_bad
+    ys=$(ev 0 "$F" "work_pipeline: yielding memory to" block | awk -v b="$B2" '$3 == b { print $1 }' | sort -n)
+    cs=$(ev 0 "$F" "work_pipeline: chunk sent" block_id reply | awk -v b="$B2" '$3 == b && $4 == "stored" { print $1 }')
+    ws=$( { ev 0 "$F" "rejected offer for block" ; ev 0 "$F" "deliver_to_holder_worker failed"; } | awk '{ print $1 }')
+    nys=$(count_lines "$ys")
+    gap_bad=$( { echo "Y $ys"; echo "P $cs $ws"; } | awk '
+        $1 == "Y" { for (i = 2; i <= NF; i++) y[++ny] = $i }
+        $1 == "P" { for (i = 2; i <= NF; i++) p[++np] = $i }
+        END { for (i = 1; i < ny; i++) { ok = 0; for (j = 1; j <= np; j++) if (p[j] > y[i] && p[j] <= y[i + 1]) ok = 1; if (!ok) printf "%.1f-%.1f ", y[i], y[i + 1] } }')
+    if [ -n "$gap_bad" ]; then fail "3b: no stored chunk (new ESIs) and no failed-offer WARN between two yields of the worker for B2 (backup-i24-a): $gap_bad"
+    else pass "3b: $nys yield(s) for B2; every gap between two yields has a stored chunk with new ESIs or a failed-offer WARN"; fi
+    local paused; paused=$(clog 0 "$F" | grep -aF "work_pipeline: paused while a restore job runs or a DR session leases memory" | head -3 | cut -c1-30 | tr '\n' ' ')
+    note "3b: INFO paused-while-restore line (once per pause, Q-V9 (a)): ${paused:-none}; worker grants during the restore job: $(ev 0 "$F" "mem_budget: granted" kind block | awk -v a="$RST_T0" -v b="$RST_TEND" '$3 == "worker" && $1 >= a && $1 <= b' | wc -l)"
+    # ---- memory
+    local bar_kib=$((2656 * 1024))
+    if [ -z "$S3B_HWMD" ]; then fail "3b: cannot read VmHWM of node-00"
+    elif [ "$S3B_HWMD" -le "$bar_kib" ]; then pass "3b: node-00 ΔVmHWM = $((S3B_HWMD / 1024)) MiB <= 2656 MiB"
+    else fail "3b: node-00 ΔVmHWM = $((S3B_HWMD / 1024)) MiB > 2656 MiB"; fi
+}
+
+# step3c: a holder answers PoS on a big share (spec v3.11 §2 "3c").
+step3c() {
+    echo ""
+    echo "=== Step 3c: a holder answers PoS on a $NEAR_MB MiB share (pos-i14) ==="
+    local h attempt D hwm_end settled=0 end_t d
+    # B2 delivery must have settled on h: all its placements Alive, or an iteration without a yield.
+    end_t=$(( T_CONT + 180 ))
+    for attempt in 1 2; do
+        h=$attempt; D=$(dev_id "$h")
+        [ -n "$D" ] || { rough "3c: no device id for node-0$h"; continue; }
+        if [ "$attempt" -eq 1 ]; then
+            while :; do
+                if [ -n "$(ev 0 "$((L3B + 1))" "work_pipeline: symbols confirmed stored" block_id holder | awk -v b="$B2" -v d="$D" '$3 == b && $4 == d { if (!_d++) print }')" ] \
+                    || [ -n "$(ev 0 "$((L3B + 1))" "work_pipeline: iteration complete" block_id yielded | awk -v b="$B2" '$3 == b && $4 == "false" { if (!_d++) print }')" ]; then
+                    settled=1; break; fi
+                [ "$(date +%s)" -ge "$end_t" ] && break
+                sleep 2
+            done
+            [ "$settled" -eq 1 ] || rough "3c: B2 delivery did not settle on node-0$h within 180 s of the resume"
+        fi
+        nb_alive_on "$h" || { note "3c: NB is not Alive on node-0$h"; continue; }
+        hwm_reset "${DPID[$h]}" || { fail "setup: VmHWM reset of node-0$h failed"; exit 1; }
+        local rss0=$HWM_RSS0_KB Lh L0 t0 found="" tR dh vt
+        Lh=$(log_line_count "$h"); L0=$(log_line_count 0); t0=$(now_f)
+        end_t=$(( $(date +%s) + 120 ))
+        while [ "$(date +%s)" -lt "$end_t" ]; do
+            found=$(tail -n +$((Lh + 1)) "$(node_log "$h")" | sed 's/\x1b\[[0-9;]*m//g' | grep -aF "responding with chain hash" | grep -aF -m1 "block_id=$NB" || true)
+            [ -n "$found" ] && break
+            sleep 0.2
+        done
+        hwm_end=$(hwm_kb "${DPID[$h]}")
+        if [ -z "$found" ]; then fail "3c: node-0$h did not answer a PoS challenge for NB within 120 s"; continue; fi
+        dh=$(( hwm_end - rss0 ))
+        tR=$(ev "$h" "$((Lh + 1))" "responding with chain hash" block_id | awk -v nb="$NB" '$3 == nb { if (!_d++) print $1 }')
+        # clean: the owner sent no chunk to h in [t0, the answer] (T8)
+        local ch
+        ch=$(ev 0 "$((L0 + 1))" "work_pipeline: chunk sent" holder block_id | awk -v d="$D" -v a="$t0" -v b="${tR:-$t0}" '$3 == d && $1 >= a && $1 <= b' | wc -l)
+        # the owner's verdict
+        vt=""
+        for _ in $(seq 1 60); do
+            vt=$(ev 0 "$((L0 + 1))" "scheduler: PoS verdict" block_id holder outcome | awk -v nb="$NB" -v d="$D" '$3 == nb && $4 == d && $5 == "pass" { if (!_d++) print $1 }')
+            [ -n "$vt" ] && break
+            sleep 1
+        done
+        info "3c: holder node-0$h ($D): ΔVmHWM = $((dh / 1024)) MiB (bar 64), owner chunks to h in the window: $ch, verdict pass: ${vt:-none}"
+        if [ "$ch" -gt 0 ]; then
+            if [ "$attempt" -lt 2 ]; then info "3c: contaminated by a transfer (attempt $attempt): the other holder"; continue; fi
+            rough "3c contaminated by a transfer (2 attempts: $ch chunk(s) to node-0$h in the window; ΔVmHWM $((dh / 1024)) MiB)"
+            return 0
+        fi
+        if [ "$dh" -lt $((64 * 1024)) ]; then pass "3c: node-0$h answered PoS on a ${NEAR_MB} MiB share with ΔVmHWM = $((dh / 1024)) MiB < 64 MiB"
+        else fail "3c: node-0$h ΔVmHWM = $((dh / 1024)) MiB >= 64 MiB (the share was read into RAM)"; fi
+        [ -n "$vt" ] && pass "3c: owner logged scheduler: PoS verdict block_id=NB holder=node-0$h outcome=pass" \
+            || fail "3c: no 'scheduler: PoS verdict ... block_id=NB holder=$D outcome=pass' within 60 s of the answer"
+        return 0
+    done
+    rough "3c contaminated / blind: no clean attempt"
+}
+
+# whole-log lines of node-00 (pre-registered, PHASE b), called before the shutdown.
+final_lines_check() {
+    local n
+    n=$(count_lines "$(clog 0 | grep -aF 'mem_budget: written off a stuck holder' || true)")
+    [ "$n" -eq 0 ] && pass "no 'mem_budget: written off a stuck holder' on node-00" || fail "$n 'mem_budget: written off a stuck holder' line(s) on node-00 (nothing hangs in this scenario)"
+    n=$(count_lines "$(clog 0 | grep -aF 'pos: overdue batch ended early' | grep -aF 'reason=written off' || true)")
+    [ "$n" -eq 0 ] && pass "no 'overdue batch ended early ... reason=written off'" || fail "$n 'pos: overdue batch ended early ... reason=written off' line(s)"
+    n=$(count_lines "$(clog 0 | grep -aF 'pos: a batch member panicked' || true)")
+    [ "$n" -eq 0 ] && pass "no 'pos: a batch member panicked'" || fail "$n 'pos: a batch member panicked' line(s)"
+    # v3.12 §4 (M85 guard): no (holder, ESI) pair twice in `chunk sent ... reply=stored` within one process.
+    local dup
+    dup=$(awk -v bounds="$PROC_BOUNDS" -v logf="$(node_log 0)" '
+        function kv(name) { if (match($0, "[ ]" name "=[^ ]+")) return substr($0, RSTART + 2 + length(name), RLENGTH - 2 - length(name)); return "" }
+        BEGIN { n = split(bounds, B, " "); for (i = 1; i <= n; i++) cut[B[i]] = 1 }
+        { gsub(/\033\[[0-9;]*m/, "") }
+        (FNR - 1) in cut { delete seen }
+        /work_pipeline: chunk sent/ && /reply=stored/ {
+            h = kv("holder"); b = kv("block_id"); m = split(kv("esis"), R, ",")
+            for (i = 1; i <= m; i++) {
+                if (split(R[i], ab, "\\.\\.") != 2) continue
+                for (e = ab[1] + 0; e <= ab[2] + 0; e++) {
+                    k = h "|" b "|" e
+                    if (k in seen) { dups++; if (dups <= 3) ex = ex " " h "/" b "/" e "@" FNR }
+                    seen[k] = 1
+                }
+            }
+        }
+        END { printf "%d%s\n", dups, ex }' "$(node_log 0)")
+    if [ "${dup%% *}" = "0" ]; then pass "no (holder, ESI) pair stored twice in one process (no delivery restart)"
+    else fail "delivery restarts: (holder, ESI) pair(s) sent and stored twice in one process: ${dup}"; fi
+    # 'still running': NB is ROUGH only past 2 x t_encode(NB); another block is ROUGH always.
+    local sr; sr=$(ev 0 1 "scheduler: PoS preparation still running" block age_s)
+    if [ -z "$sr" ]; then info "no 'PoS preparation still running' on node-00"
+    else
+        local lim; lim=$(awk -v t="${S3_TENC:-0}" 'BEGIN { printf "%.1f", 2 * t }')
+        local bad_nb other
+        bad_nb=$(awk -v nb="${NB:-none}" -v l="$lim" '$3 == nb && $4 + 0 > l + 0' <<< "$sr")
+        other=$(awk -v nb="${NB:-none}" '$3 != nb' <<< "$sr")
+        info "'PoS preparation still running': $(count_lines "$sr") line(s): $(awk '{ printf "%s age_s=%s; ", $3, $4 }' <<< "$sr")"
+        if [ -n "$bad_nb" ] || [ -n "$other" ]; then rough "stuck warn on a loaded rig: PoS preparation still running (NB limit age > 2 x t_encode = ${lim} s): $(awk '{ printf "%s age_s=%s; ", $3, $4 }' <<< "${bad_nb}${bad_nb:+$'\n'}${other}")"
+        else note "'still running' for NB only, age <= 2 x t_encode (${lim} s): not a finding (v3.11a WARN-2 a)"; fi
+    fi
+}
+
+# phase_b: steps 2b-before, 3, 2b, 3b, 3c.
+phase_b() {
+    DOC="${DOC:-$FILES/doc.txt}"
+    if ! run_a; then
+        echo ""
+        echo "=== Step 2b (before): doc.txt 10 KB restorable (DP) ==="
+        make_random "$DOC" 10240
+        wait_file_restorable 0 "$DOC" 300 || { fail "step 2b: doc.txt not restorable per node-00 after 300s"; exit 1; }
+        wait_on_holders "$DOC" 120 && pass "doc.txt restorable, holders hold $OH_ON >= k_eff $OH_TARGET" \
+            || { fail "step 2b: doc.txt: holders hold $OH_ON of ${OH_TARGET:-?}"; exit 1; }
+    fi
+    NB_L0=1
+    step3
+    [ "${S3_OK:-0}" -eq 1 ] || { fail "step 3 gave no measurement: the later steps need NB"; return 0; }
+    stop_after 3 && return 0
+    step2b
+    stop_after 2b && return 0
+    step3b
+    stop_after 3b && return 0
+    step3c
+    stop_after 3c && return 0
+    return 0   # the last stop_after returns 1 when no STOP_AFTER is set: under set -e that killed the run before step 9
 }
 
 echo "============================================================"
@@ -378,7 +1031,20 @@ if poll 30 status_is 1 max_file_size_bytes "$AUTO_N"; then
 else
     fail "backup-i4: node-01 max_file_size_bytes == $(status_num 1 max_file_size_bytes), want $AUTO_N (M=$AUTO_M_BYTES, divisor $RAM_DIVISOR)"
 fi
-stub_b "step 0 (b): block_work_budget_bytes == 2147483648 on node-00 + WARN '(test only)'; node-01 budget == floor(M*14/32)"
+if run_b; then
+    # 0b: the budget of node-00 is the test one; node-01's follows the formula M*14/32, in whole MiB.
+    WANT_B0=$((BUDGET_MB_0 * MIB))
+    WANT_B1=$(( (AUTO_M_BYTES * 14 / 32) / MIB * MIB ))
+    OK_0B=1
+    status_is 0 block_work_budget_bytes "$WANT_B0" \
+        || { fail "0b: node-00 block_work_budget_bytes == $(status_num 0 block_work_budget_bytes), want $WANT_B0"; OK_0B=0; }
+    grep -aF "memory: block work budget set by VIATICUM_TEST_BLOCK_WORK_BUDGET_MB (test only)" "$(node_log 0)" > /dev/null \
+        || { fail "0b: no WARN 'memory: block work budget set by VIATICUM_TEST_BLOCK_WORK_BUDGET_MB (test only)' in node-00's log"; OK_0B=0; }
+    status_is 1 block_work_budget_bytes "$WANT_B1" \
+        || { fail "0b: node-01 block_work_budget_bytes == $(status_num 1 block_work_budget_bytes), want $WANT_B1 (floor(floor(M*14/32)/MiB)*MiB, M=$AUTO_M_BYTES)"; OK_0B=0; }
+    [ "$OK_0B" -eq 1 ] && pass "0b: node-00 budget == $WANT_B0 (+ WARN '(test only)'), node-01 budget == $WANT_B1 (M*14/32 in MiB)"
+    stop_after 0b || true
+fi
 # The peak-RSS reset must work, otherwise every ΔVmHWM below is meaningless.
 if hwm_reset "${DPID[0]}"; then
     HD=$(hwm_delta_kb "${DPID[0]}")
@@ -388,7 +1054,7 @@ else
     fail "setup: cannot reset VmHWM of node-00 (echo 5 > /proc/PID/clear_refs)"; exit 1
 fi
 
-if run_a; then
+if run_a && [ "$STOPPED" -eq 0 ]; then
 
 # ── STEP 1: 4 GiB SPARSE FILE ────────────────────────────────────
 echo ""
@@ -493,15 +1159,14 @@ stub_b "step 2 (b): files/r.bin 200 MiB, full copy on node-01 or node-02"
 
 fi  # run_a (steps 0a..2a)
 
-# ── STEP 3, 3b, 3c: PHASE b ──────────────────────────────────────
-echo ""
-echo "=== Steps 3, 3b, 3c: peak of a 240 MiB encode, the memory budget, PoS on a big share ==="
-stub_b "step 3 (worker peak p <= 3.1 + R + 1 on a fresh process)"
-stub_b "step 3b (ADVERSARIAL: two holders SIGSTOPped, budget held; PoS deferred / small-pack PoS / restore waits)"
-stub_b "step 3c (a holder answers PoS on a 240 MiB share, ΔVmHWM < 64 MiB)"
-run_b || note "PHASE=$PHASE: steps 3, 3b, 3c belong to PHASE b (R1-d-b)"
+# ── STEPS 2b, 3, 3b, 3c: PHASE b ─────────────────────────────────
+if run_b && [ "$STOPPED" -eq 0 ]; then
+    phase_b
+else
+    run_b || note "PHASE=$PHASE: steps 2b, 3, 3b, 3c belong to PHASE b (R1-d-b)"
+fi
 
-if run_a; then
+if run_a && [ "$STOPPED" -eq 0 ]; then
 
 # ── STEP 4: GROWTH UNDER PoS ─────────────────────────────────────
 echo ""
@@ -709,6 +1374,8 @@ fi  # run_a
 # ── STEP 9: SHUTDOWN ─────────────────────────────────────────────
 echo ""
 echo "=== Step 9: SIGTERM all ==="
+for i in "${!DPID[@]}"; do kill -CONT "${DPID[$i]}" 2>/dev/null || true; done
+run_b && final_lines_check
 for i in $(seq 0 $((NUM_NODES-1))); do
     kill -TERM "${DPID[$i]}" 2>/dev/null || true
 done

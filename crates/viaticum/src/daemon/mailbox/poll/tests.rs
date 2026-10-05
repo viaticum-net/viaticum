@@ -191,6 +191,7 @@ async fn full_channel_defers_response_to_next_poll() {
 
     // The scheduler drains the channel; the next poll sends the deferred response.
     assert_eq!(rx.try_recv().expect("filler").challenge_id, [0xEE; 16]);
+    pos.begin_poll(now + 4);
     let mut counts = PollCounts::default();
     super::forward_pos_responses(&mut pos, &tx, vec![entry], now + 4, &mut counts).await;
     assert_eq!((counts.forwarded, counts.deferred_full), (1, 0));
@@ -2356,8 +2357,7 @@ async fn poll_forgets_an_answered_challenge_one_ttl_later() {
             900,
             at,
         )
-        .await
-        .expect("poll");
+        .await;
         assert_eq!(
             pos.answered.len(),
             want,
@@ -2702,8 +2702,7 @@ async fn poll_forwards_only_pending_responses_once() {
             900,
             now + 4 * poll,
         )
-        .await
-        .expect("poll");
+        .await;
         total.forwarded += counts.forwarded;
         total.not_pending += counts.not_pending;
         total.in_flight += counts.in_flight;
@@ -2882,3 +2881,5 @@ async fn sibling_challenge_calls_handler_once_across_polls() {
     assert_eq!((counts.not_mine, counts.skipped), (1, 3));
     assert!(sender.stored.lock().await.is_empty());
 }
+
+mod stream;

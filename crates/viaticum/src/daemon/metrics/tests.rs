@@ -3,6 +3,7 @@ use crate::cli::types::{PeerSummary, StatusData};
 
 fn make_status(peers: Vec<PeerSummary>) -> StatusData {
     StatusData {
+        daemon_version: String::new(),
         node_identity: "abcdef0123456789".to_string(),
         device_id: "abcdef0123456789".to_string(),
         node_addr: "test-addr".to_string(),
@@ -56,6 +57,9 @@ fn make_status(peers: Vec<PeerSummary>) -> StatusData {
         max_file_size_bytes: 0,
         block_work_budget_bytes: 0,
         blocks_esi_exhausted: 0,
+        dr_lease: None,
+        backup_paused_while_restoring: false,
+        backup_pause_overlong: false,
     }
 }
 

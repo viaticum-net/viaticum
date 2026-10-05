@@ -1,0 +1,29 @@
+# reqwest is built without a default crypto provider (rustls-no-provider, R3 Р-4′):
+# a client built before `ring` is installed panics. Build clients only through
+# `viaticum::http_client::{blocking_builder, async_builder}`, the one place that
+# allows these lints.
+#
+# Types: naming a Client or a ClientBuilder at all (`Client::new()`,
+# `Client::default()`, `ClientBuilder::new()`, `ClientBuilder::default()`, a type
+# in a signature) is a way around the provider. Code that holds a client gets its
+# type inferred from `http_client`; a function that must name it gets a reviewed
+# `#[allow(clippy::disallowed_types)]`.
+disallowed-types = [
+    { path = "reqwest::Client", reason = "build it from viaticum::http_client::async_builder (installs the ring provider)" },
+    { path = "reqwest::ClientBuilder", reason = "get one from viaticum::http_client::async_builder (installs the ring provider)" },
+    { path = "reqwest::blocking::Client", reason = "build it from viaticum::http_client::blocking_builder (installs the ring provider)" },
+    { path = "reqwest::blocking::ClientBuilder", reason = "get one from viaticum::http_client::blocking_builder (installs the ring provider)" },
+]
+# Free functions that build a client inside; and heavy block work, which goes through the memory
+# budget (backup-i24, J8): every encode and decode of a block is a wrapper in
+# `viaticum::daemon::mem_budget` that takes a `&MemPermit` (tests and the erasure code opt out).
+disallowed-methods = [
+    { path = "reqwest::get", reason = "builds a client without the ring provider; use viaticum::http_client" },
+    { path = "reqwest::blocking::get", reason = "builds a client without the ring provider; use viaticum::http_client" },
+    { path = "viaticum_core::erasure::ErasureEncoder::encode", reason = "use daemon::mem_budget (needs a MemPermit)" },
+    { path = "viaticum_core::erasure::ErasureEncoder::decode", reason = "use daemon::mem_budget::decode_block" },
+    { path = "viaticum_core::erasure::ErasureEncoder::generate_repair", reason = "use daemon::mem_budget (needs a MemPermit)" },
+    { path = "viaticum_core::erasure::ErasureEncoder::encode_raw", reason = "use daemon::mem_budget::encode_block" },
+    { path = "viaticum_core::erasure::ErasureEncoder::encode_raw_ranges", reason = "use daemon::mem_budget::encode_block" },
+    { path = "viaticum_core::erasure::ErasureEncoder::encode_raw_ranges_each", reason = "use daemon::mem_budget::encode_ranges_each" },
+]

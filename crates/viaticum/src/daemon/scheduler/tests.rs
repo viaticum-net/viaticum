@@ -37,10 +37,18 @@ mod issue_stall;
 mod issue_prepare;
 // The shared owner / postman set-up of the issue-tick tests.
 mod issue_support;
+// R1-d-b (F8'): the folded hashes equal the old way's.
+mod issue_fold;
+// R1-d-b (backup-i24, pos-i13, pos-i7-d-c/d): the issue tick under the memory budget.
+mod issue_mem;
+// R1-d-b fix round К-b2b (spec v3.7, v3.7a): the batch of overdue preparations, the marking.
+mod issue_batch;
 // backup-i7: the load-failure WARN of a PoS block once per day.
 mod pos_load_warn;
 // pos-i16 (C-SP): only the placement's device key resolves its challenge.
 mod sibling_response;
+// dr-i8: service mail is addressed by PEERS after a DR, a holder without a master is skipped.
+mod dr_master;
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -650,8 +658,9 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
     db.upsert_placement(&placement).unwrap();
 
     // Peer record (needed for trust lookup in due_challenges, also for deletion signing).
-    let peer = make_peer_record(holder_id);
-    db.upsert_peer(&peer).unwrap();
+    // dr-i8: the master is in PEERS (as after a DR), is NOT the device id, and
+    // device_to_master is empty — the address must come from PEERS.
+    seed_holder_peer(&db, holder_id);
 
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(16);
     // T-13b-1: use RecordingMailboxSender to capture mailbox publishes.
@@ -700,11 +709,15 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
         .find(|r| r.entry.class == MailboxClass::DeleteRequest)
         .expect("expected a DeleteRequest-class mailbox entry");
 
-    // Target = holder master (falls back to IdentityPub(holder_id.0) when no master mapping).
+    // Target = the box of the holder's master from PEERS, never the device-id box.
     assert_eq!(
         delete_req.entry.target,
-        viaticum_core::mailbox::MailboxAddress(holder_id.0),
+        viaticum_core::mailbox::MailboxAddress::for_master(&holder_master_of(holder_id)),
         "delete_published_via_mailbox_not_relay: entry target must be holder master"
+    );
+    assert_ne!(
+        delete_req.entry.target,
+        viaticum_core::mailbox::MailboxAddress(holder_id.0)
     );
 
     // Sender = owner master (my_master_pub passed to scheduler).
@@ -1318,6 +1331,65 @@ async fn delete_sent_to_every_holder_of_multi_holder_block() {
             "every holder placement must transition to Deleting"
         );
     }
+}
+
+/// dr-i8: a holder whose master is known nowhere gets no Delete and its placement is left
+/// as it is (no box addressed by the device id); once its PeerRecord is there, the next
+/// deletion tick sends it to the master's box.
+#[tokio::test]
+async fn delete_skips_holder_with_unknown_master_then_sends_when_known() {
+    use viaticum_core::mailbox::{MailboxAddress, MailboxClass};
+    let db = Db::open_in_memory().unwrap();
+    let block_id = make_block_id(0xA7);
+    let fid = FileId(707);
+    db.upsert_file(&make_multi_holder_file(fid, block_id))
+        .unwrap();
+    db.upsert_source_block(&make_active_block(block_id))
+        .unwrap();
+    let (known, _) = make_real_holder(0xB1);
+    let (unknown, _) = make_real_holder(0xB2);
+    for d in [known, unknown] {
+        let mut p = make_placement(block_id, d);
+        p.file_id = fid;
+        db.upsert_placement(&p).unwrap();
+    }
+    seed_holder_peer(&db, known);
+
+    let recording_sender = Arc::new(RecordingMailboxSender::new());
+    let router = Arc::new(MailboxRouter::with_sender(
+        Arc::clone(&recording_sender) as Arc<dyn MailboxNetworkSender>,
+        db.clone(),
+    ));
+    let (scheduler, _repair_rx) = make_deletion_scheduler(&db, router);
+
+    scheduler.process_deletion_tick().await.unwrap();
+    let deletes = |s: &RecordingMailboxSender| {
+        s.captured_requests()
+            .iter()
+            .filter(|r| r.entry.class == MailboxClass::DeleteRequest)
+            .map(|r| r.entry.target)
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let known_box = MailboxAddress::for_master(&holder_master_of(known));
+    assert_eq!(
+        deletes(&recording_sender),
+        std::collections::HashSet::from([known_box]),
+        "Deletes only to the known holder's master"
+    );
+    let status = |d: DeviceId| db.get_placement(&block_id, &d).unwrap().unwrap().status;
+    assert_eq!(status(known), PlacementStatus::Deleting);
+    assert_eq!(
+        status(unknown),
+        PlacementStatus::Alive,
+        "the unknown holder's placement is untouched, so the next tick retries it"
+    );
+
+    seed_holder_peer(&db, unknown);
+    scheduler.process_deletion_tick().await.unwrap();
+    let after = deletes(&recording_sender);
+    assert_eq!(after.len(), 2, "one box per holder master: {after:?}");
+    assert!(after.contains(&MailboxAddress::for_master(&holder_master_of(unknown))));
+    assert_eq!(status(unknown), PlacementStatus::Deleting);
 }
 
 /// H3 per-holder retry: if one holder's publish gets 0 acks, only that holder stays
@@ -2168,6 +2240,22 @@ fn make_peer_record(holder_id: DeviceId) -> viaticum_core::types::PeerRecord {
     }
 }
 
+/// A master for `holder` that is NOT its device id (dr-i8): a fixture where the two coincide
+/// proves nothing about which of them an address was built from. Never the zero placeholder.
+fn holder_master_of(holder: DeviceId) -> IdentityPub {
+    let mut m = [0xC3u8; 32];
+    m[0] = holder.0[0];
+    IdentityPub(m)
+}
+
+/// The PeerRecord of `holder` with master `holder_master_of(holder)`, and nothing in
+/// `device_to_master`: what is in the database after a DR, once the SS is restored.
+fn seed_holder_peer(db: &Db, holder: DeviceId) {
+    let mut peer = make_peer_record(holder);
+    peer.master_identity = holder_master_of(holder);
+    db.upsert_peer(&peer).unwrap();
+}
+
 // ─── T-6 test: challenge goes via mailbox, not relay ─────────────────────────
 
 /// A due PoS challenge is published via MailboxRouter (the mailbox bus).
@@ -2191,7 +2279,7 @@ async fn scheduler_issues_challenge_via_mailbox_not_relay() {
 
     let placement = make_placement(block_id, holder_id);
     db.upsert_placement(&placement).unwrap();
-    db.upsert_peer(&make_peer_record(holder_id)).unwrap();
+    seed_holder_peer(&db, holder_id);
 
     let recording_sender = Arc::new(RecordingMailboxSender::new());
     let router = Arc::new(MailboxRouter::with_sender(
@@ -2243,11 +2331,16 @@ async fn scheduler_issues_challenge_via_mailbox_not_relay() {
         .find(|r| r.entry.class == MailboxClass::PosChallenge)
         .expect("expected a PosChallenge entry in captured requests");
 
-    // Entry target = holder's master (which is IdentityPub(holder_id.0) since no device cert in DB).
+    // Entry target = the box of the holder's master from PEERS (dr-i8: device_to_master is
+    // empty, as after a DR), never the device-id box.
     assert_eq!(
         pos_req.entry.target,
-        viaticum_core::mailbox::MailboxAddress(holder_id.0),
+        viaticum_core::mailbox::MailboxAddress::for_master(&holder_master_of(holder_id)),
         "PosChallenge entry target must be holder's master pub"
+    );
+    assert_ne!(
+        pos_req.entry.target,
+        viaticum_core::mailbox::MailboxAddress(holder_id.0)
     );
 
     // sender = Some(owner master_pub) so holder knows where to publish the response.
