@@ -94,7 +94,8 @@
 #                  first), X logs `swarm: on-demand dial peer_id=<Y> … msg=PeerAnnounce`;
 #                  0 pairs = FAIL (i42; bar in lru24/lru/hold, NOTE in main)
 #               8b. source deleted at a live daemon; per attempt: wait for the owner's
-#                  `auto-dial pass` (<= 40 s; its next pass would re-dial the cooled), then
+#                  `mailbox_poll: poll done` (<= 75 s; the poll re-dials postmen, many of them
+#                  holders; fallback `auto-dial pass` <= 40 s), then
 #                  EVERY holder of the block, the seed included, disconnected at once
 #                  (net-probe under timeout 15), <= 2 s until they leave the owner's
 #                  authenticated set (still-warm ones NOTEd: asked first), restore -> <= 120
@@ -1592,11 +1593,24 @@ if runs_step 8b && [ "$SKIP_8BC" = 0 ]; then
     for attempt in 1 2 3; do
         for j in $HOLDERS; do HL0[$j]=$(log_line_count "$j"); done
         LP=$(log_line_count "$OWNER"); PASSED=0
-        for t in $(seq 1 200); do
-            log_has_since "$OWNER" "$LP" "auto-dial pass" "auto-dial pass" && { PASSED=1; break; }
+        # Sync on the end of the owner's mailbox poll (review of c4b9709): the poll re-dials
+        # ~20 postmen, many of them holders, and runs in phase with every second auto-dial
+        # pass. Right after `poll done` the next poll is a full period away and the next
+        # auto-dial pass <= 30 s. An empty poll logs `poll done` at DEBUG only, so an
+        # `auto-dial pass` line is the fallback.
+        for t in $(seq 1 375); do
+            log_has_since "$OWNER" "$LP" "mailbox_poll: poll done" "poll done" && { PASSED=1; break; }
             sleep 0.2
         done
-        [ "$PASSED" = 1 ] || note "attempt $attempt: no 'auto-dial pass' line of node-$OWNER in 40 s; cooling anyway"
+        if [ "$PASSED" != 1 ]; then
+            note "attempt $attempt: no 'mailbox_poll: poll done' line of node-$OWNER in 75 s; syncing on 'auto-dial pass'"
+            LP=$(log_line_count "$OWNER")
+            for t in $(seq 1 200); do
+                log_has_since "$OWNER" "$LP" "auto-dial pass" "auto-dial pass" && { PASSED=1; break; }
+                sleep 0.2
+            done
+            [ "$PASSED" = 1 ] || note "attempt $attempt: no 'auto-dial pass' line of node-$OWNER in 40 s; cooling anyway"
+        fi
         # In parallel, each bounded; wait on these PIDs only (the daemons are this shell's
         # jobs too).
         DPIDS=""
