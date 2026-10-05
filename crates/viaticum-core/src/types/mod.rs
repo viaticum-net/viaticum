@@ -1219,6 +1219,10 @@ pub struct EventEntry {
 ///
 /// Lives in core (review A3) so `processor`, `restore`, `holder_cleanup` and
 /// any future module share the same implementation instead of drifting.
+///
+/// No overflow for ESIs near `u32::MAX` (C-SP review N4): "is the next one" is
+/// `esi - start == count`, and a range never grows past `u32::MAX` symbols. A repeated
+/// ESI starts a new range of its own, as before.
 pub fn esi_list_to_ranges(esis: &[u32]) -> Vec<(u32, u32)> {
     if esis.is_empty() {
         return Vec::new();
@@ -1227,7 +1231,7 @@ pub fn esi_list_to_ranges(esis: &[u32]) -> Vec<(u32, u32)> {
     let mut start = esis[0];
     let mut count = 1u32;
     for &esi in &esis[1..] {
-        if esi == start + count {
+        if esi.checked_sub(start) == Some(count) && count < u32::MAX {
             count += 1;
         } else {
             ranges.push((start, count));

@@ -1340,3 +1340,25 @@ fn source_block_record_without_high_water_decodes_as_zero() {
     let back: SourceBlockRecord = from_cbor_bytes(&to_cbor_bytes(&raised)).unwrap();
     assert_eq!(back.esi_high_water, 1 << 23);
 }
+
+// ============================================================
+// C-SP review N4: esi_list_to_ranges without overflow
+// ============================================================
+
+/// ESIs at the top of u32, the last one repeated: no overflow panic, the run merges up to
+/// `u32::MAX` and a repeated ESI is a range of its own (as for any repeated ESI).
+#[test]
+fn esi_list_to_ranges_near_u32_max_with_repeat_does_not_overflow() {
+    let max = u32::MAX;
+    assert_eq!(
+        esi_list_to_ranges(&[max - 2, max - 1, max, max]),
+        vec![(max - 2, 3), (max, 1)]
+    );
+    assert_eq!(esi_list_to_ranges(&[max, max]), vec![(max, 1), (max, 1)]);
+    assert_eq!(esi_list_to_ranges(&[max]), vec![(max, 1)]);
+    // The ordinary behaviour stays: runs merge, gaps and repeats split.
+    assert_eq!(
+        esi_list_to_ranges(&[0, 1, 2, 2, 3, 7]),
+        vec![(0, 3), (2, 2), (7, 1)]
+    );
+}
