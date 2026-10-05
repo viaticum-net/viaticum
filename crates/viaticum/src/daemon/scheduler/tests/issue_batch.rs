@@ -342,7 +342,7 @@ async fn batch_publishes_after_releasing_its_permit() {
 /// `OverduePos` waiter stands in the budget's queue and nothing is outstanding but the hold.
 #[tokio::test]
 async fn at_most_one_overdue_waits_in_the_budget_queue() {
-    let (owner, budget) = budgeted(2, 1, make_test_encoder());
+    let (owner, budget) = budgeted_at(1, 2, 1, make_test_encoder());
     let hold = hold_all(&budget);
     let mut in_flight = InFlight::default();
     tick(&owner, &mut in_flight).await; // marks A, B
@@ -381,7 +381,7 @@ async fn at_most_one_overdue_waits_in_the_budget_queue() {
 /// block marked meanwhile waits for the next tick — nothing chains at the publication.
 #[tokio::test]
 async fn at_most_one_batch_in_flight_and_only_at_tick_start() {
-    let (owner, budget) = budgeted(2, 1, make_test_encoder());
+    let (owner, budget) = budgeted_at(1, 2, 1, make_test_encoder());
     let hold = hold_all(&budget);
     let mut in_flight = InFlight::default();
     tick(&owner, &mut in_flight).await;
@@ -432,7 +432,7 @@ async fn at_most_one_batch_in_flight_and_only_at_tick_start() {
 #[tokio::test]
 async fn batch_members_are_excluded_from_ticks_until_returned() {
     let encoder = StallingEncoder::new(0, 1, Duration::from_millis(1500));
-    let (owner, budget) = budgeted(3, 1, Arc::clone(&encoder) as _);
+    let (owner, budget) = budgeted_at(1, 3, 1, Arc::clone(&encoder) as _);
     let hold = hold_all(&budget);
     let mut in_flight = InFlight::default();
     tick(&owner, &mut in_flight).await;
