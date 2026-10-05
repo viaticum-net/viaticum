@@ -453,33 +453,38 @@ impl Scheduler {
                     Ok(()) => {
                         // A valid signature under `got` proves only that `got` signed it,
                         // not that `got` is a device of the holder's master (C-SP review
-                        // N3): "another device of the holder's master" only when the
-                        // certificate-backed device→master table puts both under one master.
-                        let responder_master = self.db.get_master_for_device(&got).ok().flatten();
-                        let holder_master = self.db.get_master_for_device(&expected).ok().flatten();
-                        let same_master = matches!(
-                            (responder_master, holder_master),
-                            (Some(r), Some(h)) if r == h
-                        );
-                        if same_master {
-                            warn!(
+                        // N3): "another device of the holder's master" only when both
+                        // masters are known and equal. The masters come as for addressing
+                        // (dr-i8, review N2): PEERS first, the device→master table after.
+                        let responder_master = self.db.master_for_holder(&got).ok().flatten();
+                        let holder_master = self.db.master_for_holder(&expected).ok().flatten();
+                        match (responder_master, holder_master) {
+                            (Some(r), Some(h)) if r == h => warn!(
                                 block_id = %block_id,
                                 holder = %expected,
                                 responder = %got,
-                                responder_master = ?responder_master,
+                                responder_master = %r,
                                 challenge_id = %hex_encode(&response.challenge_id),
                                 "scheduler: PosHashResponse from another device of the holder's master — ignored, pending left intact"
-                            );
-                        } else {
-                            warn!(
+                            ),
+                            (Some(r), Some(h)) => warn!(
+                                block_id = %block_id,
+                                holder = %expected,
+                                holder_master = %h,
+                                responder = %got,
+                                responder_master = %r,
+                                challenge_id = %hex_encode(&response.challenge_id),
+                                "scheduler: PosHashResponse from a device of another master — ignored, pending left intact"
+                            ),
+                            _ => warn!(
                                 block_id = %block_id,
                                 holder = %expected,
                                 holder_master = ?holder_master,
                                 responder = %got,
                                 responder_master = ?responder_master,
                                 challenge_id = %hex_encode(&response.challenge_id),
-                                "scheduler: PosHashResponse from a device of another master — ignored, pending left intact"
-                            );
+                                "scheduler: PosHashResponse from another device, master unknown — ignored, pending left intact"
+                            ),
                         }
                     }
                     Err(e) => {
