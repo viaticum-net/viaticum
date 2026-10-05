@@ -20,6 +20,9 @@ use super::{
     union_ranges,
 };
 
+/// repair-i8 / repair-i10 cursor (`esi_high_water`) and the 2^24 ceiling (C-SP K1b).
+mod high_water;
+
 const SYMBOL: u64 = 65_535;
 /// Device index 3 in a cluster: fresh numbers start at 3·2^20.
 const NS: u32 = 3 << 20;
@@ -45,6 +48,7 @@ fn block(db: &Db, k: u32) -> SourceBlockRecord {
     id[0] = 0xB1;
     let record = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: SourceBlockId(id),
         k,
         t: SYMBOL as u16,
@@ -107,7 +111,15 @@ fn tick_all_reject(
 }
 
 fn cursor(db: &Db, block: &SourceBlockRecord) -> u32 {
-    esi_cursor(&db.list_placements_for_block(&block.block_id).unwrap(), NS)
+    let high_water = db
+        .get_source_block(&block.block_id)
+        .unwrap()
+        .map_or(0, |b| b.esi_high_water);
+    esi_cursor(
+        &db.list_placements_for_block(&block.block_id).unwrap(),
+        high_water,
+        NS,
+    )
 }
 
 fn intersects(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
@@ -385,7 +397,7 @@ fn esi_cursor_counts_lost_and_deleting_placements() {
     for status in [PlacementStatus::Lost, PlacementStatus::Deleting] {
         let rows = five_rows_top(&block, status);
 
-        let next = esi_cursor(&rows, NS);
+        let next = esi_cursor(&rows, 0, NS);
 
         assert!(
             next >= NS + 35,

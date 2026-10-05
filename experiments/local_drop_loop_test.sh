@@ -20,8 +20,8 @@
 #               same holder.
 # Cannot close: a holder clock running ahead (no libfaketime; unit DN1-5); DR of the owner
 #               inside the TTL (4r-i51; unit DN1-8 covers the mechanism); a stale notice whose
-#               FIRST delivery comes after a re-placement (one spurious Lost by design, unit
-#               DN1-12); the final-notice flood after deleting a big folder (4r-i49; unit
+#               FIRST delivery comes after a re-placement (a Lost only if it names ESIs the new
+#               placement holds, unit DN1-12; see the DELAYED item below); the final-notice flood after deleting a big folder (4r-i49; unit
 #               DN1-15); pressure republication with new deadlines (new notices; В-1a); two
 #               devices of one holder master (4r-i35; unit DN1-17 for the device choice); the
 #               owner-side SymbolReject path choosing the first device (dead for
@@ -34,10 +34,13 @@
 #               per window per notice; the У-4 ledger is not touched (EvidenceBeforeEpisode); in
 #               a circle of friends the postmen are the friends; no scenario forges an
 #               envelope; a holder clock running ahead of the owner's by more than the SCALED
-#               TTL on multi-machine demos (the postman's clamp is on the raw TTL); a DELAYED first delivery of a notice arriving after repair re-placed
-#               the block on the same holder (unit DN1-12; since repair-i8 the re-placement
-#               gets fresh ESIs, so the ranges could tell the stale notice apart, but rule 2 of
-#               choose_placement_for_notice still marks the new placement Lost until Р-3).
+#               TTL on multi-machine demos (the postman's clamp is on the raw TTL); a DELAYED
+#               first delivery of a notice arriving after repair re-placed the block on the
+#               same holder (not staged here): since repair-i8 the re-placement gets fresh
+#               ESIs, and since Р-3 (C-SP К1c) a notice that names no ESI of this master's
+#               placements is ignored, so such a stale notice no longer marks the new
+#               placement Lost (units drop_notice_without_intersection_changes_nothing,
+#               DN1-12 for the intersecting case).
 # Steps:        1. start 4 daemons, star-connect -> O has 3 authenticated peers (30 s)
 #               2. O writes f1 (1 MiB random) -> restorable within 60 s; B1 = its block; symbols
 #                    of B1 on the disks of A, P1 AND P2 (block_symbols_on) — premise, else

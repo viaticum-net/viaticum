@@ -126,6 +126,7 @@ pub fn ss_source_block_record(
     let target_rel = viaticum_core::reliability::target_reliability(SYSTEM_STATE_IMPORTANCE);
     Ok(SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: params.k,
         t: params.t,

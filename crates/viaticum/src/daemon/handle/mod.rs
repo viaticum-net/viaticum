@@ -123,6 +123,8 @@ pub struct DaemonState {
         std::sync::Arc<crate::daemon::dispatch::missing_sources::MissingSourceCache>,
     /// backup-i4: this machine's file size limit in bytes (`status`, `files`).
     pub max_file_size_bytes: u64,
+    /// Blocks the worker found out of ESI numbers (repair-i8 ceiling), for `status`.
+    pub esi_space: std::sync::Arc<crate::daemon::work_pipeline::EsiSpace>,
     /// backup-i24: this machine's block work budget in bytes (`status`).
     pub block_work_budget_bytes: u64,
     /// К-b3 (spec v3.9a): the leases a `viaticum dr` on this machine holds on the budget, one SS
@@ -814,6 +816,7 @@ impl DaemonHandle {
             mailbox_router: Some(std::sync::Arc::clone(&early_mailbox_router)),
             missing_sources: Default::default(),
             max_file_size_bytes,
+            esi_space: Default::default(),
             block_work_budget_bytes: mem_budget.total_bytes(),
             dr_leases: Some(Arc::clone(&dr_leases)),
         });
@@ -1061,16 +1064,21 @@ impl DaemonHandle {
                 backup_event_tx,
                 Some(cluster_state.clone()),
                 accepted_offers.clone(),
-                master_key.clone(),
+                device_key.clone(),
             );
             // Wire WorkPipeline event channel to Processor so on_peer_authenticated
             // sends WorkEvent::PeerAuthenticated to wake the worker.
             processor.set_work_event_tx(work_event_tx.clone());
+            // pos-i15/i16: the responder answers only challenges addressed to this device
+            // and signs with the device key; siblings come from the device→master table
+            // and the cluster state.
             pos_responder = processor.pos_responder(
                 crate::daemon::processor::PosResponder::new(
                     db.clone(),
                     holdings_dir.clone(),
-                    master_key.clone(),
+                    device_key.clone(),
+                    identity_pub,
+                    Some(cluster_state.clone()),
                 )
                 .with_time_scale(time_scale),
             );
@@ -1094,6 +1102,7 @@ impl DaemonHandle {
                     min_pool_size: 2,
                     recheck_tx: Some(recheck_tx.clone()),
                     max_source_bytes: max_file_size_bytes,
+                    esi_space: Arc::clone(&state.esi_space),
                     mem_budget: Arc::clone(&mem_budget),
                     chunk_budget_bytes:
                         viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,

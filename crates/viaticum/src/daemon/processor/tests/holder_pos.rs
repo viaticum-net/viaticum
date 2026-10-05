@@ -22,7 +22,7 @@ use viaticum_core::types::{
 use super::super::ProcessorError;
 use super::super::pos::{HOLDER_POS_CONCURRENCY, PosResponder, ProcessorPosHandler, new_pos_slots};
 use super::make_processor;
-use crate::daemon::mailbox::poll::PosMailboxChallengeHandler;
+use crate::daemon::mailbox::poll::{PosChallengeAnswer, PosMailboxChallengeHandler};
 use crate::daemon::mem_budget::{HolderKind, MemBudget};
 use crate::daemon::scheduler::{FoldHolder, hash_holders};
 
@@ -85,11 +85,22 @@ impl Held {
         self.block_dir().join(format!("{esi}.bin"))
     }
 
+    /// This holder device's key: the responder signs with it, challenges are addressed to it.
+    fn device_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32])
+    }
+
+    fn device_id() -> DeviceId {
+        DeviceId(Self::device_key().verifying_key().to_bytes())
+    }
+
     fn responder(&self) -> PosResponder {
         PosResponder::new(
             self.db.clone(),
             self.dir.path().to_path_buf(),
-            ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]),
+            Self::device_key(),
+            IdentityPub([0xABu8; 32]),
+            None,
         )
     }
 
@@ -99,7 +110,7 @@ impl Held {
             self.block_id,
             ranges,
             Timestamp::now(),
-            None,
+            Self::device_id(),
             &self.owner_key,
         )
     }
@@ -151,7 +162,7 @@ async fn missing_symbol_after_hashed_ones_gives_nack_with_its_esi() {
             .await
             .expect("not a handler error");
         assert!(
-            over_mailbox.is_none(),
+            matches!(over_mailbox, PosChallengeAnswer::NoAnswer),
             "gone={gone}: the mailbox path publishes nothing"
         );
     }
@@ -217,7 +228,7 @@ async fn holder_answer_equals_owner_fold_with_overlapping_and_unsorted_ranges() 
         held.block_id,
         ranges.clone(),
         Timestamp::now(),
-        None,
+        Held::device_id(),
         &held.owner_key,
     );
     let answer = hash_of(

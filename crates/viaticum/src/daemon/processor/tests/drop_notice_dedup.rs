@@ -32,7 +32,7 @@ impl DropFixture {
         p.consecutive_misses = 0;
         self.db.upsert_placement(&p).unwrap();
     }
-    fn seen_rows(&self) -> usize {
+    pub(super) fn seen_rows(&self) -> usize {
         self.db.list_seen_signed_letters().unwrap().len()
     }
 }
@@ -467,7 +467,10 @@ impl DropFixture {
     /// A second device `d2` of the same holder master holding the same block with ESIs
     /// `(10, 10)` (the fixture's device holds `(0, 10)`), in `status`, with a PeerRecord keyed to
     /// the same ledger master (so a wrong Lost on it would show as a second Announced).
-    fn add_second_device(&self, status: PlacementStatus) -> viaticum_core::types::DeviceId {
+    pub(super) fn add_second_device(
+        &self,
+        status: PlacementStatus,
+    ) -> viaticum_core::types::DeviceId {
         let d2 = make_device_id(self.device.0[0].wrapping_add(1));
         assert!(
             self.device.0 < d2.0,
@@ -482,7 +485,7 @@ impl DropFixture {
         self.db.upsert_placement(&p2).unwrap();
         d2
     }
-    fn status_of(&self, d: viaticum_core::types::DeviceId) -> PlacementStatus {
+    pub(super) fn status_of(&self, d: viaticum_core::types::DeviceId) -> PlacementStatus {
         self.db
             .get_placement(&self.block, &d)
             .unwrap()
@@ -490,7 +493,12 @@ impl DropFixture {
             .status
     }
     /// A notice for ESIs `esi`, stamped `after` seconds after the placement, deadline `deadline_after`.
-    fn notice_for(&self, esi: (u32, u32), after: u64, deadline_after: u64) -> SymbolDropNoticeMsg {
+    pub(super) fn notice_for(
+        &self,
+        esi: (u32, u32),
+        after: u64,
+        deadline_after: u64,
+    ) -> SymbolDropNoticeMsg {
         build_signed_symbol_drop_notice(
             self.block,
             vec![esi],
@@ -556,16 +564,8 @@ async fn an_advance_then_final_notice_on_two_devices_is_one_event_and_leaves_the
     assert_eq!(f.announced_for(f.ledger_master), 1, "one loss, one event");
 }
 
-#[tokio::test]
-async fn a_notice_naming_no_held_esi_goes_to_a_placement_it_can_change() {
-    // DN1-17c (Д-DN1-8 fallback). ESIs that match no placement of this master (e.g. a record of
-    // the holder that lags ours): first placement the notice can change, as before W-1.
-    let f = drop_fixture(0x85, PlacementStatus::Lost, None);
-    let d2 = f.add_second_device(PlacementStatus::Alive);
-
-    assert!(f.apply(f.notice_for((500, 10), 10, 10)));
-    assert_eq!(f.status_of(d2), PlacementStatus::Lost);
-}
+// DN1-17c (a notice naming no held ESI) changed with Р-3 (C-SP K1c): it is ignored now —
+// `drop_notice_device.rs`, `drop_notice_without_intersection_changes_nothing`.
 
 #[tokio::test]
 async fn the_transition_and_the_seen_row_commit_together() {

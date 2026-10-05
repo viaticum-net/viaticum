@@ -416,20 +416,15 @@ impl Scheduler {
         response: PosHashResponseMsg,
     ) -> anyhow::Result<()> {
         // Find the pending challenge by challenge_id through the index (pos-i7). Capture
-        // its key + the holder_master we resolved AT ISSUE TIME (CS-POS-3) without
-        // consuming the entry — the verify below must leave the pending intact on failure.
+        // its key without consuming the entry — the verify below must leave the pending
+        // intact on failure.
         //
         // pos-i6: the poll loop forwards only responses to pending challenges, once per
         // envelope, so this WARN is left for the race "the response arrived while its
         // challenge was timing out" and a second honest envelope of one challenge (a
         // holder restart while this scheduler was busy).
-        let found = {
-            let guard = self.pending.lock().await;
-            guard
-                .key_of(&response.challenge_id)
-                .and_then(|k| guard.get(&k).map(|v| (k, v.holder_master)))
-        };
-        let Some((key, holder_master)) = found else {
+        let found = self.pending.lock().await.key_of(&response.challenge_id);
+        let Some(key) = found else {
             warn!(
                 challenge_id = %hex_encode(&response.challenge_id),
                 "scheduler: PosHashResponse from mailbox with unknown challenge_id (stale or duplicate)"
@@ -440,24 +435,80 @@ impl Scheduler {
         let block_id = key.0;
         let holder_id = key.1;
 
-        // CS-ID-1 / P1-1 / P1-7: authenticate the response BEFORE consuming the pending entry
-        // or applying any outcome. The holder signs the response with its master key; we verify
-        // against the holder_master captured when this challenge was issued (CS-POS-3) — the
-        // SAME key the challenge was addressed to. A positioned postman forging a wrong-hash
-        // response cannot sign for that master → verification fails, we DROP the response and
-        // LEAVE the pending entry intact so the honest holder's real response can still resolve
-        // it (and so the forge does not frame the holder with a Fail). Verifying against the
-        // captured master (rather than a re-resolve here) means a peer-record change between
-        // issue and response can no longer flip an honest holder's response to unverifiable.
-        if let Err(e) = viaticum_core::messages::verify_pos_hash_response(&response, &holder_master)
-        {
-            warn!(
-                block_id = %block_id,
-                holder_id = %holder_id,
-                err = %e,
-                "scheduler: PosHashResponse signature verification failed — ignoring (forge attempt or unsigned), pending left intact"
-            );
-            return Ok(());
+        // CS-ID-1 / pos-i16: authenticate the response BEFORE consuming the pending entry
+        // or applying any outcome. Only the placement's own device may resolve it: the
+        // response must name `holder_id` and be signed by that device's key (DeviceId IS
+        // the public key). A sibling device of the holder's master (it reads the same
+        // master box), a postman's forgery, or a response signed with the master key all
+        // fail here; we DROP the response and LEAVE the pending entry intact so the
+        // addressed device's real response can still resolve it, and nothing is written
+        // to the placement, the pair ledger or trust.
+        match viaticum_core::messages::verify_pos_hash_response(&response, &holder_id) {
+            Ok(()) => {}
+            Err(viaticum_core::messages::MessageError::WrongDevice { expected, got }) => {
+                // Name the responder only if the response really is its (signed by `got`):
+                // a postman's garbage with some other `device_id` must not be logged as a
+                // sibling's answer.
+                match viaticum_core::messages::verify_pos_hash_response(&response, &got) {
+                    Ok(()) => {
+                        // A valid signature under `got` proves only that `got` signed it,
+                        // not that `got` is a device of the holder's master (C-SP review
+                        // N3): "another device of the holder's master" only when both
+                        // masters are known and equal. The masters come as for addressing
+                        // (dr-i8, review N2): PEERS first, the device→master table after.
+                        let responder_master = self.db.master_for_holder(&got).ok().flatten();
+                        let holder_master = self.db.master_for_holder(&expected).ok().flatten();
+                        match (responder_master, holder_master) {
+                            (Some(r), Some(h)) if r == h => warn!(
+                                block_id = %block_id,
+                                holder = %expected,
+                                responder = %got,
+                                responder_master = %r,
+                                challenge_id = %hex_encode(&response.challenge_id),
+                                "scheduler: PosHashResponse from another device of the holder's master — ignored, pending left intact"
+                            ),
+                            (Some(r), Some(h)) => warn!(
+                                block_id = %block_id,
+                                holder = %expected,
+                                holder_master = %h,
+                                responder = %got,
+                                responder_master = %r,
+                                challenge_id = %hex_encode(&response.challenge_id),
+                                "scheduler: PosHashResponse from a device of another master — ignored, pending left intact"
+                            ),
+                            _ => warn!(
+                                block_id = %block_id,
+                                holder = %expected,
+                                holder_master = ?holder_master,
+                                responder = %got,
+                                responder_master = ?responder_master,
+                                challenge_id = %hex_encode(&response.challenge_id),
+                                "scheduler: PosHashResponse from another device, master unknown — ignored, pending left intact"
+                            ),
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            block_id = %block_id,
+                            holder_id = %holder_id,
+                            challenge_id = %hex_encode(&response.challenge_id),
+                            err = %e,
+                            "scheduler: PosHashResponse signature verification failed — ignoring (forge attempt or unsigned), pending left intact"
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    block_id = %block_id,
+                    holder_id = %holder_id,
+                    challenge_id = %hex_encode(&response.challenge_id),
+                    err = %e,
+                    "scheduler: PosHashResponse signature verification failed — ignoring (forge attempt or unsigned), pending left intact"
+                );
+                return Ok(());
+            }
         }
 
         // Defence-in-depth: the signed response binds source_block_id, and the challenge_id
@@ -1018,6 +1069,15 @@ impl Scheduler {
                     source_block_id,
                     holder_id,
                 } => {
+                    // Rows go only with the block (repair-i8: a live block's ESI cursor must
+                    // not lose a range); the deletion engine emits this for `Deleting` blocks.
+                    debug_assert!(
+                        !matches!(
+                            self.db.get_source_block(&source_block_id),
+                            Ok(Some(ref b)) if b.status != SourceBlockStatus::Deleting
+                        ),
+                        "CleanupPlacement for a block that is not being released"
+                    );
                     if let Err(e) = self.db.delete_placement(&source_block_id, &holder_id) {
                         error!(block_id = %source_block_id, holder_id = %holder_id, "deletion: failed to delete placement: {e}");
                     }

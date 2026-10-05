@@ -19,12 +19,17 @@
 //   inject --data-dir D --target HEX --class C [--version V] [--msg-id HEX]
 //          [--stored-at N] [--expires-in N] [--replace]
 //          (--junk-len N | --copy-from TARGET_HEX:MSGID_HEX:CLASS
-//           | --sign-with DIR --drop-block HEX)
+//           | --sign-with DIR --drop-block HEX
+//           | --sign-with DIR --pos-response CID_HEX:BLOCK_HEX:DEVICE_HEX --key device|master)
 //       Writes one entry straight into redb (`Db::mailbox_insert`), bypassing every
 //       postman rule: a hostile postman. `--replace` first deletes the entry under the
 //       same (target, msg_id, class), so a pointer place can be swapped (S1 step 6f). `--sign-with` builds a VALIDLY signed
 //       SymbolDropNoticeBatchMsg with the master key of DIR/identity.key (a holder of
-//       the same run) and stores it as plaintext version 1 (S1 step 6c).
+//       the same run) and stores it as plaintext version 1 (S1 step 6c). With
+//       `--pos-response` it builds a PosHashResponseMsg for challenge CID / block BLOCK
+//       naming device DEVICE (full 32-byte hex), a junk chain hash, signed by the device
+//       key or the master key of DIR/identity.key (`--class PosResponse`, `--target` = the
+//       owner's master box, sender = DIR's master): the forgeries of C-SP step 4 (pos-i16).
 //
 //   remove --data-dir D --target HEX [--msg-id HEX] [--class C]
 //       Deletes the matching entries of one address (expired included) by the same
@@ -43,7 +48,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use viaticum::daemon::identity::load_identity;
+use viaticum::daemon::identity::{derive_keys, load_identity};
 use viaticum_core::cluster::{derive_master_key, master_identity};
 use viaticum_core::db::{Db, read_only_mailbox_raw_entries};
 use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxEntry};
@@ -103,6 +108,12 @@ enum Cmd {
         sign_with: Option<PathBuf>,
         #[arg(long)]
         drop_block: Option<String>,
+        /// With --sign-with: forge a PoS response `CID_HEX:BLOCK_HEX:DEVICE_HEX`.
+        #[arg(long)]
+        pos_response: Option<String>,
+        /// With --pos-response: sign with DIR's `device` or `master` key.
+        #[arg(long)]
+        key: Option<String>,
         /// Overwrite an entry under the same (target, msg_id, class).
         #[arg(long)]
         replace: bool,
@@ -234,6 +245,8 @@ fn main() {
             copy_from,
             sign_with,
             drop_block,
+            pos_response,
+            key,
             replace,
         } => {
             let target = MailboxAddress(hex32(&target, "--target"));
@@ -266,7 +279,44 @@ fn main() {
                         found.sender,
                     )
                 }
+                (None, None, Some(dir)) if pos_response.is_some() => {
+                    if class != MailboxClass::PosResponse {
+                        die("--pos-response builds a PoS response: use --class PosResponse");
+                    }
+                    if drop_block.is_some() {
+                        die("--pos-response and --drop-block are exclusive");
+                    }
+                    let spec = pos_response.as_deref().unwrap_or_default();
+                    let (cid, block, device) = inject::parse_pos_response_spec(spec)
+                        .unwrap_or_else(|| {
+                            die(format!(
+                                "--pos-response {spec:?}: want CID_HEX:BLOCK_HEX:DEVICE_HEX"
+                            ))
+                        });
+                    let which = key
+                        .as_deref()
+                        .and_then(inject::parse_forge_key)
+                        .unwrap_or_else(|| die("--pos-response needs --key device|master"));
+                    let keyfile = load_identity(&dir)
+                        .unwrap_or_else(|e| die(format!("identity in {}: {e}", dir.display())));
+                    let (master_key, device_key, _) =
+                        derive_keys(&keyfile, 0).unwrap_or_else(|e| die(e));
+                    let signer = match which {
+                        inject::ForgeKey::Device => &device_key,
+                        inject::ForgeKey::Master => &master_key,
+                    };
+                    let response =
+                        inject::forged_pos_response(cid, block, device, signer, Timestamp(now));
+                    (
+                        version.unwrap_or(1),
+                        to_cbor_bytes(&response),
+                        Some(master_identity(&master_key)),
+                    )
+                }
                 (None, None, Some(dir)) => {
+                    if key.is_some() {
+                        die("--key goes with --pos-response");
+                    }
                     if class != MailboxClass::DropNotice {
                         die("--sign-with builds a DropNotice: use --class DropNotice");
                     }

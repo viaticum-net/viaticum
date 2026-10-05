@@ -277,8 +277,11 @@ pub struct PosHashChallengeMsg {
     pub source_block_id: SourceBlockId,
     pub esi_ranges: Vec<(u32, u32)>,     // (start_esi, count) — one challenge covers a whole range
     pub timestamp: Timestamp,
-    pub device_id: Option<DeviceId>,     // target device within a cluster
+    pub device_id: DeviceId,             // the placement's holder DEVICE (required, signed)
+    pub sig: [u8; 64],                   // OWNER's master key
 }
+// sig input: b"viaticum-pos-challenge-v2" || challenge_id || source_block_id || device_id
+//            || CBOR(esi_ranges) || timestamp_be
 ```
 
 **PosHashResponseMsg** (Holder → Owner):
@@ -286,10 +289,14 @@ pub struct PosHashChallengeMsg {
 pub struct PosHashResponseMsg {
     pub v: u8,
     pub challenge_id: [u8; 16],
+    pub source_block_id: SourceBlockId,
     pub chain_hash: [u8; 32],            // SHA256 chain over the bound symbols, not the symbols themselves
     pub timestamp: Timestamp,
-    pub device_id: Option<DeviceId>,
+    pub device_id: DeviceId,             // the responding device (required, signed)
+    pub sig: [u8; 64],                   // the responding DEVICE's key
 }
+// sig input: b"viaticum-pos-resp-v2" || challenge_id || source_block_id || device_id
+//            || chain_hash || timestamp_be
 ```
 
 **PosHashNackMsg** (Holder → Owner):
@@ -300,10 +307,32 @@ pub struct PosHashNackMsg {
     pub source_block_id: SourceBlockId,
     pub first_missing_esi: u32,          // first ESI in the range the holder does not have
     pub timestamp: Timestamp,
-    pub device_id: Option<DeviceId>,
-    pub sig: [u8; 64],                   // signed — a Nack cannot be forged
+    pub device_id: DeviceId,             // the responding device (required, signed)
+    pub sig: [u8; 64],                   // the responding DEVICE's key — a Nack cannot be forged
 }
+// sig input: b"viaticum-pos-nack-v2" || challenge_id || source_block_id || device_id || timestamp_be
 ```
+
+**Device addressing.** A placement belongs to one holder *device*; the challenge goes to the
+holder's *master* mailbox, which every device of that master reads. `device_id` in the
+challenge names the addressed device and is under the owner's signature, so a postman cannot
+re-address it. The holder checks, in order: owner signature → freshness → addressee → holding
+→ disk. A challenge addressed to another device of its own master (a sibling, known from the
+device→master table or the cluster state) is not served at all: no response, no Nack, no disk
+read; the poll remembers it as *not mine* until it expires. A challenge addressed to a device it
+does not know as its own is dropped like junk.
+
+The response and the Nack are signed with the responding device's key (`DeviceId` is that
+key's public half). The owner accepts a response only if `response.device_id ==
+pending.holder_id` and the signature verifies under `holder_id`
+(`verify_pos_hash_response(msg, &holder_id)` → `WrongDevice` / `BadSignature`). A response from
+a sibling device, a forgery, or one signed with the master key is ignored and the pending
+challenge is left intact for the addressed device's own answer. Siblings share the master and
+epoch keys (they are not cryptographically isolated from each other), so the guarantee is
+narrower: a sibling running honest software, and anyone who holds only the master key, cannot
+pass or fail a PoS challenge for another device. It does not hold for a device whose key is
+derived from the phrase (`init --mnemonic` without `--new-device`, `device add`): anyone who
+holds the phrase can compute that key and sign for it.
 
 `PosHashNack` means: "I am not storing (some of) these symbols" (evicted under disk pressure, or never received). A holder must send `PosHashNack` instead of staying silent if it knows it does not hold them.
 
@@ -382,7 +411,7 @@ challenge is always deposited, not delivered synchronously:
 
 1. **Challenge**: the scheduler publishes a `PosChallenge` mailbox entry addressed to the holder's master identity (`target = holder_master`, `sender = owner_master`), carrying the signed `PosHashChallengeMsg`. `publish` deposits it with the holder's Kademlia-close postmen; the placement is only moved to Pending once at least one postman Acks (challenge is durably stored before the owner starts its timeout).
 
-2. **Response**: when the holder next polls its mailbox it finds the challenge, recomputes the chain hash and publishes a `PosResponse` entry back (`target = owner_master`, `sender = holder_master`). The response uses a stable `msg_id` derived from the chain hash, so a retried response is idempotent.
+2. **Response**: when the addressed holder device next polls its master mailbox it finds the challenge, recomputes the chain hash and publishes a `PosResponse` entry back (`target = owner_master`, `sender = holder_master`), signed by its device key. Sibling devices reading the same mailbox skip the challenge. The response uses a stable `msg_id` derived from the chain hash, so a retried response is idempotent.
 
 3. **No live connection required**: `idle_connection_timeout = 600s` in libp2p means peer-to-peer connections are **ephemeral** — peers do not hold persistent links. The mailbox absorbs this: challenge and response each wait in postman storage (TTL 7 days, `POS_CHALLENGE_TTL`) until the addressee polls.
 

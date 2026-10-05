@@ -206,7 +206,6 @@ async fn a_holder_that_stopped_being_challengeable_during_preparation_gets_no_ch
         expected_chain_hash: [7; 32],
         issued_at: Timestamp::now(),
         challenge_id: [9; 16],
-        holder_master: viaticum_core::types::IdentityPub(b.0),
     };
     owner.pending.lock().await.insert((block, b), theirs);
     owner.db.delete_placement(&block, &c).unwrap();

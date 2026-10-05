@@ -52,6 +52,13 @@ pub fn render_status(data: &StatusData) -> String {
         "  repair needed:  {} blocks\n",
         data.blocks_needing_repair
     ));
+    // repair-i8 ceiling: shown only when it happens.
+    if data.blocks_esi_exhausted > 0 {
+        out.push_str(&format!(
+            "  not repairable: {} blocks (ESI numbers used up)\n",
+            data.blocks_esi_exhausted
+        ));
+    }
     // backup-i4
     if data.max_file_size_bytes > 0 {
         out.push_str(&format!(

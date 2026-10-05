@@ -67,6 +67,7 @@ fn make_block(
 ) -> SourceBlockRecord {
     SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: bid,
         k: 1,
         t: 1024,

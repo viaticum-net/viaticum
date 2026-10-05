@@ -18,10 +18,11 @@
 //! pos-i5-a: nothing a postman controls without a signature steers the memory. The key
 //! of a decodable challenge is its owner-signed content plus the signature
 //! (`ChallengeKey::signed`): not the `msg_id`, not the raw payload bytes (a postman can re-encode
-//! a signed challenge many ways without breaking the signature: another `v` or
-//! `device_id`, another key order, an extra field, a trailing byte). An entry lives `ttl`
+//! a signed challenge many ways without breaking the signature: another `v`, another key
+//! order, an extra field, a trailing byte). An entry lives `ttl`
 //! from first sight, not until the envelope's `expires_at`; the number of entries is capped
-//! per kind (see `MAX_REMEMBERED_RESPONSES`, `MAX_REMEMBERED_NO_ANSWERS`). The holder
+//! per kind (see `MAX_REMEMBERED_RESPONSES`, `MAX_REMEMBERED_NO_ANSWERS`,
+//! `MAX_REMEMBERED_NOT_MINE`). The holder
 //! answers only a fresh challenge (`PosResponder`: age ≤ TTL + clock skew), so a postman
 //! can only replay challenges within that window, and each distinct signed challenge is
 //! computed at most once per TTL of memory.
@@ -70,6 +71,19 @@ pub const MAX_REMEMBERED_RESPONSES: usize = 200_000;
 /// a signature check or a freshness check, all before any disk read.
 pub const MAX_REMEMBERED_NO_ANSWERS: usize = 10_000;
 
+/// Cap on remembered not-mine challenges (pos-i15).
+///
+/// A not-mine entry is a challenge with a valid owner signature addressed to another
+/// device of our own master (a known sibling): our master box carries our siblings'
+/// challenges too. A postman cannot mint one: the addressee is signed by the owner and
+/// must be our sibling. Honest bound: live challenges of the siblings' placements ≤ 2 ×
+/// their placements (see `MAX_REMEMBERED_RESPONSES`) ≈ 200 000 in a friends circle.
+/// ~100 B per entry ≈ 20 MB at the cap. Kept apart from the junk no-answers so the
+/// siblings' challenges never push junk out or the other way round. Above the cap a
+/// not-mine challenge is re-checked on every poll: decode, signature, freshness and the
+/// sibling lookup, no disk read.
+pub const MAX_REMEMBERED_NOT_MINE: usize = 200_000;
+
 /// A refusal to remember (cap reached) is logged on the 1st, then every this many.
 pub const MEMO_FULL_WARN_EVERY: u64 = 1_000;
 
@@ -86,20 +100,24 @@ pub struct ChallengeKey([u8; 32]);
 impl ChallengeKey {
     /// blake3 over the class, the claimed sender (the owner whose key the signature is
     /// checked against), the fields the owner signs (challenge_id, source_block_id,
-    /// esi_ranges, timestamp — decoded values in one fixed layout) and the signature.
+    /// device_id, esi_ranges, timestamp — decoded values in one fixed layout) and the
+    /// signature.
     ///
     /// Every re-encoding a postman can make without breaking the signature (another key
-    /// order, an extra field, a trailing byte, another `v` or `device_id`) maps to the
-    /// same key: `v` and `device_id` are not signed and the chain hash does not depend on
-    /// them. The signature is in the key: a forgery with the honest `challenge_id` and a
-    /// junk signature is another key, so it cannot occupy the honest challenge's entry.
+    /// order, an extra field, a trailing byte, another `v`) maps to the same key: `v` is
+    /// not signed and the chain hash does not depend on it. The addressed `device_id` is
+    /// signed and in the key (pos-i15): two challenges that differ only in the addressee
+    /// never share an entry, so a not-mine entry cannot stand for a challenge to us. The
+    /// signature is in the key: a forgery with the honest `challenge_id` and a junk
+    /// signature is another key, so it cannot occupy the honest challenge's entry.
     pub fn signed(sender: Option<&IdentityPub>, c: &PosHashChallengeMsg) -> Self {
         let mut h = blake3::Hasher::new();
-        h.update(b"viaticum-pos-memo-signed-challenge-v1");
+        h.update(b"viaticum-pos-memo-signed-challenge-v2");
         h.update(&[MailboxClass::PosChallenge as u8]);
         update_sender(&mut h, sender);
         h.update(&c.challenge_id);
         h.update(&c.source_block_id.0);
+        h.update(&c.device_id.0);
         h.update(&(c.esi_ranges.len() as u64).to_le_bytes());
         for (start, count) in &c.esi_ranges {
             h.update(&start.to_le_bytes());
@@ -161,11 +179,35 @@ enum Outcome {
     },
     /// The handler gave no answer (Nack, junk, unauthenticated or oversized challenge).
     NoAnswer,
+    /// pos-i15: addressed to a sibling device of our master. Skipped until forgotten.
+    NotMine,
+}
+
+/// The capped kinds of remembered outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Response,
+    NoAnswer,
+    NotMine,
+}
+
+impl Kind {
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Response => "response",
+            Kind::NoAnswer => "no_answer",
+            Kind::NotMine => "not_mine",
+        }
+    }
 }
 
 impl Outcome {
-    fn is_response(&self) -> bool {
-        matches!(self, Outcome::Response { .. })
+    fn kind(&self) -> Kind {
+        match self {
+            Outcome::Response { .. } => Kind::Response,
+            Outcome::NoAnswer => Kind::NoAnswer,
+            Outcome::NotMine => Kind::NotMine,
+        }
     }
 }
 
@@ -186,8 +228,10 @@ pub struct AnsweredChallenges {
     retry_secs: u64,
     max_responses: usize,
     max_no_answers: usize,
+    max_not_mine: usize,
     responses: usize,
     no_answers: usize,
+    not_mine: usize,
     refused: u64,
 }
 
@@ -201,8 +245,24 @@ impl AnsweredChallenges {
         )
     }
 
-    /// `new` with other caps (tests exercise the cap without 200 000 entries).
+    /// `new` with other caps for responses and no-answers (tests exercise the cap without
+    /// 200 000 entries); the not-mine cap stays `MAX_REMEMBERED_NOT_MINE`.
     pub(crate) fn with_caps(time_scale: u64, max_responses: usize, max_no_answers: usize) -> Self {
+        Self::with_all_caps(
+            time_scale,
+            max_responses,
+            max_no_answers,
+            MAX_REMEMBERED_NOT_MINE,
+        )
+    }
+
+    /// `new` with every cap given.
+    pub(crate) fn with_all_caps(
+        time_scale: u64,
+        max_responses: usize,
+        max_no_answers: usize,
+        max_not_mine: usize,
+    ) -> Self {
         let ttl_secs = scaled_ttl_secs(POS_CHALLENGE_TTL.as_secs(), time_scale);
         AnsweredChallenges {
             by_key: HashMap::new(),
@@ -210,8 +270,10 @@ impl AnsweredChallenges {
             retry_secs: (ttl_secs / 4).max(1),
             max_responses,
             max_no_answers,
+            max_not_mine,
             responses: 0,
             no_answers: 0,
+            not_mine: 0,
             refused: 0,
         }
     }
@@ -261,6 +323,8 @@ impl AnsweredChallenges {
                     ChallengeStep::Skip
                 }
             }
+            // pos-i15: the addressee is signed and in the key — nothing to re-check.
+            Outcome::NotMine => ChallengeStep::Skip,
         }
     }
 
@@ -289,6 +353,11 @@ impl AnsweredChallenges {
         self.remember(key, Outcome::NoAnswer, now_secs);
     }
 
+    /// Remember that the challenge is addressed to a sibling device (pos-i15).
+    pub fn remember_not_mine(&mut self, key: ChallengeKey, now_secs: u64) {
+        self.remember(key, Outcome::NotMine, now_secs);
+    }
+
     /// Record a re-publish of the remembered response and its acks.
     pub fn record_republish(&mut self, key: ChallengeKey, acks: usize, now_secs: u64) {
         if let Some(a) = self.by_key.get_mut(&key) {
@@ -301,21 +370,18 @@ impl AnsweredChallenges {
 
     /// Drop entries whose `forget_at` passed; returns how many.
     pub fn forget_expired(&mut self, now_secs: u64) -> usize {
-        let (mut responses, mut no_answers) = (0usize, 0usize);
+        let mut dropped: Vec<Kind> = Vec::new();
         self.by_key.retain(|_, a| {
             let keep = a.forget_at > now_secs;
             if !keep {
-                if a.outcome.is_response() {
-                    responses += 1;
-                } else {
-                    no_answers += 1;
-                }
+                dropped.push(a.outcome.kind());
             }
             keep
         });
-        self.responses -= responses;
-        self.no_answers -= no_answers;
-        responses + no_answers
+        for kind in &dropped {
+            self.uncount(*kind);
+        }
+        dropped.len()
     }
 
     pub fn len(&self) -> usize {
@@ -337,30 +403,21 @@ impl AnsweredChallenges {
     /// (and an entry that would change into that kind is dropped): the challenge is then
     /// computed on every poll, the pre-pos-i5 behaviour.
     fn remember(&mut self, key: ChallengeKey, outcome: Outcome, now_secs: u64) {
-        let is_response = outcome.is_response();
-        let was_response = self.by_key.get(&key).map(|a| a.outcome.is_response());
-        if was_response != Some(is_response) {
-            let full = if is_response {
-                self.responses >= self.max_responses
-            } else {
-                self.no_answers >= self.max_no_answers
-            };
-            if full {
-                if let Some(old) = was_response {
+        let kind = outcome.kind();
+        let was = self.by_key.get(&key).map(|a| a.outcome.kind());
+        if was != Some(kind) {
+            if *self.count_mut(kind) >= self.cap(kind) {
+                if let Some(old) = was {
                     self.by_key.remove(&key);
                     self.uncount(old);
                 }
-                self.refuse(is_response);
+                self.refuse(kind);
                 return;
             }
-            if let Some(old) = was_response {
+            if let Some(old) = was {
                 self.uncount(old);
             }
-            if is_response {
-                self.responses += 1;
-            } else {
-                self.no_answers += 1;
-            }
+            *self.count_mut(kind) += 1;
         }
         let forget_at = now_secs.saturating_add(self.ttl_secs);
         self.by_key
@@ -380,21 +437,34 @@ impl AnsweredChallenges {
             });
     }
 
-    fn uncount(&mut self, was_response: bool) {
-        if was_response {
-            self.responses -= 1;
-        } else {
-            self.no_answers -= 1;
+    fn count_mut(&mut self, kind: Kind) -> &mut usize {
+        match kind {
+            Kind::Response => &mut self.responses,
+            Kind::NoAnswer => &mut self.no_answers,
+            Kind::NotMine => &mut self.not_mine,
         }
     }
 
-    fn refuse(&mut self, is_response: bool) {
+    fn cap(&self, kind: Kind) -> usize {
+        match kind {
+            Kind::Response => self.max_responses,
+            Kind::NoAnswer => self.max_no_answers,
+            Kind::NotMine => self.max_not_mine,
+        }
+    }
+
+    fn uncount(&mut self, kind: Kind) {
+        *self.count_mut(kind) -= 1;
+    }
+
+    fn refuse(&mut self, kind: Kind) {
         self.refused += 1;
         if self.refused % MEMO_FULL_WARN_EVERY == 1 {
             warn!(
-                kind = if is_response { "response" } else { "no_answer" },
+                kind = kind.name(),
                 responses = self.responses,
                 no_answers = self.no_answers,
+                not_mine = self.not_mine,
                 refused_total = self.refused,
                 "pos_memo: memory cap reached — not remembering this challenge (computed on every poll)"
             );
@@ -411,6 +481,8 @@ pub struct PollCounts {
     pub computed: u32,
     /// Challenges the handler gave no answer to (Nack, unauthenticated, oversized).
     pub no_answer: u32,
+    /// Challenges addressed to a sibling device of our master (pos-i15).
+    pub not_mine: u32,
     /// Challenges the handler failed on (not remembered, retried next poll).
     pub handler_error: u32,
     /// Remembered responses published again from memory.

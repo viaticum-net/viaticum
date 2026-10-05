@@ -405,6 +405,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         files_too_large: count_too_large_under_watches(state),
         max_file_size_bytes: state.max_file_size_bytes,
         block_work_budget_bytes: state.block_work_budget_bytes,
+        blocks_esi_exhausted: count_esi_exhausted(state),
         backup_paused_while_restoring: state.restore_jobs.backup_paused()
             || (crate::daemon::work_pipeline::RESTORE_PAUSES_BACKUP
                 && state
@@ -422,6 +423,17 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
                 revoked: s.revoked,
             }),
     }))
+}
+
+/// repair-i8 ceiling: blocks the worker found out of ESI numbers that are still in service.
+fn count_esi_exhausted(state: &DaemonState) -> u32 {
+    let in_service = state
+        .esi_space
+        .exhausted_blocks()
+        .iter()
+        .filter(|id| block_in_service(state, id))
+        .count();
+    u32::try_from(in_service).unwrap_or(u32::MAX)
 }
 
 /// backup-i4: the too-large marks of files under the watch directories now. A mark left

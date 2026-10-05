@@ -57,17 +57,20 @@ fn esi_ranges_intersect(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
     })
 }
 
-/// Pick the placement a DropNotice of a holder MASTER is about (Д-DN1-8, review W-1). The notice
-/// names no device but carries its signed `esi_ranges`, and live placements of one block get
-/// disjoint ranges (`work_pipeline::offer_plan::esi_cursor`), so:
-///   1. a placement whose ESIs intersect the notice's — preferring one the notice can still
-///      change if several intersect (repair never reuses a Lost placement's numbers for a live
-///      block — the cursor counts every row, repair-i8 — so several rows intersect only after a
-///      block was deleted and its content added back);
-///   2. else the first placement the notice can change (a stale notice about a Lost range that
-///      the same holder was since re-placed on with fresh numbers lands here and marks the new
-///      placement Lost — residual door until Р-3, C-SP §3.7, repair-i10 addendum);
-///   3. else the first found.
+/// Pick the placement a DropNotice of a holder MASTER is about (Д-DN1-8, review W-1; Р-3, C-SP
+/// §3.7). The notice names no device but carries its signed `esi_ranges`, and the rows of one
+/// block never share an ESI (the owner's ESI cursor counts every row and never goes back,
+/// repair-i8, repair-i10), so the ESIs name the placement:
+///   - the notice names ESIs: a placement whose ESIs intersect the notice's — preferring one
+///     the notice can still change if several intersect (only after a block was deleted and
+///     its content added back). None intersects → `None`: the letter is about a range this
+///     master no longer has (a stale notice about a range the device was since re-placed
+///     with fresh numbers), or about another device that reads the same master mailbox (an
+///     owner-sibling's rows, cluster-i2). Taking "some placement of the master" instead put a
+///     false `Lost` on a sibling;
+///   - the notice names no ESI (`holder_cleanup` sends empty ranges): only when the master
+///     has exactly one placement of the block the notice can change; otherwise `None` —
+///     which device it means is unknown.
 ///
 /// Rule 1 is what keeps "advance notice, then the final notice a week later" on ONE device:
 /// the final notice finds its device already Lost and must not move on to the sibling.
@@ -75,6 +78,14 @@ fn choose_placement_for_notice(
     found: &[SymbolPlacement],
     notice_esi: &[(u32, u32)],
 ) -> Option<(DeviceId, PlacementStatus)> {
+    let names_esis = notice_esi.iter().any(|&(_, count)| count > 0);
+    if !names_esis {
+        let mut changeable = found.iter().filter(|p| notice_can_change(p.status));
+        return match (changeable.next(), changeable.next()) {
+            (Some(only), None) => Some((only.holder_id, only.status)),
+            _ => None,
+        };
+    }
     let intersecting: Vec<&SymbolPlacement> = found
         .iter()
         .filter(|p| esi_ranges_intersect(&p.esi_ranges, notice_esi))
@@ -83,9 +94,6 @@ fn choose_placement_for_notice(
         .iter()
         .find(|p| notice_can_change(p.status))
         .or_else(|| intersecting.first())
-        .copied()
-        .or_else(|| found.iter().find(|p| notice_can_change(p.status)))
-        .or_else(|| found.first())
         .map(|p| (p.holder_id, p.status))
 }
 
@@ -206,13 +214,24 @@ impl SymbolDropHandler {
         }
         let chosen = choose_placement_for_notice(&found, &notice.esi_ranges);
 
+        // Not remembered, no repair wake (Р-3): the letter changes nothing here.
         let (holder_device_id, chosen_status) = match chosen {
             Some(c) => c,
-            None => {
+            None if found.is_empty() => {
                 warn!(
                     block_id = %block_id,
                     holder = %from,
                     "processor: DropNotice — no placement found for any device of this master, ignoring"
+                );
+                return false;
+            }
+            None => {
+                info!(
+                    block_id = %block_id,
+                    holder = %from,
+                    esi_ranges = ?notice.esi_ranges,
+                    placements = found.len(),
+                    "processor: DropNotice names no ESI of any placement of this master — ignored"
                 );
                 return false;
             }
@@ -1062,7 +1081,8 @@ impl Processor {
             let in_range = held_esis.contains(&esi)
                 || accepted_esi_ranges
                     .iter()
-                    .any(|&(start, count)| esi >= start && esi < start + count);
+                    // `esi - start < count`: no `start + count` overflow (CS-ERA-6).
+                    .any(|&(start, count)| esi >= start && esi - start < count);
             if !in_range {
                 warn!(
                     block_id = %block_id,

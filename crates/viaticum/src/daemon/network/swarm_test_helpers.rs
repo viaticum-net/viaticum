@@ -134,7 +134,7 @@ pub(crate) fn app_message() -> viaticum_core::messages::Message {
         source_block_id: viaticum_core::types::SourceBlockId([2u8; 32]),
         esi_ranges: vec![(42, 1)],
         timestamp: Timestamp(1000),
-        device_id: None,
+        device_id: viaticum_core::types::DeviceId([3u8; 32]),
         sig: [0u8; 64],
     })
 }

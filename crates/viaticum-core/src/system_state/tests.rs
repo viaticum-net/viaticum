@@ -34,6 +34,7 @@ fn make_file(path: &str, id: u64) -> FileRecord {
 fn make_source_block(seed: u8) -> SourceBlockRecord {
     SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: SourceBlockId([seed; 32]),
         k: 10,
         t: 65535,
@@ -1057,4 +1058,33 @@ fn system_state_snapshot_excludes_too_large_marks() {
     let restored = test_db();
     restore_db(&restored, &after).unwrap();
     assert!(restored.list_too_large().unwrap().is_empty());
+}
+
+/// repair-i8: the ESI cursor rides SystemState with the block record — a DR restore keeps
+/// it, and a raised cursor alone makes a diff (the record bytes changed).
+#[test]
+fn snapshot_and_diff_carry_esi_high_water() {
+    let db = test_db();
+    let key = make_key();
+    let mut sb = make_source_block(1);
+    sb.esi_high_water = 4096;
+    db.upsert_source_block(&sb).unwrap();
+
+    let state = snapshot_db(&db).unwrap();
+    let blob = pack_system_state(&state, &key).unwrap();
+    let db2 = test_db();
+    restore_db(&db2, &unpack_system_state(&blob, &key).unwrap()).unwrap();
+    assert_eq!(
+        db2.get_source_block(&SourceBlockId([1; 32]))
+            .unwrap()
+            .unwrap()
+            .esi_high_water,
+        4096
+    );
+
+    let mut raised = state.clone();
+    raised.source_blocks[0].esi_high_water = 8192;
+    let diff = diff_states(&state, &raised);
+    let result = apply_diffs(state, std::slice::from_ref(&diff));
+    assert_eq!(result.source_blocks[0].esi_high_water, 8192);
 }

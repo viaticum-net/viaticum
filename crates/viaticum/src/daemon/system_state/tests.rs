@@ -23,6 +23,7 @@ mod cadence {
         let block_id = SourceBlockId([0xDD; 32]);
         db.upsert_source_block(&SourceBlockRecord {
             seal_generation: 0,
+            esi_high_water: 0,
             block_id,
             k: 6,
             t: 512,

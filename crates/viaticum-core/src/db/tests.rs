@@ -47,6 +47,7 @@ fn file_with_versions(path: &str, file_id: u64, versions: &[([u8; 32], bool)]) -
 fn make_source_block(seed: u8, status: SourceBlockStatus) -> SourceBlockRecord {
     SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: block_id(seed),
         k: 10,
         t: 65535,
@@ -779,6 +780,7 @@ fn committed_bytes_sums_active_blocks() {
     // Block A: Active, encrypted_size=Some(1000)
     let block_a = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: block_id(10),
         k: 5,
         t: 100,
@@ -798,6 +800,7 @@ fn committed_bytes_sums_active_blocks() {
     // Block B: Active, encrypted_size=None → fallback to k*t = 10*100 = 1000
     let block_b = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: block_id(11),
         k: 10,
         t: 100,
@@ -817,6 +820,7 @@ fn committed_bytes_sums_active_blocks() {
     // Block C: Deleted, encrypted_size=Some(500) → must NOT be counted
     let block_c = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: block_id(12),
         k: 5,
         t: 100,
@@ -856,6 +860,7 @@ fn update_block_cached_fields_persists_to_db() {
     // Insert a block with default (zero) cached fields.
     let initial = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: bid,
         k: 5,
         t: 65535,
@@ -1438,6 +1443,7 @@ fn refresh_peer_storage_bytes_updates_trust_s() {
     let block_id_a = SourceBlockId([0xA0u8; 32]);
     let sb_a = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: block_id_a,
         k: 10,
         t: 1000,
@@ -1518,6 +1524,7 @@ fn refresh_peer_storage_bytes_neutral_when_we_store_nothing() {
     let block_id_b = SourceBlockId([0xC0u8; 32]);
     let sb = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: block_id_b,
         k: 5,
         t: 2000,
@@ -1575,6 +1582,7 @@ fn refresh_peer_storage_bytes_only_alive_and_active_count() {
     let block_id_c = SourceBlockId([0xD0u8; 32]);
     let sb = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: block_id_c,
         k: 10,
         t: 500,
@@ -2640,6 +2648,7 @@ fn make_block_with(
 ) -> SourceBlockRecord {
     SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: SourceBlockId([seed; 32]),
         k: 10,
         t: 65535,
@@ -4618,4 +4627,46 @@ fn update_peer_without_change_writes_nothing() {
     );
     fail.store(false, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(db.get_peer(&d).unwrap().unwrap().addrs, make_peer(d).addrs);
+}
+
+// ============================================================
+// repair-i8: esi_high_water never decreases
+// ============================================================
+
+/// Both upserts keep the larger stored `esi_high_water` (a writer with an older copy of the
+/// record must not move the ESI cursor back) and still write every other field; a larger
+/// value is written.
+#[test]
+fn upsert_source_block_never_lowers_esi_high_water() {
+    let db = test_db();
+    let mut record = make_source_block(1, SourceBlockStatus::Active);
+    let stale = record.clone();
+    record.esi_high_water = 500;
+    db.upsert_source_block(&record).unwrap();
+
+    let mut stale_db = stale.clone();
+    stale_db.current_alive = 7;
+    db.upsert_source_block(&stale_db).unwrap();
+    let after = db.get_source_block(&record.block_id).unwrap().unwrap();
+    assert_eq!(after.esi_high_water, 500);
+    assert_eq!(after.current_alive, 7, "the other fields are written");
+
+    let mut stale_txn = stale;
+    stale_txn.status = SourceBlockStatus::Deleting;
+    let mut txn = db.write_txn().unwrap();
+    txn.upsert_source_block(&stale_txn).unwrap();
+    txn.commit().unwrap();
+    let after = db.get_source_block(&record.block_id).unwrap().unwrap();
+    assert_eq!(after.esi_high_water, 500);
+    assert_eq!(after.status, SourceBlockStatus::Deleting);
+
+    record.esi_high_water = 900;
+    db.upsert_source_block(&record).unwrap();
+    assert_eq!(
+        db.get_source_block(&record.block_id)
+            .unwrap()
+            .unwrap()
+            .esi_high_water,
+        900
+    );
 }

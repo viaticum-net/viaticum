@@ -29,7 +29,7 @@ fn make_pos_challenge() -> Message {
         source_block_id: SourceBlockId([2u8; 32]),
         esi_ranges: vec![(42, 1)],
         timestamp: Timestamp(1000),
-        device_id: None,
+        device_id: viaticum_core::types::DeviceId([3u8; 32]),
         sig: [0u8; 64],
     })
 }
@@ -42,7 +42,7 @@ fn make_pos_nack() -> Message {
         source_block_id: SourceBlockId([2u8; 32]),
         first_missing_esi: 42,
         timestamp: Timestamp(1001),
-        device_id: None,
+        device_id: viaticum_core::types::DeviceId([3u8; 32]),
         sig: [0u8; 64],
     })
 }

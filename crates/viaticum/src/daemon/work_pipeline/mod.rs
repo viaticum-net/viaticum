@@ -24,6 +24,7 @@ use crate::daemon::mem_budget::MemBudget;
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
 
+mod esi_space;
 mod gate;
 mod offer_plan;
 mod pool;
@@ -34,6 +35,7 @@ mod tests;
 #[cfg(test)]
 mod tests_budget;
 
+pub use esi_space::EsiSpace;
 pub use gate::{
     BACKUP_PAUSE_WARN_AFTER, GateWake, PauseWatch, RestoreGate, new_gate_wake, notify_gate,
     restore_gate,
@@ -101,6 +103,8 @@ pub struct WorkPipelineConfig {
     /// The size limit of this machine: the rebuild reads no source file above it (J1,
     /// backup-i5). Default: the RaptorQ ceiling; the daemon sets the limit in force.
     pub max_source_bytes: u64,
+    /// Blocks out of ESI numbers (repair-i8 ceiling), shared with `status`.
+    pub esi_space: Arc<EsiSpace>,
     /// The block work budget (backup-i24): the worker takes one permit per iteration. The daemon
     /// passes the one shared with the scheduler and restore (`handle`).
     pub mem_budget: Arc<MemBudget>,
@@ -130,6 +134,7 @@ impl Default for WorkPipelineConfig {
             min_pool_size: 2,
             recheck_tx: None,
             max_source_bytes: viaticum_core::constants::MAX_FILE_SIZE_CEILING_BYTES,
+            esi_space: Arc::default(),
             mem_budget: MemBudget::new(u64::MAX),
             chunk_budget_bytes: viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,
             restore_pauses_backup: RESTORE_PAUSES_BACKUP,

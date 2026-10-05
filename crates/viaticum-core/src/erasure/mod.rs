@@ -8,7 +8,7 @@ use raptorq::{
 use sha2::Sha256;
 use std::borrow::Cow;
 
-use crate::constants::RAPTORQ_MAX_SOURCE_SYMBOLS;
+use crate::constants::{MAX_ESI_EXCLUSIVE, RAPTORQ_MAX_SOURCE_SYMBOLS};
 use crate::types::{DeviceId, ErasureParams, SourceBlockId};
 
 mod raptorq_table;
@@ -97,9 +97,31 @@ pub enum ErasureError {
     #[error("repair packet not produced for esi {esi}")]
     RepairPacketMissing { esi: u32 },
 
+    /// An ESI range reaches `MAX_ESI_EXCLUSIVE` (2^24) or overflows u32; raptorq would
+    /// panic on it (CS-ERA-6).
+    #[error("ESI range {start}+{count} reaches the ESI limit {max}")]
+    EsiOutOfRange { start: u32, count: u32, max: u32 },
+
     /// `encode_raw_ranges_each` needs ranges in ascending order without overlap.
     #[error("ranges are not ascending and disjoint")]
     RangesNotAscending,
+}
+
+/// Every range ends at or below `MAX_ESI_EXCLUSIVE` (checked addition, CS-ERA-6).
+fn check_esi_ranges(ranges: &[(u32, u32)]) -> Result<(), ErasureError> {
+    for &(start, count) in ranges {
+        match start.checked_add(count) {
+            Some(end) if end <= MAX_ESI_EXCLUSIVE => {}
+            _ => {
+                return Err(ErasureError::EsiOutOfRange {
+                    start,
+                    count,
+                    max: MAX_ESI_EXCLUSIVE,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Pad a stored blob in place to `k * t` bytes for encoding (no second copy).
@@ -257,6 +279,7 @@ impl RaptorQEncoder {
         f: &mut SymbolSink<'_>,
     ) -> Result<(), ErasureError> {
         check_source_symbol_limit(params)?;
+        check_esi_ranges(ranges)?;
         if source_block.is_empty() {
             return Err(ErasureError::EmptyBlock);
         }
@@ -265,6 +288,7 @@ impl RaptorQEncoder {
         let t = params.t as usize;
         for &(start_esi, count) in ranges {
             for i in 0..count {
+                // Below 2^24: `check_esi_ranges` above.
                 let esi = start_esi + i;
                 if esi < k {
                     let from = esi as usize * t;
@@ -385,6 +409,9 @@ impl ErasureEncoder for RaptorQEncoder {
         params: &ErasureParams,
         ranges: &[(u32, u32)],
     ) -> Result<Vec<Symbol>, ErasureError> {
+        // Before the allocation sized by the ranges (CS-ERA-6, review N1): `(0, u32::MAX)`
+        // would reserve billions of symbols before `walk_ranges` rejects it.
+        check_esi_ranges(ranges)?;
         let total: usize = ranges.iter().map(|&(_, count)| count as usize).sum();
         let mut symbols = Vec::with_capacity(total);
         Self::walk_ranges(source_block, params, ranges, &mut |esi, data| {

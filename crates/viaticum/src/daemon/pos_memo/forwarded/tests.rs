@@ -37,7 +37,6 @@ fn pending_challenge(cid: [u8; 16]) -> PendingHashChallenge {
         expected_chain_hash: [0; 32],
         issued_at: Timestamp(T0),
         challenge_id: cid,
-        holder_master: IdentityPub(holder_key().verifying_key().to_bytes()),
     }
 }
 
@@ -57,7 +56,7 @@ fn resolve(p: &mut PendingIndex, cid: [u8; 16]) {
 
 /// A response to `cid` signed by `key`, at `at`.
 fn response_msg(cid: [u8; 16], key: &ed25519_dalek::SigningKey, at: u64) -> PosHashResponseMsg {
-    build_pos_hash_response(cid, block(), [9; 32], Timestamp(at), None, key)
+    build_pos_hash_response(cid, block(), [9; 32], Timestamp(at), key)
 }
 
 fn entry_of(msg: &PosHashResponseMsg, msg_id: u8) -> MailboxEntry {
@@ -210,7 +209,7 @@ fn forged_response_does_not_lock_out_the_honest_one() {
 }
 
 /// pos-i5-a on the owner: a postman's re-encoding of the honest response (another `v`,
-/// another `device_id`, another sender or msg_id) is the same envelope — it is not sent
+/// another sender or msg_id) is the same envelope — it is not sent
 /// to the scheduler again.
 #[test]
 fn reencoded_response_is_the_same_envelope() {
@@ -226,13 +225,6 @@ fn reencoded_response_is_the_same_envelope() {
                 ..msg.clone()
             },
             2,
-        ),
-        entry_of(
-            &PosHashResponseMsg {
-                device_id: Some(DeviceId([7; 32])),
-                ..msg.clone()
-            },
-            3,
         ),
         MailboxEntry {
             sender: Some(IdentityPub([0x77; 32])),
@@ -401,4 +393,20 @@ fn sent_marks_are_capped() {
     assert_eq!(out.len(), 5);
     assert_eq!(memo.len(), 3);
     assert_eq!(memo.refused(), 2);
+}
+
+/// pos-i16: two responses that differ only in the responding device are two envelopes
+/// (the device is signed and in the key): a sibling's response cannot stand for the
+/// addressed device's.
+#[test]
+fn forwarded_key_differs_when_response_device_differs() {
+    let msg = response_msg(C1, &holder_key(), T0);
+    let other_device = PosHashResponseMsg {
+        device_id: DeviceId([7; 32]),
+        ..msg.clone()
+    };
+    assert_ne!(
+        ResponseKey::signed(&msg),
+        ResponseKey::signed(&other_device)
+    );
 }

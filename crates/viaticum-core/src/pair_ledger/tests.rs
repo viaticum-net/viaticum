@@ -122,6 +122,7 @@ fn placement_in_status(
 ) {
     let block = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: SourceBlockId([block_seed; 32]),
         k: 10,
         t: T_BYTES,

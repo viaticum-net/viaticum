@@ -312,7 +312,9 @@ pub(crate) struct ExcludedHolders {
 ///  2. `offer_plan::plan_offers`: exclude holders that hold or may hold the block
 ///     (`may_hold_symbols`, repair-i2), allocate, assign ESI ranges — a holder with an
 ///     `Offered` row (e.g. after `SymbolReject`) gets its own range back, fresh numbers only
-///     for the rest (repair-i9).
+///     for the rest (repair-i9); fresh numbers come from the block's never-decreasing cursor
+///     (repair-i8, repair-i10) and stop at 2^24 (the block is then reported in
+///     `esi_space`).
 ///  3. Nobody to offer to → return `encoded = false` WITHOUT reading the source
 ///     (repair-i4: cheap outcome) and without touching the memory budget. Otherwise take the
 ///     memory permit (backup-i24), sized by the plan's symbol count; it waits its turn.
@@ -368,14 +370,39 @@ pub(crate) async fn run_block_iteration(
     // 2-3. Plan: who gets offers and which ESIs (repair-i2, repair-i9).
     let namespace_start = offer_plan::namespace_start(cluster_state, &config.device_id);
     let offers = match offer_plan::plan_offers(db, block, &pool.candidates, namespace_start)? {
-        OfferPlan::Planned { cursor, offers } => {
+        OfferPlan::Planned {
+            cursor,
+            offers,
+            esi_cut,
+        } => {
             tracing::debug!(
                 block_id = %block.block_id,
                 cursor,
                 holders = offers.len(),
+                esi_cut,
                 "work_pipeline: offer plan"
             );
+            config.esi_space.note_plan(
+                block.block_id,
+                esi_cut,
+                offer_plan::high_water_after(&offers, cursor),
+                std::time::Instant::now(),
+            );
             offers
+        }
+        OfferPlan::EsiExhausted { cursor } => {
+            // repair-i8 ceiling: no fresh ESI left below 2^24 — "not repairable".
+            config
+                .esi_space
+                .note_plan(block.block_id, true, cursor, std::time::Instant::now());
+            return Ok(WorkOutcome {
+                acked: 0,
+                failed: 0,
+                encoded: false,
+                offered: 0,
+                left_service: false,
+                yielded: false,
+            });
         }
         OfferPlan::NoCandidates(excluded) => {
             tracing::info!(

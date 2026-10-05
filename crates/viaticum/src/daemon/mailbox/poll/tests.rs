@@ -47,14 +47,25 @@ fn owner_signing_key() -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32])
 }
 
-/// A decodable PosHashChallengeMsg signed by `owner_signing_key` (issued now).
+/// The holder DEVICE key of the poll tests (the device the test challenges address).
+fn holder_device_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[0xBBu8; 32])
+}
+
+/// The device of `holder_device_key()`.
+fn holder_device() -> DeviceId {
+    DeviceId(holder_device_key().verifying_key().to_bytes())
+}
+
+/// A decodable PosHashChallengeMsg signed by `owner_signing_key` (issued now), addressed
+/// to `holder_device()`.
 fn signed_challenge() -> viaticum_core::messages::PosHashChallengeMsg {
     viaticum_core::messages::build_pos_hash_challenge(
         [0x5A; 16],
         SourceBlockId([8u8; 32]),
         vec![(0, 1)],
         Timestamp::now(),
-        None,
+        holder_device(),
         &owner_signing_key(),
     )
 }
@@ -75,7 +86,7 @@ fn response_to(cid: [u8; 16]) -> PosHashResponseMsg {
         source_block_id: SourceBlockId([8u8; 32]),
         chain_hash: [99u8; 32],
         timestamp: Timestamp::now(),
-        device_id: None,
+        device_id: holder_device(),
         sig: [0u8; 64],
     }
 }
@@ -94,7 +105,6 @@ fn pending_for(cids: &[[u8; 16]]) -> crate::daemon::scheduler::PendingChallenges
                 expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp::now(),
                 challenge_id: *cid,
-                holder_master: IdentityPub(holder_id.0),
             },
         );
     }
@@ -311,6 +321,7 @@ async fn drop_notice_batch_dispatch_marks_each_placement_lost() {
     // Insert source blocks so get_source_block succeeds.
     let block1 = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: block_id_1,
         k: 6,
         t: 512,
@@ -328,6 +339,7 @@ async fn drop_notice_batch_dispatch_marks_each_placement_lost() {
     };
     let block2 = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: block_id_2,
         ..block1.clone()
     };
@@ -483,6 +495,7 @@ async fn drop_notice_immediate_deadline_triggers_repair_now() {
     // Insert source block.
     let block = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 6,
         t: 512,
@@ -613,6 +626,7 @@ async fn drop_notice_forged_signature_is_rejected() {
     // Insert source block.
     let block = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 6,
         t: 512,
@@ -1239,6 +1253,7 @@ async fn drop_notice_dispatch_drops_entry_not_addressed_to_us() {
     let block_id = SourceBlockId([0xF1; 32]);
     let block = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 6,
         t: 512,
@@ -1357,6 +1372,8 @@ use viaticum_core::messages::{
 use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter};
 use crate::daemon::pos_memo::{AnsweredChallenges, PollCounts, PosPollState};
 
+use super::PosChallengeAnswer;
+
 /// Stub PosMailboxChallengeHandler: returns a canned response regardless of payload,
 /// so dispatch_pos_challenge proceeds to build + publish the PosResponse entry.
 struct StubChallengeHandler {
@@ -1369,8 +1386,8 @@ impl super::PosMailboxChallengeHandler for StubChallengeHandler {
         &self,
         _owner_master_pub: IdentityPub,
         _payload: Vec<u8>,
-    ) -> anyhow::Result<Option<PosHashResponseMsg>> {
-        Ok(Some(self.response.clone()))
+    ) -> anyhow::Result<PosChallengeAnswer> {
+        Ok(PosChallengeAnswer::Respond(self.response.clone()))
     }
 }
 
@@ -1450,7 +1467,7 @@ async fn pos_response_entry_ttl_is_scaled_by_time_scale() {
         source_block_id: SourceBlockId([8u8; 32]),
         chain_hash: [9u8; 32],
         timestamp: Timestamp::now(),
-        device_id: None,
+        device_id: holder_device(),
         sig: [0u8; 64],
     };
     let handler: Arc<dyn super::PosMailboxChallengeHandler> =
@@ -1523,7 +1540,7 @@ async fn pos_challenge_not_addressed_to_us_is_dropped() {
         source_block_id: SourceBlockId([8u8; 32]),
         chain_hash: [9u8; 32],
         timestamp: Timestamp::now(),
-        device_id: None,
+        device_id: holder_device(),
         sig: [0u8; 64],
     };
     let handler: Arc<dyn super::PosMailboxChallengeHandler> =
@@ -1592,7 +1609,7 @@ async fn generic_entry_is_ignored_without_effect() {
                 source_block_id: SourceBlockId([0u8; 32]),
                 chain_hash: [0u8; 32],
                 timestamp: Timestamp::now(),
-                device_id: None,
+                device_id: holder_device(),
                 sig: [0u8; 64],
             },
         });
@@ -1736,7 +1753,7 @@ async fn pos_response_msg_id_is_derived_from_chain_hash_and_stable_across_redisp
         source_block_id: SourceBlockId([8u8; 32]),
         chain_hash: [9u8; 32],
         timestamp: Timestamp::now(),
-        device_id: None,
+        device_id: holder_device(),
         sig: [0u8; 64],
     };
     let handler: Arc<dyn super::PosMailboxChallengeHandler> =
@@ -1819,7 +1836,7 @@ async fn pos_response_msg_id_depends_on_chain_hash() {
         source_block_id: SourceBlockId([8u8; 32]),
         chain_hash,
         timestamp: Timestamp::now(),
-        device_id: None,
+        device_id: holder_device(),
         sig: [0u8; 64],
     };
     let base = make_entry(
@@ -1883,7 +1900,7 @@ async fn pos_response_zero_ack_is_recovered_by_redispatch() {
         source_block_id: SourceBlockId([8u8; 32]),
         chain_hash: [9u8; 32],
         timestamp: Timestamp::now(),
-        device_id: None,
+        device_id: holder_device(),
         sig: [0u8; 64],
     };
     let handler: Arc<dyn super::PosMailboxChallengeHandler> =
@@ -1985,7 +2002,7 @@ impl super::PosMailboxChallengeHandler for CountingChallengeHandler {
         &self,
         owner_master_pub: IdentityPub,
         payload: Vec<u8>,
-    ) -> anyhow::Result<Option<PosHashResponseMsg>> {
+    ) -> anyhow::Result<PosChallengeAnswer> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner
             .handle_pos_challenge(owner_master_pub, payload)
@@ -2002,8 +2019,8 @@ impl super::PosMailboxChallengeHandler for NoAnswerHandler {
         &self,
         _owner_master_pub: IdentityPub,
         _payload: Vec<u8>,
-    ) -> anyhow::Result<Option<PosHashResponseMsg>> {
-        Ok(None)
+    ) -> anyhow::Result<PosChallengeAnswer> {
+        Ok(PosChallengeAnswer::NoAnswer)
     }
 }
 
@@ -2014,7 +2031,7 @@ fn stub_response(challenge_id: [u8; 16]) -> PosHashResponseMsg {
         source_block_id: SourceBlockId([8u8; 32]),
         chain_hash: [9u8; 32],
         timestamp: Timestamp::now(),
-        device_id: None,
+        device_id: holder_device(),
         sig: [0u8; 64],
     }
 }
@@ -2481,11 +2498,6 @@ async fn reencoded_signed_challenge_is_computed_once() {
     with_tail.extend_from_slice(&[0x00, 0x01]);
     let payloads = vec![
         honest,
-        to_cbor(&PosHashChallengeMsg {
-            device_id: Some(DeviceId([7; 32])),
-            ..c.clone()
-        })
-        .unwrap(),
         to_cbor(&PosHashChallengeMsg { v: 9, ..c.clone() }).unwrap(),
         reencoded(&c, |v| {
             if let ciborium::Value::Map(m) = v {
@@ -2525,7 +2537,7 @@ async fn reencoded_signed_challenge_is_computed_once() {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1, "the symbols are read once");
     assert_eq!(memo.len(), 1, "one entry for one signed challenge");
-    assert_eq!(counts.skipped, 5);
+    assert_eq!(counts.skipped, 4);
     assert_eq!(sender.stored.lock().await.len(), 1);
 }
 
@@ -2566,7 +2578,9 @@ async fn forgery_seen_first_does_not_block_the_honest_challenge() {
         Arc::new(ProcessorPosHandler::new(PosResponder::new(
             db.clone(),
             holdings.path().to_path_buf(),
-            ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]),
+            holder_device_key(),
+            make_identity(0xAA),
+            None,
         )));
     let my_master = make_identity(0xAA);
     let entry_of = |payload: Vec<u8>| MailboxEntry {
@@ -2738,7 +2752,6 @@ async fn production_channel_forwards_a_3000_response_poll_without_deferring() {
                 expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp::now(),
                 challenge_id: *cid,
-                holder_master: IdentityPub(holder_id.0),
             },
         );
     }
@@ -2768,6 +2781,105 @@ async fn production_channel_forwards_a_3000_response_poll_without_deferring() {
         assert!(received.insert(r.challenge_id), "one copy of each");
     }
     assert_eq!(received.len(), usize::from(BURST));
+}
+
+// ─── pos-i15 [cross:B]: a challenge addressed to a sibling device ─────────────
+
+/// The real handler of a holder device that is NOT `holder_device()` but its sibling
+/// (same master `my_master`, the sibling known through the device→master table).
+fn sibling_responder_handler(
+    db: &Db,
+    holdings: &tempfile::TempDir,
+    my_master: IdentityPub,
+) -> Arc<dyn super::PosMailboxChallengeHandler> {
+    use crate::daemon::processor::{PosResponder, ProcessorPosHandler};
+    db.set_master_for_device(&holder_device(), &my_master)
+        .expect("sibling mapping");
+    Arc::new(ProcessorPosHandler::new(PosResponder::new(
+        db.clone(),
+        holdings.path().to_path_buf(),
+        ed25519_dalek::SigningKey::from_bytes(&[0xB2u8; 32]),
+        my_master,
+        None,
+    )))
+}
+
+/// pos-i15: the sibling publishes nothing for a challenge addressed to another device of
+/// its master, and the poll counts it as not-mine (not a no-answer, not computed).
+#[tokio::test]
+async fn sibling_challenge_publishes_nothing_and_counts_not_mine() {
+    let db = Db::open_in_memory().expect("db");
+    let holdings = tempfile::TempDir::new().unwrap();
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let my_master = make_identity(0xAA);
+    let handler = sibling_responder_handler(&db, &holdings, my_master);
+    let owner = IdentityPub(owner_signing_key().verifying_key().to_bytes());
+    let mut memo = AnsweredChallenges::new(900);
+    let mut counts = PollCounts::default();
+
+    super::dispatch_pos_challenge(
+        &router,
+        &handler,
+        &mut memo,
+        &mut counts,
+        &my_master,
+        challenge_entry(my_master, owner),
+        900,
+        Timestamp::now().0,
+    )
+    .await;
+
+    assert_eq!(
+        (counts.not_mine, counts.no_answer, counts.computed),
+        (1, 0, 0)
+    );
+    assert!(
+        sender.stored.lock().await.is_empty(),
+        "nothing is published"
+    );
+    assert_eq!(memo.len(), 1, "remembered as not-mine");
+}
+
+/// pos-i15 (M5): across polls, one quarter TTL and more apart, the sibling's challenge
+/// reaches the handler once: not-mine is not re-checked like a no-answer.
+#[tokio::test]
+async fn sibling_challenge_calls_handler_once_across_polls() {
+    let db = Db::open_in_memory().expect("db");
+    let holdings = tempfile::TempDir::new().unwrap();
+    let sender = Arc::new(RecordingSender {
+        stored: tokio::sync::Mutex::new(vec![]),
+    });
+    let router = router_with_one_peer(&db, Arc::clone(&sender) as Arc<dyn MailboxNetworkSender>);
+    let my_master = make_identity(0xAA);
+    let (handler, calls) =
+        CountingChallengeHandler::wrap(sibling_responder_handler(&db, &holdings, my_master));
+    let owner = IdentityPub(owner_signing_key().verifying_key().to_bytes());
+    let entry = challenge_entry(my_master, owner);
+    let mut memo = AnsweredChallenges::new(900);
+    let mut counts = PollCounts::default();
+    let now = Timestamp::now().0;
+    let retry = memo.retry_secs();
+
+    for at in [now, now + 4, now + retry, now + 2 * retry + 1] {
+        super::dispatch_pos_challenge(
+            &router,
+            &handler,
+            &mut memo,
+            &mut counts,
+            &my_master,
+            entry.clone(),
+            900,
+            at,
+        )
+        .await;
+    }
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one look, then remembered");
+    assert_eq!((counts.not_mine, counts.skipped), (1, 3));
+    assert!(sender.stored.lock().await.is_empty());
 }
 
 mod stream;

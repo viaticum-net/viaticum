@@ -155,6 +155,11 @@
         <dd>{formatBytes(status.backed_up_bytes)}</dd>
         <dt>Blocks OK / At risk</dt>
         <dd>{status.blocks_ok} / {status.blocks_at_risk}</dd>
+        <!-- repair-i8 ceiling: blocks whose ESI numbers are used up cannot be repaired -->
+        {#if status.blocks_esi_exhausted > 0}
+          <dt>Not repairable</dt>
+          <dd title="These blocks used up their 2^24 symbol numbers; the network can no longer add redundancy to them.">{status.blocks_esi_exhausted} blocks (symbol numbers used up)</dd>
+        {/if}
         <!-- backup-i4: files above this machine's size limit are not backed up -->
         {#if status.max_file_size_bytes > 0}
           <dt>File size limit</dt>

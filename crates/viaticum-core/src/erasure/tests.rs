@@ -933,6 +933,59 @@ fn decode_with_k_above_max_returns_err() {
     ));
 }
 
+// ─── CS-ERA-6: ESI ranges at the raptorq limit ─────────────────────────────
+
+/// raptorq asserts `esi < 2^24`; a range reaching past it (or overflowing u32) is an error,
+/// not a panic. The last valid ESI still encodes.
+#[test]
+fn encode_raw_ranges_rejects_range_past_2_pow_24_and_encodes_up_to_it() {
+    let enc = encoder();
+    let (source, params) = multi_symbol_params();
+    let max = crate::constants::MAX_ESI_EXCLUSIVE;
+
+    for range in [(max - 1, 2), (max, 1), (u32::MAX, 2)] {
+        assert!(
+            matches!(
+                enc.encode_raw_ranges(&source, &params, &[(0, 1), range]),
+                Err(ErasureError::EsiOutOfRange { .. })
+            ),
+            "range {range:?}"
+        );
+    }
+    let last = enc
+        .encode_raw_ranges(&source, &params, &[(max - 1, 1)])
+        .unwrap();
+    assert_eq!(last.len(), 1);
+    assert_eq!(last[0].esi, max - 1);
+
+    // The streaming walk shares the check (one guard in `walk_ranges`).
+    let mut seen = 0usize;
+    assert!(matches!(
+        enc.encode_raw_ranges_each(&source, &params, &[(0, 1), (max - 1, 2)], &mut |_, _| {
+            seen += 1;
+            Ok(())
+        }),
+        Err(ErasureError::EsiOutOfRange { .. })
+    ));
+    assert_eq!(
+        seen, 0,
+        "the range check runs before any symbol is produced"
+    );
+}
+
+/// Review N1: a range of `u32::MAX` symbols is refused before anything is reserved for it
+/// (the output vector used to be sized by the requested count first: an allocation failure,
+/// not an error). Mutation: the range check only inside `walk_ranges` → the test aborts.
+#[test]
+fn encode_raw_ranges_refuses_a_huge_range_before_allocating() {
+    let enc = encoder();
+    let (source, params) = multi_symbol_params();
+    assert!(matches!(
+        enc.encode_raw_ranges(&source, &params, &[(0, u32::MAX)]),
+        Err(ErasureError::EsiOutOfRange { .. })
+    ));
+}
+
 // ─── R1-d-b: F5 (padding without a copy), F6 (source ESIs are slices), private plan, F8' ────
 
 /// F5: a blob padded in place by `pad_for_encoding` encodes to the same symbols as the unpadded one

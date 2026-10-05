@@ -318,6 +318,7 @@ pub fn run_pipeline(
         let effective_n = effective_n(candidates, &params, target_rel);
         let block_record = SourceBlockRecord {
             seal_generation: sealed.generation,
+            esi_high_water: 0,
             block_id: sealed.block_id,
             k: params.k,
             t: params.t,

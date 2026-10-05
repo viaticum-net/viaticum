@@ -8,6 +8,7 @@ use super::*;
 fn erasure_params_returns_stored_values() {
     let record = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: SourceBlockId([0; 32]),
         k: 100,
         t: 65535,
@@ -38,6 +39,7 @@ fn erasure_params_legacy_fallback() {
     let t: u16 = 65535;
     let record = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: SourceBlockId([0; 32]),
         k,
         t,
@@ -66,6 +68,7 @@ fn erasure_params_legacy_fallback() {
 fn source_block_record_roundtrips_n_and_overhead() {
     let record = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: SourceBlockId([0xAB; 32]),
         k: 200,
         t: 65535,
@@ -364,6 +367,7 @@ fn cbor_roundtrip_event() {
 fn cbor_roundtrip_source_block_pack() {
     let sb = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: SourceBlockId([0; 32]),
         k: 2048,
         t: 65535,
@@ -410,6 +414,7 @@ fn cbor_roundtrip_source_block_pack() {
 fn source_block_record_round_trip_with_all_new_fields() {
     let original = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: SourceBlockId([0xAB; 32]),
         k: 100,
         t: 65535,
@@ -1274,6 +1279,7 @@ fn pre_l1b_record() -> PreL1bSourceBlockRecord {
 fn record_of(pre: &PreL1bSourceBlockRecord, seal_generation: u32) -> SourceBlockRecord {
     SourceBlockRecord {
         seal_generation,
+        esi_high_water: 0,
         block_id: pre.block_id,
         k: pre.k,
         t: pre.t,
@@ -1314,4 +1320,45 @@ fn source_block_record_of_generation_zero_encodes_byte_identical_to_pre_l1b() {
     assert_ne!(bytes, to_cbor_bytes(&pre));
     let decoded: SourceBlockRecord = from_cbor_bytes(&bytes).unwrap();
     assert_eq!(decoded.seal_generation, 3);
+}
+
+// ============================================================
+// C-SP K1b (repair-i8): esi_high_water
+// ============================================================
+
+/// A record written before `esi_high_water` reads as 0; a record with hw 0 is written exactly
+/// as before; a non-zero hw round-trips.
+#[test]
+fn source_block_record_without_high_water_decodes_as_zero() {
+    let pre = pre_l1b_record();
+    let decoded: SourceBlockRecord = from_cbor_bytes(&to_cbor_bytes(&pre)).unwrap();
+    assert_eq!(decoded.esi_high_water, 0);
+    assert_eq!(to_cbor_bytes(&record_of(&pre, 0)), to_cbor_bytes(&pre));
+
+    let mut raised = record_of(&pre, 0);
+    raised.esi_high_water = 1 << 23;
+    let back: SourceBlockRecord = from_cbor_bytes(&to_cbor_bytes(&raised)).unwrap();
+    assert_eq!(back.esi_high_water, 1 << 23);
+}
+
+// ============================================================
+// C-SP review N4: esi_list_to_ranges without overflow
+// ============================================================
+
+/// ESIs at the top of u32, the last one repeated: no overflow panic, the run merges up to
+/// `u32::MAX` and a repeated ESI is a range of its own (as for any repeated ESI).
+#[test]
+fn esi_list_to_ranges_near_u32_max_with_repeat_does_not_overflow() {
+    let max = u32::MAX;
+    assert_eq!(
+        esi_list_to_ranges(&[max - 2, max - 1, max, max]),
+        vec![(max - 2, 3), (max, 1)]
+    );
+    assert_eq!(esi_list_to_ranges(&[max, max]), vec![(max, 1), (max, 1)]);
+    assert_eq!(esi_list_to_ranges(&[max]), vec![(max, 1)]);
+    // The ordinary behaviour stays: runs merge, gaps and repeats split.
+    assert_eq!(
+        esi_list_to_ranges(&[0, 1, 2, 2, 3, 7]),
+        vec![(0, 3), (2, 2), (7, 1)]
+    );
 }

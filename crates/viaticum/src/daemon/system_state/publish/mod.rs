@@ -99,6 +99,8 @@ pub fn retire_ss_block(db: &Db, data_dir: &Path, block_id: &SourceBlockId) {
     if let Err(e) = db.unmark_ss_block(block_id) {
         tracing::warn!(block = %block_id, error = %e, "retire SS block: unmark failed");
     }
+    // Rows go with the retired block: its record is deleted right below, so no ESI cursor
+    // of a live block loses a range (repair-i8).
     if let Ok(placements) = db.list_placements_for_block(block_id) {
         for p in placements {
             if let Err(e) = db.delete_placement(block_id, &p.holder_id) {

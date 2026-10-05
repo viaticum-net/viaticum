@@ -45,6 +45,10 @@ mod issue_mem;
 mod issue_batch;
 // backup-i7: the load-failure WARN of a PoS block once per day.
 mod pos_load_warn;
+// pos-i16 (C-SP): only the placement's device key resolves its challenge.
+mod sibling_response;
+// pos-i15 (C-SP): a published challenge names the placement's device and is signed.
+mod challenge_address;
 // dr-i8: service mail is addressed by PEERS after a DR, a holder without a master is skipped.
 mod dr_master;
 
@@ -147,7 +151,6 @@ async fn check_timeouts_removes_stale_entry_and_triggers_repair() {
                 expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp(0), // ancient — definitely timed out
                 challenge_id: [0u8; 16],
-                holder_master: IdentityPub(holder_id.0),
             },
         );
     }
@@ -228,7 +231,6 @@ async fn check_timeouts_ignores_fresh_challenges() {
                 expected_chain_hash: [0u8; 32],
                 issued_at: now,
                 challenge_id: [1u8; 16],
-                holder_master: IdentityPub(holder_id.0),
             },
         );
     }
@@ -294,7 +296,6 @@ async fn pending_challenges_shared_between_tasks() {
                 expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp::now(),
                 challenge_id: [7u8; 16],
-                holder_master: IdentityPub(holder_id.0),
             },
         );
     });
@@ -342,7 +343,6 @@ async fn check_timeouts_respects_time_scale() {
                 expected_chain_hash: [0u8; 32],
                 issued_at,
                 challenge_id: [0u8; 16],
-                holder_master: IdentityPub(holder_id.0),
             },
         );
     }
@@ -412,7 +412,6 @@ async fn issue_due_challenges_skips_already_pending() {
                 expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp::now(),
                 challenge_id: [2u8; 16],
-                holder_master: IdentityPub(holder_id.0),
             },
         );
     }
@@ -550,7 +549,6 @@ async fn time_scale_divides_intervals() {
                 expected_chain_hash: [0u8; 32],
                 issued_at,
                 challenge_id: [0u8; 16],
-                holder_master: IdentityPub(holder_id.0),
             },
         );
     }
@@ -639,6 +637,7 @@ async fn deletion_tick_sends_drop_notice_and_marks_placement_deleting() {
     // Source block: Active.
     let sb = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 100,
         t: 65535,
@@ -1037,6 +1036,7 @@ async fn already_deleting_holder_is_not_republished() {
     // Source block: Active.
     let sb = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 10,
         t: 65535,
@@ -1219,6 +1219,7 @@ fn make_active_block(block_id: SourceBlockId) -> viaticum_core::types::SourceBlo
     use viaticum_core::types::{SourceBlockRecord, SourceBlockStatus, SourceBlockType};
     SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 10,
         t: 65535,
@@ -1682,6 +1683,7 @@ async fn delete_not_marked_sent_when_publish_zero_acks() {
 
     let sb = SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 100,
         t: 65535,
@@ -1825,6 +1827,7 @@ async fn cleanup_block_removes_db_record() {
     // Source block: already in Deleting state.
     let sb = viaticum_core::types::SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 10,
         t: 65535,
@@ -1900,6 +1903,7 @@ fn make_block_for_hook(
 ) -> viaticum_core::types::SourceBlockRecord {
     viaticum_core::types::SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 5,
         t: 1,
@@ -1981,7 +1985,6 @@ async fn scheduler_pos_timeout_alive_to_uncertain_preserves_current_alive() {
                 expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp(0), // ancient → timed out
                 challenge_id: [0xA0u8; 16],
-                holder_master: IdentityPub(holder_a.0),
             },
         );
     }
@@ -2043,7 +2046,6 @@ async fn scheduler_pos_timeout_uncertain_to_presumed_lost_decrements_current_ali
                 expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp(0), // ancient → timed out
                 challenge_id: [0xB0u8; 16],
-                holder_master: IdentityPub(holder_a.0),
             },
         );
     }
@@ -2179,6 +2181,7 @@ fn make_source_block_record(block_id: SourceBlockId) -> viaticum_core::types::So
     let n = (k_eff as f64 * 1.5).ceil() as u32;
     SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: TEST_K,
         t: TEST_T,
@@ -2521,7 +2524,8 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
 
     let db = Db::open_in_memory().expect("db open");
     let block_id = make_block_id(0xC1);
-    let holder_id = make_identity(0xB2);
+    let holder_id_key = ed25519_dalek::SigningKey::from_bytes(&[0xB2; 32]);
+    let holder_id = DeviceId(holder_id_key.verifying_key().to_bytes());
     let challenge_id = [0x42u8; 16];
 
     // Insert placement and peer record.
@@ -2557,7 +2561,6 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
                 expected_chain_hash,
                 issued_at: Timestamp::now(),
                 challenge_id,
-                holder_master,
             },
         );
     }
@@ -2592,8 +2595,7 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
         block_id,
         expected_chain_hash, // correct hash = Pass
         Timestamp::now(),
-        Some(holder_id),
-        &holder_master_key,
+        &holder_id_key,
     );
 
     scheduler
@@ -2632,7 +2634,8 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
     // Set up a fresh DB/pending state for the Fail variant.
     let db2 = Db::open_in_memory().expect("db2 open");
     let block_id2 = make_block_id(0xD1);
-    let holder_id2 = make_identity(0xD2);
+    let holder_id2_key = ed25519_dalek::SigningKey::from_bytes(&[0xD2; 32]);
+    let holder_id2 = DeviceId(holder_id2_key.verifying_key().to_bytes());
     let challenge_id2 = [0x99u8; 16];
 
     let mut placement2 = make_placement(block_id2, holder_id2);
@@ -2661,7 +2664,6 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
                 expected_chain_hash: expected_hash2,
                 issued_at: Timestamp::now(),
                 challenge_id: challenge_id2,
-                holder_master: holder2_master,
             },
         );
     }
@@ -2698,8 +2700,7 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
         block_id2,
         wrong_hash,
         Timestamp::now(),
-        Some(holder_id2),
-        &holder2_master_key,
+        &holder_id2_key,
     );
 
     scheduler2
@@ -2737,21 +2738,20 @@ async fn pos_response_via_mailbox_resolves_pending_challenge() {
 
 // ─── CS-POS-3: response verified against holder_master captured at issue time ──
 
-/// CS-POS-3: the owner resolves the holder's master AT ISSUE TIME and stores it in
-/// the PendingHashChallenge. The response is verified against THAT captured value, not
-/// a re-resolve at response time. If the device→master mapping is lost/degraded between
-/// issue and response (peer cleanup, DR-restored minimal DB, a 14-day gap), the old
-/// re-resolve would fall back to the device-pub and reject the honest holder's
-/// master-signed response → unearned Timeout. Here the DB has NO device→master mapping
-/// (simulating that loss), yet a correctly master-signed response still verifies and
-/// resolves the pending challenge.
+/// CS-POS-3 / pos-i16: the response is verified against the placement's device key
+/// (`pending.holder_id` IS the public key), so no master lookup is involved at all. If the
+/// device→master mapping is lost/degraded between issue and response (peer cleanup,
+/// DR-restored minimal DB, a 14-day gap), the honest device's response still verifies.
+/// Here the DB has NO device→master mapping, yet a device-signed response resolves the
+/// pending challenge.
 #[tokio::test]
-async fn pos_response_verified_against_master_captured_at_issue_time() {
+async fn pos_response_verified_against_holder_device_without_master_mapping() {
     use viaticum_core::pos::compute_chain_hash;
 
     let db = Db::open_in_memory().expect("db open");
     let block_id = make_block_id(0xE7);
-    let holder_id = make_identity(0xE8);
+    let holder_id_key = ed25519_dalek::SigningKey::from_bytes(&[0xE8; 32]);
+    let holder_id = DeviceId(holder_id_key.verifying_key().to_bytes());
     let challenge_id = [0x5Au8; 16];
 
     let mut placement = make_placement(block_id, holder_id);
@@ -2759,18 +2759,13 @@ async fn pos_response_verified_against_master_captured_at_issue_time() {
     db.upsert_placement(&placement).unwrap();
     db.upsert_peer(&make_peer_record(holder_id)).unwrap();
 
-    // The holder's real master key. The owner resolved this at issue time and captured
-    // it in the pending. Critically we do NOT call set_master_for_device — the DB has
-    // NO device→master mapping, so a response-time re-resolve would fall back to the
-    // device-pub and the master-signed response below would fail to verify.
-    let holder_master_key = ed25519_dalek::SigningKey::from_bytes(&[0xE9u8; 32]);
-    let holder_master = IdentityPub(holder_master_key.verifying_key().to_bytes());
+    // We do NOT call set_master_for_device — the DB has NO device→master mapping.
     assert!(
         db.get_master_for_device(&holder_id).unwrap().is_none(),
         "precondition: device→master mapping is absent (degraded peer record)"
     );
 
-    let dummy_symbol = b"dummy_symbol_data_for_captured_master_test".as_slice();
+    let dummy_symbol = b"dummy_symbol_data_for_device_key_test".as_slice();
     let expected_chain_hash = compute_chain_hash(&challenge_id, &[(0u32, dummy_symbol)]).unwrap();
 
     let pending = make_pending_challenges();
@@ -2785,8 +2780,6 @@ async fn pos_response_verified_against_master_captured_at_issue_time() {
                 expected_chain_hash,
                 issued_at: Timestamp::now(),
                 challenge_id,
-                // Captured at issue time — the master the challenge was addressed to.
-                holder_master,
             },
         );
     }
@@ -2814,15 +2807,14 @@ async fn pos_response_verified_against_master_captured_at_issue_time() {
         std::env::temp_dir(),
     );
 
-    // Correctly master-signed Pass response. Despite the missing device→master mapping,
-    // verification against the captured holder_master succeeds and the pending resolves.
+    // Device-signed Pass response. Despite the missing device→master mapping, it verifies
+    // against `holder_id` and the pending resolves.
     let pass_response = viaticum_core::messages::build_pos_hash_response(
         challenge_id,
         block_id,
         expected_chain_hash,
         Timestamp::now(),
-        Some(holder_id),
-        &holder_master_key,
+        &holder_id_key,
     );
 
     scheduler
@@ -2833,7 +2825,7 @@ async fn pos_response_verified_against_master_captured_at_issue_time() {
     // Pending consumed → the response was accepted, NOT dropped as unverifiable.
     assert!(
         pending.lock().await.is_empty(),
-        "response signed by the captured holder_master must resolve the pending even \
+        "a response signed by the holder device must resolve the pending even \
          with no device→master mapping in the DB"
     );
 
@@ -2863,7 +2855,8 @@ async fn pos_response_duplicate_after_consume_is_dropped() {
 
     let db = Db::open_in_memory().expect("db open");
     let block_id = make_block_id(0xA1);
-    let holder_id = make_identity(0xA2);
+    let holder_id_key = ed25519_dalek::SigningKey::from_bytes(&[0xA2; 32]);
+    let holder_id = DeviceId(holder_id_key.verifying_key().to_bytes());
     let challenge_id = [0x77u8; 16];
 
     let mut placement = make_placement(block_id, holder_id);
@@ -2891,7 +2884,6 @@ async fn pos_response_duplicate_after_consume_is_dropped() {
                 expected_chain_hash,
                 issued_at: Timestamp::now(),
                 challenge_id,
-                holder_master,
             },
         );
     }
@@ -2925,8 +2917,7 @@ async fn pos_response_duplicate_after_consume_is_dropped() {
         block_id,
         expected_chain_hash, // correct hash = Pass
         Timestamp::now(),
-        Some(holder_id),
-        &holder_master_key,
+        &holder_id_key,
     );
 
     // First delivery: resolves and consumes the pending challenge.
@@ -2991,7 +2982,8 @@ async fn pos_response_from_wrong_identity_is_ignored() {
 
     let db = Db::open_in_memory().expect("db open");
     let block_id = make_block_id(0xF1);
-    let holder_id = make_identity(0xF2);
+    let holder_id_key = ed25519_dalek::SigningKey::from_bytes(&[0xF2; 32]);
+    let holder_id = DeviceId(holder_id_key.verifying_key().to_bytes());
     let challenge_id = [0x55u8; 16];
 
     let mut placement = make_placement(block_id, holder_id);
@@ -3021,7 +3013,6 @@ async fn pos_response_from_wrong_identity_is_ignored() {
                 expected_chain_hash,
                 issued_at: Timestamp::now(),
                 challenge_id,
-                holder_master,
             },
         );
     }
@@ -3057,9 +3048,13 @@ async fn pos_response_from_wrong_identity_is_ignored() {
         block_id,
         [0xFFu8; 32], // wrong hash — would be Fail → Lost if applied
         Timestamp::now(),
-        Some(holder_id),
         &attacker_key,
     );
+    // The forger claims the holder's device (a WrongDevice reply would be too easy).
+    let forged = viaticum_core::messages::PosHashResponseMsg {
+        device_id: holder_id,
+        ..forged
+    };
 
     scheduler
         .handle_pos_response_from_mailbox(forged)
@@ -3095,8 +3090,7 @@ async fn pos_response_from_wrong_identity_is_ignored() {
         block_id,
         expected_chain_hash, // correct hash = Pass
         Timestamp::now(),
-        Some(holder_id),
-        &holder_master_key,
+        &holder_id_key,
     );
     scheduler
         .handle_pos_response_from_mailbox(honest)
@@ -3156,7 +3150,6 @@ async fn pos_pending_timeout_is_14d_2h_not_7d_1h() {
                 expected_chain_hash: [0u8; 32],
                 issued_at: now,
                 challenge_id: [0xE1u8; 16],
-                holder_master: IdentityPub(holder_fresh.0),
             },
         );
         // Stale: issued 5 seconds ago — at threshold=1s, this IS timed out.
@@ -3169,7 +3162,6 @@ async fn pos_pending_timeout_is_14d_2h_not_7d_1h() {
                 expected_chain_hash: [0u8; 32],
                 issued_at: Timestamp(now.0.saturating_sub(5)),
                 challenge_id: [0xE2u8; 16],
-                holder_master: IdentityPub(holder_stale.0),
             },
         );
     }
@@ -3633,7 +3625,8 @@ async fn a_pos_pass_resolved_through_the_mailbox_confirms_the_pair_for_the_ledge
 
     let db = Db::open_in_memory().expect("db open");
     let block_id = make_block_id(0x5B);
-    let holder_id = make_identity(0x5C);
+    let holder_id_key = ed25519_dalek::SigningKey::from_bytes(&[0x5C; 32]);
+    let holder_id = DeviceId(holder_id_key.verifying_key().to_bytes());
     let pair_master = IdentityPub(holder_id.0); // make_peer_record's master
     db.upsert_source_block(&make_source_block_record(block_id))
         .unwrap();
@@ -3658,7 +3651,6 @@ async fn a_pos_pass_resolved_through_the_mailbox_confirms_the_pair_for_the_ledge
             expected_chain_hash,
             issued_at: Timestamp::now(),
             challenge_id,
-            holder_master,
         },
     );
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
@@ -3694,8 +3686,7 @@ async fn a_pos_pass_resolved_through_the_mailbox_confirms_the_pair_for_the_ledge
         block_id,
         expected_chain_hash,
         Timestamp::now(),
-        Some(holder_id),
-        &holder_master_key,
+        &holder_id_key,
     );
     scheduler
         .handle_pos_response_from_mailbox(pass)
@@ -3798,7 +3789,7 @@ fn an_always_on_holders_pos_cycle_fits_the_confirmation_window_at_every_experime
 // PeerRecord master — `make_peer_record` sets it to `IdentityPub(device.0)`, deliberately
 // different from the device_to_master mapping used to verify responses (Д-M).
 
-/// A holder device with one PeerRecord, the master key it signs PoS responses with, and a
+/// A holder device with one PeerRecord, the device key it signs PoS responses with, and a
 /// scheduler over `db` sharing `pending`.
 struct PosDropFixture {
     db: Db,
@@ -3807,7 +3798,6 @@ struct PosDropFixture {
     block: SourceBlockId,
     holder: DeviceId,
     holder_key: ed25519_dalek::SigningKey,
-    holder_master: IdentityPub,
     ledger_master: IdentityPub,
 }
 
@@ -3819,7 +3809,10 @@ fn pos_drop_fixture(
 ) -> PosDropFixture {
     let db = Db::open_in_memory().expect("db open");
     let block = make_block_id(seed);
-    let holder = make_identity(seed.wrapping_add(1));
+    // pos-i16: the holder's DEVICE key signs its PoS responses; the device→master mapping
+    // stays (a different master key) and plays no part in the verification.
+    let holder_key = ed25519_dalek::SigningKey::from_bytes(&[seed.wrapping_add(1); 32]);
+    let holder = DeviceId(holder_key.verifying_key().to_bytes());
     db.upsert_source_block(&make_source_block_record(block))
         .unwrap();
     let mut placement = make_placement(block, holder);
@@ -3828,8 +3821,8 @@ fn pos_drop_fixture(
     placement.placed_at = Timestamp(placed_at);
     db.upsert_placement(&placement).unwrap();
     db.upsert_peer(&make_peer_record(holder)).unwrap();
-    let holder_key = ed25519_dalek::SigningKey::from_bytes(&[seed.wrapping_add(2); 32]);
-    let holder_master = IdentityPub(holder_key.verifying_key().to_bytes());
+    let holder_master_key = ed25519_dalek::SigningKey::from_bytes(&[seed.wrapping_add(2); 32]);
+    let holder_master = IdentityPub(holder_master_key.verifying_key().to_bytes());
     db.set_master_for_device(&holder, &holder_master).unwrap();
     let pending = make_pending_challenges();
     let (repair_tx, _repair_rx) = mpsc::channel::<RepairTrigger>(8);
@@ -3853,7 +3846,6 @@ fn pos_drop_fixture(
         block,
         holder,
         holder_key,
-        holder_master,
         ledger_master: IdentityPub(holder.0),
     }
 }
@@ -3876,7 +3868,6 @@ impl PosDropFixture {
                 expected_chain_hash: expected,
                 issued_at,
                 challenge_id,
-                holder_master: self.holder_master,
             },
         );
         (challenge_id, expected)
@@ -3889,7 +3880,6 @@ impl PosDropFixture {
             self.block,
             [0xFF; 32],
             Timestamp::now(),
-            Some(self.holder),
             &self.holder_key,
         );
         self.scheduler

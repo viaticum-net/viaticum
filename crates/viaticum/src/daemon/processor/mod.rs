@@ -120,6 +120,14 @@ pub enum ProcessorError {
     #[error("stale PoS challenge ({age_secs} s old)")]
     StaleChallenge { age_secs: u64 },
 
+    /// pos-i15: the challenge is addressed to another device of our own master.
+    #[error("PoS challenge addressed to a sibling device")]
+    NotAddressedToThisDevice,
+
+    /// pos-i15: the challenge is addressed to a device we do not know as ours.
+    #[error("PoS challenge addressed to a device that is not of this master")]
+    NotAddressedToThisMaster,
+
     #[error("cluster sync error: {0}")]
     ClusterSync(#[from] crate::daemon::cluster_sync::ClusterSyncError),
 
@@ -205,10 +213,9 @@ pub struct Processor {
     /// Written by on_peer_authenticated, cleared by on_connection_closed.
     /// Used by handle_cluster_sync_request_libp2p to validate from_device_id.
     peer_cert_map: Arc<std::sync::Mutex<HashMap<DeviceId, (IdentityPub, DeviceCertificate)>>>,
-    /// Master identity signing key for producing signed messages.
-    /// Used to sign PosHashNackMsg (holder side) and other protocol messages requiring
-    /// master identity proof.
-    master_signing_key: ed25519_dalek::SigningKey,
+    /// This device's signing key. Signs the PoS response / Nack (pos-i16): the owner
+    /// accepts them only for a placement on this device.
+    device_signing_key: ed25519_dalek::SigningKey,
     /// Channel to notify the WorkPipeline worker of peer authentication events.
     /// When Some: `on_peer_authenticated` sends `WorkEvent::PeerAuthenticated`.
     /// None in tests that do not wire the work pipeline.
@@ -246,7 +253,7 @@ impl Processor {
         backup_event_tx: mpsc::Sender<crate::daemon::backup::BackupEvent>,
         cluster_state: Option<Arc<std::sync::Mutex<viaticum_core::cluster::ClusterState>>>,
         accepted_offers: AcceptedOffers,
-        master_signing_key: ed25519_dalek::SigningKey,
+        device_signing_key: ed25519_dalek::SigningKey,
     ) -> Self {
         Processor {
             db,
@@ -262,7 +269,7 @@ impl Processor {
             cluster_state,
             accepted_offers,
             peer_cert_map: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            master_signing_key,
+            device_signing_key,
             work_event_tx: None,
             four_r: viaticum_core::four_r_holder::FourRParams::default(),
             shadow_offer_slot: Arc::new(tokio::sync::Semaphore::new(1)),

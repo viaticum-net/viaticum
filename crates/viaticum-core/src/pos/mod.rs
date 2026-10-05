@@ -8,9 +8,7 @@ use crate::constants::{
     POS_CONSECUTIVE_MISS_UNCERTAIN, POS_VOLUME_DIVISOR, SECS_PER_WEEK,
 };
 use crate::trust::PosOutcome;
-use crate::types::{
-    DeviceId, IdentityPub, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp,
-};
+use crate::types::{DeviceId, PlacementStatus, SourceBlockId, SymbolPlacement, Timestamp};
 
 /// Outcome of verifying a PoS response.
 #[derive(Debug, Clone, PartialEq)]
@@ -366,6 +364,8 @@ pub fn verify_hash_response(
 #[derive(Debug, Clone)]
 pub struct PendingHashChallenge {
     pub source_block_id: SourceBlockId,
+    /// The placement's holder device: the challenge is addressed to it and only a
+    /// response signed by its device key resolves this record (pos-i16).
     pub holder_id: DeviceId,
     /// ESI ranges the holder was asked to prove.
     pub esi_ranges: Vec<(u32, u32)>,
@@ -375,16 +375,6 @@ pub struct PendingHashChallenge {
     pub issued_at: Timestamp,
     /// Raw challenge_id from the wire message.
     pub challenge_id: [u8; 16],
-    /// Holder's master identity, resolved AT ISSUE TIME and captured here (CS-POS-3).
-    ///
-    /// The challenge is addressed to this master (it is the mailbox `target`), and the
-    /// holder signs its response with the corresponding master key. The owner verifies
-    /// the response against THIS captured value rather than re-resolving the holder's
-    /// master at response time: a peer-record change/degradation between issue and
-    /// response (peer cleanup, DR-restored minimal DB, a 14-day gap) could make the
-    /// re-resolve fall back to the device-pub, which would reject the master-signed
-    /// response of an honest holder and wrongly time it out.
-    pub holder_master: IdentityPub,
 }
 
 #[cfg(test)]

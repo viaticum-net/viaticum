@@ -27,7 +27,7 @@ use viaticum::daemon::processor::PosResponder;
 use viaticum_core::db::Db;
 use viaticum_core::messages::{Message, build_pos_hash_challenge};
 use viaticum_core::types::{
-    HoldingRecord, HoldingStatus, IdentityPub, SourceBlockId, Timestamp, hex_encode,
+    DeviceId, HoldingRecord, HoldingStatus, IdentityPub, SourceBlockId, Timestamp, hex_encode,
 };
 
 struct Counting;
@@ -118,17 +118,21 @@ fn fixture(n: u32) -> Fixture {
         let symbol: Vec<u8> = (0..T).map(|i| (i as u32 ^ esi) as u8).collect();
         std::fs::write(block_dir.join(format!("{esi}.bin")), symbol).unwrap();
     }
+    let device_key = ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]);
+    let device_id = DeviceId(device_key.verifying_key().to_bytes());
     let responder = PosResponder::new(
         db,
         dir.path().to_path_buf(),
-        ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]),
+        device_key,
+        IdentityPub([0xABu8; 32]),
+        None,
     );
     let challenge = build_pos_hash_challenge(
         [0x73; 16],
         block_id,
         vec![(0, n)],
         Timestamp::now(),
-        None,
+        device_id,
         &owner_key,
     );
     Fixture {

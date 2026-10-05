@@ -64,6 +64,27 @@ fn make_signing_key(seed: u8) -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
 }
 
+/// The holder DEVICE key of the PoS tests: the challenges are addressed to its device
+/// (pos-i15) and the response is signed by it (pos-i16).
+fn pos_device_key() -> ed25519_dalek::SigningKey {
+    make_signing_key(0xAA)
+}
+
+/// The device of `pos_device_key()`.
+fn pos_device_id() -> DeviceId {
+    DeviceId(pos_device_key().verifying_key().to_bytes())
+}
+
+/// The holder's own master identity in the PoS tests.
+fn pos_own_master() -> IdentityPub {
+    IdentityPub([0x5A; 32])
+}
+
+/// A `PosResponder` of `pos_device_key()` under `pos_own_master()`, no cluster state.
+fn pos_responder(db: Db, holdings_dir: std::path::PathBuf) -> super::pos::PosResponder {
+    super::pos::PosResponder::new(db, holdings_dir, pos_device_key(), pos_own_master(), None)
+}
+
 /// Build a signed SymbolDropNoticeMsg using `build_signed_symbol_drop_notice`.
 /// The `signing_key` must correspond to the holder master identity passed to
 /// `handle_symbol_drop_notice` (use `master_identity(&key)` to derive it).
@@ -183,7 +204,7 @@ async fn make_processor_with_quota(
         backup_event_tx,
         None, // cluster_state: not needed for handler unit tests
         accepted_offers,
-        ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
+        pos_device_key(), // device_signing_key (PoS)
     )
 }
 
@@ -279,7 +300,7 @@ async fn symbol_accept_updates_backup_event() {
         backup_event_tx,
         None, // cluster_state: not needed for handler unit tests
         super::make_empty_accepted_offers(),
-        ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
+        pos_device_key(), // device_signing_key (PoS)
     );
 
     let holder = make_identity(7);
@@ -579,7 +600,7 @@ async fn handle_pos_hash_challenge_responds_with_chain_hash_when_symbols_held() 
         block_id,
         vec![(esi, 1)],
         Timestamp::now(),
-        None,
+        pos_device_id(),
         &owner_key,
     );
 
@@ -638,7 +659,7 @@ async fn handle_pos_hash_challenge_sends_nack_when_symbol_not_held() {
         block_id,
         vec![(esi, 1)],
         Timestamp::now(),
-        None,
+        pos_device_id(),
         &owner_key,
     );
 
@@ -1658,6 +1679,7 @@ async fn handle_symbol_drop_notice_does_not_panic() {
 fn make_source_block(block_id: SourceBlockId) -> SourceBlockRecord {
     SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 10,
         t: 1,
@@ -2113,7 +2135,7 @@ async fn make_processor_with_cluster_state(
         backup_event_tx,
         Some(cluster_state.clone()),
         super::make_empty_accepted_offers(),
-        ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]), // master_signing_key
+        pos_device_key(), // device_signing_key (PoS)
     );
 
     (processor, cluster_state, own_identity)
@@ -3668,6 +3690,7 @@ async fn cluster_sync_response_from_non_cluster_peer_is_rejected() {
 fn make_source_block_for_hook(block_id: SourceBlockId, importance: f64) -> SourceBlockRecord {
     SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 5,
         t: 1,
@@ -3918,8 +3941,6 @@ async fn pos_responder_computes_response_for_held_block() {
     use viaticum_core::pos::compute_chain_hash;
     use viaticum_core::types::hex_encode;
 
-    use super::pos::PosResponder;
-
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
 
@@ -3928,7 +3949,6 @@ async fn pos_responder_computes_response_for_held_block() {
     let block_id = make_block_id(0x22);
     let esi = 3u32;
     let symbol_data = b"test-symbol-data-for-pos-responder".to_vec();
-    let master_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]);
 
     // Insert HoldingRecord so ownership check passes.
     db.upsert_holding(&HoldingRecord {
@@ -3950,7 +3970,7 @@ async fn pos_responder_computes_response_for_held_block() {
     std::fs::create_dir_all(&block_dir).unwrap();
     std::fs::write(block_dir.join(format!("{esi}.bin")), &symbol_data).unwrap();
 
-    let responder = PosResponder::new(db, holdings_dir.path().to_path_buf(), master_signing_key);
+    let responder = pos_responder(db, holdings_dir.path().to_path_buf());
 
     let challenge_id = [0xCCu8; 16];
     let challenge = build_pos_hash_challenge(
@@ -3958,7 +3978,7 @@ async fn pos_responder_computes_response_for_held_block() {
         block_id,
         vec![(esi, 1)],
         Timestamp::now(),
-        None,
+        pos_device_id(),
         &owner_key,
     );
 
@@ -3995,7 +4015,6 @@ async fn pos_responder_drops_challenge_with_bad_owner_signature() {
     use viaticum_core::messages::build_pos_hash_challenge;
     use viaticum_core::types::hex_encode;
 
-    use super::pos::PosResponder;
     use crate::daemon::processor::ProcessorError;
 
     let db = Db::open_in_memory().unwrap();
@@ -4027,8 +4046,7 @@ async fn pos_responder_drops_challenge_with_bad_owner_signature() {
     std::fs::create_dir_all(&block_dir).unwrap();
     std::fs::write(block_dir.join(format!("{esi}.bin")), &symbol_data).unwrap();
 
-    let master_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]);
-    let responder = PosResponder::new(db, holdings_dir.path().to_path_buf(), master_signing_key);
+    let responder = pos_responder(db, holdings_dir.path().to_path_buf());
 
     // Forge: sign the challenge with an ATTACKER key, but present it as if from `owner`.
     let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[0x99u8; 32]);
@@ -4037,7 +4055,7 @@ async fn pos_responder_drops_challenge_with_bad_owner_signature() {
         block_id,
         vec![(esi, 1)],
         Timestamp::now(),
-        None,
+        pos_device_id(),
         &attacker_key,
     );
 
@@ -4053,20 +4071,14 @@ async fn pos_responder_drops_challenge_with_bad_owner_signature() {
 async fn pos_responder_returns_none_when_block_not_held() {
     use viaticum_core::messages::{build_pos_hash_challenge, to_cbor};
 
-    use super::pos::PosResponder;
     use crate::daemon::mailbox::poll::PosMailboxChallengeHandler;
     use crate::daemon::processor::ProcessorPosHandler;
 
     let db = Db::open_in_memory().unwrap();
     let holdings_dir = TempDir::new().unwrap();
-    let master_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xBBu8; 32]);
 
     // No HoldingRecord, no symbol file — expect Nack path → handler returns None.
-    let handler = ProcessorPosHandler::new(PosResponder::new(
-        db,
-        holdings_dir.path().to_path_buf(),
-        master_signing_key,
-    ));
+    let handler = ProcessorPosHandler::new(pos_responder(db, holdings_dir.path().to_path_buf()));
 
     // Sign the challenge with a real owner key so it passes authentication and reaches the
     // "block not held → Nack → None" path (not an UnauthenticatedChallenge short-circuit).
@@ -4081,7 +4093,7 @@ async fn pos_responder_returns_none_when_block_not_held() {
         block_id,
         vec![(esi, 1)],
         Timestamp::now(),
-        None,
+        pos_device_id(),
         &owner_key,
     );
     let payload = to_cbor(&challenge).expect("cbor encode challenge");
@@ -4092,9 +4104,10 @@ async fn pos_responder_returns_none_when_block_not_held() {
         .await
         .expect("handle_pos_challenge must not error");
 
-    assert!(
-        result.is_none(),
-        "handler must return None (nack) when block is not held"
+    assert_eq!(
+        result,
+        crate::daemon::mailbox::poll::PosChallengeAnswer::NoAnswer,
+        "handler must return NoAnswer (nack) when block is not held"
     );
 }
 
@@ -4117,7 +4130,6 @@ async fn pos_responder_returns_none_when_block_not_held() {
 async fn pos_challenge_with_oversized_esi_range_is_rejected_without_huge_alloc() {
     use viaticum_core::messages::build_pos_hash_challenge;
 
-    use super::pos::PosResponder;
     use crate::daemon::processor::ProcessorError;
 
     let db = Db::open_in_memory().unwrap();
@@ -4141,8 +4153,7 @@ async fn pos_challenge_with_oversized_esi_range_is_rejected_without_huge_alloc()
     })
     .unwrap();
 
-    let master_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]);
-    let responder = PosResponder::new(db, holdings_dir.path().to_path_buf(), master_signing_key);
+    let responder = pos_responder(db, holdings_dir.path().to_path_buf());
 
     // VALID signature from the real owner, but an oversized range. Before the fix,
     // `flat_map((0..u32::MAX)).collect()` would try to allocate ~16 GB here → OOM.
@@ -4151,7 +4162,7 @@ async fn pos_challenge_with_oversized_esi_range_is_rejected_without_huge_alloc()
         block_id,
         vec![(0, u32::MAX)],
         Timestamp::now(),
-        None,
+        pos_device_id(),
         &owner_key,
     );
 
@@ -4169,7 +4180,6 @@ async fn pos_challenge_with_oversized_esi_range_is_rejected_without_huge_alloc()
 async fn pos_challenge_with_overflowing_range_is_rejected() {
     use viaticum_core::messages::build_pos_hash_challenge;
 
-    use super::pos::PosResponder;
     use crate::daemon::processor::ProcessorError;
 
     let db = Db::open_in_memory().unwrap();
@@ -4192,8 +4202,7 @@ async fn pos_challenge_with_overflowing_range_is_rejected() {
     })
     .unwrap();
 
-    let master_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]);
-    let responder = PosResponder::new(db, holdings_dir.path().to_path_buf(), master_signing_key);
+    let responder = pos_responder(db, holdings_dir.path().to_path_buf());
 
     // u32::MAX + 5 overflows; old `start + count` panics in debug.
     let challenge = build_pos_hash_challenge(
@@ -4201,7 +4210,7 @@ async fn pos_challenge_with_overflowing_range_is_rejected() {
         block_id,
         vec![(u32::MAX, 5)],
         Timestamp::now(),
-        None,
+        pos_device_id(),
         &owner_key,
     );
 
@@ -4221,7 +4230,6 @@ async fn pos_challenge_with_overflowing_range_is_rejected() {
 async fn pos_challenge_within_holding_bounds_is_not_rejected() {
     use viaticum_core::messages::{Message, build_pos_hash_challenge};
 
-    use super::pos::PosResponder;
     use crate::daemon::processor::ProcessorError;
 
     let db = Db::open_in_memory().unwrap();
@@ -4245,15 +4253,14 @@ async fn pos_challenge_within_holding_bounds_is_not_rejected() {
     })
     .unwrap();
 
-    let master_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]);
-    let responder = PosResponder::new(db, holdings_dir.path().to_path_buf(), master_signing_key);
+    let responder = pos_responder(db, holdings_dir.path().to_path_buf());
 
     let challenge = build_pos_hash_challenge(
         [0x58u8; 16],
         block_id,
         vec![(0, 3)],
         Timestamp::now(),
-        None,
+        pos_device_id(),
         &owner_key,
     );
 
@@ -4280,7 +4287,6 @@ async fn pos_challenge_within_holding_bounds_is_not_rejected() {
 async fn pos_challenge_with_empty_esi_ranges_is_rejected() {
     use viaticum_core::messages::build_pos_hash_challenge;
 
-    use super::pos::PosResponder;
     use crate::daemon::processor::ProcessorError;
 
     let db = Db::open_in_memory().unwrap();
@@ -4303,8 +4309,7 @@ async fn pos_challenge_with_empty_esi_ranges_is_rejected() {
     })
     .unwrap();
 
-    let master_signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xAAu8; 32]);
-    let responder = PosResponder::new(db, holdings_dir.path().to_path_buf(), master_signing_key);
+    let responder = pos_responder(db, holdings_dir.path().to_path_buf());
 
     // VALID signature, but empty esi_ranges → requested == 0.
     let challenge = build_pos_hash_challenge(
@@ -4312,7 +4317,7 @@ async fn pos_challenge_with_empty_esi_ranges_is_rejected() {
         block_id,
         vec![],
         Timestamp::now(),
-        None,
+        pos_device_id(),
         &owner_key,
     );
 
@@ -4663,6 +4668,7 @@ async fn a_notice_inside_the_owners_delete_cooldown_is_still_the_friends_drop() 
 
 // DN-1: one notice — one application (spec f1_stale_drop_notice.md, DN1-1..DN1-18).
 mod drop_notice_dedup;
+mod drop_notice_device;
 
 // В-0b: the offer path refactor and the 4R offer shadow (D-3a, D-3b, D-5).
 mod four_r_shadow;
@@ -4678,6 +4684,9 @@ mod peer_event_order;
 mod reoffer_quota;
 // К-b4 (pos-i14): the holder's PoS answer streams the share, at most two at once.
 mod holder_pos;
+
+// C-SP (pos-i15): a challenge addressed to a sibling device is not served.
+mod pos_sibling;
 
 // ─── pos-i5-a: a holder answers only a fresh challenge (replay guard) ───────────
 
@@ -4719,19 +4728,18 @@ fn challenge_aged(
         block_id,
         vec![(0, 1)],
         Timestamp(Timestamp::now().0 - age),
-        None,
+        pos_device_id(),
         owner_key,
     )
 }
 
 #[tokio::test]
 async fn challenge_older_than_ttl_plus_skew_is_dropped_before_the_disk() {
-    use super::pos::{PosResponder, challenge_max_age_secs};
+    use super::pos::challenge_max_age_secs;
 
     let (db, dir, owner_key, block_id) = held_block_for_freshness();
     let owner = IdentityPub(owner_key.verifying_key().to_bytes());
-    let responder = PosResponder::new(db, dir.path().to_path_buf(), make_signing_key(0xAA))
-        .with_time_scale(900);
+    let responder = pos_responder(db, dir.path().to_path_buf()).with_time_scale(900);
     let stale = challenge_aged(&owner_key, block_id, challenge_max_age_secs(900) + 1);
     match responder.compute_response(owner, stale).await {
         Err(crate::daemon::processor::ProcessorError::StaleChallenge { age_secs }) => {
@@ -4743,12 +4751,11 @@ async fn challenge_older_than_ttl_plus_skew_is_dropped_before_the_disk() {
 
 #[tokio::test]
 async fn challenge_just_inside_ttl_plus_skew_is_answered() {
-    use super::pos::{PosResponder, challenge_max_age_secs};
+    use super::pos::challenge_max_age_secs;
 
     let (db, dir, owner_key, block_id) = held_block_for_freshness();
     let owner = IdentityPub(owner_key.verifying_key().to_bytes());
-    let responder = PosResponder::new(db, dir.path().to_path_buf(), make_signing_key(0xAA))
-        .with_time_scale(900);
+    let responder = pos_responder(db, dir.path().to_path_buf()).with_time_scale(900);
     let edge = challenge_aged(&owner_key, block_id, challenge_max_age_secs(900) - 1);
     match responder.compute_response(owner, edge).await {
         Ok(viaticum_core::messages::Message::PosHashResponse(r)) => {
@@ -4760,23 +4767,25 @@ async fn challenge_just_inside_ttl_plus_skew_is_answered() {
 
 #[tokio::test]
 async fn stale_challenge_through_the_mailbox_handler_is_no_answer() {
-    use super::pos::{PosResponder, challenge_max_age_secs};
+    use super::pos::challenge_max_age_secs;
     use crate::daemon::mailbox::poll::PosMailboxChallengeHandler;
     use crate::daemon::processor::ProcessorPosHandler;
 
     let (db, dir, owner_key, block_id) = held_block_for_freshness();
     let owner = IdentityPub(owner_key.verifying_key().to_bytes());
-    let handler = ProcessorPosHandler::new(
-        PosResponder::new(db, dir.path().to_path_buf(), make_signing_key(0xAA))
-            .with_time_scale(900),
-    );
+    let handler =
+        ProcessorPosHandler::new(pos_responder(db, dir.path().to_path_buf()).with_time_scale(900));
     let stale = challenge_aged(&owner_key, block_id, challenge_max_age_secs(900) + 60);
     let payload = viaticum_core::messages::to_cbor(&stale).unwrap();
     let result = handler
         .handle_pos_challenge(owner, payload)
         .await
         .expect("a stale challenge is not a handler error");
-    assert!(result.is_none(), "a replay gets no answer");
+    assert_eq!(
+        result,
+        crate::daemon::mailbox::poll::PosChallengeAnswer::NoAnswer,
+        "a replay gets no answer"
+    );
 }
 
 #[test]
@@ -4795,19 +4804,20 @@ fn max_age_is_the_scaled_ttl_plus_the_unscaled_skew() {
 
 #[tokio::test]
 async fn undecodable_payload_through_the_mailbox_handler_is_no_answer() {
-    use super::pos::PosResponder;
     use crate::daemon::mailbox::poll::PosMailboxChallengeHandler;
     use crate::daemon::processor::ProcessorPosHandler;
 
     let dir = TempDir::new().unwrap();
-    let handler = ProcessorPosHandler::new(PosResponder::new(
+    let handler = ProcessorPosHandler::new(pos_responder(
         Db::open_in_memory().unwrap(),
         dir.path().to_path_buf(),
-        make_signing_key(0xAA),
     ));
     let result = handler
         .handle_pos_challenge(IdentityPub([0x42; 32]), vec![0xFF, 0x00, 0x13])
         .await
         .expect("junk is not a handler error");
-    assert!(result.is_none());
+    assert_eq!(
+        result,
+        crate::daemon::mailbox::poll::PosChallengeAnswer::NoAnswer
+    );
 }

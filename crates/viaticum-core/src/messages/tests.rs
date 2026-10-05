@@ -447,7 +447,7 @@ fn all_message_variants() -> Vec<Message> {
             source_block_id: sbid,
             esi_ranges: vec![(0, 5)],
             timestamp: ts,
-            device_id: None,
+            device_id: DeviceId([0x33; 32]),
             sig: [0u8; 64],
         }),
         Message::PosHashResponse(PosHashResponseMsg {
@@ -456,7 +456,7 @@ fn all_message_variants() -> Vec<Message> {
             source_block_id: sbid,
             chain_hash: [0x03u8; 32],
             timestamp: ts,
-            device_id: None,
+            device_id: DeviceId([0x33; 32]),
             sig: [0u8; 64],
         }),
         Message::PosHashNack(PosHashNackMsg {
@@ -465,7 +465,7 @@ fn all_message_variants() -> Vec<Message> {
             source_block_id: sbid,
             first_missing_esi: 7,
             timestamp: ts,
-            device_id: None,
+            device_id: DeviceId([0x33; 32]),
             sig: [0u8; 64],
         }),
         Message::SymbolOffer(SymbolOfferMsg {
@@ -1193,7 +1193,7 @@ fn pos_hash_challenge_cbor_roundtrip() {
         source_block_id: SourceBlockId([0xBB; 32]),
         esi_ranges: vec![(0, 5), (10, 3)],
         timestamp: Timestamp(1234567890),
-        device_id: None,
+        device_id: DeviceId([0x33; 32]),
         sig: [0u8; 64],
     };
     let bytes = to_cbor(&msg).unwrap();
@@ -1209,7 +1209,7 @@ fn pos_hash_response_cbor_roundtrip() {
         source_block_id: SourceBlockId([0xEE; 32]),
         chain_hash: [0xDD; 32],
         timestamp: Timestamp(1234567890),
-        device_id: None,
+        device_id: DeviceId([0x33; 32]),
         sig: [0u8; 64],
     };
     let bytes = to_cbor(&msg).unwrap();
@@ -1225,7 +1225,7 @@ fn pos_hash_nack_cbor_roundtrip() {
         source_block_id: SourceBlockId([0xFF; 32]),
         first_missing_esi: 42,
         timestamp: Timestamp(1234567890),
-        device_id: None,
+        device_id: DeviceId([0x33; 32]),
         sig: [0u8; 64],
     };
     let bytes = to_cbor(&msg).unwrap();
@@ -1241,7 +1241,7 @@ fn message_enum_pos_hash_challenge_roundtrip() {
         source_block_id: SourceBlockId([0x22; 32]),
         esi_ranges: vec![(0, 10)],
         timestamp: Timestamp(999),
-        device_id: Some(DeviceId([0x33; 32])),
+        device_id: DeviceId([0x33; 32]),
         sig: [0u8; 64],
     };
     let msg = Message::PosHashChallenge(inner);
@@ -1392,11 +1392,11 @@ fn pos_hash_nack_signature_covers_challenge_id() {
     let block_id = SourceBlockId([0xBBu8; 32]);
     let ts = Timestamp(1_000_000);
 
-    let mut msg = super::build_pos_hash_nack([0x01u8; 16], block_id, 0, ts, None, &sk);
+    let mut msg = super::build_pos_hash_nack([0x01u8; 16], block_id, 0, ts, &sk);
     // Tamper challenge_id.
     msg.challenge_id = [0x02u8; 16];
 
-    let holder = IdentityPub(sk.verifying_key().to_bytes());
+    let holder = DeviceId(sk.verifying_key().to_bytes());
     let result = super::verify_pos_hash_nack(&msg, &holder);
     assert!(
         matches!(result, Err(super::MessageError::BadSignature)),
@@ -1412,11 +1412,11 @@ fn pos_hash_nack_signature_covers_source_block_id() {
     let block_id_b = SourceBlockId([0xCCu8; 32]);
     let ts = Timestamp(2_000_000);
 
-    let mut msg = super::build_pos_hash_nack([0x10u8; 16], block_id_a, 5, ts, None, &sk);
+    let mut msg = super::build_pos_hash_nack([0x10u8; 16], block_id_a, 5, ts, &sk);
     // Tamper source_block_id.
     msg.source_block_id = block_id_b;
 
-    let holder = IdentityPub(sk.verifying_key().to_bytes());
+    let holder = DeviceId(sk.verifying_key().to_bytes());
     let result = super::verify_pos_hash_nack(&msg, &holder);
     assert!(
         matches!(result, Err(super::MessageError::BadSignature)),
@@ -1431,8 +1431,8 @@ fn pos_hash_nack_with_correct_signature_verifies() {
     let block_id = SourceBlockId([0x77u8; 32]);
     let ts = Timestamp(3_000_000);
 
-    let msg = super::build_pos_hash_nack([0x20u8; 16], block_id, 10, ts, None, &sk);
-    let holder = IdentityPub(sk.verifying_key().to_bytes());
+    let msg = super::build_pos_hash_nack([0x20u8; 16], block_id, 10, ts, &sk);
+    let holder = DeviceId(sk.verifying_key().to_bytes());
     super::verify_pos_hash_nack(&msg, &holder).expect("correctly built PosHashNack must verify");
 }
 
@@ -1461,6 +1461,10 @@ fn pos_hash_nack_missing_sig_field_deserializes_to_zero() {
             Value::Text("timestamp".into()),
             Value::Integer(1234567890u64.into()),
         ),
+        (
+            Value::Text("device_id".into()),
+            Value::serialized(&DeviceId([0x33u8; 32])).expect("device_id to Value"),
+        ),
         // sig field intentionally absent — old format
     ]);
 
@@ -1476,8 +1480,7 @@ fn pos_hash_nack_missing_sig_field_deserializes_to_zero() {
 
     // Now verify must fail — zero sig is not a valid Ed25519 signature.
     // Use any key as the expected holder — the zero sig will fail regardless.
-    let sk = SigningKey::generate(&mut OsRng);
-    let holder = IdentityPub(sk.verifying_key().to_bytes());
+    let holder = DeviceId([0x33u8; 32]);
     let result = super::verify_pos_hash_nack(&decoded, &holder);
     assert!(
         matches!(result, Err(super::MessageError::BadSignature)),
@@ -1606,7 +1609,7 @@ fn pos_hash_challenge_with_correct_signature_verifies() {
         block_id,
         vec![(0, 5), (10, 3)],
         Timestamp(1_000_000),
-        None,
+        DeviceId([0x61u8; 32]),
         &sk,
     );
 
@@ -1628,7 +1631,7 @@ fn pos_hash_challenge_signed_by_wrong_key_is_rejected() {
         block_id,
         vec![(0, 4)],
         Timestamp(2_000_000),
-        None,
+        DeviceId([0x61u8; 32]),
         &sk,
     );
 
@@ -1652,7 +1655,7 @@ fn pos_hash_challenge_signature_covers_source_block_id() {
         SourceBlockId([0x30u8; 32]),
         vec![(0, 6)],
         Timestamp(3_000_000),
-        None,
+        DeviceId([0x61u8; 32]),
         &sk,
     );
     msg.source_block_id = SourceBlockId([0x31u8; 32]);
@@ -1677,7 +1680,7 @@ fn pos_hash_challenge_signature_covers_esi_ranges() {
         SourceBlockId([0x40u8; 32]),
         vec![(0, 2)],
         Timestamp(4_000_000),
-        None,
+        DeviceId([0x61u8; 32]),
         &sk,
     );
     msg.esi_ranges = vec![(0, 1000)];
@@ -1701,7 +1704,7 @@ fn pos_hash_challenge_unsigned_is_rejected() {
         source_block_id: SourceBlockId([0x51u8; 32]),
         esi_ranges: vec![(0, 5)],
         timestamp: Timestamp(5_000_000),
-        device_id: None,
+        device_id: DeviceId([0x33; 32]),
         sig: [0u8; 64],
     };
 
@@ -1722,7 +1725,7 @@ fn pos_hash_challenge_cbor_roundtrip_preserves_sig() {
         SourceBlockId([0x60u8; 32]),
         vec![(0, 7), (20, 2)],
         Timestamp(6_000_000),
-        Some(DeviceId([0x61u8; 32])),
+        DeviceId([0x61u8; 32]),
         &sk,
     );
 
@@ -1735,18 +1738,17 @@ fn pos_hash_challenge_cbor_roundtrip_preserves_sig() {
 
 // ─── PosHashResponse signature (CS-ID-1 / P1-1 / P1-7) ────────────────────────
 
-// A correctly built response verifies against the signing (holder) master key.
+// pos-i16: a response built with the placement device's key verifies against that device.
 #[test]
-fn pos_hash_response_with_correct_signature_verifies() {
+fn pos_response_verify_passes_for_placement_device_key() {
     let sk = SigningKey::generate(&mut OsRng);
-    let holder = IdentityPub(sk.verifying_key().to_bytes());
+    let holder = DeviceId(sk.verifying_key().to_bytes());
 
     let msg = super::build_pos_hash_response(
         [0x07u8; 16],
         SourceBlockId([0x70u8; 32]),
         [0x71u8; 32],
         Timestamp(7_000_000),
-        None,
         &sk,
     );
 
@@ -1754,30 +1756,29 @@ fn pos_hash_response_with_correct_signature_verifies() {
         .expect("correctly built PosHashResponse must verify");
 }
 
-// A response signed by holder A does NOT verify against a different identity B —
-// a positioned postman forging a response cannot pass verification against the
-// challenged holder's master key.
+// pos-i16: a response of device A is rejected for a placement on device B with
+// WrongDevice, before any crypto (a sibling device of the same master answered).
 #[test]
-fn pos_hash_response_signed_by_wrong_key_is_rejected() {
+fn pos_response_verify_returns_wrong_device_when_device_id_differs() {
     let sk = SigningKey::generate(&mut OsRng);
     let other = SigningKey::generate(&mut OsRng);
-    let other_pub = IdentityPub(other.verifying_key().to_bytes());
+    let other_pub = DeviceId(other.verifying_key().to_bytes());
 
     let msg = super::build_pos_hash_response(
         [0x08u8; 16],
         SourceBlockId([0x80u8; 32]),
         [0x81u8; 32],
         Timestamp(8_000_000),
-        None,
         &sk,
     );
 
     assert!(
         matches!(
             super::verify_pos_hash_response(&msg, &other_pub),
-            Err(super::MessageError::BadSignature)
+            Err(super::MessageError::WrongDevice { expected, got })
+                if expected == other_pub && got == msg.device_id
         ),
-        "response signed by holder A must not verify against identity B"
+        "a response of device A must be WrongDevice for a placement on device B"
     );
 }
 
@@ -1786,14 +1787,13 @@ fn pos_hash_response_signed_by_wrong_key_is_rejected() {
 #[test]
 fn pos_hash_response_signature_covers_chain_hash() {
     let sk = SigningKey::generate(&mut OsRng);
-    let holder = IdentityPub(sk.verifying_key().to_bytes());
+    let holder = DeviceId(sk.verifying_key().to_bytes());
 
     let mut msg = super::build_pos_hash_response(
         [0x09u8; 16],
         SourceBlockId([0x90u8; 32]),
         [0x91u8; 32],
         Timestamp(9_000_000),
-        None,
         &sk,
     );
     msg.chain_hash = [0xFFu8; 32];
@@ -1812,14 +1812,13 @@ fn pos_hash_response_signature_covers_chain_hash() {
 #[test]
 fn pos_hash_response_signature_covers_source_block_id() {
     let sk = SigningKey::generate(&mut OsRng);
-    let holder = IdentityPub(sk.verifying_key().to_bytes());
+    let holder = DeviceId(sk.verifying_key().to_bytes());
 
     let mut msg = super::build_pos_hash_response(
         [0x0Au8; 16],
         SourceBlockId([0xA0u8; 32]),
         [0xA1u8; 32],
         Timestamp(10_000_000),
-        None,
         &sk,
     );
     msg.source_block_id = SourceBlockId([0xA2u8; 32]);
@@ -1836,14 +1835,14 @@ fn pos_hash_response_signature_covers_source_block_id() {
 // An unsigned (all-zero sig, the serde default for old messages) response is rejected.
 #[test]
 fn pos_hash_response_unsigned_is_rejected() {
-    let holder = IdentityPub([0xB0u8; 32]);
+    let holder = DeviceId([0xB0u8; 32]);
     let msg = PosHashResponseMsg {
         v: 1,
         challenge_id: [0x0Bu8; 16],
         source_block_id: SourceBlockId([0xB1u8; 32]),
         chain_hash: [0xB2u8; 32],
         timestamp: Timestamp(11_000_000),
-        device_id: None,
+        device_id: DeviceId([0xB0u8; 32]),
         sig: [0u8; 64],
     };
 
@@ -1857,14 +1856,13 @@ fn pos_hash_response_unsigned_is_rejected() {
 #[test]
 fn pos_hash_response_cbor_roundtrip_preserves_sig() {
     let sk = SigningKey::generate(&mut OsRng);
-    let holder = IdentityPub(sk.verifying_key().to_bytes());
+    let holder = DeviceId(sk.verifying_key().to_bytes());
 
     let msg = super::build_pos_hash_response(
         [0x0Cu8; 16],
         SourceBlockId([0xC0u8; 32]),
         [0xC1u8; 32],
         Timestamp(12_000_000),
-        Some(DeviceId([0xC2u8; 32])),
         &sk,
     );
 
@@ -1873,6 +1871,159 @@ fn pos_hash_response_cbor_roundtrip_preserves_sig() {
     assert_eq!(decoded.sig, msg.sig, "sig must survive CBOR roundtrip");
     super::verify_pos_hash_response(&decoded, &holder)
         .expect("sig must verify after CBOR roundtrip");
+}
+
+// ─── C-SP: device-addressed PoS (pos-i15, pos-i16) ──────────────────────────
+
+// pos-i15 (M3): the addressee is under the owner's signature — a postman cannot
+// re-address a challenge to a sibling device.
+#[test]
+fn pos_challenge_verify_fails_when_device_id_changed_after_signing() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let owner = IdentityPub(sk.verifying_key().to_bytes());
+    let mut msg = super::build_pos_hash_challenge(
+        [0x0Du8; 16],
+        SourceBlockId([0xD0u8; 32]),
+        vec![(0, 3)],
+        Timestamp(13_000_000),
+        DeviceId([0xD1u8; 32]),
+        &sk,
+    );
+    super::verify_pos_hash_challenge(&msg, &owner).expect("as signed it verifies");
+    msg.device_id = DeviceId([0xD2u8; 32]);
+    assert!(
+        matches!(
+            super::verify_pos_hash_challenge(&msg, &owner),
+            Err(super::MessageError::BadSignature)
+        ),
+        "a re-addressed challenge must fail verification"
+    );
+}
+
+// pos-i16 (M2′): a response for device D signed with the holder's MASTER key (the old
+// scheme, or anyone holding only the master key) is rejected.
+#[test]
+fn pos_response_verify_fails_when_signed_by_master_key() {
+    use ed25519_dalek::Signer;
+    let master = SigningKey::generate(&mut OsRng);
+    let device = DeviceId(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+    let (cid, block, hash, ts) = (
+        [0x0Eu8; 16],
+        SourceBlockId([0xE0u8; 32]),
+        [0xE1u8; 32],
+        Timestamp(14_000_000),
+    );
+    let input = super::pos_hash_response_sig_input(&cid, &block, &device, &hash, &ts);
+    let msg = PosHashResponseMsg {
+        v: 1,
+        challenge_id: cid,
+        source_block_id: block,
+        chain_hash: hash,
+        timestamp: ts,
+        device_id: device,
+        sig: master.sign(&input).to_bytes(),
+    };
+    assert!(
+        matches!(
+            super::verify_pos_hash_response(&msg, &device),
+            Err(super::MessageError::BadSignature)
+        ),
+        "a master-signed response must not verify for the device"
+    );
+}
+
+// pos-i16: a sibling's response with device_id rewritten to the placement device (by a
+// postman or the sibling itself) does not verify: device_id is under the device's sig.
+#[test]
+fn pos_response_verify_fails_when_device_id_rewritten_to_placement_device() {
+    let sibling = SigningKey::generate(&mut OsRng);
+    let placement_device = DeviceId(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+    let mut msg = super::build_pos_hash_response(
+        [0x0Fu8; 16],
+        SourceBlockId([0xF0u8; 32]),
+        [0xF1u8; 32],
+        Timestamp(15_000_000),
+        &sibling,
+    );
+    msg.device_id = placement_device;
+    assert!(
+        matches!(
+            super::verify_pos_hash_response(&msg, &placement_device),
+            Err(super::MessageError::BadSignature)
+        ),
+        "a rewritten device_id must fail verification"
+    );
+}
+
+// pos-i16 / М-27 requirement: a Nack of device A is WrongDevice for a placement on B.
+#[test]
+fn pos_nack_verify_returns_wrong_device_when_device_id_differs() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let other = DeviceId(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+    let msg = super::build_pos_hash_nack(
+        [0x10u8; 16],
+        SourceBlockId([0x11u8; 32]),
+        0,
+        Timestamp(16_000_000),
+        &sk,
+    );
+    assert!(
+        matches!(
+            super::verify_pos_hash_nack(&msg, &other),
+            Err(super::MessageError::WrongDevice { expected, got })
+                if expected == other && got == msg.device_id
+        ),
+        "a Nack of device A must be WrongDevice for a placement on device B"
+    );
+}
+
+// The builder cannot produce a device_id that disagrees with the signer.
+#[test]
+fn build_pos_hash_response_sets_device_id_from_signing_key() {
+    let sk = SigningKey::generate(&mut OsRng);
+    let me = DeviceId(sk.verifying_key().to_bytes());
+    let resp = super::build_pos_hash_response(
+        [0x12u8; 16],
+        SourceBlockId([0x13u8; 32]),
+        [0x14u8; 32],
+        Timestamp(17_000_000),
+        &sk,
+    );
+    assert_eq!(resp.device_id, me);
+    let nack = super::build_pos_hash_nack(
+        [0x12u8; 16],
+        SourceBlockId([0x13u8; 32]),
+        1,
+        Timestamp(17_000_000),
+        &sk,
+    );
+    assert_eq!(nack.device_id, me);
+}
+
+// The three PoS signing inputs carry the v2 domains (a v1 signature never verifies).
+#[test]
+fn pos_sig_inputs_start_with_v2_domain() {
+    let (cid, block, dev, ts) = (
+        [1u8; 16],
+        SourceBlockId([2u8; 32]),
+        DeviceId([3u8; 32]),
+        Timestamp(4),
+    );
+    let c = super::pos_hash_challenge_sig_input(&cid, &block, &dev, &[(0, 1)], &ts);
+    let r = super::pos_hash_response_sig_input(&cid, &block, &dev, &[5u8; 32], &ts);
+    let n = super::pos_hash_nack_sig_input(&cid, &block, &dev, &ts);
+    assert!(c.starts_with(b"viaticum-pos-challenge-v2"));
+    assert!(r.starts_with(b"viaticum-pos-resp-v2"));
+    assert!(n.starts_with(b"viaticum-pos-nack-v2"));
+    // device_id follows challenge_id and source_block_id in each input.
+    for (input, domain) in [
+        (&c, super::POS_CHALLENGE_SIG_DOMAIN),
+        (&r, super::POS_RESPONSE_SIG_DOMAIN),
+        (&n, super::POS_NACK_SIG_DOMAIN),
+    ] {
+        let at = domain.len() + 16 + 32;
+        assert_eq!(&input[at..at + 32], &dev.0);
+    }
 }
 
 // ─── CROWN-1 C2: optional signature fields ───────────────────────────────────

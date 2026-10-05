@@ -268,7 +268,7 @@ pub fn compute_allocation(
             symbol_count: count,
             start_esi: esi_cursor,
         });
-        esi_cursor += count;
+        esi_cursor = esi_cursor.saturating_add(count); // CS-ERA-6
     }
 
     Ok(allocations)
@@ -381,7 +381,7 @@ pub fn compute_allocation_with_importance(
             symbol_count: count,
             start_esi: esi_cursor,
         });
-        esi_cursor += count;
+        esi_cursor = esi_cursor.saturating_add(count); // CS-ERA-6
     }
 
     Ok(allocations)

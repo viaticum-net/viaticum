@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use viaticum_core::messages::{PosHashChallengeMsg, PosHashResponseMsg};
-use viaticum_core::types::{DeviceId, IdentityPub, SourceBlockId, Timestamp, from_cbor_bytes};
+use viaticum_core::types::{DeviceId, SourceBlockId, Timestamp, from_cbor_bytes};
 
-use super::issue_support::{Owner, SlowPostman, owner_with_due};
+use super::issue_stall::StallingEncoder;
+use super::issue_support::{Owner, SlowPostman, owner_with_due, owner_with_encoder, seed_due};
 use super::pos_scale::{LogBuf, field};
 use crate::daemon::scheduler::issue::{ISSUE_PUBLISH_CONCURRENCY, InFlight, issue_budget};
 use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
@@ -31,7 +32,6 @@ async fn pending_with_response(owner: &Owner) -> ([u8; 16], PosHashResponseMsg) 
             expected_chain_hash: [0u8; 32],
             issued_at: Timestamp::now(),
             challenge_id: cid,
-            holder_master: IdentityPub(holder.0),
         },
     );
     let response = viaticum_core::messages::build_pos_hash_response(
@@ -39,7 +39,6 @@ async fn pending_with_response(owner: &Owner) -> ([u8; 16], PosHashResponseMsg) 
         block,
         [0u8; 32],
         Timestamp::now(),
-        None,
         &holder_key,
     );
     (cid, response)
@@ -88,9 +87,11 @@ fn issue_budget_is_a_fifth_of_the_scaled_pos_period() {
 /// of the last publishes by this test-only caller, and scheduling slack) having issued
 /// part of them and deferred the rest; every later call issues more, and all 1000 are
 /// issued (nothing starves). The clock is the paused one of the runtime: the publishes sleep
-/// their 20-50 ms and the tick's deadline waits run on it, so the time a call "takes" is the
-/// model's and not the load of the machine (a 2 s hiccup of a loaded CPU was a flake; the
-/// blocking preparations hold the auto-advance back while they run).
+/// their 20-50 ms, and the tick's deadline waits AND its budget check (`started`, the slowest
+/// block) run on it, so the time a call "takes" is the model's and not the load of the machine.
+/// The budget check on the wall clock was the flake: on a loaded gate every block took long in
+/// real time, a call issued one block and "not all 1000 issued after 60 calls" (78 of 400 runs
+/// at 120 in parallel). The blocking preparations hold the auto-advance back while they run.
 #[tokio::test(start_paused = true)]
 async fn issue_tick_stops_at_its_budget_and_later_ticks_issue_the_rest() {
     const DUE: usize = 1000;
@@ -175,17 +176,77 @@ async fn issue_tick_stops_at_its_budget_and_later_ticks_issue_the_rest() {
     );
 }
 
+/// pos-i7-a, the headroom rule (review W1 after the tick went to the runtime's clock): a block
+/// starts only while the time spent plus 2 × the slowest block fits the budget. Each
+/// preparation here moves the paused clock by 300 ms (its encode advances it from the blocking
+/// thread), so after the first block 300 + 2 × 300 > 800 ms (time_scale 900): the tick starts
+/// ONE block and defers the other three, none cut. Without the rule the tick starts the next
+/// blocks until the deadline cuts one. Mutation `if false && …` on the rule → reddens.
+#[tokio::test(start_paused = true)]
+async fn a_block_starts_only_while_twice_the_slowest_still_fits() {
+    let encoder = StallingEncoder::new(0, 0, Duration::ZERO);
+    encoder.set_hook(|_| {
+        tokio::runtime::Handle::current()
+            .block_on(tokio::time::advance(Duration::from_millis(300)));
+    });
+    let owner = owner_with_encoder(
+        900,
+        SlowPostman::acking_after(Duration::from_millis(1)),
+        encoder,
+        |db, dir| seed_due(db, dir, 4, 2),
+    );
+    let mut in_flight = InFlight::default();
+
+    let buf = LogBuf::default();
+    let writer = buf.clone();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish(),
+    );
+    tracing::instrument::WithSubscriber::with_subscriber(
+        owner.scheduler.issue_tick(&mut in_flight),
+        dispatch,
+    )
+    .await
+    .expect("issue_tick");
+
+    let logs = buf.text();
+    let line = logs
+        .lines()
+        .find(|l| l.contains("scheduler: PoS issue tick"))
+        .unwrap_or_else(|| panic!("no issue tick line; logs:\n{logs}"));
+    assert_eq!(field(line, "due"), Some(8), "{line}");
+    assert_eq!(
+        field(line, "blocks"),
+        Some(1),
+        "one block, then no room: {line}"
+    );
+    assert_eq!(field(line, "issued"), Some(2), "{line}");
+    assert_eq!(field(line, "deferred"), Some(6), "{line}");
+    assert_eq!(field(line, "cut_blocks"), Some(0), "{line}");
+    assert!(
+        field(line, "slowest_block_ms").is_some_and(|ms| ms >= 300),
+        "the preparation's time is seen: {line}"
+    );
+    in_flight.shutdown().await;
+}
+
 /// W-1 (СТ-0c round 3): publishes of 2 s each do not stretch the tick. The tick fills
 /// the publish slots (block 1: 8, block 2: 1), waits for a free one at most until its
 /// budget (800 ms at time_scale 900) ends, and returns within the budget plus one block
 /// encode, its publishes still in flight and nothing pending yet. They settle afterwards.
-#[tokio::test]
+/// Paused time: the 2 s publishes and the budget are the runtime's clock, so a loaded
+/// machine cannot stop the tick before block 2 (the slots would not fill).
+#[tokio::test(start_paused = true)]
 async fn issue_tick_returns_before_its_slow_publishes_settle() {
     let owner = owner_with_due(5, 8, 900, SlowPostman::acking_after(Duration::from_secs(2)));
     let budget = issue_budget(3600, 900);
     let mut in_flight = InFlight::default();
 
-    let t = Instant::now();
+    let t = tokio::time::Instant::now();
     owner
         .scheduler
         .issue_tick(&mut in_flight)
@@ -219,9 +280,10 @@ async fn issue_tick_returns_before_its_slow_publishes_settle() {
 
 /// W-1: a placement whose challenge is still being published gets no second one. One
 /// block of 8 holders (fewer than the publish slots): the first tick starts all 8 and
-/// returns; the second finds all 8 in flight and starts none. The time scale is 1: the tick's
-/// budget (720 s) cannot run out on a loaded machine before the 8 are started.
-#[tokio::test]
+/// returns; the second finds all 8 in flight and starts none. The time scale is 1 (budget
+/// 720 s) and the time is paused: neither a loaded machine nor the 2 s publishes can end the
+/// tick before the 8 are started, or settle them before the second tick.
+#[tokio::test(start_paused = true)]
 async fn a_placement_being_published_gets_no_second_challenge() {
     let owner = owner_with_due(1, 8, 1, SlowPostman::acking_after(Duration::from_secs(2)));
     let mut in_flight = InFlight::default();

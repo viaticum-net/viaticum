@@ -235,6 +235,7 @@ impl Fx {
         self.db
             .upsert_source_block(&SourceBlockRecord {
                 seal_generation: 0,
+                esi_high_water: 0,
                 block_id,
                 k: 1,
                 t: 64,

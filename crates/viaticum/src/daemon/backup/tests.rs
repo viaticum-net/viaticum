@@ -2532,6 +2532,7 @@ fn flush_queue_preserves_importance_order_across_packs() {
 fn make_block_for_hook(block_id: SourceBlockId) -> viaticum_core::types::SourceBlockRecord {
     viaticum_core::types::SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id,
         k: 5,
         t: 1,

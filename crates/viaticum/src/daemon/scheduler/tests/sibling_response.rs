@@ -1,0 +1,257 @@
+// pos-i16 (C-SP К1): the owner rules on a placement only by a response signed with the key of
+// that placement's device. A sibling device of the holder's master (it reads the same master
+// box) or anything signed with the master key is ignored: the pending stays, nothing is written
+// to the placement, the weekly PoS counters, trust or the pair ledger, and the addressed
+// device's own answer still resolves the challenge.
+
+use ed25519_dalek::Signer;
+use viaticum_core::messages::{
+    PosHashResponseMsg, build_pos_hash_response, pos_hash_response_sig_input,
+};
+use viaticum_core::types::{DeviceId, IdentityPub, PlacementStatus, Timestamp, hex_encode};
+
+use super::stale_verdict::logged;
+use super::{PosDropFixture, pos_drop_fixture};
+
+/// A sibling device of the fixture holder's master (registered under the same master).
+fn sibling_of(f: &PosDropFixture, seed: u8) -> ed25519_dalek::SigningKey {
+    let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    // The holder's master as the owner resolves it (PEERS first, dr-i8).
+    let master: IdentityPub = f.db.master_for_holder(&f.holder).unwrap().unwrap();
+    f.db.set_master_for_device(&DeviceId(key.verifying_key().to_bytes()), &master)
+        .unwrap();
+    key
+}
+
+/// The fixture holder's master key (`pos_drop_fixture` derives it from `seed + 2`).
+fn master_key_of(seed: u8) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[seed.wrapping_add(2); 32])
+}
+
+async fn deliver(f: &PosDropFixture, response: PosHashResponseMsg) {
+    f.scheduler
+        .handle_pos_response_from_mailbox(response)
+        .await
+        .expect("a response is never a handler error");
+}
+
+/// Nothing ruled: the pending of `cid` is still there, the placement is as it was and
+/// unverified, no weekly PoS row, no pair-ledger event, trust untouched.
+async fn assert_nothing_ruled(f: &PosDropFixture, cid: [u8; 16], trust: (f64, f64), case: &str) {
+    assert!(
+        f.pending.lock().await.contains_challenge(&cid),
+        "{case}: pending left intact"
+    );
+    let p = f.placement();
+    assert_eq!(p.status, PlacementStatus::Alive, "{case}: no verdict");
+    assert!(p.last_verified.is_none(), "{case}: no Pass");
+    assert!(
+        f.db.list_pos_weekly_for_peer(&f.holder).unwrap().is_empty(),
+        "{case}: no weekly PoS row"
+    );
+    assert!(
+        f.db.list_pending_drops().unwrap().is_empty(),
+        "{case}: no pair-ledger event"
+    );
+    let peer = f.db.get_peer(&f.holder).unwrap().unwrap();
+    assert_eq!(
+        (peer.trust_p, peer.trust_i),
+        trust,
+        "{case}: trust untouched"
+    );
+}
+
+fn trust_of(f: &PosDropFixture) -> (f64, f64) {
+    let peer = f.db.get_peer(&f.holder).unwrap().unwrap();
+    (peer.trust_p, peer.trust_i)
+}
+
+// M2: a response of a sibling device (its own key, its stale bytes → a wrong hash) is
+// ignored with the "another device" WARN carrying the challenge_id.
+#[tokio::test]
+async fn mailbox_response_signed_by_sibling_device_is_ignored_and_pending_kept() {
+    let f = pos_drop_fixture(0xC1, PlacementStatus::Alive, 0, 0);
+    let trust = trust_of(&f);
+    let (cid, _) = f.challenge(Timestamp::now(), 0xC1).await;
+    let sibling = sibling_of(&f, 0xC9);
+    let response = build_pos_hash_response(cid, f.block, [0xFF; 32], Timestamp::now(), &sibling);
+
+    let ((), log) = logged(deliver(&f, response)).await;
+
+    assert_nothing_ruled(&f, cid, trust, "sibling response").await;
+    let line = log
+        .lines()
+        .find(|l| l.contains("from another device of the holder's master"))
+        .unwrap_or_else(|| panic!("the WARN is printed:\n{log}"));
+    assert!(
+        line.contains(&hex_encode(&cid)),
+        "with the challenge_id: {line}"
+    );
+}
+
+// M2′: a response naming the holder's device but signed with the holder's MASTER key (the
+// old scheme) is ignored; so is one built by the master key as its own "device".
+#[tokio::test]
+async fn mailbox_response_signed_by_master_key_is_ignored_and_pending_kept() {
+    let f = pos_drop_fixture(0xC2, PlacementStatus::Alive, 0, 0);
+    let trust = trust_of(&f);
+    let (cid, _) = f.challenge(Timestamp::now(), 0xC2).await;
+    let master = master_key_of(0xC2);
+    let ts = Timestamp::now();
+    let input = pos_hash_response_sig_input(&cid, &f.block, &f.holder, &[0xFF; 32], &ts);
+    let as_holder = PosHashResponseMsg {
+        v: 1,
+        challenge_id: cid,
+        source_block_id: f.block,
+        chain_hash: [0xFF; 32],
+        timestamp: ts,
+        device_id: f.holder,
+        sig: master.sign(&input).to_bytes(),
+    };
+    let as_itself = build_pos_hash_response(cid, f.block, [0xFF; 32], ts, &master);
+
+    let ((), log) = logged(async {
+        deliver(&f, as_holder).await;
+        deliver(&f, as_itself).await;
+    })
+    .await;
+
+    assert_nothing_ruled(&f, cid, trust, "master-signed responses").await;
+    let line = log
+        .lines()
+        .find(|l| l.contains("signature verification failed"))
+        .unwrap_or_else(|| panic!("the signature WARN is printed:\n{log}"));
+    assert!(
+        line.contains(&hex_encode(&cid)),
+        "with the challenge_id: {line}"
+    );
+}
+
+// The sibling's answer first (ignored), then the addressed device's own: Pass by the
+// same challenge.
+#[tokio::test]
+async fn mailbox_response_from_sibling_then_placement_device_passes() {
+    let f = pos_drop_fixture(0xC3, PlacementStatus::Alive, 0, 0);
+    let trust = trust_of(&f);
+    let (cid, expected) = f.challenge(Timestamp::now(), 0xC3).await;
+    let sibling = sibling_of(&f, 0xCA);
+    // Even the right hash from the sibling (case d, one key on two machines aside) is ignored.
+    deliver(
+        &f,
+        build_pos_hash_response(cid, f.block, expected, Timestamp::now(), &sibling),
+    )
+    .await;
+    assert_nothing_ruled(&f, cid, trust, "sibling first").await;
+
+    deliver(
+        &f,
+        build_pos_hash_response(cid, f.block, expected, Timestamp::now(), &f.holder_key),
+    )
+    .await;
+
+    assert!(f.pending.lock().await.is_empty(), "resolved by the holder");
+    let p = f.placement();
+    assert_eq!(p.status, PlacementStatus::Alive);
+    assert!(p.last_verified.is_some(), "Pass");
+    assert_eq!(f.db.list_pos_weekly_for_peer(&f.holder).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn mailbox_response_from_placement_device_passes() {
+    let f = pos_drop_fixture(0xC4, PlacementStatus::Alive, 0, 0);
+    let (cid, expected) = f.challenge(Timestamp::now(), 0xC4).await;
+
+    deliver(
+        &f,
+        build_pos_hash_response(cid, f.block, expected, Timestamp::now(), &f.holder_key),
+    )
+    .await;
+
+    assert!(f.pending.lock().await.is_empty());
+    assert!(f.placement().last_verified.is_some(), "Pass");
+}
+
+// B cross-review WARN-2: garbage from a postman naming some other device, with a signature
+// that is not that device's, is logged as a signature failure — not as "another device of
+// the holder's master" — and rules nothing. Mutation: drop the signature check under
+// `response.device_id` in the `WrongDevice` branch → the "another device" WARN; reddens.
+#[tokio::test]
+async fn mailbox_response_with_foreign_device_and_bad_signature_logs_signature_failure() {
+    let f = pos_drop_fixture(0xC5, PlacementStatus::Alive, 0, 0);
+    let trust = trust_of(&f);
+    let (cid, _) = f.challenge(Timestamp::now(), 0xC5).await;
+    let sibling = sibling_of(&f, 0xCB);
+    let mut garbage = build_pos_hash_response(cid, f.block, [0xEE; 32], Timestamp::now(), &sibling);
+    garbage.sig = [0x5A; 64];
+
+    let ((), log) = logged(deliver(&f, garbage)).await;
+
+    assert_nothing_ruled(&f, cid, trust, "garbage response").await;
+    assert!(
+        !log.contains("from another device of the holder's master"),
+        "not attributed to the sibling:\n{log}"
+    );
+    let line = log
+        .lines()
+        .find(|l| l.contains("signature verification failed"))
+        .unwrap_or_else(|| panic!("the signature WARN is printed:\n{log}"));
+    assert!(
+        line.contains(&hex_encode(&cid)),
+        "with the challenge_id: {line}"
+    );
+}
+
+// C-SP review N3/N2: a validly signed response of another device is named by what the
+// owner knows of the two masters (`master_for_holder`, PEERS first): the same master → "another
+// device of the holder's master"; another master → "a device of another master"; a master
+// unknown on either side → "master unknown". Each WARN carries the responder and the
+// challenge_id, the others are absent; nothing is ruled. Mutations: the sibling WARN whatever
+// the masters, or the masters through `get_master_for_device` only → reddens.
+#[tokio::test]
+async fn mailbox_response_of_another_device_is_named_by_its_master() {
+    const SIBLING: &str = "from another device of the holder's master";
+    const FOREIGN: &str = "from a device of another master";
+    const UNKNOWN: &str = "master unknown";
+    let f = pos_drop_fixture(0xC6, PlacementStatus::Alive, 0, 0);
+    let trust = trust_of(&f);
+    let (cid, expected) = f.challenge(Timestamp::now(), 0xC6).await;
+    let sibling = sibling_of(&f, 0xCF);
+    let stranger = ed25519_dalek::SigningKey::from_bytes(&[0xCC; 32]);
+    f.db.set_master_for_device(
+        &DeviceId(stranger.verifying_key().to_bytes()),
+        &IdentityPub([0xCD; 32]),
+    )
+    .unwrap();
+    let unknown = ed25519_dalek::SigningKey::from_bytes(&[0xCE; 32]);
+
+    for (key, want, case) in [
+        (&sibling, SIBLING, "same master"),
+        (&stranger, FOREIGN, "another master"),
+        (&unknown, UNKNOWN, "unknown master"),
+    ] {
+        let id = DeviceId(key.verifying_key().to_bytes());
+        // Even the right hash does not count: the placement's device did not sign it.
+        let response = build_pos_hash_response(cid, f.block, expected, Timestamp::now(), key);
+        let ((), log) = logged(deliver(&f, response)).await;
+
+        assert_nothing_ruled(&f, cid, trust, case).await;
+        let line = log
+            .lines()
+            .find(|l| l.contains(want))
+            .unwrap_or_else(|| panic!("{case}: the {want:?} WARN is printed:\n{log}"));
+        for other in [SIBLING, FOREIGN, UNKNOWN]
+            .into_iter()
+            .filter(|o| *o != want)
+        {
+            assert!(!log.contains(other), "{case}: no {other:?} WARN:\n{log}");
+        }
+        assert!(
+            line.contains(&hex_encode(&cid)),
+            "{case}: with the challenge_id: {line}"
+        );
+        assert!(
+            line.contains(&id.to_string()),
+            "{case}: with the responder: {line}"
+        );
+    }
+}

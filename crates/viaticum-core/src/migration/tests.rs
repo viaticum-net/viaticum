@@ -18,6 +18,7 @@ fn holder_id(seed: u8) -> DeviceId {
 fn make_block(seed: u8, overhead: Option<f64>) -> SourceBlockRecord {
     SourceBlockRecord {
         seal_generation: 0,
+        esi_high_water: 0,
         block_id: block_id(seed),
         k: 5,
         t: 65535,
@@ -255,6 +256,7 @@ fn migrate_block_records_logs_progress_every_10000_blocks() {
         let bid = SourceBlockId(id);
         let block = SourceBlockRecord {
             seal_generation: 0,
+            esi_high_water: 0,
             block_id: bid,
             k: 5,
             t: 65535,
