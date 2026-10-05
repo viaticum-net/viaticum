@@ -100,7 +100,10 @@
 #                  friends are the three DR does not ask"). Step 7: node-05 dr_ready=true
 #                  within 15 min (FAIL otherwise; NOTE acks/held/near set and its last
 #                  `pointer kad-near set` line), then SIGKILL node-05 and F1..F3, DR onto
-#                  node-42 via the seed: bar P >= 1 pointer(s) (FAIL at P = 0 or no search).
+#                  node-42 via the seed: bar P >= 1 pointer(s) and DR exit 0 (FAIL at P = 0 or
+#                  no search). DR enters through a friend outside the 20 nearest and outside F
+#                  (not the seed, which may be near): the door "the entry peer is not a
+#                  postman" is tested every run.
 #                  On a build before the union (knob only) the pointer lives only at the
 #                  killed F while dr_ready said true -> P = 0, RED: the scenario is not blind.
 #
@@ -975,6 +978,17 @@ if [ "$DR63" = 1 ]; then
     for h in $(echo "$RANKED" | tail -3); do DR63_F+=("${HEX_IDX[$h]}"); done
     DR63_F_HEX=$(echo "$RANKED" | tail -3 | paste -sd, -)
     [ "${#DR63_F[@]}" -eq 3 ] || setup_fail "dr-i63: could not pick F"
+    # Is the seed itself among the 20 nearest of the box? Then P >= 1 may come from the
+    # seed alone, and the door "the seed is not a postman" is not tested by this run.
+    SEED_HEX=$("$TRUST_TOOL" identity-show --data-dir "$(node_dir "$SEED")" | jq -r .device_id) \
+        || setup_fail "identity-show seed"
+    SEED_POS=$("$PROBE" rendezvous --phrase "$M_DR_SOURCE" "${RANK_ARGS[@]}" --rank "$SEED_HEX" \
+        | jq -r --arg s "$SEED_HEX" '.ranked | index($s)') || setup_fail "mailbox-probe rendezvous --rank (seed)"
+    echo "  dr-i63: the seed is #$(( SEED_POS + 1 )) nearest of $(( ${#RANK_ARGS[@]} / 2 + 1 )) to node-$DR_SOURCE's box"
+    # DR's --peer (step 7): the first live friend from rank 22 on (outside the 20 nearest,
+    # the seed may shift ranks by one) and before F, so DR's entry point is not a postman.
+    DR63_ENTRY=()
+    for h in $(echo "$RANKED" | sed -n '22,$p' | head -n -3); do DR63_ENTRY+=("${HEX_IDX[$h]}"); done
     echo "  dr-i63: node-$DR_SOURCE's trust-top = F = nodes ${DR63_F[*]} (farthest from its box)"
 fi
 # Seed: fixed port, the infrastructure role (C-DK v3.2/v3.3; ignored by builds before C4)
@@ -1650,8 +1664,19 @@ if runs_step 7; then
     mkdir -p "$(node_dir $DR_NODE)"
     DR_LOG="$TEST_DIR/logs/dr-$DR_NODE.log"
     set +e
+    DR_PEER_ADDR="$SEED_ADDR"
+    if [ "$DR63" = 1 ]; then
+        DR_PEER_ADDR=""; DR63_PEER=""
+        for e in "${DR63_ENTRY[@]}"; do
+            [ "${ALIVE[$e]:-0}" = 1 ] || continue
+            a=$(api_get "$e" /api/status | jq -r '.node_addr // ""' 2>/dev/null || true)
+            if [[ "$a" == /ip*/p2p/* ]]; then DR_PEER_ADDR="$a"; DR63_PEER="$e"; break; fi
+        done
+        [ -n "$DR_PEER_ADDR" ] || { fail "dr-i63: no live non-near friend for DR's --peer"; DR_PEER_ADDR="$SEED_ADDR"; }
+        note "DR enters through node-${DR63_PEER:-seed} ($DR_PEER_ADDR); the seed is #$(( SEED_POS + 1 )) nearest to the box"
+    fi
     RUST_LOG=info timeout 900 "$BINARY" --data-dir "$(node_dir $DR_NODE)" dr --mnemonic "$M_DR_SOURCE" \
-        --peer "$SEED_ADDR" > "$DR_LOG" 2>&1
+        --peer "$DR_PEER_ADDR" > "$DR_LOG" 2>&1
     DR_RC=$?
     set -e
     DRP=$(sed 's/\x1b\[[0-9;]*m//g' "$DR_LOG")
@@ -1680,8 +1705,10 @@ if runs_step 7; then
     if [ "$DR63" = 1 ]; then
         P=$(grep -aoE "Mailbox search: asked [0-9]+ postmen, [0-9]+ answered, [0-9]+ pointer" <<< "$DRP" \
             | tail -1 | grep -oE '[0-9]+ pointer' | grep -oE '[0-9]+' || true)
-        if [ -n "$P" ] && [ "$P" -ge 1 ]; then
-            pass "dr-i63: DR found $P pointer(s) with node-$DR_SOURCE's trust-top dead (the near postmen hold it)"
+        if [ -n "$P" ] && [ "$P" -ge 1 ] && [ "$DR_RC" -ne 0 ]; then
+            fail "dr-i63: DR found $P pointer(s) but exited $DR_RC"
+        elif [ -n "$P" ] && [ "$P" -ge 1 ]; then
+            pass "dr-i63: DR found $P pointer(s) entering through a non-postman with node-$DR_SOURCE's trust-top dead (the near postmen hold it)"
         else
             fail "dr-i63: DR found no pointer (P=${P:-no mailbox search}) — it lived only at the killed trust-top"
         fi
