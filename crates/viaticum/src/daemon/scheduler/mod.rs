@@ -451,15 +451,36 @@ impl Scheduler {
                 // sibling's answer.
                 match viaticum_core::messages::verify_pos_hash_response(&response, &got) {
                     Ok(()) => {
+                        // A valid signature under `got` proves only that `got` signed it,
+                        // not that `got` is a device of the holder's master (C-SP review
+                        // N3): "another device of the holder's master" only when the
+                        // certificate-backed device→master table puts both under one master.
                         let responder_master = self.db.get_master_for_device(&got).ok().flatten();
-                        warn!(
-                            block_id = %block_id,
-                            holder = %expected,
-                            responder = %got,
-                            responder_master = ?responder_master,
-                            challenge_id = %hex_encode(&response.challenge_id),
-                            "scheduler: PosHashResponse from another device of the holder's master — ignored, pending left intact"
+                        let holder_master = self.db.get_master_for_device(&expected).ok().flatten();
+                        let same_master = matches!(
+                            (responder_master, holder_master),
+                            (Some(r), Some(h)) if r == h
                         );
+                        if same_master {
+                            warn!(
+                                block_id = %block_id,
+                                holder = %expected,
+                                responder = %got,
+                                responder_master = ?responder_master,
+                                challenge_id = %hex_encode(&response.challenge_id),
+                                "scheduler: PosHashResponse from another device of the holder's master — ignored, pending left intact"
+                            );
+                        } else {
+                            warn!(
+                                block_id = %block_id,
+                                holder = %expected,
+                                holder_master = ?holder_master,
+                                responder = %got,
+                                responder_master = ?responder_master,
+                                challenge_id = %hex_encode(&response.challenge_id),
+                                "scheduler: PosHashResponse from a device of another master — ignored, pending left intact"
+                            );
+                        }
                     }
                     Err(e) => {
                         warn!(

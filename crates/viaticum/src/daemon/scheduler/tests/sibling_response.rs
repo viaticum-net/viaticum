@@ -199,3 +199,47 @@ async fn mailbox_response_with_foreign_device_and_bad_signature_logs_signature_f
         "with the challenge_id: {line}"
     );
 }
+
+// C-SP review N3: a response validly signed by a device of ANOTHER master (or of a master we
+// do not know) is not a sibling's answer: the "another master" WARN with the responder and the
+// challenge_id, never the "holder's master" one; nothing ruled. Mutation: print the sibling
+// WARN whatever the masters (drop the `same_master` check) → reddens.
+#[tokio::test]
+async fn mailbox_response_signed_by_device_of_another_master_is_ignored_as_foreign() {
+    let f = pos_drop_fixture(0xC6, PlacementStatus::Alive, 0, 0);
+    let trust = trust_of(&f);
+    let (cid, expected) = f.challenge(Timestamp::now(), 0xC6).await;
+    let stranger = ed25519_dalek::SigningKey::from_bytes(&[0xCC; 32]);
+    let stranger_id = DeviceId(stranger.verifying_key().to_bytes());
+    f.db.set_master_for_device(&stranger_id, &IdentityPub([0xCD; 32]))
+        .unwrap();
+    let unknown = ed25519_dalek::SigningKey::from_bytes(&[0xCE; 32]);
+    let unknown_id = DeviceId(unknown.verifying_key().to_bytes());
+
+    for (key, id, case) in [
+        (&stranger, stranger_id, "device of another master"),
+        (&unknown, unknown_id, "device of an unknown master"),
+    ] {
+        // Even the right hash does not count: the placement's device did not sign it.
+        let response = build_pos_hash_response(cid, f.block, expected, Timestamp::now(), key);
+        let ((), log) = logged(deliver(&f, response)).await;
+
+        assert_nothing_ruled(&f, cid, trust, case).await;
+        assert!(
+            !log.contains("from another device of the holder's master"),
+            "{case}: not attributed to a sibling:\n{log}"
+        );
+        let line = log
+            .lines()
+            .find(|l| l.contains("from a device of another master"))
+            .unwrap_or_else(|| panic!("{case}: the foreign-master WARN is printed:\n{log}"));
+        assert!(
+            line.contains(&hex_encode(&cid)),
+            "{case}: with the challenge_id: {line}"
+        );
+        assert!(
+            line.contains(&id.to_string()),
+            "{case}: with the responder: {line}"
+        );
+    }
+}
