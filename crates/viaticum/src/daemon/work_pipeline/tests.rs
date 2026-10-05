@@ -2355,6 +2355,7 @@ async fn esi_exhausted_block_is_parked_and_the_iteration_serves_the_next_block()
             .is_empty(),
         "B's offers were recorded"
     );
+}
 
 /// RMW PeerRecord (tech-debt MED, 2026-10-05): T-12 writes the addresses in one
 /// transaction with its read — a concurrent writer of the same record loses nothing.

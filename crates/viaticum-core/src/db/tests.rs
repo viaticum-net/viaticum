@@ -4629,8 +4629,7 @@ fn update_peer_without_change_writes_nothing() {
     assert_eq!(db.get_peer(&d).unwrap().unwrap().addrs, make_peer(d).addrs);
 }
 
-// =====================================================
-
+// ============================================================
 // repair-i8: esi_high_water never decreases
 // ============================================================
 
@@ -4670,7 +4669,8 @@ fn upsert_source_block_never_lowers_esi_high_water() {
             .esi_high_water,
         900
     );
-=======
+}
+
 /// RMW PeerRecord (tech-debt MED, 2026-10-05): `refresh_peer_storage_bytes` writes its
 /// three fields in one transaction with the read — a concurrent writer of the same record
 /// (here `last_avail_sample`) loses nothing. Mutation "get_peer + upsert_peer" → bumps lost.
