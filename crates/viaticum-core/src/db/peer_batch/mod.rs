@@ -119,12 +119,12 @@ impl Db {
     /// the batch. NOT against a writer that reads with [`Db::get_peer`] and writes back with
     /// [`Db::upsert_peer`] in two transactions: if the batch commits between its read and its
     /// write, the write-back restores the record as it was before the batch (addresses,
-    /// `last_seen`, the contact count lost). Such writers today (C-DK C4 fix round 4, in
-    /// tech-debt; not changed here): `daemon/mailbox/routing/fanout.rs`
-    /// `record_avail_contact`, `daemon/work_pipeline/worker.rs`
-    /// `persist_holder_addrs_to_db`, `viaticum-core/src/trust/mod.rs` `recalculate_trust`,
-    /// [`Db::refresh_peer_storage_bytes`], `daemon/processor/symbol.rs`
-    /// `RevocationHandler::apply`.
+    /// `last_seen`, the contact count lost). The daemon has no such writer since 2026-10-05
+    /// (line B): `record_avail_contact`, `persist_holder_addrs_to_db`, `recalculate_trust`,
+    /// [`Db::refresh_peer_storage_bytes`], `RevocationHandler::apply`, the trust_p
+    /// migration at start and DR's peer writes all go through [`Db::update_peer`]; the
+    /// avail decay passes over every peer read the records inside their write transaction.
+    /// [`Db::upsert_peer`] stays for blind writes (a restored snapshot, offline tools).
     ///
     /// Returns `f`'s value and whether a commit happened.
     pub fn update_peers<R>(

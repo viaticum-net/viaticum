@@ -240,29 +240,29 @@ async fn store_one(
 /// without this, a holder on a long-lived connection would look gone, because
 /// `last_seen` otherwise moves only at (re)authentication).
 /// Non-fatal: logs warning on DB error.
+///
+/// Read and write in one transaction (`Db::update_peer`): addresses or trust written
+/// concurrently by another task are not overwritten with a stale snapshot.
 pub(super) fn record_avail_contact(db: &Db, device_id: DeviceId, now_secs: u64) {
-    match db.get_peer(&device_id) {
-        Ok(Some(mut record)) => {
+    let updated = db.update_peer(&device_id, |r| {
+        r.map(|mut record| {
             record.avail_ewma = ewma_contact_observed(record.avail_ewma, AVAIL_EWMA_ALPHA);
             record.last_avail_sample = now_secs;
             record.last_seen = Timestamp(record.last_seen.0.max(now_secs));
-            if let Err(e) = db.upsert_peer(&record) {
-                warn!(
-                    device = %device_id,
-                    err = %e,
-                    "mailbox router: failed to persist avail_ewma contact observation"
-                );
-            }
-        }
+            record
+        })
+    });
+    match updated {
+        Ok(Some(_)) => {}
         Ok(None) => {
-            // Peer not in DB (unusual — they were a candidate). No-op.
+            // Peer not in DB (a Kademlia-near postman not yet authenticated). No-op.
             debug!(device = %device_id, "mailbox router: avail contact for unknown peer");
         }
         Err(e) => {
             warn!(
                 device = %device_id,
                 err = %e,
-                "mailbox router: failed to load peer for avail update"
+                "mailbox router: failed to persist avail_ewma contact observation"
             );
         }
     }

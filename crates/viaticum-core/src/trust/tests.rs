@@ -800,3 +800,39 @@ fn effective_trust_is_nonnegative() {
         }
     }
 }
+
+/// RMW PeerRecord (tech-debt MED, 2026-10-05): `recalculate_trust` writes P and I in one
+/// transaction with the read — a concurrent writer of the same record (addresses, avail,
+/// counters) loses nothing. Mutation "get_peer + upsert_peer" → bumps lost.
+#[test]
+fn recalculate_trust_keeps_concurrent_writes_to_the_record() {
+    use crate::db::testutil::{bump_peer_in_thread, test_db};
+    let db = test_db();
+    let d = peer(0x31);
+    db.upsert_peer(&crate::types::PeerRecord {
+        device_id: d,
+        master_identity: master(0x31),
+        trust_p: 0.3,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: ts(1),
+        last_seen: ts(1),
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma: crate::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
+    })
+    .unwrap();
+    let start = db.get_peer(&d).unwrap().unwrap().bytes_peer_stores_for_us;
+    let bump = bump_peer_in_thread(db.clone(), d, 300);
+    for _ in 0..300 {
+        assert!(super::recalculate_trust(&db, &d, 10).is_some());
+    }
+    bump.join().unwrap();
+    let rec = db.get_peer(&d).unwrap().unwrap();
+    assert_eq!(rec.bytes_peer_stores_for_us, start + 300, "no bump lost");
+    assert_eq!(rec.trust_p, INITIAL_TRUST_P);
+}

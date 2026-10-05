@@ -869,14 +869,24 @@ impl RevocationHandler {
             return Ok(());
         }
         for did in &devices {
-            let mut record = match self.db.get_peer(did)? {
-                Some(r) => r,
-                None => continue,
-            };
-            if !record.revoked_device_pub_keys.contains(&revoked_pub) {
-                record.revoked_device_pub_keys.push(revoked_pub);
-                self.db.upsert_peer(&record)?;
+            // Already revoked: a read is enough, no write lock.
+            if self
+                .db
+                .get_peer(did)?
+                .is_none_or(|r| r.revoked_device_pub_keys.contains(&revoked_pub))
+            {
+                continue;
             }
+            // One transaction per record: two revocations of the same peer applied at
+            // once both stay (no lost update).
+            self.db.update_peer(did, |r| {
+                let mut record = r?;
+                if record.revoked_device_pub_keys.contains(&revoked_pub) {
+                    return None;
+                }
+                record.revoked_device_pub_keys.push(revoked_pub);
+                Some(record)
+            })?;
         }
 
         info!(

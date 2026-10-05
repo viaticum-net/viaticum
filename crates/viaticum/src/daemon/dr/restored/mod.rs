@@ -83,11 +83,12 @@ pub(crate) fn install_restored_state(
 ) -> Result<(), SystemStateError> {
     restore_db_force(db, state)?;
     for l in live {
-        let merged = match db.get_peer(&l.device_id)? {
-            Some(snapshot) => merge_live_peer(&snapshot, l),
-            None => l.clone(),
-        };
-        db.upsert_peer(&merged)?;
+        db.update_peer(&l.device_id, |snapshot| {
+            Some(match snapshot {
+                Some(snapshot) => merge_live_peer(&snapshot, l),
+                None => l.clone(),
+            })
+        })?;
     }
     Ok(())
 }

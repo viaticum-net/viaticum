@@ -2371,6 +2371,71 @@ async fn revocation_broadcast_marks_device_key_revoked() {
     );
 }
 
+/// RMW PeerRecord (tech-debt MED, 2026-10-05): revocations of many devices of one master,
+/// applied while another task writes the known peer's record, all land and lose nothing —
+/// `RevocationHandler::apply` reads and writes each record in one transaction. Mutation
+/// "get_peer + upsert_peer" → bumps (or revocations) lost.
+#[test]
+fn revocations_keep_concurrent_writes_to_the_record() {
+    use viaticum_core::db::testutil::bump_peer_in_thread;
+    let db = Db::open_in_memory().unwrap();
+    let seed = [0x56u8; 64];
+    let peer_master_key = derive_master_key(&seed).expect("derive_master_key");
+    let peer_identity = master_identity(&peer_master_key);
+    let now = Timestamp::now();
+    let known = DeviceId([0x56u8; 32]);
+    db.upsert_peer(&viaticum_core::types::PeerRecord {
+        device_id: known,
+        master_identity: peer_identity,
+        trust_p: viaticum_core::constants::INITIAL_TRUST_P,
+        trust_i: 0.0,
+        trust_s: 0.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: now,
+        last_seen: now,
+        revoked_device_pub_keys: vec![],
+        addrs: vec![],
+        x25519_pub: None,
+        avail_ewma: viaticum_core::constants::AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
+    })
+    .unwrap();
+    db.set_master_for_device(&known, &peer_identity).unwrap();
+    let broadcasts: Vec<_> = (0..100u8)
+        .map(|i| {
+            let key = viaticum_core::cluster::derive_device_key(&seed, &[i; 32]).unwrap();
+            let device = DeviceId(key.verifying_key().to_bytes());
+            viaticum_core::messages::RevocationBroadcast {
+                revocation: viaticum_core::cluster::issue_revocation(
+                    &peer_master_key,
+                    device,
+                    now,
+                    viaticum_core::cluster::EpochCounter(1),
+                ),
+                device_cert: viaticum_core::cluster::issue_device_certificate(
+                    &peer_master_key,
+                    device,
+                    now,
+                ),
+            }
+        })
+        .collect();
+    let bump = bump_peer_in_thread(db.clone(), known, 300);
+    let handler = super::RevocationHandler::new(db.clone());
+    for b in broadcasts {
+        handler.apply(peer_identity, b).expect("apply");
+    }
+    bump.join().unwrap();
+    let rec = db.get_peer(&known).unwrap().unwrap();
+    assert_eq!(rec.bytes_peer_stores_for_us, 300, "no bump lost");
+    assert_eq!(
+        rec.revoked_device_pub_keys.len(),
+        100,
+        "every revocation kept"
+    );
+}
+
 // revocation_broadcast_idempotent_on_duplicate
 //
 // Given: Peer already has device_pub_key in revoked list.

@@ -214,3 +214,23 @@ async fn publish_without_need_acks_returns_by_timeout_with_verdict() {
     let out = router.publish_detailed(entry(7), None, 1).await;
     assert_eq!((out.pending, out.verdict()), (2, PublishVerdict::NoAck));
 }
+
+/// RMW PeerRecord (tech-debt MED, 2026-10-05): a contact recorded while another task
+/// writes the same record keeps that task's writes — `record_avail_contact` reads and
+/// writes in one transaction. Mutation "get_peer + upsert_peer" → bumps lost.
+#[test]
+fn avail_contact_keeps_concurrent_writes_to_the_record() {
+    use viaticum_core::db::testutil::bump_peer_in_thread;
+    let db = test_db();
+    let d = gen_device_id();
+    db.upsert_peer(&peer(d)).unwrap();
+    let start = db.get_peer(&d).unwrap().unwrap().bytes_peer_stores_for_us;
+    let bump = bump_peer_in_thread(db.clone(), d, 300);
+    for i in 0..300 {
+        super::record_avail_contact(&db, d, 1_000 + i);
+    }
+    bump.join().unwrap();
+    let rec = db.get_peer(&d).unwrap().unwrap();
+    assert_eq!(rec.bytes_peer_stores_for_us, start + 300, "no bump lost");
+    assert_eq!(rec.last_avail_sample, 1_299);
+}
