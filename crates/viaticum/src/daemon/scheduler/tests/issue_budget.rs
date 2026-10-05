@@ -11,7 +11,8 @@ use tokio_util::sync::CancellationToken;
 use viaticum_core::messages::{PosHashChallengeMsg, PosHashResponseMsg};
 use viaticum_core::types::{DeviceId, SourceBlockId, Timestamp, from_cbor_bytes};
 
-use super::issue_support::{Owner, SlowPostman, owner_with_due};
+use super::issue_stall::StallingEncoder;
+use super::issue_support::{Owner, SlowPostman, owner_with_due, owner_with_encoder, seed_due};
 use super::pos_scale::{LogBuf, field};
 use crate::daemon::scheduler::issue::{ISSUE_PUBLISH_CONCURRENCY, InFlight, issue_budget};
 use crate::daemon::scheduler::{PendingChallenges, PendingHashChallenge};
@@ -173,6 +174,64 @@ async fn issue_tick_stops_at_its_budget_and_later_ticks_issue_the_rest() {
         calls > 1,
         "the budget must spread {DUE} challenges over ticks"
     );
+}
+
+/// pos-i7-a, the headroom rule (review W1 after the tick went to the runtime's clock): a block
+/// starts only while the time spent plus 2 × the slowest block fits the budget. Each
+/// preparation here moves the paused clock by 300 ms (its encode advances it from the blocking
+/// thread), so after the first block 300 + 2 × 300 > 800 ms (time_scale 900): the tick starts
+/// ONE block and defers the other three, none cut. Without the rule the tick starts the next
+/// blocks until the deadline cuts one. Mutation `if false && …` on the rule → reddens.
+#[tokio::test(start_paused = true)]
+async fn a_block_starts_only_while_twice_the_slowest_still_fits() {
+    let encoder = StallingEncoder::new(0, 0, Duration::ZERO);
+    encoder.set_hook(|_| {
+        tokio::runtime::Handle::current()
+            .block_on(tokio::time::advance(Duration::from_millis(300)));
+    });
+    let owner = owner_with_encoder(
+        900,
+        SlowPostman::acking_after(Duration::from_millis(1)),
+        encoder,
+        |db, dir| seed_due(db, dir, 4, 2),
+    );
+    let mut in_flight = InFlight::default();
+
+    let buf = LogBuf::default();
+    let writer = buf.clone();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish(),
+    );
+    tracing::instrument::WithSubscriber::with_subscriber(
+        owner.scheduler.issue_tick(&mut in_flight),
+        dispatch,
+    )
+    .await
+    .expect("issue_tick");
+
+    let logs = buf.text();
+    let line = logs
+        .lines()
+        .find(|l| l.contains("scheduler: PoS issue tick"))
+        .unwrap_or_else(|| panic!("no issue tick line; logs:\n{logs}"));
+    assert_eq!(field(line, "due"), Some(8), "{line}");
+    assert_eq!(
+        field(line, "blocks"),
+        Some(1),
+        "one block, then no room: {line}"
+    );
+    assert_eq!(field(line, "issued"), Some(2), "{line}");
+    assert_eq!(field(line, "deferred"), Some(6), "{line}");
+    assert_eq!(field(line, "cut_blocks"), Some(0), "{line}");
+    assert!(
+        field(line, "slowest_block_ms").is_some_and(|ms| ms >= 300),
+        "the preparation's time is seen: {line}"
+    );
+    in_flight.shutdown().await;
 }
 
 /// W-1 (СТ-0c round 3): publishes of 2 s each do not stretch the tick. The tick fills
