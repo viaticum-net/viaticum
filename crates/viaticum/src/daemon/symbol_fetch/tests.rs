@@ -756,3 +756,5 @@ async fn fetch_in_rounds_stops_at_no_answer() {
 
 // restore-i43: the order a round asks a block's holders in.
 mod holder_order;
+// restore-i43: the swarm's authenticated devices are the connected holders.
+mod connected;
