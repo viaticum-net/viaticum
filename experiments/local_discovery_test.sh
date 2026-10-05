@@ -23,8 +23,10 @@
 #               discovery = 0) and lookups slow down after convergence; a known peer with no
 #               authentication on either side (cold() reads authenticated_devices on both
 #               nodes; a connection without a cert may exist) is reached on demand (seen on
-#               THAT peer) and a restore from such cold holders succeeds without the
-#               no-answer redial (bars in lru24/lru; NOTE in the main run); every friend's file lands on >= 2 holders other than the seed
+#               THAT peer) and a restore whose symbols come over the network (a holder
+#               logs RestoreResponse) gets them from a holder the owner had to dial on
+#               demand for RestoreRequest, without the no-answer redial (bars in
+#               lru24/lru; NOTE in the main run); every friend's file lands on >= 2 holders other than the seed
 #               (symbols on THEIR disks); the seed's crash goes unnoticed and the seed rejoins
 #               every live friend without `connect`; the late node is known by >= 10 old
 #               nodes (on THEIR status); no daemon ever opens a TCP socket (any state) to a
@@ -39,7 +41,11 @@
 #               malicious peers; a permanently lost seed; liveness of known peers (known !=
 #               online); the placement pool drawn from known peers (в-2); closing cold
 #               connections (i40, R2); on-demand reach at TIME_SCALE=1200 (the mailbox poll
-#               every 3 s keeps everyone connected: step 8 is a NOTE there, spec v3.2 BL-1).
+#               every 3 s keeps everyone connected: step 8 is a NOTE there, spec v3.2 BL-1);
+#               8b: a restore that reaches a cold holder only after warm ones failed (the
+#               first holders asked are the cooled ones; the rest stay as kad leaves them),
+#               and the cooled set relies on the ask order of rounds.rs — a changed order
+#               only makes attempts spoil (FAIL), never a false PASS.
 # Steps:        0. preconditions: >= 12 GiB free, e2e-tools binary + net-probe, alias log
 #                  line per node (AMP > 0), connection-cap log line per node (CAP set),
 #                  alias 127.0.0.2:P dialable, H1 forecast 51*N_v4 + 63*N_v6 > 775, P free
@@ -81,10 +87,14 @@
 #                  then every 0.5 s up to 5 s: the reach connection is handshake-only and goes
 #                  first), X logs `swarm: on-demand dial peer_id=<Y> … msg=PeerAnnounce`;
 #                  0 pairs = FAIL (i42; bar in lru24/lru/hold, NOTE in main)
-#               8b. node-07's holders cold, source deleted at a live daemon, restore -> <= 120
-#                  s hash match, 0 `fetch: redialed holders`, >= 1 cold holder sends
-#                  RestoreResponse and was dialed on demand with msg=RestoreRequest (i42; bar in
-#                  lru24/lru, NOTE main)
+#               8b. source deleted at a live daemon; the first 3 holders in the order a restore
+#                  asks them (placement key block ‖ holder device id) cooled, restore -> <= 120
+#                  s hash match, 0 `fetch: redialed holders`; >= 1 holder that sent
+#                  RestoreResponse for the block was dialed on demand by the owner with
+#                  msg=RestoreRequest. Read from who answered, not from the cold list: no
+#                  holder answering = "restore served locally (T4)" FAIL; only warm holders
+#                  answering (kad re-warmed the cooled ones) = attempt spoiled, up to 3
+#                  restores, then FAIL (i42; bar in lru24/lru, NOTE main)
 #               8c. black-hole holder H (>= 2 of 6 blocks), restore 6 files -> <= 180 s hashes
 #                  match; in the restore window on-demand failures to H with msg=RestoreRequest
 #                  <= 1 + ceil(T/60); `on-demand: gave up` lines are not failures; NOTE:
@@ -1536,46 +1546,70 @@ fi
 if runs_step 8b && [ "$SKIP_8BC" = 0 ]; then
     step 8b "restore from holders with no live connection"
     K8="$OWNER:photo.jpg"; BLK="${FILE_BLOCK[$K8]}"
-    HOLDERS=""
-    for j in $(alive_nodes); do
+    # The holders in the order the restore asks them: SYMBOL_PLACEMENTS is keyed block ‖
+    # holder device id (viaticum-core db/mod.rs placement_key) and BlockFetch::round
+    # (symbol_fetch/rounds.rs) asks one holder after another in that order until k_eff
+    # symbols are in, so the holders after the first few are never asked and cooling them
+    # proves nothing (run 20261005-145034: node-02 the only cold holder, 3rd in that order;
+    # node-39 and node-20, warm, gave all the symbols). The order only aims the cooling: the
+    # verdict reads who actually answered and how it was reached.
+    HOLDERS=$(for j in $(alive_nodes); do
         [ "$j" = "$OWNER" ] && continue
-        [ "$(block_symbols_on "$j" "$BLK")" -gt 0 ] && HOLDERS="$HOLDERS $j"
-    done
-    note "holders of node-$OWNER's block ${BLK:0:16}:$HOLDERS"
+        if [ "$(block_symbols_on "$j" "$BLK")" -gt 0 ]; then echo "${DEV8[$j]} $j"; fi
+    done | sort | awk '{printf " %s", $2}')
+    AIM=$(echo $HOLDERS | cut -d' ' -f1-3)
+    note "holders of node-$OWNER's block ${BLK:0:16} in the order a restore asks them:$HOLDERS (cooled: $AIM)"
     assert_delete_window "$TIME_SCALE"
     rm -f "${FILE_PATH[$K8]}"
     wait_file_deleted "$OWNER" "${FILE_PATH[$K8]}" 60 || note "the deletion is not registered after 60 s"
-    COLD=""
-    for try in 1 2 3; do
-        for j in $HOLDERS; do make_cold "$OWNER" "$j" || true; done
-        COLD=""; for j in $HOLDERS; do cold "$OWNER" "$j" && COLD="$COLD $j"; done
-        [ -n "$COLD" ] && break
-    done
-    if [ -z "$COLD" ]; then
-        bar8_fail "sample empty: no holder cold at the start of restore (kad reconnected all)"
-    else
-        note "cold at restore start (checked on both sides):$COLD"
-        declare -A HL0
-        for j in $COLD; do HL0[$j]=$(log_line_count "$j"); done
-        L7=$(log_line_count "$OWNER")
-        if restore_from_network "$OWNER" "${FILE_PATH[$K8]}" "${FILE_HASH[$K8]}" 120; then
-            bar8_pass "restore: $RESTORE_MSG"
-        else
-            bar8_fail "restore: $RESTORE_MSG"
-        fi
-        REDIALS=$(plain_log_since "$OWNER" "$L7" | grep -ac "fetch: redialed holders before a retry" || true)
-        [ "$REDIALS" -eq 0 ] && bar8_pass "0 'fetch: redialed holders before a retry' during restore" \
-            || bar8_fail "$REDIALS 'fetch: redialed holders before a retry' during restore (reached only by restore-i26 redial)"
-        SERVED=""
-        for j in $COLD; do
-            if log_has_since "$j" "${HL0[$j]}" "sending RestoreResponse" "${BLK:0:16}" \
-                && on_demand_dial_since "$OWNER" "$L7" "${PEER_ID[$j]}" RestoreRequest; then
-                SERVED="$SERVED $j"
-            fi
+    # Up to 3 restores (the source stays deleted, each one is a new job). An attempt counts
+    # when a holder that answered it was reached by an on-demand dial for RestoreRequest. A
+    # holder kad re-warms between the cold check and the request (run 20261005-141704:
+    # node-04/05 cold at the check, dialed in by their own kad 1.4 s before the restore)
+    # spoils the attempt: retried, never a PASS. No holder answering = the block came from
+    # the owner's source files (local tier T4): FAIL at once.
+    L7_0=$(log_line_count "$OWNER")
+    declare -A HL0
+    RESTORED=0; LOCAL=0; SERVED=""; RESP=""
+    for attempt in 1 2 3; do
+        COLD=""
+        for try in 1 2 3; do
+            for j in $AIM; do make_cold "$OWNER" "$j" || true; done
+            COLD=""; for j in $AIM; do cold "$OWNER" "$j" && COLD="$COLD $j"; done
+            [ -n "$COLD" ] && break
         done
-        [ -n "$SERVED" ] && bar8_pass "cold holders dialed on demand that sent RestoreResponse:$SERVED" \
-            || bar8_fail "no cold holder was dialed on demand (msg=RestoreRequest) and sent RestoreResponse (cold:$COLD)"
+        note "attempt $attempt: cold at restore start (checked on both sides):${COLD:- none} (of $AIM)"
+        for j in $HOLDERS; do HL0[$j]=$(log_line_count "$j"); done
+        L7=$(log_line_count "$OWNER")
+        if ! restore_from_network "$OWNER" "${FILE_PATH[$K8]}" "${FILE_HASH[$K8]}" 120; then
+            RESTORED=0; break
+        fi
+        RESTORED=1; RESP=""; SERVED=""
+        for j in $HOLDERS; do
+            log_has_since "$j" "${HL0[$j]}" "sending RestoreResponse" "${BLK:0:16}" && RESP="$RESP $j"
+        done
+        [ -z "$RESP" ] && { LOCAL=1; break; }
+        for j in $RESP; do
+            on_demand_dial_since "$OWNER" "$L7" "${PEER_ID[$j]}" RestoreRequest && SERVED="$SERVED $j"
+        done
+        [ -n "$SERVED" ] && break
+        note "attempt $attempt: every holder that answered ($RESP ) was reached over a live connection (no on-demand dial with msg=RestoreRequest): the cold path was not exercised"
+    done
+    if [ "$RESTORED" = 0 ]; then
+        bar8_fail "restore (attempt $attempt): $RESTORE_MSG"
+    else
+        bar8_pass "restore (attempt $attempt): $RESTORE_MSG"
+        if [ "$LOCAL" = 1 ]; then
+            bar8_fail "restore served locally (T4), network path not exercised: no holder logged 'sending RestoreResponse' for ${BLK:0:16}"
+        elif [ -n "$SERVED" ]; then
+            bar8_pass "cold holders dialed on demand (msg=RestoreRequest) that sent RestoreResponse:$SERVED (attempt $attempt)"
+        else
+            bar8_fail "no cold holder was dialed on demand (msg=RestoreRequest) and sent RestoreResponse in 3 attempts: the holders that answered ($RESP ) were warm at the request, the cold path was not exercised"
+        fi
     fi
+    REDIALS=$(plain_log_since "$OWNER" "$L7_0" | grep -ac "fetch: redialed holders before a retry" || true)
+    [ "$REDIALS" -eq 0 ] && bar8_pass "0 'fetch: redialed holders before a retry' during restore" \
+        || bar8_fail "$REDIALS 'fetch: redialed holders before a retry' during restore (reached only by restore-i26 redial)"
 fi
 
 # ── STEP 8c: A BLACK-HOLE HOLDER ────────────────────────────────────────────
