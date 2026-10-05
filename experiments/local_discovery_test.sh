@@ -24,9 +24,9 @@
 #               authentication on either side (cold() reads authenticated_devices on both
 #               nodes; a connection without a cert may exist) is reached on demand (seen on
 #               THAT peer) and a restore whose symbols come over the network (a holder
-#               logs RestoreResponse) gets them from a holder the owner had to dial on
-#               demand for RestoreRequest, without the no-answer redial (bars in
-#               lru24/lru; NOTE in the main run); every friend's file lands on >= 2 holders other than the seed
+#               logs RestoreResponse) gets symbols from at least one holder the owner had
+#               to dial on demand for RestoreRequest, with no failed on-demand dial and
+#               without the no-answer redial (bars in lru24/lru; NOTE in the main run); every friend's file lands on >= 2 holders other than the seed
 #               (symbols on THEIR disks); the seed's crash goes unnoticed and the seed rejoins
 #               every live friend without `connect`; the late node is known by >= 10 old
 #               nodes (on THEIR status); no daemon ever opens a TCP socket (any state) to a
@@ -44,8 +44,12 @@
 #               every 3 s keeps everyone connected: step 8 is a NOTE there, spec v3.2 BL-1);
 #               8b: a restore that reaches a cold holder only after warm ones failed (the
 #               first holders asked are the cooled ones; the rest stay as kad leaves them),
-#               and the cooled set relies on the ask order of rounds.rs — a changed order
-#               only makes attempts spoil (FAIL), never a false PASS.
+#               and the cooled set relies on the ask order of rounds.rs (device id) — a
+#               changed order only makes attempts spoil (FAIL), never a false PASS. If the
+#               daemon starts asking connected holders first (candidate restore-iN), 8b
+#               turns FAIL by construction and must be re-aimed (cool every holder of the
+#               block). Closed now: a failed on-demand dial to a cold holder, covered by
+#               warm holders reaching k_eff, is a FAIL (no longer a spoiled attempt).
 # Steps:        0. preconditions: >= 12 GiB free, e2e-tools binary + net-probe, alias log
 #                  line per node (AMP > 0), connection-cap log line per node (CAP set),
 #                  alias 127.0.0.2:P dialable, H1 forecast 51*N_v4 + 63*N_v6 > 775, P free
@@ -89,12 +93,16 @@
 #                  0 pairs = FAIL (i42; bar in lru24/lru/hold, NOTE in main)
 #               8b. source deleted at a live daemon; the first 3 holders in the order a restore
 #                  asks them (placement key block ‖ holder device id) cooled, restore -> <= 120
-#                  s hash match, 0 `fetch: redialed holders`; >= 1 holder that sent
+#                  s hash match, 0 no-answer redials (`restore: holders did not answer;
+#                  redialing them` | `fetch: redialed holders`); >= 1 holder that sent
 #                  RestoreResponse for the block was dialed on demand by the owner with
 #                  msg=RestoreRequest. Read from who answered, not from the cold list: no
-#                  holder answering = "restore served locally (T4)" FAIL; only warm holders
-#                  answering (kad re-warmed the cooled ones) = attempt spoiled, up to 3
-#                  restores, then FAIL (i42; bar in lru24/lru, NOTE main)
+#                  holder answering = "restore served locally (T4)" FAIL; an `on-demand
+#                  dial failed` / `unreachable (cached)` with msg=RestoreRequest or a `fetch:
+#                  holder did not answer` for the block in the window = FAIL at once (even
+#                  when warm holders covered k_eff); only warm holders answering (cooled
+#                  ones not asked or re-warmed by kad) = attempt spoiled, up to 3 restores,
+#                  then FAIL (i42; bar in lru24/lru, NOTE main)
 #               8c. black-hole holder H (>= 2 of 6 blocks), restore 6 files -> <= 180 s hashes
 #                  match; in the restore window on-demand failures to H with msg=RestoreRequest
 #                  <= 1 + ceil(T/60); `on-demand: gave up` lines are not failures; NOTE:
@@ -1566,11 +1574,14 @@ if runs_step 8b && [ "$SKIP_8BC" = 0 ]; then
     # when a holder that answered it was reached by an on-demand dial for RestoreRequest. A
     # holder kad re-warms between the cold check and the request (run 20261005-141704:
     # node-04/05 cold at the check, dialed in by their own kad 1.4 s before the restore)
-    # spoils the attempt: retried, never a PASS. No holder answering = the block came from
-    # the owner's source files (local tier T4): FAIL at once.
+    # spoils the attempt: retried, never a PASS. Retried ONLY when the cooled holders were
+    # not asked at all or were authenticated again before the request; a failed on-demand
+    # dial / cached-unreachable answer with msg=RestoreRequest or a silent holder of the
+    # block in the window is a FAIL at once. No holder answering = the block came from the
+    # owner's source files (local tier T4): FAIL at once.
     L7_0=$(log_line_count "$OWNER")
     declare -A HL0
-    RESTORED=0; LOCAL=0; SERVED=""; RESP=""
+    RESTORED=0; LOCAL=0; SERVED=""; RESP=""; DIALFAIL=""
     for attempt in 1 2 3; do
         COLD=""
         for try in 1 2 3; do
@@ -1585,6 +1596,18 @@ if runs_step 8b && [ "$SKIP_8BC" = 0 ]; then
             RESTORED=0; break
         fi
         RESTORED=1; RESP=""; SERVED=""
+        # A failed dial or a silent holder in the window is a FAIL, never a spoiled attempt:
+        # warm holders covering k_eff would hide it, and a retry could then pass on a holder
+        # kad re-warmed (review W1 of 93e12bb).
+        WIN7=$(plain_log_since "$OWNER" "$L7")
+        RR_RE='msg=([A-Za-z]+,)*RestoreRequest(,| |$)'
+        DF=$(grep -a "swarm: on-demand dial failed" <<< "$WIN7" | grep -acE "$RR_RE" || true)
+        DC=$(grep -a "on-demand: unreachable (cached)" <<< "$WIN7" | grep -acE "$RR_RE" || true)
+        DS=$(grep -a "fetch: holder did not answer" <<< "$WIN7" | grep -acF "${BLK:0:16}" || true)
+        if [ "$((DF + DC + DS))" -gt 0 ]; then
+            DIALFAIL="$DF 'on-demand dial failed', $DC 'unreachable (cached)' with msg=RestoreRequest, $DS 'fetch: holder did not answer' for ${BLK:0:16}"
+            break
+        fi
         for j in $HOLDERS; do
             log_has_since "$j" "${HL0[$j]}" "sending RestoreResponse" "${BLK:0:16}" && RESP="$RESP $j"
         done
@@ -1593,13 +1616,15 @@ if runs_step 8b && [ "$SKIP_8BC" = 0 ]; then
             on_demand_dial_since "$OWNER" "$L7" "${PEER_ID[$j]}" RestoreRequest && SERVED="$SERVED $j"
         done
         [ -n "$SERVED" ] && break
-        note "attempt $attempt: every holder that answered ($RESP ) was reached over a live connection (no on-demand dial with msg=RestoreRequest): the cold path was not exercised"
+        note "attempt $attempt: every holder that answered ($RESP ) was reached over a live connection (no on-demand dial with msg=RestoreRequest, no failed one): the cooled holders were not asked or kad re-warmed them before the request; retrying"
     done
     if [ "$RESTORED" = 0 ]; then
         bar8_fail "restore (attempt $attempt): $RESTORE_MSG"
     else
         bar8_pass "restore (attempt $attempt): $RESTORE_MSG"
-        if [ "$LOCAL" = 1 ]; then
+        if [ -n "$DIALFAIL" ]; then
+            bar8_fail "on-demand dial to a cold holder failed during restore (i42), even though warm holders covered k_eff (attempt $attempt): $DIALFAIL"
+        elif [ "$LOCAL" = 1 ]; then
             bar8_fail "restore served locally (T4), network path not exercised: no holder logged 'sending RestoreResponse' for ${BLK:0:16}"
         elif [ -n "$SERVED" ]; then
             bar8_pass "cold holders dialed on demand (msg=RestoreRequest) that sent RestoreResponse:$SERVED (attempt $attempt)"
@@ -1607,9 +1632,13 @@ if runs_step 8b && [ "$SKIP_8BC" = 0 ]; then
             bar8_fail "no cold holder was dialed on demand (msg=RestoreRequest) and sent RestoreResponse in 3 attempts: the holders that answered ($RESP ) were warm at the request, the cold path was not exercised"
         fi
     fi
-    REDIALS=$(plain_log_since "$OWNER" "$L7_0" | grep -ac "fetch: redialed holders before a retry" || true)
-    [ "$REDIALS" -eq 0 ] && bar8_pass "0 'fetch: redialed holders before a retry' during restore" \
-        || bar8_fail "$REDIALS 'fetch: redialed holders before a retry' during restore (reached only by restore-i26 redial)"
+    # The no-answer redial: `restore: holders did not answer; redialing them` is written on
+    # every such retry (restore/no_answer/mod.rs), `fetch: redialed holders` only when the
+    # reconnect returned Ok (symbol_fetch/mod.rs) — both counted.
+    REDIALS=$(plain_log_since "$OWNER" "$L7_0" \
+        | grep -acE "restore: holders did not answer; redialing them|fetch: redialed holders before a retry" || true)
+    [ "$REDIALS" -eq 0 ] && bar8_pass "0 no-answer redials ('restore: holders did not answer; redialing them' / 'fetch: redialed holders before a retry') during restore" \
+        || bar8_fail "$REDIALS no-answer redial lines during restore (reached only by the restore-i26 redial)"
 fi
 
 # ── STEP 8c: A BLACK-HOLE HOLDER ────────────────────────────────────────────
