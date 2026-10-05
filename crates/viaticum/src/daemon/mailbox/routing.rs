@@ -266,8 +266,18 @@ impl MailboxRouter {
         need: usize,
     ) -> PublishOutcome {
         let target = entry.target;
-        let ranked = self.build_ranked_candidates(&target);
-        let write_peers = self.select_write_peers_from_ranked(&ranked, &target, unix_now());
+        let override_peers = if entry.class == viaticum_core::mailbox::MailboxClass::SelfPointer {
+            e2e_pointer_postmen()
+        } else {
+            None
+        };
+        let write_peers = match override_peers {
+            Some(list) => list,
+            None => {
+                let ranked = self.build_ranked_candidates(&target);
+                self.select_write_peers_from_ranked(&ranked, &target, unix_now())
+            }
+        };
         let req = MailboxStoreRequest {
             v: MAILBOX_WIRE_VERSION,
             entry,
@@ -439,6 +449,41 @@ impl MailboxRouter {
 }
 
 // ─── Utility ─────────────────────────────────────────────────────────────────
+
+/// E2E only (dr-i63 step 7 of `local_discovery_test.sh`): `VIATICUM_E2E_POINTER_POSTMEN`
+/// = comma-separated device hex — the trust-top of every pointer publication is
+/// exactly these devices ("the owner's most trusted friends are these three").
+#[cfg(feature = "e2e-tools")]
+fn e2e_pointer_postmen() -> Option<Vec<DeviceId>> {
+    let raw = std::env::var("VIATICUM_E2E_POINTER_POSTMEN").ok()?;
+    let parsed: Option<Vec<DeviceId>> = raw
+        .split(',')
+        .filter(|h| !h.trim().is_empty())
+        .map(|h| device_from_hex(h.trim()))
+        .collect();
+    if parsed.is_none() {
+        warn!(value = %raw, "e2e: VIATICUM_E2E_POINTER_POSTMEN is not a device hex list, ignored");
+    }
+    parsed
+}
+
+/// 64 hex chars → DeviceId.
+#[cfg(feature = "e2e-tools")]
+fn device_from_hex(h: &str) -> Option<DeviceId> {
+    if h.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(DeviceId(out))
+}
+
+#[cfg(not(feature = "e2e-tools"))]
+fn e2e_pointer_postmen() -> Option<Vec<DeviceId>> {
+    None
+}
 
 /// Attempt to recover DeviceId from PeerId (best-effort, only works for Ed25519 PeerIds).
 ///
