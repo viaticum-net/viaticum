@@ -44,19 +44,20 @@ const CANDIDATE_DIAL_TIMEOUT_SECS: u64 = 10;
 
 // ─── Peer records learned live ────────────────────────────────────────────────
 
-/// The record of a peer that just authenticated: the existing record refreshed, or a
-/// new one. `listen_addrs` (normalized, with `/p2p/`) replace the stored addresses when
+/// The record of a peer that just authenticated: `existing` (the stored record, read in
+/// the same write transaction by `Db::update_peer`) refreshed, or a new one.
+/// `listen_addrs` (normalized, with `/p2p/`) replace the stored addresses when
 /// non-empty — the same rule the daemon applies (`processor/peer.rs`).
 pub(super) fn live_peer_record(
-    db: &Db,
+    existing: Option<PeerRecord>,
     device_id: DeviceId,
     identity_pub: IdentityPub,
     x25519_pub: Option<[u8; 32]>,
     listen_addrs: &[Multiaddr],
 ) -> PeerRecord {
     let now = Timestamp::now();
-    let mut record = match db.get_peer(&device_id) {
-        Ok(Some(mut existing)) => {
+    let mut record = match existing {
+        Some(mut existing) => {
             existing.master_identity = identity_pub;
             existing.last_seen = now;
             if x25519_pub.is_some() {
@@ -66,7 +67,7 @@ pub(super) fn live_peer_record(
             existing.last_avail_sample = now.0;
             existing
         }
-        _ => PeerRecord {
+        None => PeerRecord {
             device_id,
             master_identity: identity_pub,
             trust_p: INITIAL_TRUST_P,
@@ -89,7 +90,8 @@ pub(super) fn live_peer_record(
     record
 }
 
-/// Upsert the record of an authenticated peer; `true` on success.
+/// Upsert the record of an authenticated peer (read and write in one transaction, so
+/// addresses written concurrently are not lost); `true` on success.
 fn upsert_authenticated(
     db: &Db,
     device_id: DeviceId,
@@ -97,9 +99,17 @@ fn upsert_authenticated(
     x25519_pub: Option<[u8; 32]>,
     listen_addrs: &[Multiaddr],
 ) -> bool {
-    let record = live_peer_record(db, device_id, identity_pub, x25519_pub, listen_addrs);
-    match db.upsert_peer(&record) {
-        Ok(()) => true,
+    let updated = db.update_peer(&device_id, |existing| {
+        Some(live_peer_record(
+            existing,
+            device_id,
+            identity_pub,
+            x25519_pub,
+            listen_addrs,
+        ))
+    });
+    match updated {
+        Ok(_) => true,
         Err(e) => {
             tracing::warn!(device = %device_id, "dr: upsert_peer failed: {e}");
             false
@@ -107,14 +117,19 @@ fn upsert_authenticated(
     }
 }
 
-/// Persist identify addresses on an already-upserted record.
+/// Persist identify addresses on an already-upserted record (one transaction).
 fn persist_identified_addrs(db: &Db, device_id: DeviceId, listen_addrs: &[Multiaddr]) {
     if listen_addrs.is_empty() {
         return;
     }
-    if let Ok(Some(mut record)) = db.get_peer(&device_id) {
-        record.addrs = listen_addrs.iter().map(|a| a.to_string()).collect();
-        let _ = db.upsert_peer(&record);
+    let addrs: Vec<String> = listen_addrs.iter().map(|a| a.to_string()).collect();
+    if let Err(e) = db.update_peer(&device_id, |r| {
+        r.map(|mut record| {
+            record.addrs = addrs;
+            record
+        })
+    }) {
+        tracing::warn!(device = %device_id, "dr: persisting identify addresses failed: {e}");
     }
 }
 

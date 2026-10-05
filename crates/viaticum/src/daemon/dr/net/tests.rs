@@ -230,7 +230,7 @@ fn live_peer_record_takes_the_authenticated_identity_and_listen_addrs() {
     let device = DeviceId([7u8; 32]);
     let addr: Multiaddr = "/ip4/10.0.0.5/tcp/4001".parse().unwrap();
     let r = live_peer_record(
-        &db,
+        db.get_peer(&device).unwrap(),
         device,
         IdentityPub([0x42; 32]),
         None,
@@ -244,12 +244,24 @@ fn live_peer_record_takes_the_authenticated_identity_and_listen_addrs() {
 fn live_peer_record_keeps_history_and_addrs_of_an_existing_record_when_none_given() {
     let db = Db::open_in_memory().unwrap();
     let device = DeviceId([8u8; 32]);
-    let mut first = live_peer_record(&db, device, IdentityPub([1; 32]), None, &[]);
+    let mut first = live_peer_record(
+        db.get_peer(&device).unwrap(),
+        device,
+        IdentityPub([1; 32]),
+        None,
+        &[],
+    );
     first.trust_p = 0.77;
     first.addrs = vec!["/ip4/10.0.0.9/tcp/1".to_string()];
     db.upsert_peer(&first).unwrap();
 
-    let again = live_peer_record(&db, device, IdentityPub([1; 32]), Some([3; 32]), &[]);
+    let again = live_peer_record(
+        db.get_peer(&device).unwrap(),
+        device,
+        IdentityPub([1; 32]),
+        Some([3; 32]),
+        &[],
+    );
     assert_eq!(again.trust_p, 0.77);
     assert_eq!(again.addrs, vec!["/ip4/10.0.0.9/tcp/1".to_string()]);
     assert_eq!(again.x25519_pub, Some([3; 32]));
@@ -305,4 +317,37 @@ fn order_hint_addrs_drops_unparsable_and_addrs_without_p2p() {
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].0, p);
     assert_eq!(got[0].1.to_string(), hints[2]);
+}
+
+/// RMW PeerRecord (tech-debt MED, 2026-10-05): DR's writes of a live peer (authenticated,
+/// then identify addresses) go through one transaction each — a concurrent writer of the
+/// same record loses nothing. Mutation "get_peer + upsert_peer" → bumps lost.
+#[test]
+fn dr_peer_writes_keep_concurrent_writes_to_the_record() {
+    use viaticum_core::db::testutil::bump_peer_in_thread;
+    let db = Db::open_in_memory().unwrap();
+    let device = DeviceId([9u8; 32]);
+    let addr: Multiaddr = "/ip4/10.0.0.7/tcp/4001".parse().unwrap();
+    assert!(upsert_authenticated(
+        &db,
+        device,
+        IdentityPub([1; 32]),
+        None,
+        &[]
+    ));
+    let bump = bump_peer_in_thread(db.clone(), device, 300);
+    for _ in 0..150 {
+        assert!(upsert_authenticated(
+            &db,
+            device,
+            IdentityPub([1; 32]),
+            None,
+            &[]
+        ));
+        persist_identified_addrs(&db, device, std::slice::from_ref(&addr));
+    }
+    bump.join().unwrap();
+    let rec = db.get_peer(&device).unwrap().unwrap();
+    assert_eq!(rec.bytes_peer_stores_for_us, 300, "no bump lost");
+    assert_eq!(rec.addrs, vec![addr.to_string()]);
 }

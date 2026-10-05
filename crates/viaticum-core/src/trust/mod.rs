@@ -428,7 +428,7 @@ pub fn recalculate_trust(
     device: &DeviceId,
     current_week: u32,
 ) -> Option<(f64, f64, f64, f64)> {
-    let mut record = match db.get_peer(device) {
+    let record = match db.get_peer(device) {
         Ok(Some(r)) => r,
         _ => return None,
     };
@@ -466,11 +466,21 @@ pub fn recalculate_trust(
         all_pass_rates.iter().sum::<f64>() / all_pass_rates.len() as f64
     };
 
-    record.trust_p = new_p;
-    record.trust_i = new_i;
-    if let Err(e) = db.upsert_peer(&record) {
-        tracing::error!(device = %device, err = %e, "trust: failed to persist trust update");
-        return None;
+    // Only P and I are written, in one transaction with the read (`Db::update_peer`):
+    // addresses or avail written since the read above are kept.
+    match db.update_peer(device, |r| {
+        r.map(|mut record| {
+            record.trust_p = new_p;
+            record.trust_i = new_i;
+            record
+        })
+    }) {
+        Ok(Some(_)) => {}
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::error!(device = %device, err = %e, "trust: failed to persist trust update");
+            return None;
+        }
     }
 
     // --- Two-level trust update ---
