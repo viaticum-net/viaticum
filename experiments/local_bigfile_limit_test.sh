@@ -38,7 +38,7 @@
 # Steps:        private/beta-planning/tasks/r1_bigfile_refusal.md §0.3
 #
 # Implemented here: PHASE=a (R1-d-a: steps 0a, 1, 1b, 2a, 4, 5, 6, 7, 8, 9) and PHASE=b (R1-d-b,
-# K-b6, spec v3.11 + v3.11a: 0 (anchors in the binary), 0b, 2b-before, 3, 2b, 3b, 3c, 9).
+# K-b6, spec v3.11 + v3.11a + v3.12d (3b: restore at a fresh worker grant for B2): 0 (anchors in the binary), 0b, 2b-before, 3, 2b, 3b, 3c, 9).
 # PHASE=all = a's steps 0a..2a, then b's 2b/3/3b/3c (step 3 is only printed, never judged: the
 # blocks of PHASE a dirty its window), then a's steps 4..8, then 9.
 # STOP_AFTER=<0b|3|2b|3b|3c> (PHASE b / all): end the run after that step (mutation runs); the
@@ -200,6 +200,9 @@ if run_b; then
         "work_pipeline: symbols confirmed stored, placement Offered→Alive"
         "work_pipeline: iteration complete"
         "work_pipeline: paused while a restore job runs or a DR session leases memory"
+        "work_pipeline: restore gate is up after the permit was granted"
+        "work_pipeline: restore gate is up after the encode"
+        "restore started" "restore finished"
         "restore: waiting for memory budget" "restore: regrant for plaintext"
         "processor: PosHashChallenge — responding with chain hash"
         "processor: sending RestoreResponse"
@@ -399,6 +402,15 @@ clog() {
 ev() {
     local idx="$1" from="$2" pat="$3"; shift 3
     events <(clog "$idx" "$from" | grep -aF -- "$pat" || true) "$pat" "$@"
+}
+
+# evl IDX FROM PATTERN KEY...: as ev, but the 2nd column is the line number in the log, not among
+# the matches: it orders events of different patterns (the stamps lose their fraction under a ru
+# locale: mawk reads "04.96" as 4).
+evl() {
+    local idx="$1" from="$2" pat="$3"; shift 3
+    events <(clog "$idx" "$from" | awk -v f="$from" -v p="$pat" 'index($0, p) { print $0 " ln=" (NR + f - 1) }') "$pat" "$@" ln \
+        | awk '{ $2 = $NF; NF--; print }'
 }
 
 # ids of the node as the logs print them (first 16 hex of the device id).
@@ -619,7 +631,7 @@ step3b() {
     L3B=$(log_line_count 0); T3B=$(date +%s)
     B2_FILE="$FILES/big2.bin"
     make_random "$B2_FILE" $((B2_MB * MIB))
-    B2=""; RST_PID=""; T_CONT=""; RST_DONE=0
+    B2=""; RST_PID=""; T_CONT=""; RST_DONE=0; L_STOP=$L3B
     # v3.12c: node-03/04 are stopped only after the worker's first grant for B2 (the step checks the
     # memory budget, not the pick order: a small block with dead holders can outrank B2, repair-i5).
     local gend=$(( $(date +%s) + 120 ))
@@ -639,6 +651,11 @@ step3b() {
         done
     fi
     kill -STOP "${DPID[3]}" "${DPID[4]}"
+    # v3.12d: the restore starts at the first worker grant for B2 AFTER the stop (a fresh turn over
+    # B2: the rebuild and the encode are ahead, the worker holds B2 for >= t_encode). Not at the
+    # first chunk: by then an overdue NB batch is often waiting and the worker yields it right after
+    # that chunk (20261005-131225: the restore began 0.2 s after the yield, the memory was free).
+    L_STOP=$(log_line_count 0)
     if [ -n "$B2" ]; then info "step 3b: worker granted for B2 = $B2, first chunk delivered; at +$(( $(date +%s) - T3B )) s node-03/04 stopped"
     else
         rough "3b: B2 never picked within 120 s of big2.bin (node-03/04 stopped anyway); picks in the window: $(clog 0 "$((L3B + 1))" | grep -aF 'picked block for work' | grep -ao 'block_id=[0-9a-f]*' | sort | uniq -c | tr '\n' ' ')"
@@ -650,9 +667,13 @@ step3b() {
             B2=$(ev 0 "$L3B" "mem_budget: granted" kind block bytes | awk -v nb="$NB" -v rb="$RB16" '$3 == "worker" && $4 != nb && $4 != rb && $5 + 0 >= 1000 * 1048576 { if (!_d++) print $4 }')
         fi
         if [ -n "$B2" ] && [ -z "$RST_PID" ]; then
-            line=$(clog 0 "$L3B" | grep -aF "work_pipeline: chunk sent" | grep -aF "block_id=$B2" | head -1 || true)
+            # Full reads, no grep -q: under pipefail an early exit SIGPIPEs the pipe into "false".
+            line=$(clog 0 "$((L_STOP + 1))" | grep -aF "mem_budget: granted" | grep -aF "kind=worker" | grep -aF "block=$B2" || true)
             if [ -n "$line" ]; then
-                info "step 3b: B2 = $B2, first chunk sent at +$((now - T3B)) s: restore of r.bin starts"
+                info "step 3b: B2 = $B2, a fresh worker grant for B2 at +$((now - T3B)) s (encode ahead): restore of r.bin starts"
+                restore_bg; restore_deadline=$((now + 300))
+            elif [ "$now" -ge $((T3B + 180)) ]; then
+                fail "step 3b: no fresh worker grant for B2 within 180 s of big2.bin: the restore starts without the worker holding B2"
                 restore_bg; restore_deadline=$((now + 300))
             fi
         fi
@@ -660,7 +681,7 @@ step3b() {
             kill -CONT "${DPID[3]}" "${DPID[4]}" 2>/dev/null || true
             T_CONT=$now
             if [ -z "$RST_PID" ]; then
-                fail "step 3b: no 'chunk sent' for B2 (${B2:-unknown}) in 240 s: the restore starts late, the window did not hold"
+                fail "step 3b: B2 never granted to the worker in 240 s (${B2:-unknown}): the restore starts late, the window did not hold"
                 restore_bg; restore_deadline=$((now + 300))
             fi
         fi
@@ -670,7 +691,8 @@ step3b() {
         fi
         # (г): the restore is awaited with its own deadline (300 s from the command), not at the window end.
         if [ -n "$T_CONT" ] && { [ "$RST_DONE" -eq 1 ] || [ "$now" -ge "$restore_deadline" ]; }; then break; fi
-        sleep 1
+        # Waiting for the fresh grant: poll often (the encode of B2 lasts ~3 s on the server).
+        if [ -z "$RST_PID" ]; then sleep 0.25; else sleep 1; fi
     done
     if [ "$RST_DONE" -eq 0 ]; then
         RST_TEND=$(now_f); kill "$RST_PID" 2>/dev/null || true; wait "$RST_PID" 2>/dev/null || true; RST_RC=124
@@ -766,50 +788,86 @@ step3b_judge() {
     else
         fail "3b (c): not all four lines in order: batch wait for NB ${tA:+yes}${tA:-NO}; yield to overdue PoS for B2 ${tB:+yes}${tB:-NO}; grant kind=pos ${tC:+yes}${tC:-NO}; late preparation published for NB ${tD:+yes}${tD:-NO}"
     fi
-    # ---- (d) the restore waits for memory and gets through
-    local W G1 tW tG shr reg rel tres sha_ok="" outcome sp f got
-    tW=$(ev 0 "$F" "restore: waiting for memory budget" block tier need_mib queued_ahead | awk -v b="$RB16" '$3 == b { if (!_d++) print $1 " " $5 " " $6 " " $4 }')
-    G1=$(ev 0 "$F" "mem_budget: granted" kind block | awk -v b="$RB16" '$3 == "restore" && $4 == b { print $1 }')
-    tG=$(awk 'NR == 1 { print }' <<< "$G1")
-    shr=$(ev 0 "$F" "mem_budget: released (shrunk)" kind block | awk -v b="$RB16" '$3 == "restore" && $4 == b { if (!_d++) print $1 }')
-    reg=$(ev 0 "$F" "restore: regrant for plaintext" block | awk -v b="$RB16" '$3 == b { if (!_d++) print $1 }')
-    rel=$(ev 0 "$F" "mem_budget: released kind=" kind block | awk -v b="$RB16" '$3 == "restore" && $4 == b { t = $1 } END { print t }')
-    tres=$(ev 0 "$F" "restored path=" path | awk '$3 ~ /r\.bin$/ { if (!_d++) print $1 }')
-    info "3b (d): waiting line: ${tW:-none} (t need_mib queued_ahead tier); granted restore RB: $(count_lines "$G1")x; shrunk: ${shr:-none}; regrant: ${reg:-none}; last release: ${rel:-none}; restored line: ${tres:-none}"
-    # v3.12a/b + Q-V9 (a): a running restore job pauses the backup (the worker yields at a portion
-    # boundary and the gate holds it), and the restore asks for memory only after it fetched the
-    # symbols. So the INFO 'waiting' line is not guaranteed any more: without it the worker must have
-    # given way to the restore before the grant (checked below), otherwise FAIL.
-    # The worker gives way in one of three logged forms (portion boundary, gate after the permit
-    # (K-b2a^5 step 5b), pause line); all are grep'd by prefix "restore gate is up" / "yielding memory to restore".
-    local gave_way
-    gave_way=$({ ev 0 "$F" "work_pipeline: yielding memory to restore" block | awk -v b="$B2" '$3 == b { print $1 }'; \
-                 ev 0 "$F" "restore gate is up after the permit was granted" block | awk -v b="$B2" '$3 == b { print $1 }'; } | head -1)
-    if [ -z "$tW" ] && [ -z "$gave_way" ]; then
-        fail "3b (d): no INFO 'restore: waiting for memory budget ... block=RB' and no 'yielding memory to restore' by the worker (the restore neither waited nor was given the budget)"
-    else
-        [ -n "$tW" ] || note "3b (d): no 'waiting for memory budget' line: the worker paused the backup for the restore first (Q-V9 (a)), the grant came without a wait"
-        local tw_t; tw_t=${tW%% *}
-        [ -n "$tG" ] || fail "3b (d): no DEBUG 'mem_budget: granted kind=restore block=RB'"
-        if [ -n "$tG" ]; then
-            local ok=1
-            if [ -n "$shr" ] || { [ -n "$reg" ] && [ "$(count_lines "$G1")" -ge 2 ]; }; then :; else
-                ok=0; fail "3b (d): after the grant neither 'released (shrunk) kind=restore' nor a regrant with a second grant for RB"; fi
-            [ -n "$rel" ] && [ -n "$tres" ] && fle "$rel" "$tres" && [ "$ok" -eq 1 ] \
-                && pass "3b (d): released kind=restore block=RB ($rel) is not later than 'restored' ($tres)" \
-                || { [ "$ok" -eq 1 ] && fail "3b (d): released kind=restore (${rel:-none}) not earlier than 'restored' (${tres:-none})"; }
-            # yield of the worker to the restore: before the grant
-            local y1 y2
-            y1=$(ev 0 "$F" "work_pipeline: yielding memory to restore" block | awk -v b="$B2" -v g="$tG" '$3 == b && $1 <= g { if (!_d++) print $1 }')
-            y2=$(ev 0 "$F" "mem_budget: released kind=" kind block | awk -v b="$B2" -v g="$tG" '$3 == "worker" && $4 == b && $1 <= g { if (!_d++) print $1 }')
-            if [ -n "$y1" ] || [ -n "$y2" ]; then pass "3b (d): the worker gave way to the restore (${y1:+yielding memory to restore at $y1}${y1:+ }${y2:+released kind=worker block=B2 at $y2}) before the restore's grant"
-            else fail "3b (d): no 'yielding memory to restore' / 'released kind=worker block=B2' before 'granted kind=restore block=RB'"; fi
-            local wt; wt=$(awk -v a="$tw_t" -v b="$tG" 'BEGIN { printf "%.1f", b - a }')
-            local lim2; lim2=$(awk -v t="${S3_TENC:-0}" 'BEGIN { printf "%.1f", t + 90 }')
-            if [ -z "$tW" ]; then :
-            elif fle "$wt" "$lim2"; then pass "3b (d): the restore waited ${wt} s for memory (limit t_encode ${S3_TENC}s + 90 = ${lim2} s)"
-            else rough "3b (d): restore waited past one holder attempt: ${wt} s > t_encode + 90 = ${lim2} s"; fi
+    # ---- (d) the restore gets the memory the worker held (v3.12d; Q-V9 (a), restore-i39)
+    # Order is by log line (evl's 2nd column): the stamps lose their fraction under the server's ru
+    # locale (mawk reads "04.96" as 4), and the events here are < 1 s apart.
+    local G1 tW tG nG shr reg rel tres outcome sp f got
+    tW=$(evl 0 "$F" "restore: waiting for memory budget" block tier need_mib queued_ahead | awk -v b="$RB16" '$3 == b { if (!_d++) print $1 " " $5 " " $6 " " $4 }')
+    G1=$(evl 0 "$F" "mem_budget: granted" kind block | awk -v b="$RB16" '$3 == "restore" && $4 == b { print $1 " " $2 }')
+    tG=$(awk 'NR == 1 { print $1 }' <<< "$G1"); nG=$(awk 'NR == 1 { print $2 }' <<< "$G1")
+    shr=$(evl 0 "$F" "mem_budget: released (shrunk)" kind block | awk -v b="$RB16" '$3 == "restore" && $4 == b { if (!_d++) print $1 }')
+    reg=$(evl 0 "$F" "restore: regrant for plaintext" block | awk -v b="$RB16" '$3 == b { if (!_d++) print $1 }')
+    rel=$(evl 0 "$F" "mem_budget: released kind=" kind block | awk -v b="$RB16" '$3 == "restore" && $4 == b { t = $1 } END { print t }')
+    tres=$(evl 0 "$F" "restored path=" path | awk '$3 ~ /r\.bin$/ { if (!_d++) print $1 }')
+    # The job of r.bin: its first line (the gate is up from the submit, a moment before it) and its end.
+    local J tJ nJ jid nJend
+    J=$(evl 0 "$F" "restore started path=" path job | awk '$3 ~ /r\.bin$/ { if (!_d++) print $1 " " $2 " " $4 }')
+    read -r tJ nJ jid <<< "${J:-}" || true
+    nJend=""
+    [ -n "${jid:-}" ] && nJend=$(evl 0 "$F" "restore finished" job | awk -v j="$jid" '$3 == j { if (!_d++) print $2 }')
+    [ -n "$nJend" ] || nJend=999999999
+    info "3b (d): job line ${tJ:-none} (#${nJ:-?}); waiting line: ${tW:-none} (t need_mib queued_ahead tier); granted restore RB: $(count_lines "$G1")x; shrunk: ${shr:-none}; regrant: ${reg:-none}; last release: ${rel:-none}; restored line: ${tres:-none}"
+    # (d1) set-up: the job started while the worker held B2 (its last grant before the job line has no
+    # full release before it). Without it the step proves nothing about the hand-over: FAIL, not skip.
+    local wg nWg nWr held=0
+    wg=$(evl 0 "$F" "mem_budget: granted" kind block | awk -v b="$B2" -v n="${nJ:-0}" '$3 == "worker" && $4 == b && $2 < n { g = $2 } END { print g }')
+    nWg=${wg:-}
+    [ -n "$nWg" ] && nWr=$(evl 0 "$F" "mem_budget: released kind=" kind block | awk -v b="$B2" -v n="$nWg" '$3 == "worker" && $4 == b && $2 > n { if (!_d++) print $2 }')
+    if [ -z "${nJ:-}" ]; then fail "3b (d): no 'restore started path=…r.bin' line on node-00"
+    elif [ -z "$nWg" ]; then fail "3b (d) set-up: no worker grant for B2 before the restore job started: the step did not start the restore while the worker held B2"
+    elif [ -n "${nWr:-}" ] && [ "$nWr" -lt "$nJ" ]; then fail "3b (d) set-up: the worker released B2 (line #$nWr) before the restore job started (#$nJ): the memory was free, the hand-over is not exercised"
+    else held=1; pass "3b (d) set-up: the restore job started (#$nJ) while the worker held B2 (granted at #$nWg)"; fi
+    # (d2) hand-over: after the job line the worker gives B2 back at its nearest boundary (gate after
+    # the permit / after the encode, a yield at a chunk or holder boundary; a yield to the overdue NB
+    # counts too, the pause below then keeps it off), and the release comes before the restore's grant.
+    local gw nY yk nR tR
+    gw=$({ evl 0 "$F" "restore gate is up after the" block | awk -v b="$B2" -v n="${nJ:-0}" '$3 == b && $2 > n { print $2 " gate" }'
+           evl 0 "$F" "work_pipeline: yielding memory to restore" block | awk -v b="$B2" -v n="${nJ:-0}" '$3 == b && $2 > n { print $2 " yield-to-restore" }'
+           evl 0 "$F" "work_pipeline: yielding memory to overdue PoS" block | awk -v b="$B2" -v n="${nJ:-0}" '$3 == b && $2 > n { print $2 " yield-to-overdue-PoS" }'; } | sort -n | head -1)
+    read -r nY yk <<< "${gw:-}" || true
+    nR=$(evl 0 "$F" "mem_budget: released kind=" kind block | awk -v b="$B2" -v n="${nJ:-0}" '$3 == "worker" && $4 == b && $2 > n { if (!_d++) print $2 }')
+    tR=$(evl 0 "$F" "mem_budget: released kind=" kind block | awk -v b="$B2" -v n="${nJ:-0}" '$3 == "worker" && $4 == b && $2 > n { if (!_d++) print $1 }')
+    if [ "$held" -eq 1 ]; then
+        local lim3; lim3=$(awk -v t="${S3_TENC:-0}" 'BEGIN { printf "%.1f", t + 65 }')
+        local dR; dR=$(awk -v a="$tJ" -v b="${tR:-0}" 'BEGIN { printf "%.1f", b - a }')
+        if [ -z "${nY:-}" ] || [ -z "${nR:-}" ]; then
+            fail "3b (d): the worker held B2 when the job started, but no give-way line (${yk:-none}) or no release of B2 after it (release #${nR:-none})"
+        elif [ -n "$nG" ] && [ "$nR" -gt "$nG" ]; then
+            fail "3b (d): the restore was granted (#$nG) before the worker released B2 (#$nR)"
+        elif ! fle "$dR" "$lim3"; then
+            fail "3b (d): the worker released B2 ${dR} s after the job started > t_encode ${S3_TENC:-?} s + 65 s (job ${tJ}, release ${tR})"
+        else
+            pass "3b (d): the worker gave B2 back to the restore (${yk} at #$nY, released at #$nR, ${dR} s after the job line; limit ${lim3} s) before the restore's grant (#${nG:-none})"
         fi
+    fi
+    # (d3) the backup stands while the job runs (Q-V9 (a)): the pause line, then no encode or chunk
+    # of the worker until the job finished. A gate that never rises fails here even when the
+    # restore got its memory another way (the waiting restore of rule (B') takes it at a holder).
+    local nP busy
+    nP=$(evl 0 "$F" "work_pipeline: paused while a restore job runs" | awk -v a="${nJ:-0}" -v b="$nJend" '$2 > a && $2 < b { if (!_d++) print $2 }')
+    if [ -z "$nP" ]; then
+        fail "3b (d): no 'work_pipeline: paused while a restore job runs' between the job line and the end of the job: the backup did not stop for the restore"
+    else
+        busy=$( { evl 0 "$F" "work_pipeline: encoded raw symbols" block_id; evl 0 "$F" "work_pipeline: chunk sent" block_id; } \
+            | awk -v a="$nP" -v b="$nJend" '$2 > a && $2 < b { print $3 }' | sort | uniq -c | tr '\n' ' ')
+        if [ -n "$busy" ]; then fail "3b (d): the worker encoded or sent between the pause (#$nP) and the end of the job: $busy"
+        else pass "3b (d): the backup paused for the restore job (#$nP) and sent nothing until the job finished"; fi
+    fi
+    if [ -z "$tG" ]; then fail "3b (d): no DEBUG 'mem_budget: granted kind=restore block=RB'"
+    else
+        [ -n "$tW" ] || note "3b (d): no 'restore: waiting for memory budget' line: the worker gave the memory back before the restore asked for it"
+        local tw_t; tw_t=${tW%% *}
+        local ok=1
+        if [ -n "$shr" ] || { [ -n "$reg" ] && [ "$(count_lines "$G1")" -ge 2 ]; }; then :; else
+            ok=0; fail "3b (d): after the grant neither 'released (shrunk) kind=restore' nor a regrant with a second grant for RB"; fi
+        [ -n "$rel" ] && [ -n "$tres" ] && fle "$rel" "$tres" && [ "$ok" -eq 1 ] \
+            && pass "3b (d): released kind=restore block=RB ($rel) is not later than 'restored' ($tres)" \
+            || { [ "$ok" -eq 1 ] && fail "3b (d): released kind=restore (${rel:-none}) not earlier than 'restored' (${tres:-none})"; }
+        local wt; wt=$(awk -v a="$tw_t" -v b="$tG" 'BEGIN { printf "%.1f", b - a }')
+        local lim2; lim2=$(awk -v t="${S3_TENC:-0}" 'BEGIN { printf "%.1f", t + 90 }')
+        if [ -z "$tW" ]; then :
+        elif fle "$wt" "$lim2"; then pass "3b (d): the restore waited ${wt} s for memory (limit t_encode ${S3_TENC}s + 90 = ${lim2} s)"
+        else rough "3b (d): restore waited past one holder attempt: ${wt} s > t_encode + 90 = ${lim2} s"; fi
     fi
     # content: the finished job, hash
     outcome=$(tail -n 1 "$RST_OUT" 2>/dev/null | jq -r '.outcome // "none"' 2>/dev/null || echo none)
