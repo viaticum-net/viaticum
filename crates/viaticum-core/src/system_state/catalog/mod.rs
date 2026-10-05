@@ -147,6 +147,14 @@ pub struct PlacePublication {
     pub reached: Option<ReachedEnvelope>,
 }
 
+impl PlacePublication {
+    /// dr-i63: how many of this envelope's acks come from `kad_near` (the postmen DR
+    /// asks) — what the dr-i39 threshold counts.
+    pub fn near_acks(&self, kad_near: &[DeviceId]) -> usize {
+        self.acks.iter().filter(|a| kad_near.contains(a)).count()
+    }
+}
+
 /// An earlier envelope of a place (same base) that reached the dr-i39 threshold
 /// (dr-i52). The postmen that acked it keep it until they accept a newer one.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -158,8 +166,10 @@ pub struct ReachedEnvelope {
     pub created_at: Timestamp,
     /// Live files of the state it restores.
     pub files: u32,
-    /// Distinct postmen that acked it.
-    pub acks: u32,
+    /// The postmen that acked it (dr-i63: readiness counts those still in the current
+    /// Kademlia-near set, as for a place's own envelope).
+    #[serde(default)]
+    pub acked: Vec<DeviceId>,
     /// Its envelope's `expires_at`: after that the postmen no longer hold it.
     pub expires_at: u64,
 }
@@ -233,6 +243,13 @@ pub struct PointerPublications {
     pub other: Option<PlacePublication>,
     /// Set while the newest catalog state is in no accepted pointer (mailbox-i54).
     pub waiting: Option<Waiting>,
+    /// dr-i63 (Ilya 2026-10-03): the Kademlia-near peers of the rendezvous box, from the
+    /// last publisher tick whose lookup found any — the postmen DR asks. The dr-i39
+    /// threshold is counted on the acks of these peers only ([`PlacePublication::near_acks`]);
+    /// a peer that left the set no longer counts. Empty (an older META, or no lookup
+    /// found anyone yet): no place is ready.
+    #[serde(default)]
+    pub kad_near: Vec<DeviceId>,
 }
 
 impl PointerPublications {
@@ -243,6 +260,7 @@ impl PointerPublications {
             current: None,
             other: None,
             waiting: None,
+            kad_near: Vec::new(),
         }
     }
 

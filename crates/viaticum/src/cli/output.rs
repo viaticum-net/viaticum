@@ -191,10 +191,12 @@ pub fn render_dr_readiness(data: &StatusData) -> String {
         );
     } else if data.dr_ready {
         out.push_str(&format!(
-            "  DR:             ready: recovery pointer published {}, {} files, accepted by {} peer(s)\n",
+            "  DR:             ready: recovery pointer published {}, {} files, accepted by {} of the {} \
+             nodes DR will ask\n",
             iso(data.dr_pointer_published_at),
             data.dr_pointer_files,
-            data.dr_pointer_acks
+            data.dr_pointer_acks,
+            data.dr_pointer_near_set
         ));
         if data.dr_restores_state_of > 0 {
             out.push_str(&format!(
@@ -205,11 +207,13 @@ pub fn render_dr_readiness(data: &StatusData) -> String {
     } else {
         out.push_str(&format!(
             "  DR:             NOT READY: recovery pointer published {}, {} files, accepted by {} of \
-             the {} friends needed\n",
+             the {} nodes DR will ask ({} needed; held by {} in all)\n",
             iso(data.dr_pointer_published_at),
             data.dr_pointer_files,
             data.dr_pointer_acks,
-            data.dr_pointer_ack_threshold
+            data.dr_pointer_near_set,
+            data.dr_pointer_ack_threshold,
+            data.dr_pointer_held
         ));
         if data.dr_ss_blocks_placed < data.dr_ss_blocks_total {
             out.push_str(&format!(

@@ -34,8 +34,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use libp2p::PeerId;
-use tokio::sync::mpsc;
+use libp2p::{Multiaddr, PeerId};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
 use viaticum_core::constants::{
@@ -58,7 +58,9 @@ mod fanout;
 mod fetch;
 mod verdict;
 
-use fanout::{record_avail_contact, store_fanout, unix_now};
+use fanout::{
+    POINTER_NEAR_CONCURRENCY, record_avail_contact, store_fanout, store_fanout_pointer, unix_now,
+};
 use fetch::fetch_fanout;
 
 pub use dr_walk::DrWalk;
@@ -99,6 +101,31 @@ pub trait MailboxNetworkSender: Send + Sync {
         device: DeviceId,
         req: MailboxFetchRequest,
     ) -> anyhow::Result<MailboxFetchResponse>;
+
+    /// `send_store` that may dial `addrs` (dr-i63: a Kademlia-near postman of the
+    /// pointer box may be a stranger without a PeerRecord). Test senders ignore the
+    /// addresses.
+    async fn send_store_via(
+        &self,
+        device: DeviceId,
+        _addrs: Vec<Multiaddr>,
+        req: MailboxStoreRequest,
+    ) -> anyhow::Result<MailboxStoreResponse> {
+        self.send_store(device, req).await
+    }
+
+    /// The Kademlia-closest peers to `key` with the addresses the lookup returned
+    /// (dr-i63). Test senders know no Kademlia: none.
+    async fn closest_peers(&self, _key: Vec<u8>) -> anyhow::Result<Vec<NearPeer>> {
+        Ok(Vec::new())
+    }
+}
+
+/// A peer of a Kademlia lookup: its device and the addresses the lookup returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NearPeer {
+    pub device: DeviceId,
+    pub addrs: Vec<Multiaddr>,
 }
 
 // ─── Production impl: wraps SwarmHandle ──────────────────────────────────────
@@ -153,6 +180,46 @@ impl MailboxNetworkSender for SwarmSender {
             ),
         }
     }
+
+    async fn send_store_via(
+        &self,
+        device: DeviceId,
+        addrs: Vec<Multiaddr>,
+        req: MailboxStoreRequest,
+    ) -> anyhow::Result<MailboxStoreResponse> {
+        let msg = Message::MailboxStoreRequest(req);
+        let resp = timeout(
+            PEER_REQUEST_TIMEOUT,
+            self.swarm.send_to_device_via(device, addrs, msg),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("mailbox store timeout to {device}"))?
+        .map_err(|e| anyhow::anyhow!("mailbox store to {device}: {e}"))?;
+        match resp {
+            Message::MailboxStoreResponse(r) => Ok(r),
+            other => anyhow::bail!(
+                "unexpected response to MailboxStoreRequest: {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    async fn closest_peers(&self, key: Vec<u8>) -> anyhow::Result<Vec<NearPeer>> {
+        let found = self
+            .swarm
+            .get_closest_peers(key)
+            .await
+            .map_err(|e| anyhow::anyhow!("get_closest_peers: {e}"))?;
+        Ok(found
+            .into_iter()
+            .filter_map(|(peer, addrs)| {
+                Some(NearPeer {
+                    device: peer_id_to_device_id_best_effort(&peer)?,
+                    addrs,
+                })
+            })
+            .collect())
+    }
 }
 
 // ============================================================
@@ -173,6 +240,10 @@ pub struct MailboxRouter {
     pub write_fanout: usize,
     /// Read fanout: broader for overlap guarantee.
     pub read_fanout: usize,
+    /// dr-i63: near-postman stores of every pointer publication of this router share
+    /// these `POINTER_NEAR_CONCURRENCY` permits — the tasks of a publication that
+    /// returned keep theirs while they run (review W4).
+    near_permits: Arc<Semaphore>,
 }
 
 impl MailboxRouter {
@@ -184,6 +255,7 @@ impl MailboxRouter {
             candidates_n: MAILBOX_CANDIDATES_N,
             write_fanout: MAILBOX_WRITE_FANOUT,
             read_fanout: MAILBOX_READ_FANOUT,
+            near_permits: Arc::new(Semaphore::new(POINTER_NEAR_CONCURRENCY)),
         }
     }
 
@@ -195,6 +267,7 @@ impl MailboxRouter {
             candidates_n: MAILBOX_CANDIDATES_N,
             write_fanout: MAILBOX_WRITE_FANOUT,
             read_fanout: MAILBOX_READ_FANOUT,
+            near_permits: Arc::new(Semaphore::new(POINTER_NEAR_CONCURRENCY)),
         }
     }
 
@@ -266,18 +339,8 @@ impl MailboxRouter {
         need: usize,
     ) -> PublishOutcome {
         let target = entry.target;
-        let override_peers = if entry.class == viaticum_core::mailbox::MailboxClass::SelfPointer {
-            e2e_pointer_postmen()
-        } else {
-            None
-        };
-        let write_peers = match override_peers {
-            Some(list) => list,
-            None => {
-                let ranked = self.build_ranked_candidates(&target);
-                self.select_write_peers_from_ranked(&ranked, &target, unix_now())
-            }
-        };
+        let ranked = self.build_ranked_candidates(&target);
+        let write_peers = self.select_write_peers_from_ranked(&ranked, &target, unix_now());
         let req = MailboxStoreRequest {
             v: MAILBOX_WIRE_VERSION,
             entry,
@@ -302,6 +365,64 @@ impl MailboxRouter {
                 "mailbox publish: stored"
             );
         }
+        outcome
+    }
+
+    /// dr-i63: the Kademlia-near peers of the box `target` — the lookup DR makes
+    /// (`dr_lookup_key`, the preimage), so the postmen DR asks.
+    pub async fn kad_near(&self, target: &MailboxAddress) -> anyhow::Result<Vec<NearPeer>> {
+        self.sender
+            .closest_peers(crate::daemon::dr::dr_lookup_key(target))
+            .await
+    }
+
+    /// dr-i63: publish a pointer envelope to the trust-top write fanout AND to the
+    /// Kademlia-near postmen of its box (`near`, sent with the lookup's addresses; a
+    /// trust-top postman that is also near is sent as near). Returns once `need` near
+    /// postmen acked or every near postman answered (`fanout::store_fanout_pointer`);
+    /// with no near postman, as `publish_detailed(…, need)`.
+    pub async fn publish_pointer(
+        &self,
+        entry: MailboxEntry,
+        target_sig: Option<[u8; 64]>,
+        need: usize,
+        near: &[NearPeer],
+    ) -> PublishOutcome {
+        let target = entry.target;
+        let write_peers = match e2e_pointer_postmen() {
+            Some(list) => list,
+            None => {
+                let ranked = self.build_ranked_candidates(&target);
+                self.select_write_peers_from_ranked(&ranked, &target, unix_now())
+            }
+        };
+        let write_peers: Vec<DeviceId> = write_peers
+            .into_iter()
+            .filter(|d| !near.iter().any(|p| p.device == *d))
+            .collect();
+        let req = MailboxStoreRequest {
+            v: MAILBOX_WIRE_VERSION,
+            entry,
+            target_sig,
+        };
+        let outcome = store_fanout_pointer(
+            &self.sender,
+            &self.db,
+            &write_peers,
+            near,
+            req,
+            need,
+            &self.near_permits,
+        )
+        .await;
+        debug!(
+            target = %target,
+            trust_top = write_peers.len(),
+            kad_near = near.len(),
+            ack_count = outcome.acks.len(),
+            still_answering = outcome.pending,
+            "mailbox publish: pointer"
+        );
         outcome
     }
 
