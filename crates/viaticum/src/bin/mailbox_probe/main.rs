@@ -34,10 +34,11 @@
 //   peer-x25519 --data-dir D --device HEX --clear
 //       Clears `PeerRecord.x25519_pub` of one peer (S1 step 10, mailbox-i8).
 //
-//   rendezvous --phrase "<words>" [--lineage HEX32] [--place a|b] [--json]
+//   rendezvous --phrase "<words>" [--lineage HEX32] [--place a|b] [--rank DEV]... [--json]
 //       Offline, no data dir, no clock: the phrase's pointer box address (`address`,
 //       `address_short` as the postman logs `target=`) and, with a catalog history,
-//       its two pointer place slots `slot_a`, `slot_b` (`slot` for `--place`).
+//       its two pointer place slots `slot_a`, `slot_b` (`slot` for `--place`); with
+//       `--rank` the devices as `ranked`, closest to the box by Kademlia's metric first.
 
 use std::path::{Path, PathBuf};
 
@@ -127,6 +128,9 @@ enum Cmd {
         lineage: Option<String>,
         #[arg(long)]
         place: Option<String>,
+        /// Device (64 hex) to rank by distance to the box; repeatable.
+        #[arg(long)]
+        rank: Vec<String>,
         /// Accepted for scripts; the output is always JSON.
         #[arg(long)]
         json: bool,
@@ -339,10 +343,12 @@ fn main() {
             phrase,
             lineage,
             place,
+            rank,
             json: _,
         } => {
             let lineage = lineage.map(|l| hex16(&l, "--lineage"));
-            let v = rendezvous::rendezvous_json(&phrase, lineage, place.as_deref())
+            let rank: Vec<DeviceId> = rank.iter().map(|d| DeviceId(hex32(d, "--rank"))).collect();
+            let v = rendezvous::rendezvous_json(&phrase, lineage, place.as_deref(), &rank)
                 .unwrap_or_else(|e| die(e));
             println!("{v}");
         }

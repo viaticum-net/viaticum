@@ -13,7 +13,8 @@
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use libp2p::Multiaddr;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant, timeout, timeout_at};
 use tracing::{debug, warn};
 use viaticum_core::constants::AVAIL_EWMA_ALPHA;
@@ -22,7 +23,12 @@ use viaticum_core::mailbox::{MailboxAddress, MailboxClass, MailboxRejectReason};
 use viaticum_core::messages::{MailboxStoreRequest, MailboxStoreResponse};
 use viaticum_core::types::{DeviceId, Timestamp, ewma_contact_observed, hex_encode};
 
-use super::{MailboxNetworkSender, PEER_REQUEST_TIMEOUT, PublishOutcome};
+use super::{MailboxNetworkSender, NearPeer, PEER_REQUEST_TIMEOUT, PublishOutcome};
+
+/// dr-i63: Kademlia-near postmen of a pointer stored at once. Each may need an on-demand
+/// dial; the swarm has `MAX_ON_DEMAND_DIALS` (16) slots for every consumer (PoS,
+/// restore), so the pointer takes at most half.
+pub(crate) const POINTER_NEAR_CONCURRENCY: usize = 8;
 
 /// One postman's answer to a store, as its task reports it.
 enum StoreAnswer {
@@ -58,7 +64,7 @@ pub(super) async fn store_fanout(
         let req = req.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
-            let answer = store_one(sender.as_ref(), &db, device, req).await;
+            let answer = store_one(sender.as_ref(), &db, device, None, req).await;
             // The publication may have returned already: its receiver is gone and the
             // answer was recorded above anyway.
             let _ = tx.send((device, answer));
@@ -92,6 +98,94 @@ pub(super) async fn store_fanout(
     outcome
 }
 
+/// dr-i63: the store fanout of a pointer envelope to the trust-top `write_peers` and to
+/// the Kademlia-near postmen of its box (`near`, disjoint from `write_peers`, sent with
+/// the addresses of the lookup; `permits` = the router's `POINTER_NEAR_CONCURRENCY`
+/// near stores at a time over all its pointer publications).
+///
+/// mailbox-i60 counted on the near set: returns as soon as `need` NEAR postmen acked
+/// (the acks DR readiness counts), or every near postman answered, or the waves'
+/// deadline passed. A trust-top ack never ends the wait; what the trust-top answered by
+/// then is counted, the rest is `pending` (late acks record the contact, as in
+/// `store_fanout`). A near ack that comes later is not needed: either the threshold is
+/// already met, or the wait lasted until every near postman answered or timed out.
+/// With no near postman it is `store_fanout(…, need)`.
+pub(super) async fn store_fanout_pointer(
+    sender: &Arc<dyn MailboxNetworkSender>,
+    db: &Db,
+    write_peers: &[DeviceId],
+    near: &[NearPeer],
+    req: MailboxStoreRequest,
+    need: usize,
+    permits: &Arc<Semaphore>,
+) -> PublishOutcome {
+    if near.is_empty() {
+        return store_fanout(sender, db, write_peers, req, need).await;
+    }
+    let waves = near.len().div_ceil(POINTER_NEAR_CONCURRENCY) as u32;
+    // Each wave: its permits' sends end within PEER_REQUEST_TIMEOUT; one more for the
+    // task scheduling around them.
+    let deadline = Instant::now() + PEER_REQUEST_TIMEOUT * (waves + 1);
+    let asked = write_peers.len() + near.len();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    for &device in write_peers {
+        let sender = Arc::clone(sender);
+        let db = db.clone();
+        let req = req.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let answer = store_one(sender.as_ref(), &db, device, None, req).await;
+            let _ = tx.send((device, answer, false));
+        });
+    }
+    for p in near {
+        let sender = Arc::clone(sender);
+        let db = db.clone();
+        let req = req.clone();
+        let tx = tx.clone();
+        let permits = Arc::clone(permits);
+        let (device, addrs) = (p.device, p.addrs.clone());
+        tokio::spawn(async move {
+            let answer = match permits.acquire_owned().await {
+                Ok(_permit) => store_one(sender.as_ref(), &db, device, Some(addrs), req).await,
+                Err(_) => StoreAnswer::Error,
+            };
+            let _ = tx.send((device, answer, true));
+        });
+    }
+    drop(tx);
+
+    let need = need.max(1);
+    let mut outcome = PublishOutcome::default();
+    let mut answered = 0;
+    let mut near_answered = 0;
+    let mut near_acked = 0;
+    while near_answered < near.len() && near_acked < need {
+        match timeout_at(deadline, rx.recv()).await {
+            Ok(Some((device, answer, is_near))) => {
+                answered += 1;
+                if is_near {
+                    near_answered += 1;
+                    near_acked += usize::from(matches!(answer, StoreAnswer::Ack));
+                }
+                count(&mut outcome, device, answer);
+            }
+            Ok(None) => {
+                outcome.errors += asked - answered;
+                answered = asked;
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    while let Ok((device, answer, _)) = rx.try_recv() {
+        answered += 1;
+        count(&mut outcome, device, answer);
+    }
+    outcome.pending = asked - answered;
+    outcome
+}
+
 fn count(outcome: &mut PublishOutcome, device: DeviceId, answer: StoreAnswer) {
     match answer {
         StoreAnswer::Ack => outcome.acks.push(device),
@@ -102,16 +196,24 @@ fn count(outcome: &mut PublishOutcome, device: DeviceId, answer: StoreAnswer) {
 
 /// One postman: send, then record the answer (contact on Ack, log otherwise). The
 /// send is bounded by `PEER_REQUEST_TIMEOUT` whatever the sender, so the task ends.
+/// `addrs`: a Kademlia-near postman, sent with the lookup's addresses (dr-i63).
 async fn store_one(
     sender: &dyn MailboxNetworkSender,
     db: &Db,
     device: DeviceId,
+    addrs: Option<Vec<Multiaddr>>,
     req: MailboxStoreRequest,
 ) -> StoreAnswer {
     let target = req.entry.target;
     let msg_id = req.entry.msg_id;
     let class = req.entry.class;
-    let answer = timeout(PEER_REQUEST_TIMEOUT, sender.send_store(device, req))
+    let send = async {
+        match addrs {
+            Some(addrs) => sender.send_store_via(device, addrs, req).await,
+            None => sender.send_store(device, req).await,
+        }
+    };
+    let answer = timeout(PEER_REQUEST_TIMEOUT, send)
         .await
         .unwrap_or_else(|_| Err(anyhow::anyhow!("mailbox store timeout to {device}")));
     match answer {

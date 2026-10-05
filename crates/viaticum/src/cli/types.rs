@@ -272,9 +272,16 @@ pub struct StatusData {
     /// Live files in the catalog that publication restores.
     #[serde(default)]
     pub dr_pointer_files: u32,
-    /// Postmen that accepted that publication.
+    /// dr-i63: postmen of the Kademlia-near set (the ones DR asks) that accepted that
+    /// publication — what `dr_pointer_ack_threshold` counts.
     #[serde(default)]
     pub dr_pointer_acks: u32,
+    /// Every postman holding that publication, the owner's most trusted ones included.
+    #[serde(default)]
+    pub dr_pointer_held: u32,
+    /// dr-i63: how many postmen DR asks (the Kademlia-near set of the pointer box).
+    #[serde(default)]
+    pub dr_pointer_near_set: u32,
     /// Hex of this DB's catalog history id; "" before the node minted one.
     #[serde(default)]
     pub catalog_lineage: String,
@@ -287,7 +294,8 @@ pub struct StatusData {
     /// within 7 days).
     #[serde(default)]
     pub dr_ready: bool,
-    /// Distinct friends that must hold the pointer (3; half of a circle below 6).
+    /// Distinct postmen of the near set that must hold the pointer (3; half of a set
+    /// below 6).
     #[serde(default)]
     pub dr_pointer_ack_threshold: u32,
     /// Catalog (SystemState) blocks of the accepted pointer that are recoverable.

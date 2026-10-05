@@ -390,6 +390,8 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         dr_pointer_published_at: dr.published_at,
         dr_pointer_files: dr.files,
         dr_pointer_acks: dr.acks,
+        dr_pointer_held: dr.held,
+        dr_pointer_near_set: dr.near_set,
         catalog_lineage: dr.lineage,
         files_without_source: dr.files_without_source,
         dr_ready: dr.ready,
@@ -459,7 +461,12 @@ fn count_too_large_under_watches(state: &DaemonState) -> u32 {
 pub(crate) struct DrReadiness {
     pub(crate) published_at: u64,
     pub(crate) files: u32,
+    /// dr-i63: acks of the Kademlia-near set (what the threshold counts).
     pub(crate) acks: u32,
+    /// Every postman holding the shown envelope, the trust-top included.
+    pub(crate) held: u32,
+    /// The Kademlia-near set DR asks.
+    pub(crate) near_set: u32,
     pub(crate) lineage: String,
     pub(crate) files_without_source: u32,
     pub(crate) ready: bool,
@@ -485,19 +492,15 @@ pub(crate) fn dr_readiness(
     time_scale: u64,
 ) -> DrReadiness {
     let mut r = DrReadiness::default();
-    let known_peers = db.list_all_peers().map(|p| p.len()).unwrap_or(0);
-    match crate::daemon::system_state::strength::pointer_readiness(
-        db,
-        known_peers,
-        now_secs,
-        time_scale,
-    ) {
+    match crate::daemon::system_state::strength::pointer_readiness(db, now_secs, time_scale) {
         Ok(p) => {
             if let Some((at, files, acks)) = p.accepted {
                 r.published_at = at;
                 r.files = files;
                 r.acks = acks;
             }
+            r.held = p.held;
+            r.near_set = p.near_set;
             r.ready = p.ready;
             r.restores_state_of = p.restores_state_of.unwrap_or(0);
             r.threshold = p.threshold;

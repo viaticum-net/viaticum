@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use libp2p::Multiaddr;
 use viaticum_core::db::Db;
 use viaticum_core::db::testutil::{test_db, test_db_with_write_switch};
 use viaticum_core::mailbox::MailboxEntry;
@@ -24,7 +25,7 @@ use viaticum_core::types::{
 };
 
 use super::{PointerPublisher, RunningState};
-use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter};
+use crate::daemon::mailbox::routing::{MailboxNetworkSender, MailboxRouter, NearPeer};
 use crate::daemon::mailbox::test_postman::InProcessPostmanNet;
 use crate::daemon::system_state::pointer_refresh_interval_secs;
 use crate::daemon::system_state::publish::PointerCatalog;
@@ -46,6 +47,15 @@ struct Gate {
     delays: Mutex<HashMap<DeviceId, Option<u64>>>,
     sent: Mutex<Vec<(DeviceId, MailboxEntry)>>,
     meta_before_send: Mutex<Vec<bool>>,
+    /// dr-i63: what the Kademlia lookup of the box returns. `None` = every postman (a
+    /// small circle: the near set is the whole circle); `Some(Err)` = the lookup fails.
+    near: Mutex<Option<Result<Vec<NearPeer>, ()>>>,
+    /// Every postman, in fixture order.
+    devices: Vec<DeviceId>,
+    /// Stores sent with lookup addresses (to near postmen).
+    via: Mutex<Vec<(DeviceId, Vec<Multiaddr>)>>,
+    /// Near stores in flight now, and the most at once.
+    near_in_flight: Mutex<(usize, usize)>,
 }
 
 #[async_trait]
@@ -92,6 +102,44 @@ impl MailboxNetworkSender for Gate {
         req: MailboxFetchRequest,
     ) -> anyhow::Result<MailboxFetchResponse> {
         self.inner.send_fetch(device, req).await
+    }
+
+    async fn send_store_via(
+        &self,
+        device: DeviceId,
+        addrs: Vec<Multiaddr>,
+        req: MailboxStoreRequest,
+    ) -> anyhow::Result<MailboxStoreResponse> {
+        /// Leaves the in-flight count also when the send is cancelled (a timeout).
+        struct InFlight<'a>(&'a Mutex<(usize, usize)>);
+        impl Drop for InFlight<'_> {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().0 -= 1;
+            }
+        }
+        self.via.lock().unwrap().push((device, addrs));
+        {
+            let mut f = self.near_in_flight.lock().unwrap();
+            f.0 += 1;
+            f.1 = f.1.max(f.0);
+        }
+        let _in_flight = InFlight(&self.near_in_flight);
+        self.send_store(device, req).await
+    }
+
+    async fn closest_peers(&self, _key: Vec<u8>) -> anyhow::Result<Vec<NearPeer>> {
+        match self.near.lock().unwrap().clone() {
+            None => Ok(self
+                .devices
+                .iter()
+                .map(|&device| NearPeer {
+                    device,
+                    addrs: vec![],
+                })
+                .collect()),
+            Some(Ok(list)) => Ok(list),
+            Some(Err(())) => anyhow::bail!("lookup failed"),
+        }
     }
 }
 
@@ -149,6 +197,10 @@ fn fx_on(db: Db, n: usize) -> Fx {
         delays: Mutex::new(HashMap::new()),
         sent: Mutex::new(vec![]),
         meta_before_send: Mutex::new(vec![]),
+        near: Mutex::new(None),
+        devices: devices.clone(),
+        via: Mutex::new(vec![]),
+        near_in_flight: Mutex::new((0, 0)),
     });
     let router = MailboxRouter::with_sender(
         Arc::clone(&gate) as Arc<dyn MailboxNetworkSender>,
@@ -916,7 +968,7 @@ async fn readiness_does_not_flicker_while_a_new_envelope_collects_acks() {
     let f = fx(6); // threshold 3
     let b1 = f.block(1, 6);
     let t = now();
-    let readiness = |at| pointer_readiness(&f.db, 6, at, 1).unwrap();
+    let readiness = |at| pointer_readiness(&f.db, at, 1).unwrap();
     f.tick(1, &b1, &[], t).await;
     let first = f.meta().current.unwrap();
     assert!(first.acks.len() >= 3);
@@ -976,7 +1028,7 @@ async fn new_base_in_a_place_does_not_keep_the_displaced_base_ready() {
         cur.reached, None,
         "a new base starts without a kept envelope"
     );
-    let r = pointer_readiness(&f.db, 6, t + 2, 1).unwrap();
+    let r = pointer_readiness(&f.db, t + 2, 1).unwrap();
     assert_eq!(
         r.accepted.unwrap().0,
         m.other.as_ref().unwrap().created_at.0,
@@ -1008,7 +1060,7 @@ async fn reseal_keeps_reached_while_the_resealed_envelope_collects_acks() {
     assert_eq!((a.place, a.base), (PointerPlace::A, b1));
     assert!(a.acks.len() >= 3);
     assert_eq!(m.current.as_ref().unwrap().acks.len(), 2);
-    let readiness = |at| pointer_readiness(&f.db, 6, at, ts).unwrap();
+    let readiness = |at| pointer_readiness(&f.db, at, ts).unwrap();
     assert_eq!(readiness(t + 1).restores_state_of, Some(a.created_at.0));
 
     f.answering(Some(0));
@@ -1029,8 +1081,305 @@ async fn reseal_keeps_reached_while_the_resealed_envelope_collects_acks() {
         .as_ref()
         .expect("the envelope at the threshold kept");
     assert_eq!(reached.created_at, a.created_at);
-    assert!(reached.acks >= 3);
+    assert!(reached.acked.len() >= 3);
     let r = readiness(at);
     assert!(r.ready, "readiness holds on place A");
     assert_eq!(r.restores_state_of, Some(a.created_at.0));
+}
+
+// ─── dr-i63: the Kademlia-near postmen DR asks (Ilya 2026-10-03) ──────────────
+
+/// `n` postmen; the owner's trust-top is the first 3 (higher trust, write fanout 3);
+/// the Kademlia lookup of the box returns `near` (indices), each with one address.
+fn fx_near(n: usize, near: std::ops::Range<usize>) -> Fx {
+    let mut f = fx(n);
+    for d in f.devices.iter().take(3) {
+        let mut p = peer(*d, Timestamp::now().0);
+        p.trust_p = 0.9;
+        f.db.upsert_peer(&p).unwrap();
+    }
+    f.router.write_fanout = 3;
+    f.set_near(near);
+    f
+}
+
+impl Fx {
+    fn set_near(&self, near: std::ops::Range<usize>) {
+        let list = near
+            .map(|i| NearPeer {
+                device: self.devices[i],
+                addrs: vec![format!("/ip4/10.0.0.{i}/tcp/4001").parse().unwrap()],
+            })
+            .collect();
+        *self.gate.near.lock().unwrap() = Some(Ok(list));
+    }
+
+    fn near_acks(&self) -> usize {
+        let m = self.meta();
+        m.current.as_ref().unwrap().near_acks(&m.kad_near)
+    }
+}
+
+/// The pointer reaches the near postmen DR asks, sent with the lookup's addresses — not
+/// only the trust-top. Mutation "no union" (near ignored) → no near postman holds it.
+#[tokio::test]
+async fn pointer_goes_to_kad_near_with_the_lookup_addresses() {
+    let f = fx_near(23, 3..23);
+    let b1 = f.block(1, 3);
+    f.tick(1, &b1, &[], now()).await;
+    let m = f.meta();
+    assert_eq!(m.kad_near, f.devices[3..23].to_vec());
+    let via = f.gate.via.lock().unwrap().clone();
+    assert_eq!(via.len(), 20, "every near postman, with its address");
+    for (d, addrs) in &via {
+        let i = f.devices.iter().position(|x| x == d).unwrap();
+        assert!((3..23).contains(&i));
+        assert_eq!(
+            addrs,
+            &vec![format!("/ip4/10.0.0.{i}/tcp/4001").parse().unwrap()]
+        );
+    }
+    assert!(f.near_acks() >= 3);
+    let holding_near = (3..23).filter(|&i| !f.held_at(i).is_empty()).count();
+    assert!(
+        holding_near >= 3,
+        "near postmen hold the pointer: {holding_near}"
+    );
+    for i in 0..3 {
+        assert_eq!(f.held_at(i).len(), 1, "the trust-top still gets it");
+    }
+}
+
+/// mailbox-i60 on the near set: three instant trust-top acks do not end the wait; the
+/// third NEAR ack does (2 s), and META has the near acks.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn pointer_publish_returns_at_threshold_of_near_acks_not_trust_acks() {
+    let f = fx_near(23, 3..23);
+    let b1 = f.block(1, 3);
+    let mut delays = HashMap::new();
+    for i in 3..23 {
+        delays.insert(f.devices[i], if i < 6 { Some(2) } else { None });
+    }
+    *f.gate.delays.lock().unwrap() = delays;
+    let start = tokio::time::Instant::now();
+    f.tick(1, &b1, &[], now()).await;
+    assert_eq!(start.elapsed(), std::time::Duration::from_secs(2));
+    let cur = f.meta().current.unwrap();
+    assert_eq!(f.near_acks(), 3);
+    assert_eq!(cur.acks.len(), 6, "3 trust-top + 3 near");
+}
+
+/// At most `POINTER_NEAR_CONCURRENCY` (8) near stores at once: each may be an on-demand
+/// dial, and the swarm has 16 dial slots for every consumer.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn near_stores_run_at_most_8_at_once() {
+    let f = fx_near(23, 3..23);
+    let b1 = f.block(1, 3);
+    *f.gate.delays.lock().unwrap() = (3..23).map(|i| (f.devices[i], None)).collect();
+    f.tick(1, &b1, &[], now()).await;
+    assert_eq!(f.gate.near_in_flight.lock().unwrap().1, 8);
+    assert_eq!(f.gate.via.lock().unwrap().len(), 20, "every wave went");
+}
+
+/// Acks of the trust-top only (every near postman unreachable): the pointer is held,
+/// DR is not ready, and the next tick offers the same envelope again.
+#[tokio::test]
+async fn trust_acks_alone_do_not_reach_the_threshold_and_the_offer_repeats() {
+    use crate::daemon::system_state::strength::pointer_readiness;
+    let f = fx_near(23, 3..23);
+    let b1 = f.block(1, 3);
+    f.answering(Some(3));
+    let t = now();
+    f.tick(1, &b1, &[], t).await;
+    assert_eq!(
+        (f.meta().current.unwrap().acks.len(), f.near_acks()),
+        (3, 0)
+    );
+    let r = pointer_readiness(&f.db, t, 1).unwrap();
+    assert_eq!((r.ready, r.held, r.near_set), (false, 3, 20));
+    let sent = f.sent().len();
+    f.answering(None);
+    f.tick(1, &b1, &[], t + 1).await;
+    assert!(f.sent().len() > sent, "re-offered");
+    assert!(f.near_acks() >= 3);
+    assert!(pointer_readiness(&f.db, t + 1, 1).unwrap().ready);
+}
+
+/// The near set drifts: postmen that acked leave it, so their acks stop counting and
+/// the envelope goes again — byte-identical — to the newcomers of the set (Р.6).
+#[tokio::test]
+async fn node_leaving_kad_near_stops_counting_and_the_offer_resumes() {
+    let f = fx_near(43, 3..23);
+    let b1 = f.block(1, 3);
+    let t = now();
+    f.tick(1, &b1, &[], t).await;
+    let first = f.meta().current.unwrap().entry_cbor;
+    assert!(f.near_acks() >= 3);
+    f.set_near(23..43);
+    f.tick(1, &b1, &[], t + 1).await;
+    let m = f.meta();
+    assert_eq!(m.kad_near, f.devices[23..43].to_vec());
+    assert_eq!(
+        m.current.as_ref().unwrap().entry_cbor,
+        first,
+        "the same envelope"
+    );
+    assert!(f.near_acks() >= 3, "the newcomers acked it");
+    assert!((23..43).filter(|&i| !f.held_at(i).is_empty()).count() >= 3);
+}
+
+/// A lookup that finds nobody, or fails, keeps the last near set.
+#[tokio::test]
+async fn empty_or_failed_lookup_keeps_the_last_kad_near() {
+    let f = fx_near(23, 3..23);
+    let b1 = f.block(1, 3);
+    let t = now();
+    f.tick(1, &b1, &[], t).await;
+    let set = f.meta().kad_near;
+    assert_eq!(set.len(), 20);
+    *f.gate.near.lock().unwrap() = Some(Ok(vec![]));
+    f.tick(1, &b1, &[], t + 1).await;
+    assert_eq!(f.meta().kad_near, set);
+    *f.gate.near.lock().unwrap() = Some(Err(()));
+    f.tick(1, &b1, &[], t + 2).await;
+    assert_eq!(f.meta().kad_near, set);
+}
+
+/// At `MAX_ACKS_KEPT` a near ack takes the place of the first ack from outside the set;
+/// an outside ack is dropped.
+#[test]
+fn full_acks_make_room_for_a_near_ack() {
+    use crate::daemon::mailbox::routing::PublishOutcome;
+    let outside: Vec<DeviceId> = (0..64u8).map(|i| DeviceId([i; 32])).collect();
+    let near = vec![DeviceId([0xAA; 32])];
+    let mut rec = PlacePublication {
+        place: PointerPlace::A,
+        base: SourceBlockId([1; 32]),
+        diffs: vec![],
+        generation: 1,
+        created_at: Timestamp(1),
+        files: 1,
+        acks: outside.clone(),
+        entry_cbor: vec![],
+        target_sig: [0; 64],
+        last_refusal: None,
+        to_retire: vec![],
+        reached: None,
+    };
+    let outcome = PublishOutcome {
+        acks: vec![DeviceId([0xBB; 32]), near[0]],
+        ..PublishOutcome::default()
+    };
+    super::absorb(&mut rec, &outcome, &near, 10);
+    assert_eq!(rec.acks.len(), 64);
+    assert!(rec.acks.contains(&near[0]));
+    assert!(
+        !rec.acks.contains(&outside[0]),
+        "the first outside ack made room"
+    );
+    assert!(!rec.acks.contains(&DeviceId([0xBB; 32])));
+    assert_eq!(rec.near_acks(&near), 1);
+}
+
+/// Review W4: the near stores of two places in one tick (a fresh envelope that returned
+/// at its third near ack, then the other place's re-offer) share the 8 permits.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn near_stores_of_one_tick_share_8_permits() {
+    let f = fx_near(23, 3..23);
+    let b0 = f.block(1, 3);
+    let t = now();
+    f.answering(Some(3));
+    f.tick(1, &b0, &[], t).await; // place A: trust acks only, short of the threshold
+    f.answering(None);
+    let mut delays = HashMap::new();
+    for i in 3..23 {
+        delays.insert(f.devices[i], if i < 6 { Some(1) } else { Some(30) });
+    }
+    *f.gate.delays.lock().unwrap() = delays;
+    *f.gate.near_in_flight.lock().unwrap() = (0, 0);
+    let b1 = f.block(2, 3);
+    f.tick(2, &b1, &[], t + 1).await; // a new base → place B, then A is re-offered
+    assert!(f.gate.near_in_flight.lock().unwrap().1 <= 8);
+}
+
+/// Review W6: a failed lookup keeps the last near set AND sends to it (by the address
+/// book, no lookup address), so a place short of the threshold still reaches DR's
+/// postmen.
+#[tokio::test]
+async fn failed_lookup_sends_to_the_last_near_set() {
+    let f = fx_near(23, 3..23);
+    let b1 = f.block(1, 3);
+    let t = now();
+    f.answering(Some(3));
+    f.tick(1, &b1, &[], t).await;
+    assert_eq!(f.near_acks(), 0);
+    f.gate.via.lock().unwrap().clear();
+    *f.gate.near.lock().unwrap() = Some(Err(()));
+    f.answering(None);
+    f.tick(1, &b1, &[], t + 1).await;
+    let via = f.gate.via.lock().unwrap().clone();
+    assert_eq!(via.len(), 20, "sent to the kept near set");
+    assert!(via.iter().all(|(_, a)| a.is_empty()), "no lookup addresses");
+    assert!(f.near_acks() >= 3);
+}
+
+/// Code review W-1: a displaced base is retired only once the new record has the
+/// threshold of NEAR acks — trust-top acks alone (the near postmen still hold the old
+/// pointer, DR finds it) keep its SS blocks. Mutation "retire by all acks" → retired.
+#[tokio::test]
+async fn displaced_base_waits_for_near_acks_not_trust_acks() {
+    let f = fx_near(23, 3..23);
+    let b0 = f.block(1, 6);
+    let base1 = f.block(2, 1);
+    two_places(&f, base1, b0);
+    f.answering(Some(3));
+    let t = now();
+    let base2 = f.block(3, 1);
+    f.tick(1, &base2, &[], t).await;
+    let m = f.meta();
+    assert_eq!(m.current.as_ref().unwrap().acks.len(), 3);
+    assert_eq!(f.near_acks(), 0);
+    assert!(f.in_ledger(&base1), "trust-top acks only: base1 waits");
+    assert_eq!(m.current.as_ref().unwrap().to_retire.len(), 1);
+    f.answering(None);
+    f.tick(1, &base2, &[], t + 1).await;
+    assert!(f.near_acks() >= 3);
+    assert!(!f.in_ledger(&base1), "near threshold reached: retired");
+}
+
+/// Code review W-2: a poor answer (2 peers while 23 are known) does not replace the near
+/// set — readiness does not blink; the tick still sends to the kept set.
+#[tokio::test]
+async fn poor_lookup_answer_keeps_the_near_set_and_readiness() {
+    use crate::daemon::system_state::strength::pointer_readiness;
+    let f = fx_near(23, 3..23);
+    let b1 = f.block(1, 3);
+    let t = now();
+    f.tick(1, &b1, &[], t).await;
+    let set = f.meta().kad_near;
+    assert!(pointer_readiness(&f.db, t, 1).unwrap().ready);
+    f.set_near(3..5);
+    f.tick(1, &b1, &[], t + 1).await;
+    assert_eq!(
+        f.meta().kad_near,
+        set,
+        "the poor answer is not the near set"
+    );
+    assert!(pointer_readiness(&f.db, t + 1, 1).unwrap().ready);
+}
+
+/// W8 wired into the tick and readiness: a first lookup of only 2 peers (23 known) is
+/// the near set, but the threshold stays 3 — two near acks are not "ready". Mutation
+/// "threshold by the near set only" → threshold 1 → ready.
+#[tokio::test]
+async fn threshold_stays_at_the_known_circle_with_a_small_near_set() {
+    use crate::daemon::system_state::strength::pointer_readiness;
+    let f = fx_near(23, 3..5);
+    let b1 = f.block(1, 3);
+    let t = now();
+    f.tick(1, &b1, &[], t).await;
+    assert_eq!(f.meta().kad_near.len(), 2);
+    assert_eq!(f.near_acks(), 2);
+    let r = pointer_readiness(&f.db, t, 1).unwrap();
+    assert_eq!((r.threshold, r.ready), (3, false));
 }

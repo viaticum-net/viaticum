@@ -25,13 +25,25 @@ pub(crate) const HOLDER_SEEN_WINDOW_SECS: u64 = 7 * 24 * 3600;
 
 /// dr-i39: distinct postmen that must hold the pointer for "DR ready", and until which
 /// the same envelope is re-offered (i47): 3; in a circle of fewer than 6 known peers,
-/// half of the others (rounded up), at least 1.
+/// half of the others (rounded up), at least 1. dr-i63 (Ilya 2026-10-03): the peers are
+/// the Kademlia-near set DR asks (`PointerPublications::kad_near`), and only their acks
+/// count.
 pub(crate) fn readiness_ack_threshold(known_peers: usize) -> usize {
     if known_peers >= 6 {
         3
     } else {
         known_peers.div_ceil(2).max(1)
     }
+}
+
+/// dr-i63: how many postmen DR's Kademlia lookup returns (libp2p-kad's K).
+pub(crate) const KAD_NEAR_K: usize = 20;
+
+/// dr-i63: the dr-i39 threshold of this history — over the Kademlia-near set, but never
+/// below what the circle the node knows calls for: a poor lookup (2 near peers in a
+/// network of 40) must not make one ack "ready" (review W8).
+pub(crate) fn dr_ack_threshold(kad_near: usize, known_peers: usize) -> usize {
+    readiness_ack_threshold(kad_near.max(known_peers.min(KAD_NEAR_K)))
 }
 
 /// `W` of V.17.1 at this time scale.
@@ -173,9 +185,15 @@ pub(crate) fn sweep_ss_ledger(
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct PointerReadiness {
     /// The place readiness is reported for, by its standing envelope (dr-i52): its
-    /// `created_at`, files, acks. The newest restorable place when there is one
-    /// (dr-i53), else the newest place at least one postman acked.
+    /// `created_at`, files, acks of the Kademlia-near set (dr-i63). The newest
+    /// restorable place when there is one (dr-i53), else the newest place at least one
+    /// postman acked.
     pub accepted: Option<(u64, u32, u32)>,
+    /// Every postman holding the shown place's own envelope, the trust-top included
+    /// (dr-i63: only the near ones count for readiness).
+    pub held: u32,
+    /// dr-i63: the size of the Kademlia-near set DR asks.
+    pub near_set: u32,
     /// dr-i39 number of acks needed.
     pub threshold: u32,
     /// Blocks (base + diffs) of the accepted pointer, and how many of them are
@@ -194,24 +212,27 @@ pub(crate) struct PointerReadiness {
     pub waiting: Option<viaticum_core::system_state::catalog::Waiting>,
 }
 
-/// DR readiness from META and the owner's placements. `known_peers` sets the dr-i39
-/// threshold. Read-only. dr-i53: ready when at least one place of the history is
-/// restorable — a new base collecting its first acks in one place does not hide a
-/// restorable state in the other.
+/// DR readiness from META and the owner's placements. Read-only. dr-i53: ready when at
+/// least one place of the history is restorable — a new base collecting its first acks
+/// in one place does not hide a restorable state in the other. dr-i63: the dr-i39
+/// threshold is over META's Kademlia-near set and counts only its acks; a place any
+/// postman holds is shown, ready or not.
 pub(crate) fn pointer_readiness(
     db: &Db,
-    known_peers: usize,
     now_secs: u64,
     time_scale: u64,
 ) -> Result<PointerReadiness, DbError> {
-    let threshold = readiness_ack_threshold(known_peers);
     let mut r = PointerReadiness {
-        threshold: u32::try_from(threshold).unwrap_or(u32::MAX),
+        threshold: u32::try_from(readiness_ack_threshold(0)).unwrap_or(u32::MAX),
         ..PointerReadiness::default()
     };
     let Some(meta) = db.pointer_publications()? else {
         return Ok(r);
     };
+    let known_peers = db.list_all_peers()?.len();
+    let threshold = dr_ack_threshold(meta.kad_near.len(), known_peers);
+    r.threshold = u32::try_from(threshold).unwrap_or(u32::MAX);
+    r.near_set = u32::try_from(meta.kad_near.len()).unwrap_or(u32::MAX);
     r.waiting = meta.waiting;
     r.refusal = meta
         .current
@@ -224,8 +245,8 @@ pub(crate) fn pointer_readiness(
         .into_iter()
         .flatten()
     {
-        let st = standing(rec, threshold, now_secs);
-        if st.acks == 0 {
+        let st = standing(rec, &meta.kad_near, threshold, now_secs);
+        if st.acks == 0 && st.held == 0 {
             continue;
         }
         let blocks: Vec<&SourceBlockId> = std::iter::once(st.base).chain(st.diffs).collect();
@@ -236,6 +257,7 @@ pub(crate) fn pointer_readiness(
             }
         }
         places.push(PlaceReadiness {
+            held: st.held,
             ready: st.acks >= threshold && placed == blocks.len(),
             total: blocks.len(),
             placed,
@@ -251,6 +273,7 @@ pub(crate) fn pointer_readiness(
     if let Some(p) = shown {
         let n = |x: usize| u32::try_from(x).unwrap_or(u32::MAX);
         r.accepted = Some((p.st.created_at, p.st.files, n(p.st.acks)));
+        r.held = n(p.held);
         r.blocks_total = n(p.total);
         r.blocks_placed = n(p.placed);
         r.ready = p.ready;
@@ -262,6 +285,8 @@ pub(crate) fn pointer_readiness(
 /// One place judged for readiness (dr-i53).
 struct PlaceReadiness<'a> {
     st: Standing<'a>,
+    /// Every postman holding the record's own envelope.
+    held: usize,
     placed: usize,
     total: usize,
     ready: bool,
@@ -273,27 +298,38 @@ struct Standing<'a> {
     diffs: &'a [SourceBlockId],
     created_at: u64,
     files: u32,
+    /// Acks of the Kademlia-near set (dr-i63).
     acks: usize,
+    /// Every postman that acked the envelope stood on.
+    held: usize,
 }
 
 /// A place stands on its own envelope, unless that one is short of the threshold and
 /// an earlier envelope of the same base that reached it is still unexpired: then on
 /// that one, so a new envelope collecting acks does not make readiness blink.
-fn standing(r: &PlacePublication, threshold: usize, now_secs: u64) -> Standing<'_> {
+fn standing<'a>(
+    r: &'a PlacePublication,
+    kad_near: &[viaticum_core::types::DeviceId],
+    threshold: usize,
+    now_secs: u64,
+) -> Standing<'a> {
+    let near = r.near_acks(kad_near);
     match r.reached.as_ref() {
-        Some(e) if r.acks.len() < threshold && e.expires_at > now_secs => Standing {
+        Some(e) if near < threshold && e.expires_at > now_secs => Standing {
             base: &r.base,
             diffs: &e.diffs,
             created_at: e.created_at.0,
             files: e.files,
-            acks: e.acks as usize,
+            acks: e.acked.iter().filter(|a| kad_near.contains(a)).count(),
+            held: e.acked.len(),
         },
         _ => Standing {
             base: &r.base,
             diffs: &r.diffs,
             created_at: r.created_at.0,
             files: r.files,
-            acks: r.acks.len(),
+            acks: near,
+            held: r.acks.len(),
         },
     }
 }

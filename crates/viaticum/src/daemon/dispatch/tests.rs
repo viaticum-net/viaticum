@@ -1997,6 +1997,8 @@ async fn status_reports_dr_pointer_from_last_publication() {
         1_790_000_000,
         2,
     ));
+    // dr-i63: both acks come from the Kademlia-near set, plus 4 more near peers.
+    meta.kad_near = (0..6).map(|i| DeviceId([0xE0 + i as u8; 32])).collect();
     state.db.put_pointer_publications(&meta).unwrap();
     let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
         panic!("expected Status");
@@ -2004,6 +2006,9 @@ async fn status_reports_dr_pointer_from_last_publication() {
     assert_eq!(data.dr_pointer_published_at, 1_790_000_000);
     assert_eq!(data.dr_pointer_files, 4);
     assert_eq!(data.dr_pointer_acks, 2);
+    assert_eq!(data.dr_pointer_held, 2);
+    assert_eq!(data.dr_pointer_near_set, 6);
+    assert_eq!(data.dr_pointer_ack_threshold, 3);
     assert_eq!(data.catalog_lineage, lineage.to_hex());
     assert!(!data.dr_ready, "the catalog block has no holder");
     assert_eq!((data.dr_ss_blocks_placed, data.dr_ss_blocks_total), (0, 1));
@@ -2134,6 +2139,8 @@ async fn status_names_the_date_dr_would_restore() {
     let mut newer = place_record(new, 1_790_100_000, 1);
     newer.place = PointerPlace::B;
     meta.current = Some(newer);
+    // dr-i63: the three acking postmen are the near set DR asks.
+    meta.kad_near = (0..3).map(|i| DeviceId([0xE0 + i as u8; 32])).collect();
     state.db.put_pointer_publications(&meta).unwrap();
     let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
         panic!("expected Status");
@@ -2691,4 +2698,33 @@ async fn dispatch_status_known_devices_exclude_siblings_by_cluster_master() {
         "the founder's device is a sibling, not a known peer"
     );
     assert_eq!(data.peer_count_known, 1);
+}
+
+/// dr-i63 (Ilya 2026-10-03): acks of postmen outside the Kademlia-near set (the owner's
+/// trust-top) hold the pointer but do not count: status shows them as held, 0 accepted
+/// of the nodes DR asks.
+#[tokio::test]
+async fn status_counts_only_acks_of_the_kad_near_set() {
+    use viaticum_core::system_state::catalog::PointerPublications;
+    let state = make_test_state().await;
+    let lineage = state.db.get_or_create_catalog_lineage().unwrap();
+    let mut meta = PointerPublications::new(lineage);
+    meta.current = Some(place_record(
+        viaticum_core::types::SourceBlockId([7; 32]),
+        1_790_000_000,
+        3,
+    ));
+    meta.kad_near = (0..20).map(|i| DeviceId([0x10 + i as u8; 32])).collect();
+    state.db.put_pointer_publications(&meta).unwrap();
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    assert_eq!(
+        data.dr_pointer_published_at, 1_790_000_000,
+        "a held pointer is shown"
+    );
+    assert_eq!(data.dr_pointer_acks, 0);
+    assert_eq!(data.dr_pointer_held, 3);
+    assert_eq!(data.dr_pointer_near_set, 20);
+    assert!(!data.dr_ready);
 }

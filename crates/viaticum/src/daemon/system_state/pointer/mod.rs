@@ -48,12 +48,14 @@ use viaticum_core::system_state::catalog::{
     PlacePublication, PointerPublications, PointerRefusal, ReachedEnvelope, RefusalKind,
     RetiredPointer, Waiting, WaitingReason,
 };
-use viaticum_core::types::{SourceBlockId, Timestamp, from_cbor_bytes, hex_encode, to_cbor_bytes};
+use viaticum_core::types::{
+    DeviceId, SourceBlockId, Timestamp, from_cbor_bytes, hex_encode, to_cbor_bytes,
+};
 
 use super::publish::{self, PointerCatalog};
-use super::strength::{place_for_new_base, readiness_ack_threshold, sweep_ss_ledger};
+use super::strength::{KAD_NEAR_K, dr_ack_threshold, place_for_new_base, sweep_ss_ledger};
 use super::{log_refusal, pointer_refresh_interval_secs};
-use crate::daemon::mailbox::routing::{MailboxRouter, PublishOutcome, PublishVerdict};
+use crate::daemon::mailbox::routing::{MailboxRouter, NearPeer, PublishOutcome, PublishVerdict};
 
 #[cfg(test)]
 mod tests;
@@ -117,13 +119,17 @@ impl PointerPublisher<'_> {
                 return;
             }
         };
-        let threshold = match self.db.list_all_peers() {
-            Ok(p) => readiness_ack_threshold(p.len()),
+        // dr-i63: the postmen DR asks — this tick's Kademlia lookup of the box; an
+        // empty or failed lookup keeps the last set.
+        let known_peers = match self.db.list_all_peers() {
+            Ok(p) => p.len(),
             Err(e) => {
-                warn!(error = %e, "system_state push: cannot count peers; threshold 3");
-                3
+                warn!(error = %e, "system_state push: cannot count peers; threshold by the near set");
+                0
             }
         };
+        let near = self.refresh_kad_near(&mut meta, known_peers).await;
+        let threshold = dr_ack_threshold(meta.kad_near.len(), known_peers);
 
         // 1-2. A new envelope for the running base, when due.
         let mut fresh: Option<SelfPointer> = None;
@@ -159,20 +165,22 @@ impl PointerPublisher<'_> {
         let resealed = self.reseal_due(&mut meta, fresh_place, threshold, now_secs);
 
         // mailbox-i52, i59: META is on disk before anything leaves this tick; when it
-        // cannot be written nothing is sent (no new envelope, no re-offer).
+        // cannot be written nothing is sent (no new envelope, no re-offer). A changed
+        // Kademlia-near set is written with it (or by the write at the end of the tick).
         if (fresh.is_some() || resealed) && !self.put(&meta) {
             return;
         }
+        let kad_near = meta.kad_near.clone();
 
         let mut fresh_accepted = false;
         if let Some(pointer) = fresh.as_ref() {
             let outcome = self
-                .send(meta.current.as_ref().expect("installed"), threshold)
+                .send(meta.current.as_ref().expect("installed"), threshold, &near)
                 .await;
             let current = meta.current.as_mut().expect("installed");
             fresh_accepted = !outcome.acks.is_empty();
             self.log_fresh(current, pointer, &outcome);
-            absorb(current, &outcome, now_secs);
+            absorb(current, &outcome, &kad_near, now_secs);
         }
 
         // 3. Re-offer the other envelopes that lack the dr-i39 number of acks.
@@ -180,7 +188,7 @@ impl PointerPublisher<'_> {
             let Some(record) = slot.as_mut() else {
                 continue;
             };
-            if Some(record.place) == fresh_place || record.acks.len() >= threshold {
+            if Some(record.place) == fresh_place || record.near_acks(&kad_near) >= threshold {
                 continue;
             }
             let Some((entry, sig)) = envelope(record) else {
@@ -191,12 +199,13 @@ impl PointerPublisher<'_> {
             }
             let outcome = self
                 .router
-                .publish_detailed(entry, Some(sig), threshold)
+                .publish_pointer(entry, Some(sig), threshold, &near)
                 .await;
-            absorb(record, &outcome, now_secs);
+            absorb(record, &outcome, &kad_near, now_secs);
             debug!(
                 place = ?record.place,
                 acks = record.acks.len(),
+                near_acks = record.near_acks(&kad_near),
                 threshold,
                 "system_state push: re-offered the pointer envelope"
             );
@@ -209,7 +218,8 @@ impl PointerPublisher<'_> {
             .into_iter()
             .flatten()
         {
-            if record.acks.len() >= threshold
+            let reached_threshold = record.near_acks(&kad_near) >= threshold;
+            if reached_threshold
                 || record
                     .reached
                     .as_ref()
@@ -217,7 +227,7 @@ impl PointerPublisher<'_> {
             {
                 record.reached = None;
             }
-            if record.acks.len() >= threshold && !record.to_retire.is_empty() {
+            if reached_threshold && !record.to_retire.is_empty() {
                 info!(
                     place = ?record.place,
                     bases = record.to_retire.len(),
@@ -306,6 +316,7 @@ impl PointerPublisher<'_> {
     ) -> bool {
         let lineage = meta.lineage.0;
         let interval = pointer_refresh_interval_secs(self.time_scale);
+        let kad_near = meta.kad_near.clone();
         let mut any = false;
         for slot in [&mut meta.current, &mut meta.other] {
             let Some(record) = slot.as_mut() else {
@@ -343,7 +354,7 @@ impl PointerPublisher<'_> {
                     continue;
                 }
             };
-            record.reached = reached_of(record, threshold);
+            record.reached = reached_of(record, &kad_near, threshold);
             record.entry_cbor = to_cbor_bytes(sealed.entry());
             record.target_sig = sealed
                 .target_sig()
@@ -408,12 +419,98 @@ impl PointerPublisher<'_> {
         })
     }
 
-    /// Publish `record`'s envelope; returns once `need` postmen acked (mailbox-i60).
-    async fn send(&self, record: &PlacePublication, need: usize) -> PublishOutcome {
+    /// Publish `record`'s envelope to the trust-top and the Kademlia-near postmen
+    /// (dr-i63); returns once every near postman answered (with none: at `need` acks,
+    /// mailbox-i60).
+    async fn send(
+        &self,
+        record: &PlacePublication,
+        need: usize,
+        near: &[NearPeer],
+    ) -> PublishOutcome {
         match envelope(record) {
-            Some((entry, sig)) => self.router.publish_detailed(entry, Some(sig), need).await,
+            Some((entry, sig)) => {
+                self.router
+                    .publish_pointer(entry, Some(sig), need, near)
+                    .await
+            }
             None => PublishOutcome::default(),
         }
+    }
+
+    /// dr-i63: look up the Kademlia-near peers of the box and keep them in META's
+    /// `kad_near`. An empty or failed lookup keeps the last set (a lookup that found
+    /// nobody does not make every place unready), and this tick sends to it without
+    /// lookup addresses — the address book's (review W6). So does a POOR answer (fewer
+    /// than half of `min(known peers, K)`, a node that sees 1-2 peers after a restart or
+    /// on another network) while a set is kept: it would make readiness blink until the
+    /// next tick; this tick then sends to the kept set and to the answer's peers (code
+    /// review W-2). Returns this tick's near peers.
+    async fn refresh_kad_near(
+        &self,
+        meta: &mut PointerPublications,
+        known_peers: usize,
+    ) -> Vec<NearPeer> {
+        let kept = |meta: &PointerPublications| -> Vec<NearPeer> {
+            meta.kad_near
+                .iter()
+                .map(|&device| NearPeer {
+                    device,
+                    addrs: Vec::new(),
+                })
+                .collect()
+        };
+        let near = match self.router.kad_near(&self.rv.address).await {
+            Ok(near) => near,
+            Err(e) => {
+                warn!(error = %e, kept = meta.kad_near.len(), "system_state push: Kademlia lookup of the pointer box failed; the last near set is kept");
+                return kept(meta);
+            }
+        };
+        if near.is_empty() {
+            debug!(
+                kept = meta.kad_near.len(),
+                "system_state push: Kademlia lookup of the pointer box found nobody; the last near set is kept"
+            );
+            return kept(meta);
+        }
+        let poor = near.len() < known_peers.min(KAD_NEAR_K).div_ceil(2);
+        if poor && !meta.kad_near.is_empty() {
+            info!(
+                answer = near.len(),
+                kept = meta.kad_near.len(),
+                known_peers,
+                "system_state push: poor Kademlia answer for the pointer box; the last near set is kept"
+            );
+            let mut out = near;
+            for p in kept(meta) {
+                if !out.iter().any(|q| q.device == p.device) {
+                    out.push(p);
+                }
+            }
+            return out;
+        }
+        let devices: Vec<DeviceId> = near.iter().map(|p| p.device).collect();
+        let same = devices.len() == meta.kad_near.len()
+            && devices.iter().all(|d| meta.kad_near.contains(d));
+        if !same {
+            let unknown = devices
+                .iter()
+                .filter(|d| matches!(self.db.get_peer(d), Ok(None)))
+                .count();
+            info!(
+                size = devices.len(),
+                left = meta
+                    .kad_near
+                    .iter()
+                    .filter(|d| !devices.contains(d))
+                    .count(),
+                unknown_to_owner = unknown,
+                "system_state push: pointer kad-near set"
+            );
+            meta.kad_near = devices;
+        }
+        near
     }
 
     fn log_fresh(
@@ -478,7 +575,7 @@ pub(crate) fn install(
         .is_some_and(|c| c.base == *running_base && c.place == record.place);
     if same_base {
         let old = meta.current.take().expect("checked");
-        record.reached = reached_of(&old, threshold);
+        record.reached = reached_of(&old, &meta.kad_near, threshold);
         record.to_retire = old.to_retire;
         meta.current = Some(record);
         return;
@@ -512,8 +609,13 @@ pub(crate) fn install(
 
 /// dr-i52: what an envelope being replaced in its place (same base) leaves for
 /// readiness: itself when it reached the threshold, else the earlier one it kept.
-fn reached_of(record: &PlacePublication, threshold: usize) -> Option<ReachedEnvelope> {
-    if record.acks.len() < threshold {
+fn reached_of(
+    record: &PlacePublication,
+    kad_near: &[DeviceId],
+    threshold: usize,
+) -> Option<ReachedEnvelope> {
+    let near = record.near_acks(kad_near);
+    if near < threshold {
         return record.reached.clone();
     }
     let (entry, _) = envelope(record)?;
@@ -522,7 +624,7 @@ fn reached_of(record: &PlacePublication, threshold: usize) -> Option<ReachedEnve
         generation: record.generation,
         created_at: record.created_at,
         files: record.files,
-        acks: u32::try_from(record.acks.len()).unwrap_or(u32::MAX),
+        acked: record.acks.clone(),
         expires_at: entry.expires_at,
     })
 }
@@ -530,9 +632,25 @@ fn reached_of(record: &PlacePublication, threshold: usize) -> Option<ReachedEnve
 /// Merge one publication's answers into `record`. Late acks (after the publication
 /// returned, mailbox-i60) are not merged: a record short of the threshold re-offers
 /// the same envelope next tick (step 3) and the postman acks it again.
-pub(crate) fn absorb(record: &mut PlacePublication, outcome: &PublishOutcome, now_secs: u64) {
+///
+/// dr-i63: at `MAX_ACKS_KEPT`, a new ack of the Kademlia-near set takes the place of the
+/// first ack from outside it (the near acks are what the threshold counts).
+pub(crate) fn absorb(
+    record: &mut PlacePublication,
+    outcome: &PublishOutcome,
+    kad_near: &[DeviceId],
+    now_secs: u64,
+) {
     for a in &outcome.acks {
-        if !record.acks.contains(a) && record.acks.len() < MAX_ACKS_KEPT {
+        if record.acks.contains(a) {
+            continue;
+        }
+        if record.acks.len() < MAX_ACKS_KEPT {
+            record.acks.push(*a);
+        } else if kad_near.contains(a)
+            && let Some(i) = record.acks.iter().position(|x| !kad_near.contains(x))
+        {
+            record.acks.remove(i);
             record.acks.push(*a);
         }
     }
