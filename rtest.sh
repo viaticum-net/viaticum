@@ -46,7 +46,12 @@ if [ -z "$LOCAL" ] && server_up; then
         --exclude .claude \
         --exclude '.git/objects' \
         . "$SERVER:~/$REMOTE_DIR/"
+    # One gate at a time on the server: parallel worktrees used to run 3-4 gates at once
+    # (load 150+), which made timing tests flap and E2E bars go ROUGH. Waiters queue on the
+    # lock (fd 9, held until the remote shell exits).
     ssh "$SERVER" "source ~/.cargo/env && cd ~/$REMOTE_DIR && \
+        exec 9>~/viaticum-gate.lock && \
+        { flock -n 9 || { echo '=== gate lock busy (another checkout is testing), waiting ==='; flock 9; }; } && \
         cargo fmt --all --check && \
         if command -v cargo-nextest >/dev/null; then \
             cargo nextest run --no-fail-fast $ARGS --features viaticum/e2e-tools $SIM_FILTER && cargo test --doc $ARGS; \
