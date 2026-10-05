@@ -47,6 +47,11 @@ async fn drop_notice_without_intersection_changes_nothing() {
 /// cluster-i2, owner side. Owner devices O1 and O2 read one master mailbox. Here we are O2:
 /// our placement of the block on the holder's device is 0..10; the holder's letter is about
 /// O1's placement, 10..20 — not ours. Mutation M13 → our placement goes `Lost`; reddens.
+///
+/// Holds only the case of DISJOINT ranges of the owner siblings. The overlapping case (both
+/// siblings in ESI namespace 0, the same `block_id` from the same file) is not closed: a
+/// letter about O1's placement also names ESIs of ours, and ours goes `Lost`. That is the
+/// residual door of cluster-i2-a, accepted by the conductor, not fixed by Р-3.
 #[tokio::test]
 async fn drop_notice_for_owner_sibling_range_changes_nothing() {
     let f = drop_fixture(0x87, PlacementStatus::Alive, None);
