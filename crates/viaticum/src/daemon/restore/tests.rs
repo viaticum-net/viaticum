@@ -1555,6 +1555,8 @@ pub(super) struct FakeHolders {
     pub(super) online_after_reconnects: Mutex<Option<usize>>,
     /// Every `reconnect` call: when (tokio clock) and with which holders.
     pub(super) reconnects: Mutex<Vec<(tokio::time::Instant, Vec<DeviceId>)>>,
+    /// What `connected_holders` reports: asked first in a round (restore-i43).
+    pub(super) connected: Mutex<std::collections::HashSet<DeviceId>>,
 }
 
 #[async_trait::async_trait]
@@ -1591,6 +1593,10 @@ impl SymbolSource for FakeHolders {
             .iter()
             .filter_map(|e| map.get(&(holder, req.source_block_id, *e)).cloned())
             .collect())
+    }
+
+    async fn connected_holders(&self) -> std::collections::HashSet<DeviceId> {
+        self.connected.lock().unwrap().clone()
     }
 }
 
@@ -2358,6 +2364,13 @@ async fn block_fetch_has_no_deadline_slow_holders_past_60s_still_decode() {
     place_on_fake_holders(&db, &path, &holders).await;
     holders
         .silent_first
+        .lock()
+        .unwrap()
+        .extend([DeviceId([0x40; 32]), DeviceId([0x41; 32])]);
+    // The two silent holders are asked before the slow one: they are the connected ones
+    // (restore-i43), not the per-block shuffle.
+    holders
+        .connected
         .lock()
         .unwrap()
         .extend([DeviceId([0x40; 32]), DeviceId([0x41; 32])]);

@@ -5,6 +5,13 @@
 // ended. Callers decide what to do next: `fetch_in_rounds` stops at the first
 // round without progress (DR, tests); restore pauses after a round nobody
 // answered and tries the same `BlockFetch` again (restore-i26).
+//
+// Holder order (restore-i43): each round asks first the holders we have a live
+// authenticated connection to (a snapshot taken at the start of the round), then
+// the rest; within both groups the order is shuffled per block —
+// `blake3(block_id ‖ device_id)` — never the `SYMBOL_PLACEMENTS` key order, so no
+// holder serves nearly every block just for a small device id, and a cold holder
+// costs a dial only when the connected ones are not enough.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -52,6 +59,8 @@ pub(crate) struct Round {
 /// Per-holder state across rounds.
 struct HolderRound<'a> {
     placement: &'a SymbolPlacement,
+    /// This holder's place in the per-block shuffled order (`holder_order_key`).
+    order_key: [u8; 32],
     /// The holder's assigned ESIs, in order.
     esis: Vec<u32>,
     /// ESIs this holder was asked for and did not return (or returned malformed).
@@ -96,6 +105,7 @@ impl<'a> BlockFetch<'a> {
             })
             .map(|p| HolderRound {
                 placement: p,
+                order_key: holder_order_key(block_id, &p.holder_id),
                 esis: ranges_to_esi_list(&p.esi_ranges),
                 missing: HashSet::new(),
                 exhausted: false,
@@ -124,7 +134,8 @@ impl<'a> BlockFetch<'a> {
         self.accepted_esis.len()
     }
 
-    /// One round: each holder not exhausted is asked, in chunks of at most `chunk`
+    /// One round: each holder not exhausted is asked — connected ones first, each
+    /// group in the per-block shuffled order (restore-i43) — in chunks of at most `chunk`
     /// ESIs from its ranges not yet accepted and not yet asked-and-not-returned by
     /// it, until it has nothing left for us, fails, is exhausted, or the block is
     /// complete. A holder whose request errors is skipped for the rest of the round
@@ -145,6 +156,13 @@ impl<'a> BlockFetch<'a> {
         }
         self.round += 1;
         let round = self.round;
+        let connected = if self.holders.iter().any(|h| !h.exhausted) {
+            source.connected_holders().await
+        } else {
+            HashSet::new()
+        };
+        self.holders
+            .sort_by_key(|h| (!connected.contains(&h.placement.holder_id), h.order_key));
         let block_id = self.block_id;
         let (k_eff, chunk) = (self.k_eff, self.chunk);
         let before = self.accepted_esis.len();
@@ -280,4 +298,14 @@ impl<'a> BlockFetch<'a> {
             Ok(self.unbound_symbols)
         }
     }
+}
+
+/// A holder's place in the order a block's holders are asked (restore-i43): the
+/// same for every round and run of this block, different from block to block, and
+/// unrelated to the device id's order.
+pub(crate) fn holder_order_key(block_id: &SourceBlockId, holder: &DeviceId) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(&block_id.0);
+    h.update(&holder.0);
+    *h.finalize().as_bytes()
 }
