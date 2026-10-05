@@ -973,6 +973,19 @@ fn encode_raw_ranges_rejects_range_past_2_pow_24_and_encodes_up_to_it() {
     );
 }
 
+/// Review N1: a range of `u32::MAX` symbols is refused before anything is reserved for it
+/// (the output vector used to be sized by the requested count first: an allocation failure,
+/// not an error). Mutation: the range check only inside `walk_ranges` → the test aborts.
+#[test]
+fn encode_raw_ranges_refuses_a_huge_range_before_allocating() {
+    let enc = encoder();
+    let (source, params) = multi_symbol_params();
+    assert!(matches!(
+        enc.encode_raw_ranges(&source, &params, &[(0, u32::MAX)]),
+        Err(ErasureError::EsiOutOfRange { .. })
+    ));
+}
+
 // ─── R1-d-b: F5 (padding without a copy), F6 (source ESIs are slices), private plan, F8' ────
 
 /// F5: a blob padded in place by `pad_for_encoding` encodes to the same symbols as the unpadded one

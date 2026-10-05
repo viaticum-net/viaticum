@@ -409,6 +409,9 @@ impl ErasureEncoder for RaptorQEncoder {
         params: &ErasureParams,
         ranges: &[(u32, u32)],
     ) -> Result<Vec<Symbol>, ErasureError> {
+        // Before the allocation sized by the ranges (CS-ERA-6, review N1): `(0, u32::MAX)`
+        // would reserve billions of symbols before `walk_ranges` rejects it.
+        check_esi_ranges(ranges)?;
         let total: usize = ranges.iter().map(|&(_, count)| count as usize).sum();
         let mut symbols = Vec::with_capacity(total);
         Self::walk_ranges(source_block, params, ranges, &mut |esi, data| {
