@@ -244,15 +244,27 @@ impl DaemonHandle {
             match db.list_all_peers() {
                 Ok(peers) => {
                     let mut migrated = 0u32;
-                    for mut record in peers {
-                        if record.trust_i == 0.0 && record.trust_p < INITIAL_TRUST_P {
-                            record.trust_p = INITIAL_TRUST_P;
-                            if let Err(e) = db.upsert_peer(&record) {
-                                tracing::warn!(device = %record.device_id, err = %e,
-                                    "trust_p migration: upsert failed");
+                    for listed in peers {
+                        if !(listed.trust_i == 0.0 && listed.trust_p < INITIAL_TRUST_P) {
+                            continue;
+                        }
+                        // Re-checked on the record read in the write transaction.
+                        let mut bumped = false;
+                        let r = db.update_peer(&listed.device_id, |r| {
+                            let mut record = r?;
+                            if record.trust_i == 0.0 && record.trust_p < INITIAL_TRUST_P {
+                                record.trust_p = INITIAL_TRUST_P;
+                                bumped = true;
+                                Some(record)
                             } else {
-                                migrated += 1;
+                                None
                             }
+                        });
+                        match r {
+                            Err(e) => tracing::warn!(device = %listed.device_id, err = %e,
+                                "trust_p migration: upsert failed"),
+                            Ok(_) if bumped => migrated += 1,
+                            Ok(_) => {}
                         }
                     }
                     if migrated > 0 {

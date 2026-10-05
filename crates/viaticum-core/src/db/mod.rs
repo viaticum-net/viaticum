@@ -1784,15 +1784,16 @@ impl Db {
             peer_stores as f64 / we_store as f64
         };
 
-        // Update PeerRecord. No-op if device not yet in DB.
-        let mut record = match self.get_peer(device_id)? {
-            Some(r) => r,
-            None => return Ok(()),
-        };
-        record.bytes_we_store_for_peer = we_store;
-        record.bytes_peer_stores_for_us = peer_stores;
-        record.trust_s = trust_s;
-        self.upsert_peer(&record)?;
+        // Update PeerRecord in one transaction with its read (no lost update of fields
+        // written concurrently). No-op if device not yet in DB.
+        self.update_peer(device_id, |r| {
+            r.map(|mut record| {
+                record.bytes_we_store_for_peer = we_store;
+                record.bytes_peer_stores_for_us = peer_stores;
+                record.trust_s = trust_s;
+                record
+            })
+        })?;
         Ok(())
     }
 
@@ -2131,11 +2132,13 @@ impl Db {
         if tick_secs == 0 {
             return Ok(0);
         }
-        let peers = self.list_all_peers()?;
+        // The records are read inside the write transaction (a snapshot read before it
+        // would write back addresses, contacts and revocations committed in between).
         let mut updated = 0u64;
         let tx = self.inner.begin_write()?;
         {
             let mut table = tx.open_table(PEERS)?;
+            let peers = peers_in(&table)?;
             for mut record in peers {
                 let elapsed = now_secs.saturating_sub(record.last_avail_sample);
                 if elapsed >= tick_secs {
@@ -2147,7 +2150,11 @@ impl Db {
                 }
             }
         }
-        tx.commit()?;
+        if updated > 0 {
+            tx.commit()?;
+        } else {
+            tx.abort()?;
+        }
         Ok(updated)
     }
 
@@ -2168,11 +2175,12 @@ impl Db {
         if tick_secs == 0 {
             return Ok(0);
         }
-        let peers = self.list_all_peers()?;
+        // Read inside the write transaction, as `apply_avail_decay_batch`.
         let mut decayed = 0u64;
         let tx = self.inner.begin_write()?;
         {
             let mut table = tx.open_table(PEERS)?;
+            let peers = peers_in(&table)?;
             for mut record in peers {
                 let elapsed = now_secs.saturating_sub(record.last_avail_sample);
                 let n = (elapsed / tick_secs) as u32;
@@ -2188,6 +2196,18 @@ impl Db {
         tx.commit()?;
         Ok(decayed)
     }
+}
+
+/// Every PeerRecord of `table`, read through the caller's (write) transaction.
+fn peers_in(
+    table: &redb::Table<'_, &'static [u8; 32], &'static [u8]>,
+) -> Result<Vec<PeerRecord>, DbError> {
+    let mut out = Vec::new();
+    for row in table.iter()? {
+        let (_, v) = row?;
+        out.push(from_cbor_bytes(v.value())?);
+    }
+    Ok(out)
 }
 
 // ============================================================
@@ -3350,6 +3370,25 @@ pub mod testutil {
 
     pub fn week(n: u32) -> Timestamp {
         Timestamp(n as u64 * crate::constants::SECS_PER_WEEK)
+    }
+
+    /// A concurrent PeerRecord writer for lost-update tests: a thread that bumps
+    /// `bytes_peer_stores_for_us` of `device` `n` times, each in its own
+    /// [`Db::update_peer`] transaction. A writer under test that reads and writes back in
+    /// two transactions overwrites some bumps with its stale snapshot; one that goes
+    /// through `update_peer` loses none (the field ends at its start value + `n`).
+    pub fn bump_peer_in_thread(db: Db, device: DeviceId, n: u64) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            for _ in 0..n {
+                db.update_peer(&device, |r| {
+                    r.map(|mut rec| {
+                        rec.bytes_peer_stores_for_us += 1;
+                        rec
+                    })
+                })
+                .expect("bump");
+            }
+        })
     }
 
     /// An in-memory storage for probing tests: its writes fail while `fail` is set (a full

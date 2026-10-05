@@ -1044,38 +1044,46 @@ pub(crate) fn persist_holder_addrs_to_db(db: &Db, holder_id: DeviceId, addr_stri
     if addr_strings.is_empty() {
         return;
     }
-    match db.get_peer(&holder_id) {
-        Ok(Some(mut record)) => {
-            if record.addrs == addr_strings {
-                return; // no-op: already up to date
-            }
-            record.addrs = addr_strings;
-            if let Err(e) = db.upsert_peer(&record) {
-                tracing::warn!(
-                    holder = %holder_id,
-                    err = %e,
-                    "T-12: failed to persist holder addrs after SymbolStored"
-                );
-            } else {
-                tracing::debug!(
-                    holder = %holder_id,
-                    "T-12: persisted holder addrs from SymbolStored connection"
-                );
-            }
+    // The common case (addresses already stored) takes a read transaction only: this
+    // runs for every SymbolStored and must not queue the worker behind the write lock.
+    if let Ok(Some(r)) = db.get_peer(&holder_id)
+        && r.addrs == addr_strings
+    {
+        return;
+    }
+    // Read and write in one transaction: avail/trust written concurrently by another
+    // task are not overwritten with a stale snapshot.
+    let mut wrote = false;
+    let updated = db.update_peer(&holder_id, |r| {
+        let mut record = r?;
+        if record.addrs == addr_strings {
+            return None; // no-op: already up to date
         }
+        record.addrs = addr_strings;
+        wrote = true;
+        Some(record)
+    });
+    match updated {
+        Err(e) => {
+            tracing::warn!(
+                holder = %holder_id,
+                err = %e,
+                "T-12: failed to persist holder addrs after SymbolStored"
+            );
+        }
+        Ok(Some(_)) if wrote => {
+            tracing::debug!(
+                holder = %holder_id,
+                "T-12: persisted holder addrs from SymbolStored connection"
+            );
+        }
+        Ok(Some(_)) => {}
         Ok(None) => {
             // Peer record not yet in DB (rare: delivery happened before the PeerRecord
             // writer committed the authentication).
             tracing::debug!(
                 holder = %holder_id,
                 "T-12: PeerRecord not found after SymbolStored — on_peer_identified will update later"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                holder = %holder_id,
-                err = %e,
-                "T-12: db.get_peer failed in persist_holder_addrs_to_db"
             );
         }
     }

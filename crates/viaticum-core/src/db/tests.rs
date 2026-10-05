@@ -4619,3 +4619,54 @@ fn update_peer_without_change_writes_nothing() {
     fail.store(false, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(db.get_peer(&d).unwrap().unwrap().addrs, make_peer(d).addrs);
 }
+
+/// RMW PeerRecord (tech-debt MED, 2026-10-05): `refresh_peer_storage_bytes` writes its
+/// three fields in one transaction with the read — a concurrent writer of the same record
+/// (here `last_avail_sample`) loses nothing. Mutation "get_peer + upsert_peer" → bumps lost.
+#[test]
+fn refresh_peer_storage_bytes_keeps_concurrent_writes_to_the_record() {
+    let db = test_db();
+    let d = DeviceId([0x42u8; 32]);
+    db.upsert_peer(&make_peer(d)).unwrap();
+    let bump = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            for _ in 0..300 {
+                db.update_peer(&d, |r| {
+                    r.map(|mut rec| {
+                        rec.last_avail_sample += 1;
+                        rec
+                    })
+                })
+                .unwrap();
+            }
+        })
+    };
+    for _ in 0..300 {
+        db.refresh_peer_storage_bytes(&d).unwrap();
+    }
+    bump.join().unwrap();
+    let rec = db.get_peer(&d).unwrap().unwrap();
+    assert_eq!(rec.last_avail_sample, 300, "no bump lost");
+    assert_eq!(rec.trust_s, 1.0);
+}
+
+/// Review B1 (2026-10-05): the daily avail decay over every peer reads the records inside
+/// its write transaction — a writer committing between (an authentication's addresses, a
+/// revocation, a contact) is not overwritten with a stale snapshot. Mutation "list_all_peers
+/// before begin_write" → bumps lost.
+#[test]
+fn avail_decay_keeps_concurrent_writes_to_the_record() {
+    use crate::db::testutil::bump_peer_in_thread;
+    let db = test_db();
+    let d = DeviceId([0x43u8; 32]);
+    db.upsert_peer(&make_peer(d)).unwrap();
+    let bump = bump_peer_in_thread(db.clone(), d, 300);
+    for i in 1..=300u64 {
+        assert_eq!(db.apply_avail_decay_batch(0.1, i * 10, 1).unwrap(), 1);
+    }
+    bump.join().unwrap();
+    let rec = db.get_peer(&d).unwrap().unwrap();
+    assert_eq!(rec.bytes_peer_stores_for_us, 300, "no bump lost");
+    assert_eq!(rec.last_avail_sample, 3000);
+}

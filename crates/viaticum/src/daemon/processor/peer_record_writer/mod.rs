@@ -60,10 +60,9 @@
 // redb's writer lock elsewhere), and a concurrent `update_peer` (PeerAnnounce) just waits
 // for it.
 //
-// Lost updates. Against `update_peer` each sees the other's commit whole. Not against the
-// writers that read with `get_peer` and write back with `upsert_peer` in two transactions:
-// a batch committed between the two is overwritten. The list and why it is left as it is:
-// `Db::update_peers` in viaticum-core (`db/peer_batch`).
+// Lost updates. Against `update_peer` each sees the other's commit whole. Since 2026-10-05
+// (line B) no daemon writer reads with `get_peer` and writes back with `upsert_peer` in two
+// transactions any more (see `Db::update_peers` in viaticum-core, `db/peer_batch`).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};

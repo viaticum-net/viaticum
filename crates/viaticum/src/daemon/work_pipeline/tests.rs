@@ -2304,3 +2304,28 @@ async fn worker_iteration_delivers_only_recorded_offers() {
             .is_empty()
     );
 }
+
+/// RMW PeerRecord (tech-debt MED, 2026-10-05): T-12 writes the addresses in one
+/// transaction with its read — a concurrent writer of the same record loses nothing.
+/// Mutation "get_peer + upsert_peer" → bumps lost.
+#[test]
+fn holder_addrs_persist_keeps_concurrent_writes_to_the_record() {
+    use crate::daemon::work_pipeline::worker::persist_holder_addrs_to_db;
+    use viaticum_core::db::testutil::bump_peer_in_thread;
+    let db = make_db();
+    let holder = device_id(0xB3);
+    db.upsert_peer(&make_peer_record_no_addrs(holder)).unwrap();
+    let start = db
+        .get_peer(&holder)
+        .unwrap()
+        .unwrap()
+        .bytes_peer_stores_for_us;
+    let bump = bump_peer_in_thread(db.clone(), holder, 300);
+    for i in 0..300 {
+        persist_holder_addrs_to_db(&db, holder, vec![format!("/ip4/10.0.0.{}/tcp/4001", i % 2)]);
+    }
+    bump.join().unwrap();
+    let rec = db.get_peer(&holder).unwrap().unwrap();
+    assert_eq!(rec.bytes_peer_stores_for_us, start + 300, "no bump lost");
+    assert_eq!(rec.addrs, vec!["/ip4/10.0.0.1/tcp/4001".to_string()]);
+}
