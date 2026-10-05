@@ -99,13 +99,15 @@
 #                  VIATICUM_E2E_POINTER_POSTMEN=F from its first start ("its most trusted
 #                  friends are the three DR does not ask"). Step 7: node-05 dr_ready=true
 #                  within 15 min (FAIL otherwise; NOTE acks/held/near set and its last
-#                  `pointer kad-near set` line), then SIGKILL node-05 and F1..F3, DR onto
+#                  `pointer kad-near set` line), then SIGKILL node-05, F1..F3 lose the
+#                  pointer box (stopped, `mailbox-probe remove`, restarted: they may hold
+#                  node-05's catalog blocks, so they stay alive), DR onto
 #                  node-42 via the seed: bar P >= 1 pointer(s) and DR exit 0 (FAIL at P = 0 or
 #                  no search). DR enters through a friend outside the 20 nearest and outside F
 #                  (not the seed, which may be near): the door "the entry peer is not a
 #                  postman" is tested every run.
-#                  On a build before the union (knob only) the pointer lives only at the
-#                  killed F while dr_ready said true -> P = 0, RED: the scenario is not blind.
+#                  On a build before the union (knob only) the pointer lives only at F
+#                  (removed) while dr_ready said true -> P = 0, RED: the scenario is not blind.
 #
 # Modes (spec C-DK v3.2/v3.3 "Варианты"):
 #   MODE=main  (default) TIME_SCALE=1200, AMP=20, no CAP (48): steps 0-7, 8a/8b as NOTE.
@@ -1657,8 +1659,22 @@ if runs_step 7; then
         KN=$(sed 's/\x1b\[[0-9;]*m//g' "$(node_log "$DR_SOURCE")" | grep -a "pointer kad-near set" | tail -1 || true)
         note "node-$DR_SOURCE last near-set line: ${KN:-none (a build before the union)}"
         [ "$RDY" = true ] || fail "node-$DR_SOURCE never reported dr_ready=true in 15 min"
-        for f in "${DR63_F[@]}"; do kill_node "$f"; done
-        note "killed F = nodes ${DR63_F[*]} (node-$DR_SOURCE's trust-top) with node-$DR_SOURCE"
+        # node-05 first (no re-offer after this), then F loses the pointer box: stopped,
+        # the rendezvous entries removed from its mailbox, started again. F stays alive —
+        # it may hold node-05's catalog (SS) blocks (run 20261005-114014: two of F did,
+        # killing them made the catalog unrecoverable — not what dr-i63 tests).
+        kill_node "$DR_SOURCE"
+        RV_ADDR=$("$PROBE" rendezvous --phrase "$M_DR_SOURCE" | jq -r .address)
+        for f in "${DR63_F[@]}"; do
+            kill_node "$f"
+            sleep 1
+            RM=$("$PROBE" remove --data-dir "$(node_dir "$f")" --target "$RV_ADDR" | jq -r .removed) \
+                || fail "dr-i63: mailbox-probe remove on node-$f"
+            note "node-$f (F): removed ${RM:-?} entr(ies) of node-$DR_SOURCE's pointer box"
+            start_daemon "$f"
+        done
+        for f in "${DR63_F[@]}"; do wait_api "$f" 60 || fail "dr-i63: node-$f (F) did not come back"; done
+        note "F = nodes ${DR63_F[*]} (node-$DR_SOURCE's trust-top) back without the pointer"
     fi
     kill_node "$DR_SOURCE"
     mkdir -p "$(node_dir $DR_NODE)"
@@ -1708,9 +1724,9 @@ if runs_step 7; then
         if [ -n "$P" ] && [ "$P" -ge 1 ] && [ "$DR_RC" -ne 0 ]; then
             fail "dr-i63: DR found $P pointer(s) but exited $DR_RC"
         elif [ -n "$P" ] && [ "$P" -ge 1 ]; then
-            pass "dr-i63: DR found $P pointer(s) entering through a non-postman with node-$DR_SOURCE's trust-top dead (the near postmen hold it)"
+            pass "dr-i63: DR found $P pointer(s) entering through a non-postman with the pointer stripped from node-$DR_SOURCE's trust-top (the near postmen hold it)"
         else
-            fail "dr-i63: DR found no pointer (P=${P:-no mailbox search}) — it lived only at the killed trust-top"
+            fail "dr-i63: DR found no pointer (P=${P:-no mailbox search}) — it lived only at the trust-top (stripped)"
         fi
     fi
     VERDICT[7]="${VERDICT[7]:-}"; [ -n "${VERDICT[7]}" ] || { VERDICT[7]=NOTE; DETAIL[7]="baseline for line B, no bar"; }
