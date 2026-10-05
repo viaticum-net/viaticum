@@ -353,11 +353,15 @@ async fn waiting_for_memory_preparations_do_not_take_k_slots() {
 }
 
 /// Three marked blocks whose preparation takes 0.5 s each, all granted memory at once (the budget
-/// is free again): ONE batch, one after the other — never two preparations at once.
+/// is free again): ONE batch, one after the other — never two preparations at once. The time
+/// scale is 1: the tick's budget (720 s) cannot run out on a loaded machine. At 900 the budget
+/// is 0.8 s of real time; once `--full` saw `waiting` 0 here, which fits a first tick that cut
+/// its block at the deadline instead of marking it (the second tick then has no batch to adopt
+/// and prepares the blocks itself).
 #[tokio::test]
 async fn a_batch_prepares_its_members_one_after_the_other() {
     let encoder = StallingEncoder::new(0, usize::MAX, Duration::from_millis(500));
-    let (owner, budget) = budgeted(3, 1, Arc::clone(&encoder) as _);
+    let (owner, budget) = budgeted_at(1, 3, 1, Arc::clone(&encoder) as _);
     let hold = hold_all(&budget);
     let mut in_flight = InFlight::default();
 
