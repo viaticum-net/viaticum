@@ -93,6 +93,21 @@
 #               7. NOTE for line B (dr-i63): SIGKILL node-05, DR of its phrase onto a clean
 #                  node-42 — postmen asked/answered/pointers, Kademlia candidates, dr_ready
 #                  (runs last: it kills node-05, an X of step 8a)
+#                  DR63=1 (dr-i63, Ilya 2026-10-03) makes it a bar. Before the daemons start,
+#                  F = the 3 friends farthest from node-05's pointer box by Kademlia's metric
+#                  (`mailbox-probe rendezvous --rank`, not the seed); node-05 runs with
+#                  VIATICUM_E2E_POINTER_POSTMEN=F from its first start ("its most trusted
+#                  friends are the three DR does not ask"). Step 7: node-05 dr_ready=true
+#                  within 15 min (FAIL otherwise; NOTE acks/held/near set and its last
+#                  `pointer kad-near set` line), then SIGKILL node-05, F1..F3 lose the
+#                  pointer box (stopped, `mailbox-probe remove`, restarted: they may hold
+#                  node-05's catalog blocks, so they stay alive), DR onto
+#                  node-42 via the seed: bar P >= 1 pointer(s) and DR exit 0 (FAIL at P = 0 or
+#                  no search). DR enters through a friend outside the 20 nearest and outside F
+#                  (not the seed, which may be near): the door "the entry peer is not a
+#                  postman" is tested every run.
+#                  On a build before the union (knob only) the pointer lives only at F
+#                  (removed) while dr_ready said true -> P = 0, RED: the scenario is not blind.
 #
 # Modes (spec C-DK v3.2/v3.3 "Варианты"):
 #   MODE=main  (default) TIME_SCALE=1200, AMP=20, no CAP (48): steps 0-7, 8a/8b as NOTE.
@@ -151,6 +166,7 @@ SEED=0
 LATE=40          # the late joiner (step 5)
 DR_NODE=42       # the clean machine of step 7
 DR_SOURCE=5      # the friend whose phrase step 7 recovers
+DR63="${DR63:-0}"  # 1: step 7 is the dr-i63 bar (F = 3 farthest from the box hold the trust-top)
 IPFS_KEY_NODE=39 # carries the legacy kademlia_disable_ipfs_bootstrap = false (step 6)
 # On disk, not /tmp: /tmp on the build server is tmpfs (RAM), and 41 DEBUG logs are large.
 TEST_DIR="${TEST_DIR:-$HOME/viaticum-e2e-runs/discovery-$$}"
@@ -284,6 +300,7 @@ start_daemon() {
     mkdir -p "$(node_dir "$idx")/files"
     local envs=(RUST_LOG="$NODE_LOG_FILTER" VIATICUM_E2E_LOOPBACK_ALIASES="$AMP")
     [ -n "$CAP" ] && envs+=(VIATICUM_E2E_CONN_CAP="$CAP")
+    [ "$DR63" = 1 ] && [ "$idx" = "$DR_SOURCE" ] && envs+=(VIATICUM_E2E_POINTER_POSTMEN="$DR63_F_HEX")
     env "${envs[@]}" "$BINARY" --data-dir "$(node_dir "$idx")" daemon \
         --time-scale "$TIME_SCALE" --watch-dir "$(node_dir "$idx")/files" \
         >> "$(node_log "$idx")" 2>&1 &
@@ -886,6 +903,14 @@ if ! command -v "$BINARY" &>/dev/null; then
     [ -x "$BINARY" ] || { echo "FAIL(setup): viaticum binary not found (./rbuild.sh)"; exit 2; }
 fi
 NET_PROBE="$(cd "$(dirname "$(command -v "$BINARY")")" && pwd)/net-probe"
+PROBE="$(cd "$(dirname "$(command -v "$BINARY")")" && pwd)/mailbox-probe"
+TRUST_TOOL="$(cd "$(dirname "$(command -v "$BINARY")")" && pwd)/bootstrap-trust"
+if [ "$DR63" = 1 ]; then
+    [ -x "$PROBE" ] && [ -x "$TRUST_TOOL" ] \
+        || { echo "FAIL(setup): DR63=1 needs mailbox-probe and bootstrap-trust next to $BINARY"; exit 2; }
+fi
+DR63_F=()        # node indices of F (DR63=1)
+DR63_F_HEX=""    # their device ids, comma-separated (the knob's value)
 
 # shellcheck source=experiments/e2e_lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/e2e_lib.sh"
@@ -939,6 +964,35 @@ for i in $(seq 0 $NUM_FRIENDS); do
 done
 M_DR_SOURCE=$(grep -A1 "^Mnemonic" "$TEST_DIR/logs/init-$DR_SOURCE.out" | tail -1 | sed 's/^ *//' || true)
 [ "$(echo "$M_DR_SOURCE" | wc -w)" -eq 24 ] || setup_fail "node-$DR_SOURCE init printed no 24-word phrase"
+if [ "$DR63" = 1 ]; then
+    # dr-i63: F = the 3 friends farthest from node-05's box (not the seed, not node-05).
+    declare -A HEX_IDX
+    RANK_ARGS=()
+    for i in $(seq 1 $NUM_FRIENDS); do
+        [ "$i" = "$DR_SOURCE" ] && continue
+        h=$("$TRUST_TOOL" identity-show --data-dir "$(node_dir "$i")" | jq -r .device_id) \
+            || setup_fail "identity-show node-$i"
+        HEX_IDX[$h]=$i
+        RANK_ARGS+=(--rank "$h")
+    done
+    RANKED=$("$PROBE" rendezvous --phrase "$M_DR_SOURCE" "${RANK_ARGS[@]}" | jq -r '.ranked[]') \
+        || setup_fail "mailbox-probe rendezvous --rank"
+    for h in $(echo "$RANKED" | tail -3); do DR63_F+=("${HEX_IDX[$h]}"); done
+    DR63_F_HEX=$(echo "$RANKED" | tail -3 | paste -sd, -)
+    [ "${#DR63_F[@]}" -eq 3 ] || setup_fail "dr-i63: could not pick F"
+    # Is the seed itself among the 20 nearest of the box? Then P >= 1 may come from the
+    # seed alone, and the door "the seed is not a postman" is not tested by this run.
+    SEED_HEX=$("$TRUST_TOOL" identity-show --data-dir "$(node_dir "$SEED")" | jq -r .device_id) \
+        || setup_fail "identity-show seed"
+    SEED_POS=$("$PROBE" rendezvous --phrase "$M_DR_SOURCE" "${RANK_ARGS[@]}" --rank "$SEED_HEX" \
+        | jq -r --arg s "$SEED_HEX" '.ranked | index($s)') || setup_fail "mailbox-probe rendezvous --rank (seed)"
+    echo "  dr-i63: the seed is #$(( SEED_POS + 1 )) nearest of $(( ${#RANK_ARGS[@]} / 2 + 1 )) to node-$DR_SOURCE's box"
+    # DR's --peer (step 7): the first live friend from rank 22 on (outside the 20 nearest,
+    # the seed may shift ranks by one) and before F, so DR's entry point is not a postman.
+    DR63_ENTRY=()
+    for h in $(echo "$RANKED" | sed -n '22,$p' | head -n -3); do DR63_ENTRY+=("${HEX_IDX[$h]}"); done
+    echo "  dr-i63: node-$DR_SOURCE's trust-top = F = nodes ${DR63_F[*]} (farthest from its box)"
+fi
 # Seed: fixed port, the infrastructure role (C-DK v3.2/v3.3; ignored by builds before C4)
 # with the external address R2 will require next to it (unknown key, ignored in C-DK).
 seed_network_lines() { printf 'relay_role = "punch"\nexternal_addrs = ["/ip4/127.0.0.1/tcp/%s"]' "$1"; }
@@ -1591,15 +1645,54 @@ run_8c() {
 }
 if runs_step 8c && [ "$SKIP_8BC" = 0 ]; then run_8c; fi
 
-# ── STEP 7: DR ONTO A CLEAN MACHINE (NOTE for line B) ───────────────────────
+# ── STEP 7: DR ONTO A CLEAN MACHINE (NOTE for line B; a bar with DR63=1) ────
 if runs_step 7; then
     step 7 "NOTE for line B (dr-i63): DR of node-$DR_SOURCE's phrase onto a clean node-$DR_NODE"
+    if [ "$DR63" = 1 ]; then
+        RDY=false
+        for t in $(seq 1 180); do
+            RDY=$(status_num "$DR_SOURCE" dr_ready)
+            [ "$RDY" = true ] && break
+            sleep 5
+        done
+        note "node-$DR_SOURCE before the kill: dr_ready=$RDY acks=$(status_num "$DR_SOURCE" dr_pointer_acks) held=$(status_num "$DR_SOURCE" dr_pointer_held) near_set=$(status_num "$DR_SOURCE" dr_pointer_near_set) threshold=$(status_num "$DR_SOURCE" dr_pointer_ack_threshold)"
+        KN=$(sed 's/\x1b\[[0-9;]*m//g' "$(node_log "$DR_SOURCE")" | grep -a "pointer kad-near set" | tail -1 || true)
+        note "node-$DR_SOURCE last near-set line: ${KN:-none (a build before the union)}"
+        [ "$RDY" = true ] || fail "node-$DR_SOURCE never reported dr_ready=true in 15 min"
+        # node-05 first (no re-offer after this), then F loses the pointer box: stopped,
+        # the rendezvous entries removed from its mailbox, started again. F stays alive —
+        # it may hold node-05's catalog (SS) blocks (run 20261005-114014: two of F did,
+        # killing them made the catalog unrecoverable — not what dr-i63 tests).
+        kill_node "$DR_SOURCE"
+        RV_ADDR=$("$PROBE" rendezvous --phrase "$M_DR_SOURCE" | jq -r .address)
+        for f in "${DR63_F[@]}"; do
+            kill_node "$f"
+            sleep 1
+            RM=$("$PROBE" remove --data-dir "$(node_dir "$f")" --target "$RV_ADDR" | jq -r .removed) \
+                || fail "dr-i63: mailbox-probe remove on node-$f"
+            note "node-$f (F): removed ${RM:-?} entr(ies) of node-$DR_SOURCE's pointer box"
+            start_daemon "$f"
+        done
+        for f in "${DR63_F[@]}"; do wait_api "$f" 60 || fail "dr-i63: node-$f (F) did not come back"; done
+        note "F = nodes ${DR63_F[*]} (node-$DR_SOURCE's trust-top) back without the pointer"
+    fi
     kill_node "$DR_SOURCE"
     mkdir -p "$(node_dir $DR_NODE)"
     DR_LOG="$TEST_DIR/logs/dr-$DR_NODE.log"
     set +e
+    DR_PEER_ADDR="$SEED_ADDR"
+    if [ "$DR63" = 1 ]; then
+        DR_PEER_ADDR=""; DR63_PEER=""
+        for e in "${DR63_ENTRY[@]}"; do
+            [ "${ALIVE[$e]:-0}" = 1 ] || continue
+            a=$(api_get "$e" /api/status | jq -r '.node_addr // ""' 2>/dev/null || true)
+            if [[ "$a" == /ip*/p2p/* ]]; then DR_PEER_ADDR="$a"; DR63_PEER="$e"; break; fi
+        done
+        [ -n "$DR_PEER_ADDR" ] || { fail "dr-i63: no live non-near friend for DR's --peer"; DR_PEER_ADDR="$SEED_ADDR"; }
+        note "DR enters through node-${DR63_PEER:-seed} ($DR_PEER_ADDR); the seed is #$(( SEED_POS + 1 )) nearest to the box"
+    fi
     RUST_LOG=info timeout 900 "$BINARY" --data-dir "$(node_dir $DR_NODE)" dr --mnemonic "$M_DR_SOURCE" \
-        --peer "$SEED_ADDR" > "$DR_LOG" 2>&1
+        --peer "$DR_PEER_ADDR" > "$DR_LOG" 2>&1
     DR_RC=$?
     set -e
     DRP=$(sed 's/\x1b\[[0-9;]*m//g' "$DR_LOG")
@@ -1623,6 +1716,17 @@ if runs_step 7; then
             note "dr_ready of the recovered node-$DR_NODE: $RDY"
         else
             note "the recovered node-$DR_NODE daemon does not answer"
+        fi
+    fi
+    if [ "$DR63" = 1 ]; then
+        P=$(grep -aoE "Mailbox search: asked [0-9]+ postmen, [0-9]+ answered, [0-9]+ pointer" <<< "$DRP" \
+            | tail -1 | grep -oE '[0-9]+ pointer' | grep -oE '[0-9]+' || true)
+        if [ -n "$P" ] && [ "$P" -ge 1 ] && [ "$DR_RC" -ne 0 ]; then
+            fail "dr-i63: DR found $P pointer(s) but exited $DR_RC"
+        elif [ -n "$P" ] && [ "$P" -ge 1 ]; then
+            pass "dr-i63: DR found $P pointer(s) entering through a non-postman with the pointer stripped from node-$DR_SOURCE's trust-top (the near postmen hold it)"
+        else
+            fail "dr-i63: DR found no pointer (P=${P:-no mailbox search}) — it lived only at the trust-top (stripped)"
         fi
     fi
     VERDICT[7]="${VERDICT[7]:-}"; [ -n "${VERDICT[7]}" ] || { VERDICT[7]=NOTE; DETAIL[7]="baseline for line B, no bar"; }

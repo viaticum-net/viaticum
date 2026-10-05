@@ -1,8 +1,10 @@
 // restore-i26: a round nobody answered is not a verdict.
 //
 // Right after `viaticum dr`, or when the owner's Wi-Fi drops for ten seconds in the
-// middle of a long restore, every request fails at once (`send_to_device` does not
-// dial: no live connection → `PeerNotAuthenticated`). Without a retry the job would
+// middle of a long restore, every request fails at once: since C4 `send_to_device`
+// dials a peer without a live connection, but with the network gone each dial fails
+// (`Unreachable`, then the negative cache answers at once) and a holder without a
+// usable address is `PeerNotAuthenticated` right away. Without a retry the job would
 // give up every remaining block in milliseconds. So when a round of a block's fetch
 // gives nothing new and some holder did not answer (`RoundEnd::NoAnswer`, also when
 // others answered empty, restore-i33), the coordinator redials the block's holders

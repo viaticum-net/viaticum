@@ -109,10 +109,13 @@ fn record(
     }
 }
 
+/// The acking postmen of `record` (0xE0..) are the Kademlia-near set, six of them:
+/// threshold 3 (dr-i63).
 fn meta(current: Option<PlacePublication>, other: Option<PlacePublication>) -> PointerPublications {
     PointerPublications {
         current,
         other,
+        kad_near: (0..6).map(|i| DeviceId([0xE0 + i as u8; 32])).collect(),
         ..PointerPublications::new(CatalogLineageId([1; 16]))
     }
 }
@@ -183,7 +186,7 @@ fn readiness_needs_acks_and_every_block_recoverable() {
         })
         .unwrap();
     }
-    assert_eq!(pointer_readiness(&db, 6, NOW, 1).unwrap().accepted, None);
+    assert_eq!(pointer_readiness(&db, NOW, 1).unwrap().accepted, None);
     let base = block_of_strength(&db, 5, 3);
     let d1 = block_of_strength(&db, 6, 1);
     let d2 = ss_record(&db, 7);
@@ -193,15 +196,15 @@ fn readiness_needs_acks_and_every_block_recoverable() {
         None,
     );
     db.put_pointer_publications(&m).unwrap();
-    let r = pointer_readiness(&db, 6, NOW, 1).unwrap();
+    let r = pointer_readiness(&db, NOW, 1).unwrap();
     assert_eq!((r.blocks_placed, r.blocks_total, r.ready), (2, 3, false));
     assert_eq!(r.accepted, Some((100, 1, 3)));
     hold(&db, d2, 0x71, 4, NOW);
-    assert!(pointer_readiness(&db, 6, NOW, 1).unwrap().ready);
+    assert!(pointer_readiness(&db, NOW, 1).unwrap().ready);
     // Two acks < 3.
     m.current.as_mut().unwrap().acks.truncate(2);
     db.put_pointer_publications(&m).unwrap();
-    assert!(!pointer_readiness(&db, 6, NOW, 1).unwrap().ready);
+    assert!(!pointer_readiness(&db, NOW, 1).unwrap().ready);
     // A newer, unacked record: the older accepted one is what is reported.
     let newer = block_of_strength(&db, 8, 3);
     let m2 = meta(
@@ -209,7 +212,7 @@ fn readiness_needs_acks_and_every_block_recoverable() {
         Some(record(PointerPlace::A, base, vec![d1, d2], 100, 3)),
     );
     db.put_pointer_publications(&m2).unwrap();
-    let r = pointer_readiness(&db, 6, NOW, 1).unwrap();
+    let r = pointer_readiness(&db, NOW, 1).unwrap();
     assert_eq!(r.accepted, Some((100, 1, 3)));
     assert!(r.ready);
 }
@@ -228,14 +231,14 @@ fn readiness_stands_on_the_kept_envelope_until_it_expires() {
         generation: 1,
         created_at: Timestamp(100),
         files: 7,
-        acks: 3,
+        acked: (0..3).map(|i| DeviceId([0xE0 + i as u8; 32])).collect(),
         expires_at: NOW + 1,
     });
     db.put_pointer_publications(&meta(Some(cur), None)).unwrap();
-    let r = pointer_readiness(&db, 6, NOW, 1).unwrap();
+    let r = pointer_readiness(&db, NOW, 1).unwrap();
     assert_eq!(r.accepted, Some((100, 7, 3)));
     assert_eq!((r.blocks_total, r.ready), (1, true));
-    let r = pointer_readiness(&db, 6, NOW + 1, 1).unwrap();
+    let r = pointer_readiness(&db, NOW + 1, 1).unwrap();
     assert_eq!(r.accepted, Some((200, 1, 1)), "the kept envelope expired");
     assert!(!r.ready);
 }
@@ -255,7 +258,7 @@ fn readiness_holds_on_the_other_place_while_a_new_base_collects_acks() {
             Some(record(PointerPlace::A, old, vec![], 100, 3)),
         ))
         .unwrap();
-        let r = pointer_readiness(&db, 6, NOW, 1).unwrap();
+        let r = pointer_readiness(&db, NOW, 1).unwrap();
         assert!(
             r.ready,
             "{acks} ack(s) on the new base: place A is restorable"
@@ -273,7 +276,7 @@ fn readiness_holds_on_the_other_place_while_a_new_base_collects_acks() {
         Some(record(PointerPlace::A, old, vec![], 100, 3)),
     ))
     .unwrap();
-    let r = pointer_readiness(&db, 6, NOW, 1).unwrap();
+    let r = pointer_readiness(&db, NOW, 1).unwrap();
     assert_eq!(
         (r.ready, r.restores_state_of),
         (true, Some(200)),
@@ -288,7 +291,7 @@ fn readiness_holds_on_the_other_place_while_a_new_base_collects_acks() {
         Some(record(PointerPlace::A, gone, vec![], 100, 3)),
     ))
     .unwrap();
-    let r = pointer_readiness(&db, 6, NOW, 1).unwrap();
+    let r = pointer_readiness(&db, NOW, 1).unwrap();
     assert_eq!((r.ready, r.restores_state_of), (false, None));
     assert_eq!(r.accepted, Some((200, 1, 2)));
 }
@@ -507,7 +510,7 @@ fn keep_set_holds_both_places_their_retire_lists_and_the_candidate() {
         generation: 1,
         created_at: Timestamp(9),
         files: 1,
-        acks: 3,
+        acked: vec![],
         expires_at: NOW,
     });
     let m = meta(
@@ -539,4 +542,87 @@ fn retire_skips_blocks_no_longer_in_ss_ledger() {
     assert!(db.get_source_block(&user).unwrap().is_some());
     // A second sweep finds nothing more to retire.
     assert_eq!(sweep_ss_ledger(&db, dir.path(), Some(&m), None).unwrap(), 0);
+}
+
+// ─── dr-i63: the threshold counts the Kademlia-near set (Ilya 2026-10-03) ─────────
+
+/// Three acks of the owner's trust-top, none of them among the postmen DR asks: the
+/// pointer is held (shown, `held` = 3) but DR is not ready; three near acks make it ready.
+#[test]
+fn readiness_counts_only_acks_of_kad_near() {
+    let db = test_db();
+    let base = block_of_strength(&db, 5, 3);
+    let mut m = meta(Some(record(PointerPlace::A, base, vec![], 100, 3)), None);
+    m.kad_near = (0..20).map(|i| DeviceId([0x10 + i as u8; 32])).collect();
+    db.put_pointer_publications(&m).unwrap();
+    let r = pointer_readiness(&db, NOW, 1).unwrap();
+    assert_eq!(r.accepted, Some((100, 1, 0)), "held, 0 of the near set");
+    assert_eq!((r.held, r.near_set, r.threshold), (3, 20, 3));
+    assert!(!r.ready);
+    m.kad_near[..3].copy_from_slice(&m.current.as_ref().unwrap().acks[..3]);
+    db.put_pointer_publications(&m).unwrap();
+    let r = pointer_readiness(&db, NOW, 1).unwrap();
+    assert_eq!(r.accepted, Some((100, 1, 3)));
+    assert!(r.ready);
+}
+
+/// dr-i39 over the near set: four near peers → half of them (2) is enough.
+#[test]
+fn threshold_follows_kad_near_size_in_small_circle() {
+    let db = test_db();
+    let base = block_of_strength(&db, 5, 3);
+    let mut m = meta(Some(record(PointerPlace::A, base, vec![], 100, 2)), None);
+    m.kad_near.truncate(4);
+    db.put_pointer_publications(&m).unwrap();
+    let r = pointer_readiness(&db, NOW, 1).unwrap();
+    assert_eq!((r.threshold, r.ready), (2, true));
+}
+
+/// A META written before dr-i63 has no near set: nothing counts, not ready (until the
+/// first publisher tick looks the set up).
+#[test]
+fn meta_without_kad_near_is_not_ready() {
+    let db = test_db();
+    let base = block_of_strength(&db, 5, 3);
+    let mut m = meta(Some(record(PointerPlace::A, base, vec![], 100, 3)), None);
+    m.kad_near.clear();
+    db.put_pointer_publications(&m).unwrap();
+    let r = pointer_readiness(&db, NOW, 1).unwrap();
+    assert!(!r.ready);
+    assert_eq!(r.held, 3);
+}
+
+/// dr-i63 + dr-i52 (review W2): the kept envelope counts only its acks still in the
+/// near set — the near set moved on, the kept envelope no longer makes DR ready.
+#[test]
+fn kept_envelope_counts_only_acks_still_near() {
+    let db = test_db();
+    let base = block_of_strength(&db, 5, 3);
+    let mut cur = record(PointerPlace::A, base, vec![], 200, 0);
+    cur.reached = Some(ReachedEnvelope {
+        diffs: vec![],
+        generation: 1,
+        created_at: Timestamp(100),
+        files: 7,
+        acked: (0..3).map(|i| DeviceId([0xE0 + i as u8; 32])).collect(),
+        expires_at: NOW + 1,
+    });
+    let mut m = meta(Some(cur), None);
+    db.put_pointer_publications(&m).unwrap();
+    assert!(pointer_readiness(&db, NOW, 1).unwrap().ready);
+    m.kad_near = (0..6).map(|i| DeviceId([0x30 + i as u8; 32])).collect();
+    db.put_pointer_publications(&m).unwrap();
+    let r = pointer_readiness(&db, NOW, 1).unwrap();
+    assert!(!r.ready, "the kept envelope's postmen left the near set");
+    assert_eq!((r.accepted.map(|a| a.2), r.held), (Some(0), 3));
+}
+
+/// Review W8: a poor lookup (2 near peers) in a circle of many known peers does not make
+/// one ack enough.
+#[test]
+fn threshold_never_below_the_known_circle() {
+    assert_eq!(dr_ack_threshold(2, 40), 3);
+    assert_eq!(dr_ack_threshold(20, 3), 3);
+    assert_eq!(dr_ack_threshold(3, 3), 2);
+    assert_eq!(dr_ack_threshold(0, 0), 1);
 }

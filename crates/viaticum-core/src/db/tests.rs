@@ -4540,7 +4540,7 @@ fn pointer_publications_roundtrip() {
             generation: 2,
             created_at: Timestamp(60),
             files: 4,
-            acks: 3,
+            acked: vec![DeviceId([7; 32])],
             expires_at: 900,
         }),
     };

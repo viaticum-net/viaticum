@@ -370,3 +370,30 @@ async fn send_to_device_dials_for_peer_announce_without_touch() {
         "cert done, NO app activity, nothing in flight"
     );
 }
+
+/// dr-i63 (review W5): a Kademlia-near postman may have no PeerRecord. `send_to_device`
+/// has nothing to dial; `send_to_device_via` dials the lookup's address (here with a
+/// terminal `/p2p/`, as kad may return it) and delivers. Mutation "addrs dropped" →
+/// `PeerNotAuthenticated`.
+#[tokio::test]
+async fn send_via_dials_a_stranger_by_the_given_address() {
+    let (b, addr_b) = acking_peer(197).await;
+    let mut cfg = cached_config(196, 48, 10_000);
+    let _dir = with_book(&mut cfg, 196, &[]);
+    let (a, _ev) = SwarmHandle::start(cfg).await.expect("A");
+
+    let r = a.send_to_device(b.device_id, app_message()).await;
+    assert!(
+        matches!(r, Err(SwarmError::PeerNotAuthenticated(_))),
+        "no record, no address: {r:?}"
+    );
+    let with_peer: Multiaddr = format!("{addr_b}/p2p/{}", b.peer_id).parse().unwrap();
+    let r = a
+        .send_to_device_via(b.device_id, vec![with_peer], app_message())
+        .await;
+    assert!(
+        matches!(r, Ok(Message::Ack(_))),
+        "delivered by the given address: {r:?}"
+    );
+    wait_auth(&b, a.device_id, true).await;
+}

@@ -294,6 +294,8 @@ fn make_status_zero_peers() -> StatusData {
         dr_pointer_published_at: 0,
         dr_pointer_files: 0,
         dr_pointer_acks: 0,
+        dr_pointer_held: 0,
+        dr_pointer_near_set: 0,
         catalog_lineage: String::new(),
         files_without_source: 0,
         dr_ready: false,
@@ -540,6 +542,8 @@ fn format_status_top_peers_printed() {
         dr_pointer_published_at: 0,
         dr_pointer_files: 0,
         dr_pointer_acks: 0,
+        dr_pointer_held: 0,
+        dr_pointer_near_set: 0,
         catalog_lineage: String::new(),
         files_without_source: 0,
         dr_ready: false,
@@ -1022,6 +1026,8 @@ fn cli_response_roundtrips_cbor() {
             dr_pointer_published_at: 0,
             dr_pointer_files: 0,
             dr_pointer_acks: 0,
+            dr_pointer_held: 0,
+            dr_pointer_near_set: 0,
             catalog_lineage: String::new(),
             files_without_source: 0,
             dr_ready: false,
@@ -1691,6 +1697,7 @@ fn status_render_says_dr_ready_with_time_files_and_acks() {
     data.dr_pointer_published_at = 1_790_000_000;
     data.dr_pointer_files = 3;
     data.dr_pointer_acks = 2;
+    data.dr_pointer_near_set = 3;
     data.dr_ready = true;
     let rendered = output::render_status(&data);
     assert!(
@@ -1698,7 +1705,7 @@ fn status_render_says_dr_ready_with_time_files_and_acks() {
         "got: {rendered}"
     );
     assert!(
-        rendered.contains("3 files, accepted by 2 peer(s)"),
+        rendered.contains("3 files, accepted by 2 of the 3 nodes DR will ask"),
         "got: {rendered}"
     );
 }
@@ -1711,6 +1718,8 @@ fn status_render_says_not_ready_with_acks_needed_and_unplaced_catalog_blocks() {
     data.dr_pointer_published_at = 1_790_000_000;
     data.dr_pointer_files = 3;
     data.dr_pointer_acks = 1;
+    data.dr_pointer_held = 4;
+    data.dr_pointer_near_set = 20;
     data.dr_pointer_ack_threshold = 3;
     data.dr_ss_blocks_placed = 1;
     data.dr_ss_blocks_total = 2;
@@ -1720,7 +1729,7 @@ fn status_render_says_not_ready_with_acks_needed_and_unplaced_catalog_blocks() {
         "got: {rendered}"
     );
     assert!(
-        rendered.contains("accepted by 1 of the 3 friends needed"),
+        rendered.contains("accepted by 1 of the 20 nodes DR will ask (3 needed; held by 4 in all)"),
         "got: {rendered}"
     );
     assert!(
