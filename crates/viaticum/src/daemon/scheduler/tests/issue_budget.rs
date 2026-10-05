@@ -86,9 +86,11 @@ fn issue_budget_is_a_fifth_of_the_scaled_pos_period() {
 /// of the last publishes by this test-only caller, and scheduling slack) having issued
 /// part of them and deferred the rest; every later call issues more, and all 1000 are
 /// issued (nothing starves). The clock is the paused one of the runtime: the publishes sleep
-/// their 20-50 ms and the tick's deadline waits run on it, so the time a call "takes" is the
-/// model's and not the load of the machine (a 2 s hiccup of a loaded CPU was a flake; the
-/// blocking preparations hold the auto-advance back while they run).
+/// their 20-50 ms, and the tick's deadline waits AND its budget check (`started`, the slowest
+/// block) run on it, so the time a call "takes" is the model's and not the load of the machine.
+/// The budget check on the wall clock was the flake: on a loaded gate every block took long in
+/// real time, a call issued one block and "not all 1000 issued after 60 calls" (78 of 400 runs
+/// at 120 in parallel). The blocking preparations hold the auto-advance back while they run.
 #[tokio::test(start_paused = true)]
 async fn issue_tick_stops_at_its_budget_and_later_ticks_issue_the_rest() {
     const DUE: usize = 1000;
@@ -177,13 +179,15 @@ async fn issue_tick_stops_at_its_budget_and_later_ticks_issue_the_rest() {
 /// the publish slots (block 1: 8, block 2: 1), waits for a free one at most until its
 /// budget (800 ms at time_scale 900) ends, and returns within the budget plus one block
 /// encode, its publishes still in flight and nothing pending yet. They settle afterwards.
-#[tokio::test]
+/// Paused time: the 2 s publishes and the budget are the runtime's clock, so a loaded
+/// machine cannot stop the tick before block 2 (the slots would not fill).
+#[tokio::test(start_paused = true)]
 async fn issue_tick_returns_before_its_slow_publishes_settle() {
     let owner = owner_with_due(5, 8, 900, SlowPostman::acking_after(Duration::from_secs(2)));
     let budget = issue_budget(3600, 900);
     let mut in_flight = InFlight::default();
 
-    let t = Instant::now();
+    let t = tokio::time::Instant::now();
     owner
         .scheduler
         .issue_tick(&mut in_flight)
@@ -217,9 +221,10 @@ async fn issue_tick_returns_before_its_slow_publishes_settle() {
 
 /// W-1: a placement whose challenge is still being published gets no second one. One
 /// block of 8 holders (fewer than the publish slots): the first tick starts all 8 and
-/// returns; the second finds all 8 in flight and starts none. The time scale is 1: the tick's
-/// budget (720 s) cannot run out on a loaded machine before the 8 are started.
-#[tokio::test]
+/// returns; the second finds all 8 in flight and starts none. The time scale is 1 (budget
+/// 720 s) and the time is paused: neither a loaded machine nor the 2 s publishes can end the
+/// tick before the 8 are started, or settle them before the second tick.
+#[tokio::test(start_paused = true)]
 async fn a_placement_being_published_gets_no_second_challenge() {
     let owner = owner_with_due(1, 8, 1, SlowPostman::acking_after(Duration::from_secs(2)));
     let mut in_flight = InFlight::default();

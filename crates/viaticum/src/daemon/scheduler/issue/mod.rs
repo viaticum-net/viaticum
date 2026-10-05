@@ -322,7 +322,10 @@ impl Scheduler {
     /// slowest_block_ms, cpw_min, cpw_max, and — over the publishes settled since the
     /// previous line — zero_ack and slowest_publish_ms.
     pub(crate) async fn issue_tick(&self, in_flight: &mut InFlight) -> anyhow::Result<()> {
-        let started = Instant::now();
+        // The budget is measured on the runtime's clock, the same one its `deadline` waits on
+        // (in production it is the wall clock; a test on paused time sees the model's time,
+        // not the load of the machine).
+        let started = tokio::time::Instant::now();
         // The same moment on the batch's clock (spec v3.7a: a batch starts no member past 0.9 of
         // a period from here).
         let tick_start = (self.batch_clock)();
@@ -562,7 +565,7 @@ impl Scheduler {
                     attempted.insert((e.source_block_id, e.holder_id), tick_now);
                 }
             }
-            let block_started = Instant::now();
+            let block_started = tokio::time::Instant::now();
 
             let cpw_of: HashMap<DeviceId, u32> =
                 block_entries.iter().map(|e| (e.holder_id, e.cpw)).collect();
