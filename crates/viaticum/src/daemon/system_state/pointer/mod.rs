@@ -53,7 +53,7 @@ use viaticum_core::types::{
 };
 
 use super::publish::{self, PointerCatalog};
-use super::strength::{dr_ack_threshold, place_for_new_base, sweep_ss_ledger};
+use super::strength::{KAD_NEAR_K, dr_ack_threshold, place_for_new_base, sweep_ss_ledger};
 use super::{log_refusal, pointer_refresh_interval_secs};
 use crate::daemon::mailbox::routing::{MailboxRouter, NearPeer, PublishOutcome, PublishVerdict};
 
@@ -121,7 +121,6 @@ impl PointerPublisher<'_> {
         };
         // dr-i63: the postmen DR asks — this tick's Kademlia lookup of the box; an
         // empty or failed lookup keeps the last set.
-        let near = self.refresh_kad_near(&mut meta).await;
         let known_peers = match self.db.list_all_peers() {
             Ok(p) => p.len(),
             Err(e) => {
@@ -129,6 +128,7 @@ impl PointerPublisher<'_> {
                 0
             }
         };
+        let near = self.refresh_kad_near(&mut meta, known_peers).await;
         let threshold = dr_ack_threshold(meta.kad_near.len(), known_peers);
 
         // 1-2. A new envelope for the running base, when due.
@@ -441,8 +441,16 @@ impl PointerPublisher<'_> {
     /// dr-i63: look up the Kademlia-near peers of the box and keep them in META's
     /// `kad_near`. An empty or failed lookup keeps the last set (a lookup that found
     /// nobody does not make every place unready), and this tick sends to it without
-    /// lookup addresses — the address book's (review W6). Returns this tick's near peers.
-    async fn refresh_kad_near(&self, meta: &mut PointerPublications) -> Vec<NearPeer> {
+    /// lookup addresses — the address book's (review W6). So does a POOR answer (fewer
+    /// than half of `min(known peers, K)`, a node that sees 1-2 peers after a restart or
+    /// on another network) while a set is kept: it would make readiness blink until the
+    /// next tick; this tick then sends to the kept set and to the answer's peers (code
+    /// review W-2). Returns this tick's near peers.
+    async fn refresh_kad_near(
+        &self,
+        meta: &mut PointerPublications,
+        known_peers: usize,
+    ) -> Vec<NearPeer> {
         let kept = |meta: &PointerPublications| -> Vec<NearPeer> {
             meta.kad_near
                 .iter()
@@ -466,8 +474,26 @@ impl PointerPublisher<'_> {
             );
             return kept(meta);
         }
+        let poor = near.len() < known_peers.min(KAD_NEAR_K).div_ceil(2);
+        if poor && !meta.kad_near.is_empty() {
+            info!(
+                answer = near.len(),
+                kept = meta.kad_near.len(),
+                known_peers,
+                "system_state push: poor Kademlia answer for the pointer box; the last near set is kept"
+            );
+            let mut out = near;
+            for p in kept(meta) {
+                if !out.iter().any(|q| q.device == p.device) {
+                    out.push(p);
+                }
+            }
+            return out;
+        }
         let devices: Vec<DeviceId> = near.iter().map(|p| p.device).collect();
-        if devices != meta.kad_near {
+        let same = devices.len() == meta.kad_near.len()
+            && devices.iter().all(|d| meta.kad_near.contains(d));
+        if !same {
             let unknown = devices
                 .iter()
                 .filter(|d| matches!(self.db.get_peer(d), Ok(None)))

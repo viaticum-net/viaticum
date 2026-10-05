@@ -1209,23 +1209,23 @@ async fn trust_acks_alone_do_not_reach_the_threshold_and_the_offer_repeats() {
 /// the envelope goes again — byte-identical — to the newcomers of the set (Р.6).
 #[tokio::test]
 async fn node_leaving_kad_near_stops_counting_and_the_offer_resumes() {
-    let f = fx_near(29, 3..23);
+    let f = fx_near(43, 3..23);
     let b1 = f.block(1, 3);
     let t = now();
     f.tick(1, &b1, &[], t).await;
     let first = f.meta().current.unwrap().entry_cbor;
     assert!(f.near_acks() >= 3);
-    f.set_near(23..29);
+    f.set_near(23..43);
     f.tick(1, &b1, &[], t + 1).await;
     let m = f.meta();
-    assert_eq!(m.kad_near, f.devices[23..29].to_vec());
+    assert_eq!(m.kad_near, f.devices[23..43].to_vec());
     assert_eq!(
         m.current.as_ref().unwrap().entry_cbor,
         first,
         "the same envelope"
     );
     assert!(f.near_acks() >= 3, "the newcomers acked it");
-    assert!((23..29).filter(|&i| !f.held_at(i).is_empty()).count() >= 3);
+    assert!((23..43).filter(|&i| !f.held_at(i).is_empty()).count() >= 3);
 }
 
 /// A lookup that finds nobody, or fails, keeps the last near set.
@@ -1321,4 +1321,65 @@ async fn failed_lookup_sends_to_the_last_near_set() {
     assert_eq!(via.len(), 20, "sent to the kept near set");
     assert!(via.iter().all(|(_, a)| a.is_empty()), "no lookup addresses");
     assert!(f.near_acks() >= 3);
+}
+
+/// Code review W-1: a displaced base is retired only once the new record has the
+/// threshold of NEAR acks — trust-top acks alone (the near postmen still hold the old
+/// pointer, DR finds it) keep its SS blocks. Mutation "retire by all acks" → retired.
+#[tokio::test]
+async fn displaced_base_waits_for_near_acks_not_trust_acks() {
+    let f = fx_near(23, 3..23);
+    let b0 = f.block(1, 6);
+    let base1 = f.block(2, 1);
+    two_places(&f, base1, b0);
+    f.answering(Some(3));
+    let t = now();
+    let base2 = f.block(3, 1);
+    f.tick(1, &base2, &[], t).await;
+    let m = f.meta();
+    assert_eq!(m.current.as_ref().unwrap().acks.len(), 3);
+    assert_eq!(f.near_acks(), 0);
+    assert!(f.in_ledger(&base1), "trust-top acks only: base1 waits");
+    assert_eq!(m.current.as_ref().unwrap().to_retire.len(), 1);
+    f.answering(None);
+    f.tick(1, &base2, &[], t + 1).await;
+    assert!(f.near_acks() >= 3);
+    assert!(!f.in_ledger(&base1), "near threshold reached: retired");
+}
+
+/// Code review W-2: a poor answer (2 peers while 23 are known) does not replace the near
+/// set — readiness does not blink; the tick still sends to the kept set.
+#[tokio::test]
+async fn poor_lookup_answer_keeps_the_near_set_and_readiness() {
+    use crate::daemon::system_state::strength::pointer_readiness;
+    let f = fx_near(23, 3..23);
+    let b1 = f.block(1, 3);
+    let t = now();
+    f.tick(1, &b1, &[], t).await;
+    let set = f.meta().kad_near;
+    assert!(pointer_readiness(&f.db, t, 1).unwrap().ready);
+    f.set_near(3..5);
+    f.tick(1, &b1, &[], t + 1).await;
+    assert_eq!(
+        f.meta().kad_near,
+        set,
+        "the poor answer is not the near set"
+    );
+    assert!(pointer_readiness(&f.db, t + 1, 1).unwrap().ready);
+}
+
+/// W8 wired into the tick and readiness: a first lookup of only 2 peers (23 known) is
+/// the near set, but the threshold stays 3 — two near acks are not "ready". Mutation
+/// "threshold by the near set only" → threshold 1 → ready.
+#[tokio::test]
+async fn threshold_stays_at_the_known_circle_with_a_small_near_set() {
+    use crate::daemon::system_state::strength::pointer_readiness;
+    let f = fx_near(23, 3..5);
+    let b1 = f.block(1, 3);
+    let t = now();
+    f.tick(1, &b1, &[], t).await;
+    assert_eq!(f.meta().kad_near.len(), 2);
+    assert_eq!(f.near_acks(), 2);
+    let r = pointer_readiness(&f.db, t, 1).unwrap();
+    assert_eq!((r.threshold, r.ready), (3, false));
 }
