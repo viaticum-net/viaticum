@@ -1008,6 +1008,39 @@ impl SwarmHandle {
             .await
     }
 
+    /// `send_to_device` with extra addresses to dial (dr-i63): a peer found by a
+    /// Kademlia lookup may have no PeerRecord yet, so the address book knows
+    /// nothing of it. The given addresses (terminal `/p2p/` stripped; one naming
+    /// another peer is dropped) come first, then the book's.
+    pub async fn send_to_device_via(
+        &self,
+        device: DeviceId,
+        given: Vec<Multiaddr>,
+        msg: Message,
+    ) -> Result<Message, SwarmError> {
+        let mut addrs = Vec::new();
+        if self.dial_on_demand
+            && let Ok(peer) = device_id_to_peer_id(&device)
+        {
+            let book = match &self.address_book {
+                Some(book) => book.addrs_of(&device),
+                None => Vec::new(),
+            };
+            for a in given.iter().filter_map(|a| strip_peer_suffix(a, peer).ok()) {
+                if !addrs.contains(&a) {
+                    addrs.push(a);
+                }
+            }
+            for a in book {
+                if !addrs.contains(&a) {
+                    addrs.push(a);
+                }
+            }
+        }
+        self.send_or_dial(device, addrs, msg, self.dial_on_demand)
+            .await
+    }
+
     /// Send only over an existing authenticated connection — never dials
     /// (`send_to_device` before C4). The processor's PeerAnnounce goes this way:
     /// it follows an authentication, and must not dial a peer the cache closed.
