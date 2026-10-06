@@ -4,7 +4,7 @@
 // Virtual time (`start_paused`): the seconds are exact.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 use tokio::time::{Duration, Instant, sleep};
@@ -111,9 +111,13 @@ fn my_box() -> MailboxAddress {
     MailboxAddress::for_master(&IdentityPub([0xAA; 32]))
 }
 
+/// One moment for every record of the test binary: two `entry(n, p)` calls must build equal
+/// records, and a fresh `Timestamp::now()` per call splits them at a second boundary.
+static RECORDS_STORED_AT: LazyLock<u64> = LazyLock::new(|| Timestamp::now().0);
+
 /// A live DeleteRequest record `msg_id` with `payload`.
 fn entry(msg_id: u8, payload: &[u8]) -> MailboxEntry {
-    let now = Timestamp::now().0;
+    let now = *RECORDS_STORED_AT;
     MailboxEntry {
         target: my_box(),
         msg_id: [msg_id; 16],

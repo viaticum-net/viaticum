@@ -2336,7 +2336,13 @@ impl EventLoopState {
                 warn!(peer_id = %peer, error = %error, "viaticum outbound failure");
                 self.outbound_request_ended(request_id);
                 if let Some(reply) = self.pending_requests.remove(&request_id) {
-                    let _ = reply.send(Err(SwarmError::RequestFailed(error.to_string())));
+                    // A request the peer did not answer in time is a `Timeout`; a dropped
+                    // connection (EOF, closed) stays a failed request (restore-i44).
+                    let err = match error {
+                        request_response::OutboundFailure::Timeout => SwarmError::Timeout,
+                        other => SwarmError::RequestFailed(other.to_string()),
+                    };
+                    let _ = reply.send(Err(err));
                 }
             }
             request_response::Event::InboundFailure {

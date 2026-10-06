@@ -227,6 +227,15 @@ async fn a_block_starts_only_while_twice_the_slowest_still_fits() {
     assert_eq!(field(line, "issued"), Some(2), "{line}");
     assert_eq!(field(line, "deferred"), Some(6), "{line}");
     assert_eq!(field(line, "cut_blocks"), Some(0), "{line}");
+    assert_eq!(
+        field(line, "marked"),
+        Some(0),
+        "time defers, it does not mark: {line}"
+    );
+    assert!(
+        owner.scheduler.mem_deferred_at.lock().unwrap().is_empty(),
+        "no block waits for memory as a batch"
+    );
     assert!(
         field(line, "slowest_block_ms").is_some_and(|ms| ms >= 300),
         "the preparation's time is seen: {line}"
@@ -431,4 +440,78 @@ async fn slow_publishes_settle_through_the_run_loop() {
         "a response sent while publishes were in flight resolved after {delay:?}: \
          the loop waited for the publishes"
     );
+}
+
+/// pos-i7-a against pos-i13: a tick that runs out of TIME marks nothing. The block cut at the
+/// deadline prepares on and is published by the run loop; the blocks the tick did not reach stay
+/// plainly due and the next tick prepares them itself. Only a deferral by MEMORY marks a block
+/// and makes it wait as a batch. Time scale 900 (budget 800 ms, deadline 760 ms) on paused time:
+/// the first preparation moves the clock by 1 s from its blocking thread and is held until the
+/// tick has returned, so the deadline cuts it whatever the load of the machine. Mutation: mark the
+/// cut or the unreached blocks (`note_mem_deferred`) → reddens.
+#[tokio::test(start_paused = true)]
+async fn a_tick_out_of_time_marks_nothing_and_the_next_tick_prepares_the_rest() {
+    use super::issue_mem::{settle_until_idle, tick, tick_lines};
+
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    let encoder = StallingEncoder::new(0, 0, Duration::ZERO);
+    encoder.set_hook(move |call| {
+        if call == 0 {
+            tokio::runtime::Handle::current()
+                .block_on(tokio::time::advance(Duration::from_secs(1)));
+            // Real time: the test lets go once the tick is back; a tick that waited for this
+            // preparation instead of cutting it would fail the checks below after 10 s.
+            let _ = held
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10));
+        }
+    });
+    let owner = owner_with_encoder(
+        900,
+        SlowPostman::acking_after(Duration::from_millis(1)),
+        encoder,
+        |db, dir| seed_due(db, dir, 3, 1),
+    );
+    let mut in_flight = InFlight::default();
+    let marks = |owner: &Owner| owner.scheduler.mem_deferred_at.lock().unwrap().len();
+
+    let buf = super::issue_mem::logged(tick(&owner, &mut in_flight)).await;
+    let first = &tick_lines(&buf)[0];
+    assert_eq!(field(first, "blocks"), Some(1), "{first}");
+    assert_eq!(field(first, "cut_blocks"), Some(1), "{first}");
+    assert_eq!(field(first, "issued"), Some(0), "{first}");
+    assert_eq!(
+        field(first, "deferred"),
+        Some(2),
+        "two blocks not reached: {first}"
+    );
+    assert_eq!(field(first, "deferred_mem"), Some(0), "{first}");
+    assert_eq!(field(first, "marked"), Some(0), "{first}");
+    assert_eq!(marks(&owner), 0, "running out of time marks no block");
+    let cut = in_flight.preparing.blocks();
+    assert_eq!(cut.len(), 1, "the cut block prepares on");
+    assert_eq!(in_flight.preparing.batch_members(), 0, "and not as a batch");
+    release.send(()).unwrap();
+
+    settle_until_idle(&owner, &mut in_flight, Duration::from_secs(10)).await;
+    assert_eq!(
+        super::issue_mem::pending_len(&owner),
+        1,
+        "the run loop published the cut block"
+    );
+    assert_eq!(marks(&owner), 0);
+
+    let buf = super::issue_mem::logged(tick(&owner, &mut in_flight)).await;
+    let second = &tick_lines(&buf)[0];
+    assert_eq!(
+        field(second, "blocks"),
+        Some(2),
+        "the next tick prepares the rest itself: {second}"
+    );
+    assert_eq!(field(second, "batch"), Some(0), "no batch: {second}");
+    assert_eq!(field(second, "waiting_mem"), Some(0), "{second}");
+    settle_until_idle(&owner, &mut in_flight, Duration::from_secs(10)).await;
+    assert_eq!(super::issue_mem::pending_len(&owner), 3, "all three issued");
 }

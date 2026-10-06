@@ -410,3 +410,40 @@ fn drop_error_is_rate_limited_and_counts_the_window() {
     );
     assert_eq!(st.note_drop(t0 + DROP_LOG_EVERY * 3), Some(1));
 }
+
+/// pos-i21: an authentication does not reset the trust of a peer that failed every check
+/// (p = 0, i = 0 — only `recalculate_trust` after all-failed PoS writes that, and only a
+/// passed check lifts it). A new peer still starts at the prior.
+#[test]
+fn authentication_keeps_the_zero_trust_of_a_peer_that_failed_every_check() {
+    use viaticum_core::constants::INITIAL_TRUST_P;
+
+    let db = Db::open_in_memory().unwrap();
+    let q = PeerRecordQueue::new(16);
+    assert!(q.push(auth(1, &[])));
+    drain(&db, &q);
+    let fresh = db.get_peer(&device(1)).unwrap().expect("record");
+    assert_eq!((fresh.trust_p, fresh.trust_i), (INITIAL_TRUST_P, 0.0));
+
+    // What `recalculate_trust` leaves after every challenge in the window failed.
+    db.update_peer(&device(1), |r| {
+        let mut r = r?;
+        r.trust_p = 0.0;
+        r.trust_i = 0.0;
+        Some(r)
+    })
+    .unwrap();
+    assert!(q.push(auth(1, &[])));
+    drain(&db, &q);
+
+    let after = db.get_peer(&device(1)).unwrap().expect("record");
+    assert_eq!(
+        (after.trust_p, after.trust_i),
+        (0.0, 0.0),
+        "reconnecting must not turn a peer that failed every check into a newcomer"
+    );
+    assert!(
+        after.avail_ewma > fresh.avail_ewma,
+        "the contact itself is still counted"
+    );
+}

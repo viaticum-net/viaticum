@@ -72,7 +72,10 @@ pub(super) fn tick_lines(buf: &LogBuf) -> Vec<String> {
         .collect()
 }
 
-/// An owner with `blocks` × `holders` due placements, sharing the returned budget.
+/// An owner with `blocks` × `holders` due placements, sharing the returned budget. At time
+/// scale 900 the tick's budget is 0.8 s of real time: a test that checks the state right after
+/// a tick whose preparations it waits for takes `budgeted_at(1, …)` (720 s), or a loaded machine
+/// can cut a block at the deadline instead of marking it.
 pub(super) fn budgeted(
     blocks: u8,
     holders: u8,
@@ -160,7 +163,7 @@ pub(super) fn deferred_tick_of(owner: &Owner, block: &SourceBlockId) -> Option<u
 /// logged and counted as deferred by memory (`deferred_mem`), not by the time budget.
 #[tokio::test]
 async fn pos_issue_defers_block_when_budget_busy() {
-    let (owner, budget) = budgeted(1, 2, make_test_encoder());
+    let (owner, budget) = budgeted_at(1, 1, 2, make_test_encoder());
     let hold = hold_all(&budget);
     let mut in_flight = InFlight::default();
 
@@ -212,7 +215,7 @@ async fn pos_issue_with_a_free_budget_takes_one_permit_and_issues() {
 /// next one; then the block is served once the budget frees up.
 #[tokio::test]
 async fn pos_deferral_is_capped_at_one_issuance_tick() {
-    let (owner, budget) = budgeted(1, 2, make_test_encoder());
+    let (owner, budget) = budgeted_at(1, 1, 2, make_test_encoder());
     let hold = hold_all(&budget);
     let block = block_at(0);
     let mut in_flight = InFlight::default();
@@ -272,7 +275,7 @@ async fn pos_deferral_is_capped_at_one_issuance_tick() {
 /// comes before the order and before the time budget, which here cannot reach it.
 #[tokio::test]
 async fn deferred_on_tick_n_waits_from_tick_n_plus_1() {
-    let (owner, budget) = budgeted(3, 1, make_test_encoder());
+    let (owner, budget) = budgeted_at(1, 3, 1, make_test_encoder());
     let hold = hold_all(&budget);
     let holder = make_identity(0x80);
     let mut in_flight = InFlight::default();
@@ -317,7 +320,7 @@ async fn deferred_on_tick_n_waits_from_tick_n_plus_1() {
 /// still starts the third one (it is deferred too, but it was tried).
 #[tokio::test]
 async fn waiting_for_memory_preparations_do_not_take_k_slots() {
-    let (owner, budget) = budgeted(2, 1, make_test_encoder());
+    let (owner, budget) = budgeted_at(1, 2, 1, make_test_encoder());
     let hold = hold_all(&budget);
     let mut in_flight = InFlight::default();
 
@@ -353,11 +356,15 @@ async fn waiting_for_memory_preparations_do_not_take_k_slots() {
 }
 
 /// Three marked blocks whose preparation takes 0.5 s each, all granted memory at once (the budget
-/// is free again): ONE batch, one after the other — never two preparations at once.
+/// is free again): ONE batch, one after the other — never two preparations at once. The time
+/// scale is 1: the tick's budget (720 s) cannot run out on a loaded machine. At 900 the budget
+/// is 0.8 s of real time; once `--full` saw `waiting` 0 here, which fits a first tick that cut
+/// its block at the deadline instead of marking it (the second tick then has no batch to adopt
+/// and prepares the blocks itself).
 #[tokio::test]
 async fn a_batch_prepares_its_members_one_after_the_other() {
     let encoder = StallingEncoder::new(0, usize::MAX, Duration::from_millis(500));
-    let (owner, budget) = budgeted(3, 1, Arc::clone(&encoder) as _);
+    let (owner, budget) = budgeted_at(1, 3, 1, Arc::clone(&encoder) as _);
     let hold = hold_all(&budget);
     let mut in_flight = InFlight::default();
 
@@ -641,7 +648,7 @@ async fn overdue_waiter_is_cancelled_on_shutdown_and_priority_counter_drops() {
 /// marks, and `oldest_wait_s`; `preparing` counts only the running ones.
 #[tokio::test]
 async fn tick_line_counts_deferred_mem_and_waiting_mem() {
-    let (owner, budget) = budgeted(2, 3, make_test_encoder());
+    let (owner, budget) = budgeted_at(1, 2, 3, make_test_encoder());
     let hold = hold_all(&budget);
     let mut in_flight = InFlight::default();
 

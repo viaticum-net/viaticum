@@ -551,6 +551,7 @@ pub(super) async fn fetch_ss_block<T: serde::de::DeserializeOwned + Send + 'stat
     bref: &BlockRef,
     dr_key: &[u8; 32],
     memory: &mut super::memory::Memory,
+    failed_in_dr: &crate::daemon::symbol_fetch::FailedInTask,
 ) -> anyhow::Result<T> {
     use viaticum_core::types::{ErasureParams, FileId, PlacementStatus, SymbolPlacement};
 
@@ -581,6 +582,7 @@ pub(super) async fn fetch_ss_block<T: serde::de::DeserializeOwned + Send + 'stat
         &placements,
         &params,
         None,
+        failed_in_dr,
     )
     .await
     .map_err(|e| anyhow::anyhow!("fetch_unbound_symbols: {e}"))?;
