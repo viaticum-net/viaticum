@@ -241,6 +241,8 @@ struct ScriptedHolders {
     log: Mutex<Vec<(DeviceId, Vec<u32>)>>,
     /// Fired inside the first request (the request itself still answers).
     cancel_on_first_request: Option<CancellationToken>,
+    /// What `connected_holders` reports (restore-i43); empty unless a test sets it.
+    connected: HashSet<DeviceId>,
 }
 
 impl ScriptedHolders {
@@ -250,7 +252,15 @@ impl ScriptedHolders {
             behavior: behavior.into_iter().collect(),
             log: Mutex::new(Vec::new()),
             cancel_on_first_request: None,
+            connected: HashSet::new(),
         }
+    }
+
+    /// Pin the round order of a two-holder test to A, B: A is the connected one, asked
+    /// first (restore-i43); otherwise the per-block shuffle decides.
+    fn a_first(mut self) -> Self {
+        self.connected = [A].into_iter().collect();
+        self
     }
 
     fn asked(&self, holder: DeviceId) -> Vec<Vec<u32>> {
@@ -306,6 +316,10 @@ impl SymbolSource for ScriptedHolders {
                 unreachable!()
             }
         }
+    }
+
+    async fn connected_holders(&self) -> HashSet<DeviceId> {
+        self.connected.clone()
     }
 }
 
@@ -404,7 +418,8 @@ async fn stalled_holder_is_skipped_this_round_and_retried_next_round() {
             (A, Behavior::FailFirst(AtomicU32::new(1))),
             (B, Behavior::Serve),
         ],
-    );
+    )
+    .a_first();
     let got = fetch_in_rounds(
         &holders,
         &encoder(),
@@ -508,7 +523,8 @@ async fn esis_a_holder_did_not_return_are_not_asked_again() {
     let holders = ScriptedHolders::new(
         SYMBOL_LEN,
         vec![(A, Behavior::EvenOnly), (B, Behavior::Serve)],
-    );
+    )
+    .a_first();
     let got = fetch_in_rounds(
         &holders,
         &encoder(),
@@ -594,7 +610,8 @@ async fn round_where_every_request_fails_ends_no_answer() {
     let holders = ScriptedHolders::new(
         SYMBOL_LEN,
         vec![(A, Behavior::AlwaysFail), (B, Behavior::AlwaysFail)],
-    );
+    )
+    .a_first();
     let (enc, blk) = (encoder(), block());
     let placements = [placement(A, 0, 5), placement(B, 5, 5)];
     let p = params(5, SYMBOL_LEN as u16);
@@ -613,7 +630,8 @@ async fn round_where_every_request_fails_ends_no_answer() {
 #[tokio::test]
 async fn round_where_holders_answer_empty_ends_nothing_new() {
     let holders =
-        ScriptedHolders::new(SYMBOL_LEN, vec![(A, Behavior::Empty), (B, Behavior::Empty)]);
+        ScriptedHolders::new(SYMBOL_LEN, vec![(A, Behavior::Empty), (B, Behavior::Empty)])
+            .a_first();
     let (enc, blk) = (encoder(), block());
     let placements = [placement(A, 0, 5), placement(B, 5, 5)];
     let p = params(5, SYMBOL_LEN as u16);
@@ -735,3 +753,8 @@ async fn fetch_in_rounds_stops_at_no_answer() {
     );
     assert_eq!(holders.asked(A).len(), 1, "one round");
 }
+
+// restore-i43: the order a round asks a block's holders in.
+mod holder_order;
+// restore-i43: the swarm's authenticated devices are the connected holders.
+mod connected;

@@ -15,7 +15,8 @@
 #               MODE=lru: CAP=12 (stress: k > cap), TIME_SCALE=60.
 #               MODE=hold: CAP=12, TIME_SCALE=1: converge, then 30 min at production cadence.
 # Intent:       network-i14, i15, i16 (final editions, v3.3), i17, i18, i19 (probabilistic),
-#               i20 (via the i18 path), i41, i42, i43
+#               i20 (via the i18 path), i41, i42, i43 (network-i43); restore-i43 is
+#               NOT proved here — order: units only (see Cannot close)
 # Proves:       every node KNOWS >= 20 other owners within 300 s (a PeerRecord with a
 #               dialable address), symmetric on the OTHER node, never decreasing; every
 #               friend stays under the connection cap (connected - busy - infra - closing,
@@ -24,7 +25,8 @@
 #               authentication on either side (cold() reads authenticated_devices on both
 #               nodes; a connection without a cert may exist) is reached on demand (seen on
 #               THAT peer) and a restore whose symbols come over the network (a holder
-#               logs RestoreResponse) gets symbols from at least one holder the owner had
+#               logs RestoreResponse) with every holder of the block cooled
+#               gets symbols from at least one holder the owner had
 #               to dial on demand for RestoreRequest, with no failed on-demand dial and
 #               without the no-answer redial (bars in lru24/lru; NOTE in the main run); every friend's file lands on >= 2 holders other than the seed
 #               (symbols on THEIR disks); the seed's crash goes unnoticed and the seed rejoins
@@ -42,14 +44,14 @@
 #               online); the placement pool drawn from known peers (в-2); closing cold
 #               connections (i40, R2); on-demand reach at TIME_SCALE=1200 (the mailbox poll
 #               every 3 s keeps everyone connected: step 8 is a NOTE there, spec v3.2 BL-1);
-#               8b: a restore that reaches a cold holder only after warm ones failed (the
-#               first holders asked are the cooled ones; the rest stay as kad leaves them),
-#               and the cooled set relies on the ask order of rounds.rs (device id) — a
-#               changed order only makes attempts spoil (FAIL), never a false PASS. If the
-#               daemon starts asking connected holders first (candidate restore-iN), 8b
-#               turns FAIL by construction and must be re-aimed (cool every holder of the
-#               block). Closed now: a failed on-demand dial to a cold holder, covered by
-#               warm holders reaching k_eff, is a FAIL (no longer a spoiled attempt).
+#               8b: the ask order itself (restore-i43: connected first, shuffled per
+#               block) — every holder is cooled, so the order aims nothing here; it is held
+#               by the units symbol_fetch/tests/holder_order.rs and the two-swarm test
+#               symbol_fetch/tests/connected.rs (authenticated set = connected holders);
+#               a kad / peer-side re-dial inside the seconds between cooling and the
+#               request (spoils the attempt, never a PASS). Closed now: a failed on-demand
+#               dial to a cold holder, covered by warm holders reaching k_eff, is a FAIL
+#               (no longer a spoiled attempt).
 # Steps:        0. preconditions: >= 12 GiB free, e2e-tools binary + net-probe, alias log
 #                  line per node (AMP > 0), connection-cap log line per node (CAP set),
 #                  alias 127.0.0.2:P dialable, H1 forecast 51*N_v4 + 63*N_v6 > 775, P free
@@ -91,8 +93,12 @@
 #                  then every 0.5 s up to 5 s: the reach connection is handshake-only and goes
 #                  first), X logs `swarm: on-demand dial peer_id=<Y> … msg=PeerAnnounce`;
 #                  0 pairs = FAIL (i42; bar in lru24/lru/hold, NOTE in main)
-#               8b. source deleted at a live daemon; the first 3 holders in the order a restore
-#                  asks them (placement key block ‖ holder device id) cooled, restore -> <= 120
+#               8b. source deleted at a live daemon; per attempt: wait for the owner's
+#                  `mailbox_poll: poll done` (<= 75 s; the poll re-dials postmen, many of them
+#                  holders; fallback `auto-dial pass` <= 40 s), then
+#                  EVERY holder of the block, the seed included, disconnected at once
+#                  (net-probe under timeout 15), <= 2 s until they leave the owner's
+#                  authenticated set (still-warm ones NOTEd: asked first), restore -> <= 120
 #                  s hash match, 0 no-answer redials (`restore: holders did not answer;
 #                  redialing them` | `fetch: redialed holders`); >= 1 holder that sent
 #                  RestoreResponse for the block was dialed on demand by the owner with
@@ -851,7 +857,7 @@ make_cold() {
     local x="$1" y="$2" try t
     for try in 1 2 3; do
         cold "$x" "$y" && return 0
-        "$NET_PROBE" --data-dir "$(node_dir "$x")" disconnect "${DEV8[$y]}" > /dev/null 2>&1 || true
+        timeout 15 "$NET_PROBE" --data-dir "$(node_dir "$x")" disconnect "${DEV8[$y]}" > /dev/null 2>&1 || true
         for t in $(seq 1 20); do cold "$x" "$y" && return 0; sleep 0.5; done
     done
     return 1
@@ -1554,43 +1560,73 @@ fi
 if runs_step 8b && [ "$SKIP_8BC" = 0 ]; then
     step 8b "restore from holders with no live connection"
     K8="$OWNER:photo.jpg"; BLK="${FILE_BLOCK[$K8]}"
-    # The holders in the order the restore asks them: SYMBOL_PLACEMENTS is keyed block ‖
-    # holder device id (viaticum-core db/mod.rs placement_key) and BlockFetch::round
-    # (symbol_fetch/rounds.rs) asks one holder after another in that order until k_eff
-    # symbols are in, so the holders after the first few are never asked and cooling them
-    # proves nothing (run 20261005-145034: node-02 the only cold holder, 3rd in that order;
-    # node-39 and node-20, warm, gave all the symbols). The order only aims the cooling: the
-    # verdict reads who actually answered and how it was reached.
+    # BlockFetch::round (symbol_fetch/rounds.rs, restore-i43) asks the holders the owner is
+    # connected to first and stops at k_eff (photo.jpg: k_eff 5, ~3 symbols per holder), so
+    # two warm holders cover the block and no cold one is ever asked. Every holder is
+    # cooled, the seed too (it is a holder like the others; an infra peer, so the owner's
+    # next auto-dial pass dials it back — that is after the restore). The verdict reads who
+    # actually answered and how it was reached, not this list.
     HOLDERS=$(for j in $(alive_nodes); do
         [ "$j" = "$OWNER" ] && continue
-        if [ "$(block_symbols_on "$j" "$BLK")" -gt 0 ]; then echo "${DEV8[$j]} $j"; fi
-    done | sort | awk '{printf " %s", $2}')
-    AIM=$(echo $HOLDERS | cut -d' ' -f1-3)
-    note "holders of node-$OWNER's block ${BLK:0:16} in the order a restore asks them:$HOLDERS (cooled: $AIM)"
+        if [ "$(block_symbols_on "$j" "$BLK")" -gt 0 ]; then printf " %s" "$j"; fi
+    done)
+    note "holders of node-$OWNER's block ${BLK:0:16} (all cooled):$HOLDERS"
     assert_delete_window "$TIME_SCALE"
     rm -f "${FILE_PATH[$K8]}"
     wait_file_deleted "$OWNER" "${FILE_PATH[$K8]}" 60 || note "the deletion is not registered after 60 s"
     # Up to 3 restores (the source stays deleted, each one is a new job). An attempt counts
-    # when a holder that answered it was reached by an on-demand dial for RestoreRequest. A
-    # holder kad re-warms between the cold check and the request (run 20261005-141704:
-    # node-04/05 cold at the check, dialed in by their own kad 1.4 s before the restore)
-    # spoils the attempt: retried, never a PASS. Retried ONLY when the cooled holders were
-    # not asked at all or were authenticated again before the request; a failed on-demand
-    # dial / cached-unreachable answer with msg=RestoreRequest or a silent holder of the
-    # block in the window is a FAIL at once. No holder answering = the block came from the
-    # owner's source files (local tier T4): FAIL at once.
+    # when a holder that answered it was reached by an on-demand dial for RestoreRequest.
+    # The window between cooling and the request is kept to seconds: the owner's auto-dial
+    # pass (every max(300/T, 30) s) re-dials the freshest unauthenticated peers up to its
+    # floor — exactly the holders just cooled (the old sequential cooling took tens of
+    # seconds and lost 8 of 18 holders that way). So each attempt waits for an `auto-dial
+    # pass` line of the owner, then disconnects all holders at once, waits <= 2 s for them
+    # to leave the owner's authenticated set (owner side only: an on-demand dial is the
+    # owner's), NOTEs the ones still warm and starts the restore. Only warm holders
+    # answering (they are asked first) spoils the attempt: retried, never a PASS. A failed
+    # on-demand dial / cached-unreachable answer with msg=RestoreRequest or a silent holder
+    # of the block in the window is a FAIL at once. No holder answering = the block came
+    # from the owner's source files (local tier T4): FAIL at once.
     L7_0=$(log_line_count "$OWNER")
     declare -A HL0
     RESTORED=0; LOCAL=0; SERVED=""; RESP=""; DIALFAIL=""
     for attempt in 1 2 3; do
-        COLD=""
-        for try in 1 2 3; do
-            for j in $AIM; do make_cold "$OWNER" "$j" || true; done
-            COLD=""; for j in $AIM; do cold "$OWNER" "$j" && COLD="$COLD $j"; done
-            [ -n "$COLD" ] && break
-        done
-        note "attempt $attempt: cold at restore start (checked on both sides):${COLD:- none} (of $AIM)"
         for j in $HOLDERS; do HL0[$j]=$(log_line_count "$j"); done
+        LP=$(log_line_count "$OWNER"); PASSED=0
+        # Sync on the end of the owner's mailbox poll (review of c4b9709): the poll re-dials
+        # ~20 postmen, many of them holders, and runs in phase with every second auto-dial
+        # pass. Right after `poll done` the next poll is a full period away and the next
+        # auto-dial pass <= 30 s. An empty poll logs `poll done` at DEBUG only, so an
+        # `auto-dial pass` line is the fallback.
+        for t in $(seq 1 375); do
+            log_has_since "$OWNER" "$LP" "mailbox_poll: poll done" "poll done" && { PASSED=1; break; }
+            sleep 0.2
+        done
+        if [ "$PASSED" != 1 ]; then
+            note "attempt $attempt: no 'mailbox_poll: poll done' line of node-$OWNER in 75 s; syncing on 'auto-dial pass'"
+            LP=$(log_line_count "$OWNER")
+            for t in $(seq 1 200); do
+                log_has_since "$OWNER" "$LP" "auto-dial pass" "auto-dial pass" && { PASSED=1; break; }
+                sleep 0.2
+            done
+            [ "$PASSED" = 1 ] || note "attempt $attempt: no 'auto-dial pass' line of node-$OWNER in 40 s; cooling anyway"
+        fi
+        # In parallel, each bounded; wait on these PIDs only (the daemons are this shell's
+        # jobs too).
+        DPIDS=""
+        for j in $HOLDERS; do
+            timeout 15 "$NET_PROBE" --data-dir "$(node_dir "$OWNER")" disconnect "${DEV8[$j]}" > /dev/null 2>&1 &
+            DPIDS="$DPIDS $!"
+        done
+        for dp in $DPIDS; do wait "$dp" || true; done
+        WARM="$HOLDERS"
+        for t in $(seq 1 8); do
+            AUTH=",$({ authenticated_devices_of "$OWNER" || true; } | tr '\n' ','),"
+            WARM=""; for j in $HOLDERS; do in_list "${DEV8[$j]}" "$AUTH" && WARM="$WARM $j"; done
+            [ -z "$WARM" ] && break
+            sleep 0.25
+        done
+        note "attempt $attempt: still authenticated on node-$OWNER at restore start (asked first):${WARM:- none} (of$HOLDERS)"
         L7=$(log_line_count "$OWNER")
         if ! restore_from_network "$OWNER" "${FILE_PATH[$K8]}" "${FILE_HASH[$K8]}" 120; then
             RESTORED=0; break

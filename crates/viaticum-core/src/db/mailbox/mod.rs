@@ -566,6 +566,27 @@ impl Db {
             .get_master_for_device(device)?
             .filter(|m| m.0 != [0u8; 32]))
     }
+
+    /// Holder devices of a master — the reverse of [`Db::master_for_holder`], over the same
+    /// two sources: PEERS rows whose `master_identity` is `master` (they travel in the SS, so
+    /// they survive DR) united with `device_to_master` (a direct certificate exchange, empty
+    /// after DR). Both are written only from an authenticated certificate. Each device once,
+    /// in device-id order. The zero placeholder is not a person: empty (dr-i8-b).
+    pub fn holder_devices_of_master(&self, master: &IdentityPub) -> Result<Vec<DeviceId>, DbError> {
+        if master.0 == [0u8; 32] {
+            return Ok(Vec::new());
+        }
+        let mut devices: Vec<DeviceId> = self
+            .list_all_peers()?
+            .into_iter()
+            .filter(|p| p.master_identity == *master)
+            .map(|p| p.device_id)
+            .collect();
+        devices.extend(self.get_devices_for_master(master)?);
+        devices.sort_by_key(|d| d.0);
+        devices.dedup();
+        Ok(devices)
+    }
 }
 
 #[cfg(test)]

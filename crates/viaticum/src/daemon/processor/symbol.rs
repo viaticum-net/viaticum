@@ -126,7 +126,7 @@ impl SymbolDropHandler {
     /// What is remembered (Д-DN1-4): a verified notice of a KNOWN master whose chosen placement
     /// exists and is not `Deleting` — in the same write transaction as the transition
     /// (Д-DN1-5), or stand-alone if it was already `Lost`. Not remembered: bad signature,
-    /// unknown master (4r-i31: a re-delivery after re-authentication applies it), no placement
+    /// unknown master — neither in PEERS nor in device_to_master (dr-i8-b), no placement
     /// or `Deleting` (4r-i49: no loop there, and a flood of final notices must write nothing), a
     /// placement read error (FW-3), a failed transition.
     ///
@@ -183,7 +183,20 @@ impl SymbolDropHandler {
             return false;
         }
 
-        let devices = self.db.get_devices_for_master(&from).unwrap_or_default();
+        // dr-i8-b: PEERS as well as device_to_master — after the owner's DR only PEERS (from
+        // the SS) knows the holder's devices, and the letter must not wait for re-authentication.
+        let devices = match self.db.holder_devices_of_master(&from) {
+            Ok(d) => d,
+            Err(e) => {
+                error!(
+                    block_id = %block_id,
+                    holder = %from,
+                    err = %e,
+                    "processor: DropNotice — device lookup failed, not applying (the next delivery retries)"
+                );
+                return false;
+            }
+        };
         if devices.is_empty() {
             warn!(
                 block_id = %block_id,

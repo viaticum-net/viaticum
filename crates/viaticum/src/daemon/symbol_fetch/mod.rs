@@ -78,6 +78,10 @@ pub trait SymbolSource: Send + Sync {
         holder: DeviceId,
         req: RestoreRequestMsg,
     ) -> Result<Vec<Symbol>, FetchError>;
+
+    /// Devices we have a live authenticated connection to right now — asked first
+    /// in a round (restore-i43). A snapshot; empty when it cannot be taken.
+    async fn connected_holders(&self) -> HashSet<DeviceId>;
 }
 
 /// What restore needs on top of requests: a redial of holders that did not answer
@@ -97,6 +101,10 @@ impl SymbolSource for SwarmHandle {
         req: RestoreRequestMsg,
     ) -> Result<Vec<Symbol>, FetchError> {
         fetch_symbols_from_holder(self, &holder, req).await
+    }
+
+    async fn connected_holders(&self) -> HashSet<DeviceId> {
+        authenticated_devices(self).await
     }
 }
 
@@ -121,6 +129,22 @@ impl SymbolSource for SwarmSymbols {
         req: RestoreRequestMsg,
     ) -> Result<Vec<Symbol>, FetchError> {
         fetch_symbols_from_holder(&self.swarm, &holder, req).await
+    }
+
+    async fn connected_holders(&self) -> HashSet<DeviceId> {
+        authenticated_devices(&self.swarm).await
+    }
+}
+
+/// The swarm's authenticated devices (a live connection with the certificate
+/// exchange done). A failed snapshot is no order hint, not an error: empty.
+async fn authenticated_devices(swarm: &SwarmHandle) -> HashSet<DeviceId> {
+    match swarm.peer_sets().await {
+        Ok((authenticated, _connected)) => authenticated,
+        Err(e) => {
+            warn!(err = %e, "fetch: no snapshot of connected holders; holders asked in shuffled order only");
+            HashSet::new()
+        }
     }
 }
 
@@ -147,7 +171,8 @@ pub(crate) fn chunk_esis(chunk_bytes: u64, t: u16) -> usize {
 
 /// Collect `k_eff` distinct unbound symbols for `block_id` (restore-i12).
 ///
-/// Rounds over the candidate placements (Alive | Uncertain | PresumedLost). Within a
+/// Rounds over the candidate placements (Alive | Uncertain | PresumedLost), connected
+/// holders first, each group in a per-block shuffled order (restore-i43). Within a
 /// round each holder is asked in chunks of at most
 /// `max(1, RESTORE_FETCH_CHUNK_BYTES / params.t)` ESIs from its assigned ranges that
 /// are not yet accepted and not yet asked-and-not-returned by it. A holder whose
