@@ -678,9 +678,11 @@ fn init_config_enables_web_api_on_fixed_loopback_port() {
     assert_eq!(addr.port(), DEFAULT_WEB_PORT);
 }
 
-// Mutation: a port drawn at render time → two inits disagree, test red.
+// The web port is fixed on every node; only the libp2p port is drawn, once per
+// node (network-i31). Mutation: a web port drawn at render time → two inits
+// disagree, test red.
 #[test]
-fn init_config_port_is_the_same_on_every_render() {
+fn init_config_web_port_is_the_same_on_every_render() {
     let (a, b) = (tmp_dir(), tmp_dir());
     init_identity(a.path()).expect("init a");
     init_identity(b.path()).expect("init b");
@@ -688,7 +690,10 @@ fn init_config_port_is_the_same_on_every_render() {
         web_api_after_init(a.path()).bind,
         web_api_after_init(b.path()).bind
     );
-    assert_eq!(default_config_toml(), default_config_toml());
+    assert_eq!(
+        default_config_toml(23817, TEMPLATE_SEEDS),
+        default_config_toml(23817, TEMPLATE_SEEDS)
+    );
 }
 
 // The port the user may have edited stays: a later default write (DR, re-init
@@ -722,8 +727,15 @@ fn template_key(line: &str) -> Option<&str> {
 /// and the number of keys that are then live. An example whose key is already live
 /// in its table (the LAN `bind` alternative) stays commented: TOML refuses a
 /// duplicate key.
+/// Seeds for rendering the template in tests: the shipped list may be empty
+/// (R2 Р-6), the array must still be checked.
+const TEMPLATE_SEEDS: &[&str] = &[
+    "/dns4/seed1.example.org/udp/27210/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN",
+    "/dns4/seed1.example.org/tcp/27210/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN",
+];
+
 fn template_with_examples_on() -> (String, usize) {
-    let text = default_config_toml();
+    let text = default_config_toml(23817, TEMPLATE_SEEDS);
     let mut live = std::collections::HashSet::new();
     let mut section = "";
     for line in text.lines() {
@@ -787,6 +799,12 @@ fn init_template_every_key_turned_on_is_read_by_the_daemon() {
                 toml_edit::Value::Float(f) => got.as_f64() == Some(*f.value()),
                 toml_edit::Value::String(s) => got.as_str() == Some(s.value().as_str()),
                 toml_edit::Value::Boolean(b) => got.as_bool() == Some(*b.value()),
+                toml_edit::Value::Array(a) => got.as_array().is_some_and(|g| {
+                    g.len() == a.len()
+                        && a.iter()
+                            .zip(g)
+                            .all(|(w, g)| w.as_str().is_some() && w.as_str() == g.as_str())
+                }),
                 other => panic!("[{section}] {key}: unexpected value kind {other}"),
             };
             assert!(

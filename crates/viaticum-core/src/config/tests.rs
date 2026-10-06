@@ -1490,3 +1490,16 @@ fn config_rejects_source_block_size_above_1024() {
         "got {err:?}"
     );
 }
+
+// R2 Р2-0: the struct defaults are inert, `init` writes a working network.
+// Mutation: `is_inert` true with seeds present → the seeded case goes red.
+#[test]
+fn network_is_inert_only_with_port_zero_and_no_seeds() {
+    let mut n = NetworkCfg::default();
+    assert!(n.is_inert(), "the struct default is inert");
+    n.listen_port = 23817;
+    assert!(!n.is_inert(), "a fixed port: reachable");
+    n.listen_port = 0;
+    n.kademlia_bootstrap_peers = vec!["/dns4/seed.example/tcp/27210/p2p/x".to_string()];
+    assert!(!n.is_inert(), "a seed: it finds the network");
+}

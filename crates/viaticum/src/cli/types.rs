@@ -153,6 +153,11 @@ pub struct StatusData {
     pub device_id: String,
     /// This node's libp2p address (for `viaticum connect`).
     pub node_addr: String,
+    /// `node_addr` is reachable only from this LAN or this machine (a private
+    /// or loopback address, no confirmed external one): another home cannot
+    /// dial it (network-i27). Shown as "(LAN only)".
+    #[serde(default)]
+    pub node_addr_lan_only: bool,
     /// Number of known peers (PeerRecord rows in DB — includes peers that
     /// were once seen via libp2p `identify` but never completed the viaticum
     /// cert exchange). For the count of peers we can actually exchange heavy

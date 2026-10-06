@@ -394,6 +394,10 @@ enum SwarmCommand {
     ListenAddrs {
         reply: oneshot::Sender<Vec<Multiaddr>>,
     },
+    /// The confirmed external addresses (`status` node_addr, network-i27).
+    ExternalAddrs {
+        reply: oneshot::Sender<Vec<Multiaddr>>,
+    },
     /// Snapshot of swarm peer-set: connected_count vs authenticated_count.
     /// Connected = libp2p has a live transport-level link (post-Noise+identify).
     /// Authenticated = our cert exchange has succeeded (heavy messages allowed).
@@ -715,6 +719,25 @@ impl SwarmHandle {
             }
         }
 
+        // The OS resolver configuration (resolv.conf / the hosts file, the
+        // Windows adapters) for the DNS transport. Unreadable — an offline box
+        // with no nameserver — the node still starts: IP addresses work, a
+        // DNS name fails its dial (one ERROR here says why).
+        let (dns_cfg, dns_opts) = match hickory_resolver::system_conf::read_system_conf() {
+            Ok(conf) => conf,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "DNS: the system resolver configuration is unreadable; \
+                     seeds named by DNS will not resolve"
+                );
+                (
+                    libp2p::dns::ResolverConfig::new(),
+                    libp2p::dns::ResolverOpts::default(),
+                )
+            }
+        };
+
         // ── 3. Build Swarm (relay client comes from builder step) ─────────────
         // relay::client::Behaviour is produced by with_relay_client() and passed
         // as the second argument to with_behaviour(). relay_server and dcutr are
@@ -745,6 +768,8 @@ impl SwarmHandle {
                 )
             })
             .map_err(|e| SwarmError::Transport(e.to_string()))?
+            // network-i28: a seed is named by DNS (`/dns4/<name>/tcp/…`).
+            .with_dns_config(dns_cfg, dns_opts)
             .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)
             .map_err(|e| SwarmError::Transport(e.to_string()))?
             .with_behaviour(|key, relay_client| ViaticumBehaviour {
@@ -1169,6 +1194,16 @@ impl SwarmHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(SwarmCommand::ListenAddrs { reply: reply_tx })
+            .await
+            .map_err(|_| SwarmError::ChannelClosed)?;
+        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)
+    }
+
+    /// Return the confirmed external addresses.
+    pub async fn external_addrs(&self) -> Result<Vec<Multiaddr>, SwarmError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::ExternalAddrs { reply: reply_tx })
             .await
             .map_err(|_| SwarmError::ChannelClosed)?;
         reply_rx.await.map_err(|_| SwarmError::ChannelClosed)
@@ -1811,7 +1846,7 @@ impl EventLoopState {
                 // `cause` = KeepAliveTimeout would mean libp2p's idle timeout closed a
                 // link between live nodes (C-DK v3-C expects none).
                 debug!(peer_id = %peer_id, num_established, cause = ?cause, "connection closed");
-                let refused = self.e2e_refused_closed(connection_id);
+                self.e2e_forget_closed(connection_id);
                 if num_established > 0 {
                     // network-i19: another connection to this peer lives (a
                     // duplicate from simultaneous dials, closed by one side), so
@@ -1834,7 +1869,7 @@ impl EventLoopState {
                 self.pending_cert.remove(&peer_id);
                 let event = ProtocolEvent::ConnectionClosed { peer_id, device_id };
                 emit_event(&self.event_tx, event);
-                self.conn_closed(peer_id, Instant::now(), refused);
+                self.conn_closed(peer_id, Instant::now());
             }
             SwarmEvent::OutgoingConnectionError {
                 peer_id,
@@ -2695,11 +2730,9 @@ impl EventLoopState {
         false
     }
 
-    /// A user build has no e2e hold: no closed connection was refused.
+    /// A user build has no e2e hold: there is no refused connection to forget.
     #[cfg(not(feature = "e2e-tools"))]
-    fn e2e_refused_closed(&mut self, _cid: libp2p::swarm::ConnectionId) -> bool {
-        false
-    }
+    fn e2e_forget_closed(&mut self, _cid: libp2p::swarm::ConnectionId) {}
 
     fn handle_command(&mut self, cmd: SwarmCommand) {
         match cmd {
@@ -2762,6 +2795,9 @@ impl EventLoopState {
             SwarmCommand::ListenAddrs { reply } => {
                 let addrs: Vec<Multiaddr> = self.swarm.listeners().cloned().collect();
                 let _ = reply.send(addrs);
+            }
+            SwarmCommand::ExternalAddrs { reply } => {
+                let _ = reply.send(self.swarm.external_addresses().cloned().collect());
             }
             SwarmCommand::PeerCounts { reply } => {
                 let connected = self.swarm.connected_peers().count() as u32;

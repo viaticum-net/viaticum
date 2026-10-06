@@ -69,8 +69,10 @@ impl EventLoopState {
         self.e2e_hold.is_refused(cid)
     }
 
-    /// Connection `cid` closed: forget it; returns whether the hold refused it.
-    pub(super) fn e2e_refused_closed(&mut self, cid: ConnectionId) -> bool {
-        self.e2e_hold.closed(cid)
+    /// Connection `cid` closed: the hold forgets it if it refused it. (Its
+    /// close needs no special case in the on-demand bookkeeping: a connection
+    /// closing while our dial is under way never fails it, network-i44.)
+    pub(super) fn e2e_forget_closed(&mut self, cid: ConnectionId) {
+        self.e2e_hold.closed(cid);
     }
 }

@@ -25,6 +25,9 @@
 # binary (sources are remapped, install-i18); where the binary runs here,
 # `--version` = `viaticum <build id>` and `build-info` names the build id and the
 # fresh index.html blake3 (M14′).
+# A tagged release compiles with VIATICUM_REQUIRE_SEEDS=1: the binary refuses to
+# compile while viaticum_core::constants::DEFAULT_SEEDS is empty (R2 Р-6) — its
+# `init` would write a node that finds nobody. --snapshot builds are not gated.
 # Not yet (R3a a4 part 2): manifest tarball, notices, SHA256SUMS, get.sh.
 #
 # Environment:
@@ -73,8 +76,10 @@ resolve_ref() {
             die "--snapshot needs a clean tree (commit or stash tracked changes first)"
         fi
         REF="HEAD"
+        REQUIRE_SEEDS=""
     else
         REF="v$arg"
+        REQUIRE_SEEDS="1"
         git rev-parse -q --verify "refs/tags/$REF" >/dev/null || die "tag $REF does not exist"
     fi
     REV7="$(git rev-parse --short=7 "$REF^{commit}")"
@@ -137,6 +142,11 @@ build_target() {
     local cmap="-ffile-prefix-map=$registry=/cargo/registry -ffile-prefix-map=$SRC=/viaticum -ffile-prefix-map=$TARGET_DIR=/target -ffile-prefix-map=$HOME=/home"
     local tvar="${target//-/_}"
     env_extra+=("CFLAGS_$tvar=$cmap")
+    if [ -n "$REQUIRE_SEEDS" ]; then
+        env_extra+=(VIATICUM_REQUIRE_SEEDS=1)
+    else
+        log "snapshot: not checking DEFAULT_SEEDS (a tagged release is)"
+    fi
     log "building $target ($BUILD_ID)"
     (cd "$SRC" && env "${env_extra[@]}" VIATICUM_BUILD_ID="$BUILD_ID" \
         CARGO_TARGET_DIR="$TARGET_DIR" RUSTFLAGS="$remap" \

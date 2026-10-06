@@ -142,8 +142,10 @@ pub struct NetworkCfg {
     /// Default: [] (no bootstrap nodes).
     pub kademlia_bootstrap_peers: Vec<String>,
 
-    /// libp2p TCP listen port. 0 = ephemeral (default). Set to a fixed value
-    /// when running behind a firewall that only opens specific ports.
+    /// libp2p listen port, one number for TCP and (R2b) UDP. 0 = ephemeral, the
+    /// struct default (tests, a config written by hand); `init` writes a fixed
+    /// port drawn from `LISTEN_PORT_RANGE` (network-i31), the one to forward on
+    /// a router.
     pub listen_port: u16,
 
     /// Relay role of this node: `"off"` (default) or `"punch"`. Only for a
@@ -441,6 +443,16 @@ impl Default for NetworkCfg {
             listen_port: 0,
             relay_role: RelayRole::Off,
         }
+    }
+}
+
+impl NetworkCfg {
+    /// An inert network (R2 Р2-0): an ephemeral port and no seeds. Nobody can
+    /// find such a node and it finds nobody until `viaticum connect`. The struct
+    /// defaults are inert on purpose; `init` writes a working network (a fixed
+    /// port, the default seeds), so an inert node at start is worth a WARN.
+    pub fn is_inert(&self) -> bool {
+        self.listen_port == 0 && self.kademlia_bootstrap_peers.is_empty()
     }
 }
 

@@ -306,15 +306,13 @@ impl EventLoopState {
         self.check_over_cap(now);
     }
 
-    /// The last connection of `peer` closed. `refused`: it was one the
-    /// test-only e2e hold refused (always false in a user build; see
-    /// `OnDemand::on_closed`).
-    pub(super) fn conn_closed(&mut self, peer: PeerId, now: Instant, refused: bool) {
+    /// The last connection of `peer` closed.
+    pub(super) fn conn_closed(&mut self, peer: PeerId, now: Instant) {
         self.pending_close.remove(&peer);
         if let Some(lru) = self.lru.as_mut() {
             lru.on_disconnected(&peer);
         }
-        let (resolved, next) = self.on_demand.on_closed(peer, now, refused);
+        let (resolved, next) = self.on_demand.on_closed(peer, now);
         if let Some(r) = resolved {
             self.resolve_unreachable(r, now);
         }

@@ -258,6 +258,7 @@ fn make_status_zero_peers() -> StatusData {
         node_identity: "0000000000000000".into(),
         device_id: "0000000000000000".into(),
         node_addr: String::new(),
+        node_addr_lan_only: false,
         peer_count: 0,
         peer_count_connected: 0,
         peer_count_authenticated: 0,
@@ -339,6 +340,36 @@ fn render_status_shows_restore_staging_when_job_dirs_exist() {
 fn render_status_hides_restore_staging_when_empty() {
     let rendered = output::render_status(&make_status_zero_peers());
     assert!(!rendered.contains("restore staging"), "got: {rendered}");
+}
+
+// network-i27: a LAN address says so; the address itself stays pasteable into
+// `viaticum connect` (the mark is in the label, not after the address).
+// Mutation: drop the mark, or print it after the address → red.
+#[test]
+fn render_status_marks_lan_only_node_addr() {
+    let mut data = make_status_zero_peers();
+    data.node_addr =
+        "/ip4/192.168.1.5/tcp/23817/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+            .into();
+    data.node_addr_lan_only = true;
+    let rendered = output::render_status(&data);
+    let line = rendered
+        .lines()
+        .find(|l| l.contains("/p2p/"))
+        .expect("an addr line");
+    assert!(line.contains("addr (LAN only):"), "got: {rendered}");
+    // Review N2: the address ends the line — its tail is a `connect` argument.
+    assert!(
+        line.ends_with(&data.node_addr) && line.split_whitespace().last() == Some(&*data.node_addr),
+        "got: {line:?}"
+    );
+    data.node_addr_lan_only = false;
+    let rendered = output::render_status(&data);
+    assert!(!rendered.contains("LAN only"), "got: {rendered}");
+    assert!(
+        rendered.contains(&format!("  addr:           {}\n", data.node_addr)),
+        "got: {rendered}"
+    );
 }
 
 /// Old daemons do not send the staging fields; the CLI still parses the status.
@@ -479,6 +510,7 @@ fn format_status_top_peers_printed() {
         node_identity: "a1b2c3d4e5f60708".into(),
         device_id: "a1b2c3d4e5f60708".into(),
         node_addr: String::new(),
+        node_addr_lan_only: false,
         peer_count: 2,
         peer_count_connected: 2,
         peer_count_authenticated: 2,
@@ -990,6 +1022,7 @@ fn cli_response_roundtrips_cbor() {
             node_identity: "aabbccdd11223344".into(),
             device_id: "aabbccdd11223344".into(),
             node_addr: String::new(),
+            node_addr_lan_only: false,
             peer_count: 3,
             peer_count_connected: 3,
             peer_count_authenticated: 3,

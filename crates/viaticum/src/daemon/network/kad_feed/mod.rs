@@ -55,7 +55,7 @@ pub(crate) const MAX_KAD_ADDR_BYTES_PER_PEER: usize = 640;
 
 /// Rank of an address for the Kademlia record: lower goes first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Reach {
+pub(crate) enum Reach {
     /// Routable from anywhere (and DNS names).
     Global,
     /// RFC 1918, 100.64/10 (CGNAT), fc00::/7.
@@ -65,8 +65,9 @@ enum Reach {
 }
 
 /// The rank of `transport` (no `/p2p/` suffix), or `None` when no other machine
-/// can dial it (dropped from the record).
-fn reach(transport: &Multiaddr) -> Option<Reach> {
+/// can dial it (dropped from the record). Also ranks `status`'s `node_addr`
+/// (`addr::select_node_addr`).
+pub(crate) fn reach(transport: &Multiaddr) -> Option<Reach> {
     if transport
         .iter()
         .any(|p| matches!(p, Protocol::P2pCircuit | Protocol::P2p(_)))

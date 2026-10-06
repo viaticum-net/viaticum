@@ -32,7 +32,14 @@ pub fn render_status(data: &StatusData) -> String {
     }
     out.push_str(&format!("  identity:       {}\n", data.node_identity));
     if !data.node_addr.is_empty() {
-        out.push_str(&format!("  addr:           {}\n", data.node_addr));
+        // The mark goes before the address: the address stays the last thing on
+        // the line, so copying the line's tail gives a `connect` argument.
+        let label = if data.node_addr_lan_only {
+            "addr (LAN only):"
+        } else {
+            "addr:"
+        };
+        out.push_str(&format!("  {label:<15} {}\n", data.node_addr));
     }
     out.push_str(&format!(
         "  peers:          {}  (avg trust: {:.2})\n",

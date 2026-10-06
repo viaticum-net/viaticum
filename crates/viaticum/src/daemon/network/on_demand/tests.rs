@@ -233,23 +233,9 @@ fn closing_peer_is_dialed_after_its_connection_closed() {
     };
     let w = waiter(&o, "SymbolOffer", t0);
     assert_eq!(o.admit(p, dev(1), w, vec![], sit), Next::Wait);
-    let (r, next) = o.on_closed(p, t0, false);
+    let (r, next) = o.on_closed(p, t0);
     assert!(r.is_none());
     assert_eq!(next, Next::Dial);
-}
-
-#[test]
-fn our_connection_closed_before_cert_fails_and_caches() {
-    let t0 = Instant::now();
-    let mut o = od(16);
-    let p = PeerId::random();
-    let w = waiter(&o, "SymbolOffer", t0);
-    let _ = o.admit(p, dev(1), w, vec![], Situation::default());
-    o.dial_started(p, cid(3), t0);
-    o.on_established(p, cid(3));
-    let (r, _) = o.on_closed(p, t0, false);
-    assert!(matches!(r.map(|r| r.outcome), Some(Outcome::Failed(_))));
-    assert!(o.is_cached(&p, t0));
 }
 
 #[test]
@@ -273,11 +259,12 @@ fn our_dial_pending_only_until_our_connection_is_up() {
     assert!(!o.our_dial_pending(&p), "our connection is up");
 }
 
-/// e2e hold (W4): a refused connection — the peer's last — closing while our
-/// dial is still under way does not fail the waiters; our dial brings them out.
-/// The same close of a non-refused connection fails them as before.
+/// network-i44: the peer's last connection — an inbound one or somebody else's
+/// dial — closes before its cert exchange while our dial is still under way:
+/// the waiters stay with our dial, nothing is cached, and our dial brings them
+/// out once the peer authenticates.
 #[test]
-fn refused_last_connection_closed_during_our_dial_keeps_waiters() {
+fn foreign_connection_closed_during_our_dial_keeps_waiters() {
     let t0 = Instant::now();
     let mut o = od(16);
     let p = PeerId::random();
@@ -287,20 +274,43 @@ fn refused_last_connection_closed_during_our_dial_keeps_waiters() {
         Next::Dial
     );
     o.dial_started(p, cid(11), t0);
+    // The peer's own dial to us comes up, then closes before the cert.
+    o.on_established(p, cid(90));
 
-    let (r, next) = o.on_closed(p, t0, true);
-    assert!(r.is_none(), "the refused connection was not ours");
+    let (r, next) = o.on_closed(p, t0);
+    assert!(r.is_none(), "the closed connection was not ours");
     assert_eq!(next, Next::Wait, "our dial is still under way");
     assert!(!o.is_cached(&p, t0));
+    assert_eq!(o.counts(t0).failed_total, 0);
+    assert_eq!(o.counts(t0).inflight, 1, "our dial keeps its slot");
     o.on_established(p, cid(11));
     let (device, waiters) = o.on_authenticated(&p).expect("waiters kept");
     assert_eq!((device, waiters.len()), (dev(1), 1));
+    assert_eq!(o.counts(t0).ok_total, 1);
+}
 
-    // Control: not refused → our pending dial's waiters fail (as before).
-    let q = PeerId::random();
+/// Control for network-i44: once our dial's connection is up, its close
+/// before the cert is OUR dial failing — Unreachable and the negative cache.
+#[test]
+fn connection_closed_after_our_dial_connected_fails_and_caches() {
+    let t0 = Instant::now();
+    let mut o = od(16);
+    let p = PeerId::random();
     let w = waiter(&o, "RestoreRequest", t0);
-    let _ = o.admit(q, dev(2), w, vec![], Situation::default());
-    o.dial_started(q, cid(12), t0);
-    let (r, _) = o.on_closed(q, t0, false);
-    assert!(matches!(r.map(|r| r.outcome), Some(Outcome::Failed(_))));
+    let _ = o.admit(p, dev(2), w, vec![], Situation::default());
+    o.dial_started(p, cid(12), t0);
+    o.on_established(p, cid(12));
+    assert!(!o.our_dial_pending(&p));
+
+    let (r, next) = o.on_closed(p, t0);
+    let r = r.expect("our dial failed");
+    assert_eq!(
+        r.outcome,
+        Outcome::Failed("connection closed before the cert exchange".to_string())
+    );
+    assert_eq!(r.waiters.len(), 1);
+    assert_eq!(next, Next::Wait);
+    assert!(o.is_cached(&p, t0));
+    assert_eq!(o.counts(t0).failed_total, 1);
+    assert_eq!(o.counts(t0).inflight, 0);
 }
