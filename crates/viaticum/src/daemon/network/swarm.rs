@@ -1300,7 +1300,8 @@ impl SwarmHandle {
     /// usual `ConnectionClosed` handling drops the peer from `authenticated`.
     /// `hold`: for that long every new connection with the peer — Kademlia's,
     /// the redial pass's, its own inbound — is closed before the cert exchange;
-    /// only our on-demand dial (`send_to_device`) reconnects it.
+    /// only our on-demand dial (`send_to_device`) reconnects it. A zero `hold`
+    /// only ends the peer's hold: nothing is closed, `Ok(connected now)`.
     #[cfg(feature = "e2e-tools")]
     pub async fn disconnect_device(
         &self,

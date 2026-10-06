@@ -470,7 +470,18 @@ impl OnDemand {
 
     /// The last connection of `peer` closed. Closing / Foreign → the loop dials
     /// now; our own connection closed before the cert → our dial failed.
-    pub(crate) fn on_closed(&mut self, peer: PeerId, now: Instant) -> (Option<Resolved>, Next) {
+    /// `refused`: the closed connection was one the test-only e2e hold refused
+    /// (always false in a user build); while our dial to the peer is still under
+    /// way it was not ours — the waiters stay with that dial.
+    pub(crate) fn on_closed(
+        &mut self,
+        peer: PeerId,
+        now: Instant,
+        refused: bool,
+    ) -> (Option<Resolved>, Next) {
+        if refused && self.our_dial_pending(&peer) {
+            return (None, Next::Wait);
+        }
         let Some(on) = self.peers.get(&peer).map(|pw| pw.on) else {
             return (None, Next::Wait);
         };

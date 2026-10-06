@@ -8,6 +8,7 @@
 //       daemon closes every new connection with the peer before the cert
 //       exchange — Kademlia's dials, the redial pass, the peer's own inbound —
 //       except D's on-demand dial (`send_to_device`), which still reaches it.
+//       --hold-secs 0 only ends the hold (no disconnect).
 //   net-probe --data-dir D reach <DEVICE_HEX>
 //       Send the peer a PeerAnnounce through `send_to_device`, the path every
 //       production request takes; succeeds when the peer answered.
@@ -42,7 +43,8 @@ enum Cmd {
     Disconnect {
         /// DeviceId prefix (at least 16 hex chars).
         device: String,
-        /// Hold the peer this long: only the daemon's on-demand dial reconnects it.
+        /// Hold the peer this long: only the daemon's on-demand dial reconnects
+        /// it. 0 = end the hold, do not disconnect.
         #[arg(long)]
         hold_secs: Option<u64>,
     },

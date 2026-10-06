@@ -14,8 +14,15 @@ use crate::daemon::network::conn_lru::DialOrigin;
 
 impl EventLoopState {
     /// `net-probe disconnect`: hold the peer (when `hold`), then close every
-    /// connection to it. Returns whether there was one.
+    /// connection to it. Returns whether there was one. A zero `hold` only ends
+    /// the peer's hold (no disconnect) and returns whether it is connected.
     pub(super) fn e2e_disconnect(&mut self, peer: PeerId, hold: Option<Duration>) -> bool {
+        if hold == Some(Duration::ZERO) {
+            self.e2e_hold.release(&peer);
+            let connected = self.swarm.is_connected(&peer);
+            info!(peer_id = %peer, connected, "e2e: hold released");
+            return connected;
+        }
         if let Some(d) = hold {
             self.e2e_hold.hold(peer, Instant::now() + d);
         }

@@ -58,3 +58,23 @@ fn unheld_peer_is_never_refused() {
 
     assert!(!h.refuses(&other, ConnectionId::new_unchecked(4), false, now));
 }
+
+#[test]
+fn hold_ending_now_is_not_held() {
+    let mut h = E2eHold::new();
+    let p = PeerId::random();
+    let now = Instant::now();
+    h.hold(p, now);
+    assert!(!h.is_held(&p, now), "until = now: the hold is over");
+}
+
+#[test]
+fn released_peer_is_not_held() {
+    let mut h = E2eHold::new();
+    let p = PeerId::random();
+    let now = Instant::now();
+    h.hold(p, now + Duration::from_secs(60));
+    h.release(&p);
+    assert!(!h.is_held(&p, now));
+    assert!(!h.refuses(&p, ConnectionId::new_unchecked(5), false, now));
+}

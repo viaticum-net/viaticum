@@ -246,3 +246,26 @@ async fn disconnect_without_hold_lets_a_background_dial_back() {
         .expect("background dial");
     wait_auth(&a, b.device_id, true).await;
 }
+
+/// `--hold-secs 0` ends a hold without disconnecting: a background dial brings
+/// the peer back at once.
+#[tokio::test]
+async fn zero_hold_releases_the_peer_for_background_dials() {
+    let (a, mut events_a) = SwarmHandle::start(make_swarm_config(87)).await.expect("A");
+    let (b, _events_b) = SwarmHandle::start(make_swarm_config(86)).await.expect("B");
+    let addr_b = get_listen_addr(&b).await;
+    a.dial(b.peer_id, addr_b.clone()).await.expect("dial");
+    wait_for_authenticated(&mut events_a, b.device_id).await;
+
+    a.disconnect_device(b.device_id, Some(Duration::from_secs(60)))
+        .await
+        .expect("hold");
+    wait_not_authenticated(&a, b.device_id).await;
+    a.disconnect_device(b.device_id, Some(Duration::ZERO))
+        .await
+        .expect("release");
+    a.dial_addrs_from(b.peer_id, vec![addr_b], DialOrigin::Redial)
+        .await
+        .expect("background dial");
+    wait_auth(&a, b.device_id, true).await;
+}

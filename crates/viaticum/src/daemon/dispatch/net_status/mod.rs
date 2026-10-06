@@ -117,7 +117,8 @@ mod e2e {
 
     /// `net-probe disconnect`: close every connection to the peer (both sides
     /// then drop it from `authenticated_devices`); `hold_secs`: for that long
-    /// every new connection with it but our on-demand dial is refused.
+    /// every new connection with it but our on-demand dial is refused;
+    /// `hold_secs = 0` only ends the hold (no disconnect).
     pub(crate) async fn dispatch_e2e_disconnect(
         state: &DaemonState,
         hex: &str,
@@ -136,6 +137,7 @@ mod e2e {
             Ok(was_connected) => CliResponse::E2eProbe {
                 device_hex: hex_encode(&device.0),
                 detail: match (was_connected, hold_secs) {
+                    (_, Some(0)) => "hold released".to_string(),
                     (true, None) => "disconnected".to_string(),
                     (false, None) => "was not connected".to_string(),
                     (true, Some(s)) => format!("disconnected, held {s} s"),

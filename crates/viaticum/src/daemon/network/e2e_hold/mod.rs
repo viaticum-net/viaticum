@@ -36,9 +36,15 @@ impl E2eHold {
         Self::default()
     }
 
-    /// Hold `peer` until `until` (a later call replaces the end).
+    /// Hold `peer` until `until` (a later call replaces the end; `until` not
+    /// after now = no hold).
     pub(crate) fn hold(&mut self, peer: PeerId, until: Instant) {
         self.until.insert(peer, until);
+    }
+
+    /// End `peer`'s hold now.
+    pub(crate) fn release(&mut self, peer: &PeerId) {
+        self.until.remove(peer);
     }
 
     /// Is `peer` held at `now`? An ended hold is forgotten.
