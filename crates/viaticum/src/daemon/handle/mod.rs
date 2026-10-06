@@ -448,11 +448,17 @@ impl DaemonHandle {
                 .to_bytes(),
             );
             // R2 Р2-0: the struct defaults are inert; `init` writes a fixed port
-            // and the seeds. A node without either is said out loud.
+            // and the seeds. A node without seeds is said out loud, whatever its
+            // port (review W2 b: DEFAULT_SEEDS is empty until Р-6).
             if app_config.network.is_inert() {
                 tracing::warn!(
                     "inert node: [network] listen_port = 0 and no kademlia_bootstrap_peers — \
                      nobody can find this node and it finds nobody until `viaticum connect`"
+                );
+            } else if app_config.network.kademlia_bootstrap_peers.is_empty() {
+                tracing::warn!(
+                    "no seed configured ([network] kademlia_bootstrap_peers is empty): \
+                     this node finds the network only through manual `viaticum connect`"
                 );
             }
             // Parse kademlia_bootstrap_peers from config strings → Multiaddr.

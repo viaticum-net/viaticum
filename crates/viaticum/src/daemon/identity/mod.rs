@@ -289,6 +289,16 @@ pub fn write_keyfile_at(path: &Path, kf: &IdentityKeyFile) -> Result<(), Identit
     })
 }
 
+/// A tagged release (`packaging/build_release.sh <version>` compiles with
+/// `VIATICUM_REQUIRE_SEEDS=1`) without a default seed does not compile: its
+/// `init` would write a node that finds nobody (R2 Р-6, review W2). Snapshot,
+/// dev and test builds are not affected.
+const _: () = assert!(
+    option_env!("VIATICUM_REQUIRE_SEEDS").is_none()
+        || !viaticum_core::constants::DEFAULT_SEEDS.is_empty(),
+    "a release build needs viaticum_core::constants::DEFAULT_SEEDS (R2 Р-6: no seed deployed yet)"
+);
+
 /// Write the default `config.toml` into `data_dir` unless one exists. The
 /// libp2p port is drawn here, once per node (network-i31); an existing config —
 /// the port the user forwarded — is never rewritten.
