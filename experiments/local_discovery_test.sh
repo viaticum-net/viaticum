@@ -57,9 +57,12 @@
 #               only) is a setup instrument that switches exactly those off for HOLD8B s,
 #               so 8b says nothing about them; the owner's own on-demand traffic (mailbox
 #               store/fetch, SymbolOffer) passes the hold and may still re-warm a holder
-#               before the request (spoils the attempt, never a PASS); a request over a
-#               connection that was up and then cut (no answer, no on-demand dial before
-#               it) is setup noise, not i42 (NOTE). Closed now: a failed on-demand dial to
+#               before the request (8b waits for its burst to end; spoils the attempt,
+#               never a PASS); a request that dies with a transport error on a connection
+#               that was up (no on-demand dial before it) — e.g. the holder's LRU evicting
+#               the owner on a connection the holder dialed itself, the request landing in
+#               the closing window — is setup noise, not i42 (NOTE); a holder not reached
+#               at all is i42 (FAIL). Closed now: a failed on-demand dial to
 #               a cold holder, covered by warm holders reaching k_eff, is a FAIL (no
 #               longer a spoiled attempt).
 # Steps:        0. preconditions: >= 12 GiB free, e2e-tools binary + net-probe, alias log
@@ -105,8 +108,9 @@
 #                  0 pairs = FAIL (i42; bar in lru24/lru/hold, NOTE in main)
 #               8b. source deleted at a live daemon; per attempt: wait for the owner's
 #                  `mailbox_poll: poll done` (<= 75 s; the poll re-dials postmen, many of them
-#                  holders; fallback `auto-dial pass` <= 40 s), then
-#                  EVERY holder of the block, the seed included, disconnected and held at
+#                  holders; fallback `auto-dial pass` <= 40 s), then for the end of the
+#                  owner's on-demand burst (no new `swarm: on-demand dial` for 3 s, <= 15 s,
+#                  else NOTE), then EVERY holder of the block, the seed included, disconnected and held at
 #                  once (net-probe disconnect --hold-secs HOLD8B=120, under timeout 15: the
 #                  owner refuses every new connection with it but its own on-demand dial),
 #                  <= 2 s until they leave the owner's authenticated set (still-warm ones
@@ -119,13 +123,17 @@
 #                  (cached)` with msg=RestoreRequest, or a `fetch: holder did not answer` for
 #                  the block from a holder the owner had dialed on demand with
 #                  msg=RestoreRequest BEFORE that line (holder= DeviceId -> PeerId; unknown
-#                  holder counts as dialed) = FAIL at once (even when warm holders covered
-#                  k_eff); a `holder did not answer` with no such dial before it (a request
-#                  over a connection that was up, e.g. one our disconnect was closing) =
-#                  NOTE, the attempt counts by who served; only warm holders answering
-#                  (cooled ones not asked or re-warmed by the owner's own on-demand
-#                  traffic) = attempt spoiled, up to 3 restores, then FAIL (i42; bar in
-#                  lru24/lru, NOTE main)
+#                  holder counts as dialed), or with no such dial and an err= that is not a
+#                  transport error on an up connection (`peer unreachable`, `peer not
+#                  authenticated`, a failed dial, …: not reached at all) = FAIL at once
+#                  (even when warm holders covered k_eff); a `holder did not answer` with no
+#                  such dial and err= EOF / connection closed / response timeout (the
+#                  holder's LRU evicting the owner on a connection the holder dialed
+#                  itself, the request in the closing window) = NOTE, the attempt counts by
+#                  who served; only warm holders answering (cooled ones not asked or
+#                  re-warmed by the owner's own on-demand traffic) = attempt spoiled, up to
+#                  3 restores, then FAIL (i42; bar in lru24/lru, NOTE main); after the step
+#                  the holds are released (`--hold-secs 0`, no disconnect)
 #               8c. black-hole holder H (>= 2 of 6 blocks), restore 6 files -> <= 180 s hashes
 #                  match; in the restore window on-demand failures to H with msg=RestoreRequest
 #                  <= 1 + ceil(T/60); `on-demand: gave up` lines are not failures; NOTE:
@@ -411,9 +419,19 @@ on_demand_dial_since() {
 #   "ondemand <holder> round=<n>" — an on-demand dial with msg=RestoreRequest to that
 #       holder came BEFORE the line in the window: the request rode our on-demand dial
 #       (network-i42 failed);
-#   "live <holder> round=<n>"     — no such dial before it: the request went over a
-#       connection that was up when the round asked (a still-warm holder, asked first),
-#       e.g. one our own `net-probe disconnect` was cutting — the setup's noise, not i42;
+#   "live <holder> round=<n>"     — no such dial before it AND err= is a transport
+#       failure of a request on a connection that was up: `request failed: IO error on
+#       outbound stream: …` (EOF), `… Connection was closed before a response was
+#       received`, `… Timeout while waiting for a response`, or send_to_device's own
+#       30 s `timeout` (the on-demand wait ends at 10 s as `peer unreachable`, so this one
+#       is a request in flight). Run 2 of 2026-10-06: the holder dialed the owner itself
+#       (its on-demand MailboxStoreRequest), its LRU then evicted the owner, and the
+#       RestoreRequest landed in the 1 s closing window (`dropping inbound request from a
+#       closing peer`) -> EOF. Setup noise, not i42;
+#   "unreached <holder> round=<n>" — no such dial before it and any other err= (`peer
+#       unreachable: …` incl. `queued` after `on-demand: gave up`, `peer not
+#       authenticated: …`, `request failed: Failed to dial the requested peer`, …): the
+#       holder was not reached at all — that is i42 failing (FAIL);
 #   "unmapped <holder>"           — no node of this run has that DeviceId: its dials
 #       cannot be told, so it counts as "ondemand" (never a silent pass).
 # holder= is 16 hex chars of the DeviceId (DEV8), the dial line names the PeerId (PEER_ID).
@@ -441,17 +459,22 @@ no_answer_split() {
             h = "?"; r = "?"
             if (match($0, /holder=[0-9a-f]+/)) h = substr($0, RSTART + 7, RLENGTH - 7)
             if (match($0, /round=[0-9]+/)) r = substr($0, RSTART + 6, RLENGTH - 6)
+            e = ""
+            if (match($0, /err=.*/)) e = substr($0, RSTART + 4)
             h16 = substr(h, 1, 16)
             if (!(h16 in known)) print "unmapped " h " round=" r
             else if (h16 in dialed) print "ondemand " h " round=" r
-            else print "live " h " round=" r
+            else if (e ~ /^swarm error: request failed: (IO error on outbound stream|Connection was closed before a response was received|Timeout while waiting for a response)/ \
+                     || e == "swarm error: timeout") print "live " h " round=" r
+            else print "unreached " h " round=" r " err=" e
         }'
 }
 
 # verdict_8b_attempt : the verdict of one step-8b restore, read from node OWNER's log
 # after L7 and each holder's log after HL0[j] (block BLK, holders HOLDERS). Sets
 #   DIALFAIL — an i42 failure in the window: an `on-demand dial failed` / `on-demand:
-#              unreachable (cached)` with msg=RestoreRequest, or a holder that did not
+#              unreachable (cached)` with msg=RestoreRequest, a holder not reached at
+#              all ("unreached"), or a holder that did not
 #              answer after an on-demand dial for RestoreRequest ("ondemand"/"unmapped");
 #   LOCAL=1  — no holder sent RestoreResponse: the block came from local files (T4);
 #   RESP     — holders that sent RestoreResponse for the block;
@@ -467,10 +490,10 @@ verdict_8b_attempt() {
     df=$(grep -a "swarm: on-demand dial failed" <<< "$win" | grep -acE "$rr_re" || true)
     dc=$(grep -a "on-demand: unreachable (cached)" <<< "$win" | grep -acE "$rr_re" || true)
     na=$(no_answer_split "$OWNER" "$L7" "${BLK:0:16}")
-    ds=$(grep -acE '^(ondemand|unmapped) ' <<< "$na" || true)
+    ds=$(grep -acE '^(ondemand|unmapped|unreached) ' <<< "$na" || true)
     LIVE_NA=$(grep -a '^live ' <<< "$na" | cut -d' ' -f2- | paste -sd';' - || true)
     if [ "$((df + dc + ds))" -gt 0 ]; then
-        DIALFAIL="$df 'on-demand dial failed', $dc 'unreachable (cached)' with msg=RestoreRequest, $ds 'fetch: holder did not answer' for ${BLK:0:16} after an on-demand dial for RestoreRequest ($(grep -aE '^(ondemand|unmapped) ' <<< "$na" | paste -sd';' - || true))"
+        DIALFAIL="$df 'on-demand dial failed', $dc 'unreachable (cached)' with msg=RestoreRequest, $ds 'fetch: holder did not answer' for ${BLK:0:16} after an on-demand dial for RestoreRequest or not reached at all ($(grep -aE '^(ondemand|unmapped|unreached) ' <<< "$na" | paste -sd';' - || true))"
         return 1
     fi
     for j in $HOLDERS; do
@@ -1678,20 +1701,26 @@ if runs_step 8b && [ "$SKIP_8BC" = 0 ]; then
     # Up to 3 restores (the source stays deleted, each one is a new job). An attempt counts
     # when a holder that answered it was reached by an on-demand dial for RestoreRequest.
     # Before the hold (runs 2026-10-06) cooling did not last: Kademlia, the auto-dial pass
-    # and the holders themselves re-warmed 20 of 30 / 29 of 29 holders within the 2 s
-    # before the restore. The hold stops those; the owner's own on-demand traffic (mailbox
-    # store/fetch, SymbolOffer) still passes it and may re-warm a holder, so each attempt
-    # still syncs on the end of the owner's mailbox poll, then disconnects + holds all
-    # holders at once, waits <= 2 s for them to leave the owner's authenticated set (owner
-    # side only: an on-demand dial is the owner's), NOTEs the ones still warm and starts the
-    # restore. Only warm holders answering (they are asked first) spoils the attempt:
-    # retried, never a PASS. A failed on-demand dial / cached-unreachable answer with
-    # msg=RestoreRequest, or a holder that did not answer after an on-demand dial for
-    # RestoreRequest, is a FAIL at once. A holder that did not answer over a connection
-    # that was up (a still-warm one, asked first; run 2 of 2026-10-06: 7 x `unexpected end
-    # of file` from connections our disconnect was closing) is a NOTE, not i42: the attempt
-    # counts by who served. No holder answering = the block came from the owner's source
-    # files (local tier T4): FAIL at once.
+    # and the holders' own dials to the owner (their on-demand MailboxStoreRequest)
+    # re-warmed 20 of 30 / 29 of 29 holders within the 2 s before the restore. The hold
+    # stops those; the owner's own on-demand traffic (mailbox store/fetch, SymbolOffer)
+    # still passes it, and right after `poll done` it comes in a burst. So each attempt
+    # syncs on the end of the owner's mailbox poll, then waits for the burst to end (no new
+    # `swarm: on-demand dial` line of the owner for 3 s, <= 15 s), then disconnects + holds
+    # all holders at once, waits <= 2 s for them to leave the owner's authenticated set
+    # (owner side only: an on-demand dial is the owner's), NOTEs the ones still warm and
+    # starts the restore. Only warm holders answering (they are asked first) spoils the
+    # attempt: retried, never a PASS. A failed on-demand dial / cached-unreachable answer
+    # with msg=RestoreRequest, a holder that did not answer after an on-demand dial for
+    # RestoreRequest, or one not reached at all (`peer unreachable`, `peer not
+    # authenticated`, …) is a FAIL at once. A holder that did not answer with a transport
+    # error on a connection that was up (EOF / closed / response timeout) is a NOTE, not
+    # i42 — run 2 of 2026-10-06, 7 x `unexpected end of file`: the holder had dialed the
+    # owner itself, its LRU (cap 24) evicted the owner 1-3 s later, and the RestoreRequest
+    # landed in that connection's ~1 s closing window (`dropping inbound request from a
+    # closing peer`); the attempt counts by who served. No holder answering = the block
+    # came from the owner's source files (local tier T4): FAIL at once. After the step the
+    # holds are released (`--hold-secs 0`): 8c and 7 run without them.
     L7_0=$(log_line_count "$OWNER")
     declare -A HL0
     RESTORED=0; LOCAL=0; SERVED=""; RESP=""; DIALFAIL=""
@@ -1716,6 +1745,19 @@ if runs_step 8b && [ "$SKIP_8BC" = 0 ]; then
             done
             [ "$PASSED" = 1 ] || note "attempt $attempt: no 'auto-dial pass' line of node-$OWNER in 40 s; cooling anyway"
         fi
+        # The owner's on-demand burst after the poll (MailboxStoreRequest, SymbolOffer to
+        # holders) passes the hold: cool only once it is over — no new `swarm: on-demand
+        # dial` line of the owner for 3 s (12 x 0.25 s), at most 15 s.
+        QL=$(log_line_count "$OWNER"); QUIET=0
+        for t in $(seq 1 60); do
+            sleep 0.25
+            QN=$(log_line_count "$OWNER")
+            QD=$(plain_log_since "$OWNER" "$QL" | head -n $(( QN - QL )) | grep -ac "swarm: on-demand dial" || true)
+            QL=$QN
+            if [ "${QD:-0}" -gt 0 ]; then QUIET=0; else QUIET=$((QUIET + 1)); fi
+            [ "$QUIET" -ge 12 ] && break
+        done
+        [ "$QUIET" -ge 12 ] || note "attempt $attempt: node-$OWNER still dialing on demand after 15 s; cooling anyway"
         # In parallel, each bounded; wait on these PIDs only (the daemons are this shell's
         # jobs too).
         DPIDS=""
@@ -1743,7 +1785,7 @@ if runs_step 8b && [ "$SKIP_8BC" = 0 ]; then
         # re-warmed (review W1 of 93e12bb). verdict_8b_attempt tells it from a live
         # connection cut under a still-warm holder.
         verdict_8b_attempt && V8=0 || V8=$?
-        [ -n "$LIVE_NA" ] && note "attempt $attempt: did not answer over a connection that was up at the request (no on-demand dial for RestoreRequest before; not i42): $LIVE_NA"
+        [ -n "$LIVE_NA" ] && note "attempt $attempt: did not answer with a transport error on a connection that was up (no on-demand dial for RestoreRequest before; not i42): $LIVE_NA"
         [ "$V8" = 2 ] || break
         note "attempt $attempt: every holder that answered ($RESP ) was reached over a live connection (no on-demand dial with msg=RestoreRequest, no failed one): the cooled holders were not asked or kad re-warmed them before the request; retrying"
     done
@@ -1768,6 +1810,15 @@ if runs_step 8b && [ "$SKIP_8BC" = 0 ]; then
         | grep -acE "restore: holders did not answer; redialing them|fetch: redialed holders before a retry" || true)
     [ "$REDIALS" -eq 0 ] && bar8_pass "0 no-answer redials ('restore: holders did not answer; redialing them' / 'fetch: redialed holders before a retry') during restore" \
         || bar8_fail "$REDIALS no-answer redial lines during restore (reached only by the restore-i26 redial)"
+    # Release the holds (--hold-secs 0 ends a hold, no disconnect): 8c and 7 run without.
+    DPIDS=""; RELFAIL=0
+    for j in $HOLDERS; do
+        timeout 15 "$NET_PROBE" --data-dir "$(node_dir "$OWNER")" disconnect \
+            --hold-secs 0 "${DEV8[$j]}" > /dev/null 2>&1 &
+        DPIDS="$DPIDS $!"
+    done
+    for dp in $DPIDS; do wait "$dp" || RELFAIL=$((RELFAIL + 1)); done
+    [ "$RELFAIL" -eq 0 ] || note "$RELFAIL hold release(s) on node-$OWNER failed: they end by themselves after ${HOLD8B}s"
 fi
 
 # ── STEP 8c: A BLACK-HOLE HOLDER ────────────────────────────────────────────
