@@ -30,8 +30,8 @@ async fn ipv4_tcp_port(handle: &SwarmHandle) -> u16 {
     }
 }
 
-// Mutation: drop `.with_dns()` from the transport → the /dns4 address is not
-// supported, B never reaches A, test red.
+// Mutation: drop the `ReloadingDns` layer from the transport → the /dns4
+// address is not supported, B never reaches A, test red.
 #[tokio::test]
 async fn dns_bootstrap_resolves_localhost_tcp() {
     let cfg_a = make_swarm_config(41);
