@@ -34,6 +34,8 @@ mod worker;
 mod tests;
 #[cfg(test)]
 mod tests_budget;
+#[cfg(test)]
+mod tests_ss_fairness;
 
 pub use esi_space::EsiSpace;
 pub use gate::{
@@ -263,6 +265,9 @@ pub struct WorkPipeline {
     restore_gate: Option<RestoreGate>,
     /// The INFO line «paused» was written for the pause that is on now (once per pause).
     pause_announced: bool,
+    /// The last attempt was on a SystemState block (backup-i28): while a user block waits, the
+    /// next attempt is a user block's. RAM only.
+    last_was_ss: bool,
 }
 
 /// Resolves when a source of the restore gate changed; never while there is no gate (or its
@@ -306,6 +311,7 @@ impl WorkPipeline {
             last_attempt: std::collections::HashMap::new(),
             restore_gate: None,
             pause_announced: false,
+            last_was_ss: false,
         }
     }
 
@@ -466,13 +472,7 @@ impl WorkPipeline {
         let mut picked_any = false;
         let mut tried: std::collections::HashSet<SourceBlockId> = std::collections::HashSet::new();
         for _ in 0..MAX_BLOCKS_PER_ITERATION {
-            let block = match self.db.next_work_item(
-                self.config.completion_bonus_coef,
-                cooldown,
-                parked_cooldown,
-                now,
-                pool.signature,
-            )? {
+            let block = match self.next_block(cooldown, parked_cooldown, now, pool.signature)? {
                 Some(b) => b,
                 None => {
                     if !picked_any {
@@ -505,6 +505,49 @@ impl WorkPipeline {
         Ok(picked_any)
     }
 
+    /// The block of the next attempt (backup-i28). The service blocks of SystemState and the
+    /// user's blocks share the worker: after an attempt on an SS block, a user block that
+    /// waits goes next. Within SS, a block with no live holder that was never attempted (a new
+    /// base or diff) goes before a re-pick of a placed one, so the DR catalog does not fall
+    /// behind (backup-i28-a). Otherwise the plain order of `next_work_item`. The SS set is read for
+    /// every pick: it is small, and `next_work_item` scans every block anyway.
+    fn next_block(
+        &self,
+        cooldown: std::time::Duration,
+        parked_cooldown: std::time::Duration,
+        now: Timestamp,
+        pool_sig: u64,
+    ) -> Result<Option<SourceBlockRecord>, viaticum_core::db::DbError> {
+        let coef = self.config.completion_bonus_coef;
+        let ss = self.db.ss_block_id_set()?;
+        let is_ss = |b: &SourceBlockRecord| ss.contains(&b.block_id.0);
+        let pick = |keep: &dyn Fn(&SourceBlockRecord) -> bool| {
+            self.db
+                .next_work_item_where(coef, cooldown, parked_cooldown, now, pool_sig, keep)
+        };
+        if self.last_was_ss
+            && let Some(user) = pick(&|b| !is_ss(b))?
+        {
+            return Ok(Some(user));
+        }
+        // Never attempted: a new SS block jumps the queue once, not forever when every holder
+        // keeps refusing it (then the placed SS blocks get their turns again).
+        let untried: std::collections::HashSet<[u8; 32]> = ss
+            .iter()
+            .filter(|id| {
+                self.db
+                    .block_cooldown(&SourceBlockId(**id))
+                    .last_attempted_at
+                    .is_none()
+            })
+            .copied()
+            .collect();
+        if let Some(new_ss) = pick(&|b| b.current_alive == 0 && untried.contains(&b.block_id.0))? {
+            return Ok(Some(new_ss));
+        }
+        pick(&|_| true)
+    }
+
     /// One attempt on one block: log the pick, run the encode+deliver cycle, record
     /// the cooldown (parked when nobody could take symbols).
     async fn work_on_block(
@@ -513,8 +556,13 @@ impl WorkPipeline {
         pool: &PoolSnapshot,
         now: Timestamp,
     ) -> anyhow::Result<BlockAttempt> {
+        // backup-i28: a fresh look at the SS ledger for the picked block (its record may be
+        // written a moment before its ledger entry: at most one extra SS attempt in a row).
+        let ss = self.db.is_ss_block(&block.block_id)?;
+        self.last_was_ss = ss;
         tracing::info!(
             block_id = %block.block_id,
+            ss,
             importance = block.importance,
             current_alive = block.current_alive,
             current_reliability = block.current_reliability,

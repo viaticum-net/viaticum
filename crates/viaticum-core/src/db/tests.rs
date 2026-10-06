@@ -4721,3 +4721,41 @@ fn avail_decay_keeps_concurrent_writes_to_the_record() {
     assert_eq!(rec.bytes_peer_stores_for_us, 300, "no bump lost");
     assert_eq!(rec.last_avail_sample, 3000);
 }
+
+/// backup-i28: `next_work_item_where` keeps the order of `next_work_item` among the blocks
+/// its predicate accepts; accepting all is `next_work_item`, accepting none is `None`.
+#[test]
+fn next_work_item_where_keeps_order_among_kept_blocks() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(9999);
+    // Priorities as in next_work_item_picks_highest_priority: C 1.4 > A ≈ 1.143 > B 1.0.
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.5, 12, Some(14), 0.5, 0.999);
+    let b = make_block_with(2, SourceBlockStatus::Active, 1.0, 0, Some(12), 0.0, 0.999);
+    let c = make_block_with(3, SourceBlockStatus::Active, 0.8, 6, Some(12), 0.4, 0.999);
+    for r in [&a, &b, &c] {
+        db.upsert_source_block(r).unwrap();
+    }
+    let (cd, parked) = (
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(3600),
+    );
+    let pick = |keep: &dyn Fn(&SourceBlockRecord) -> bool| {
+        db.next_work_item_where(1.5, cd, parked, now, 0, keep)
+            .unwrap()
+            .map(|r| r.block_id)
+    };
+
+    assert_eq!(pick(&|_| true), Some(SourceBlockId([3; 32])));
+    assert_eq!(
+        pick(&|_| true),
+        db.next_work_item(1.5, cd, parked, now, 0)
+            .unwrap()
+            .map(|r| r.block_id)
+    );
+    assert_eq!(
+        pick(&|r| r.block_id != SourceBlockId([3; 32])),
+        Some(SourceBlockId([1; 32])),
+        "C left out: the next by priority"
+    );
+    assert_eq!(pick(&|_| false), None);
+}

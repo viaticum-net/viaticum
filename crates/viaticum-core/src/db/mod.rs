@@ -1246,6 +1246,28 @@ impl Db {
         now: Timestamp,
         current_pool_sig: u64,
     ) -> Result<Option<SourceBlockRecord>, DbError> {
+        self.next_work_item_where(
+            coef,
+            cooldown,
+            parked_cooldown,
+            now,
+            current_pool_sig,
+            |_| true,
+        )
+    }
+
+    /// `next_work_item` among the blocks `keep` accepts: the same eligibility and order,
+    /// one more condition (backup-i28: the worker picks by class — the service blocks of
+    /// SystemState or the user's blocks). Read-only, as `next_work_item`.
+    pub fn next_work_item_where(
+        &self,
+        coef: f64,
+        cooldown: Duration,
+        parked_cooldown: Duration,
+        now: Timestamp,
+        current_pool_sig: u64,
+        keep: impl Fn(&SourceBlockRecord) -> bool,
+    ) -> Result<Option<SourceBlockRecord>, DbError> {
         let all = self.list_all_source_blocks()?;
         let cooldown_secs = cooldown.as_secs();
         let parked_cooldown_secs = parked_cooldown.as_secs();
@@ -1256,7 +1278,7 @@ impl Db {
         };
 
         let eligible = all.into_iter().filter(|b| {
-            if b.status != SourceBlockStatus::Active {
+            if b.status != SourceBlockStatus::Active || !keep(b) {
                 return false;
             }
             if b.target_reliability <= 0.0
