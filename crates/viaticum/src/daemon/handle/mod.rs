@@ -447,6 +447,14 @@ impl DaemonHandle {
                 ))
                 .to_bytes(),
             );
+            // R2 Р2-0: the struct defaults are inert; `init` writes a fixed port
+            // and the seeds. A node without either is said out loud.
+            if app_config.network.is_inert() {
+                tracing::warn!(
+                    "inert node: [network] listen_port = 0 and no kademlia_bootstrap_peers — \
+                     nobody can find this node and it finds nobody until `viaticum connect`"
+                );
+            }
             // Parse kademlia_bootstrap_peers from config strings → Multiaddr.
             // AppConfig::validate() already checked basic syntax; full parse here.
             let kademlia_bootstrap_peers: Vec<libp2p::Multiaddr> = app_config

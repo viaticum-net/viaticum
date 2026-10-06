@@ -15,6 +15,8 @@ use viaticum_core::cluster::{
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_network;
 
 // ============================================================
 // Data-directory layout
@@ -287,11 +289,29 @@ pub fn write_keyfile_at(path: &Path, kf: &IdentityKeyFile) -> Result<(), Identit
     })
 }
 
-/// Write the default `config.toml` into `data_dir` unless one exists.
+/// Write the default `config.toml` into `data_dir` unless one exists. The
+/// libp2p port is drawn here, once per node (network-i31); an existing config —
+/// the port the user forwarded — is never rewritten.
 pub fn write_default_config_if_absent(data_dir: &Path) -> Result<(), IdentityError> {
+    use crate::daemon::network::listen_port::{PortProtocols, pick_listen_port};
     let config_path = data_dir.join(CONFIG_FILE_NAME);
     if !config_path.exists() {
-        std::fs::write(&config_path, default_config_toml())?;
+        let any = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        let port = pick_listen_port(
+            viaticum_core::constants::LISTEN_PORT_RANGE,
+            &[DEFAULT_WEB_PORT],
+            PortProtocols::TcpAndUdp,
+            any,
+        )
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                "init: no free libp2p port found in 20000..=29999; config.toml gets \
+                 listen_port = 0 (a new port on every start) — set one by hand"
+            );
+            0
+        });
+        let text = default_config_toml(port, viaticum_core::constants::DEFAULT_SEEDS);
+        std::fs::write(&config_path, text)?;
     }
     Ok(())
 }
@@ -460,9 +480,16 @@ pub const DEFAULT_WEB_PORT: u16 = 7383;
 // Not 0 (it would change on every restart) and below the Linux ephemeral range.
 const _: () = assert!(DEFAULT_WEB_PORT != 0 && DEFAULT_WEB_PORT < 32768);
 
-/// The `config.toml` that `init` (and DR, when absent) writes. Same text on every
-/// render: nothing in it is random.
-pub fn default_config_toml() -> String {
+/// The `config.toml` that `init` (and DR, when absent) writes, for the libp2p
+/// port `listen_port` and the seeds `seeds` (R2 Р2-0: a working network, not
+/// the inert struct defaults). Same text on every render of the same arguments.
+pub fn default_config_toml(listen_port: u16, seeds: &[&str]) -> String {
+    // Multiaddrs carry no quotes or backslashes: a TOML basic string as is.
+    let seeds = seeds
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         r#"# Viaticum configuration
 # Generated automatically — edit as needed.
@@ -477,6 +504,14 @@ pub fn default_config_toml() -> String {
 [storage]
 # soft_quota_gb = 50
 # disk_reserve_gb = 10
+
+[network]
+# The port other nodes reach this one on, TCP and UDP. Drawn at random for this
+# node; to be reachable from outside your home, forward it on the router (TCP
+# and UDP).
+listen_port = {listen_port}
+# The way into the network: the seeds, named by DNS.
+kademlia_bootstrap_peers = [{seeds}]
 
 [web_api]
 # The web UI and the API the CLI talks to (`viaticum status`, `viaticum open`).

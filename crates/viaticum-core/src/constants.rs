@@ -289,6 +289,45 @@ pub const MAX_HANDSHAKE_PROTECTED: usize = 16;
 /// the on-demand waiter's deadline.
 pub const TRANSPORT_TIMEOUT_SECS: u64 = 20;
 
+// === Ports and seeds of a home node (R2a: network-i28, i31) ===
+
+/// The listen port of a public seed, TCP and UDP alike (R2 Р-6).
+pub const SEED_PORT: u16 = 27210;
+
+/// `init` picks the libp2p listen port at random from this range and writes it
+/// into config.toml (network-i31): two devices behind one router never share a
+/// port, and a port the user forwarded stays the same across restarts. One
+/// number serves TCP and (R2b) UDP.
+pub const LISTEN_PORT_RANGE: std::ops::RangeInclusive<u16> = 20000..=29999;
+// Below the Linux ephemeral range (32768+), where an OS-chosen port of another
+// program could take it between restarts.
+const _: () = assert!(*LISTEN_PORT_RANGE.end() < 32768 && *LISTEN_PORT_RANGE.start() > 1024);
+
+/// Ports of LISTEN_PORT_RANGE `init` never picks: those of apps self-hosters run
+/// next to us — Syncthing (21025, 22000), Synergy (24800), Minecraft (25565,
+/// 25575), Steam / Source servers (27015..=27030, MongoDB 27017..=27019 inside
+/// it), RethinkDB (28015), 20000 and 26000 (DNP3, Quake) — and the seed's own.
+pub const LISTEN_PORT_DENYLIST: &[std::ops::RangeInclusive<u16>] = &[
+    20000..=20000,
+    21025..=21025,
+    22000..=22000,
+    24800..=24800,
+    25565..=25565,
+    25575..=25575,
+    26000..=26000,
+    27015..=27030,
+    28015..=28015,
+    SEED_PORT..=SEED_PORT,
+];
+
+/// The public seeds `init` writes into `[network] kademlia_bootstrap_peers`
+/// (network-i28): two addresses per seed, named by DNS, QUIC first —
+/// `/dns4/<name>/udp/27210/quic-v1/p2p/<id>` then `/dns4/<name>/tcp/27210/p2p/<id>`.
+/// Empty until the first seed is deployed: its name and its PeerId do not exist
+/// yet (R2 Р-6, open). Until then a new node finds the network only through
+/// `viaticum connect` or seeds written by hand.
+pub const DEFAULT_SEEDS: &[&str] = &[];
+
 /// After the Kademlia cadence settles (network-i43), discovery lookups and the
 /// Kademlia bootstrap run every 30 min (divided by `time_scale`) …
 pub const KAD_DISCOVERY_SETTLED_INTERVAL_SECS: u64 = 30 * 60;

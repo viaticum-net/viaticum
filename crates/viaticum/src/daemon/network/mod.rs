@@ -45,6 +45,9 @@ mod e2e_hold;
 // some hysteria2 setups) that drop TCP whose source port matches a listener.
 mod no_port_reuse;
 
+// The random listen port `init` writes into config.toml (network-i31).
+pub mod listen_port;
+
 #[cfg(test)]
 mod swarm_addr_tests;
 #[cfg(test)]
