@@ -13,36 +13,70 @@
 //   abcd1234...ef98@https://relay.example.com,192.168.1.5:12345
 //
 // Used by handle/mod.rs to load stored peer addresses from DB on startup.
+// Also picks the libp2p address `status` shows (`select_node_addr`).
 
 use std::net::SocketAddr;
 
+use libp2p::Multiaddr;
+use libp2p::multiaddr::Protocol;
 use viaticum_core::types::DeviceId;
+
+use super::kad_feed::{Reach, reach};
 
 #[cfg(test)]
 mod tests;
 
-/// Pick the most useful listen address to display/share from a node's set of
-/// libp2p listen multiaddrs (string form, e.g. `/ip4/192.168.1.5/tcp/12345`).
-///
-/// Selection order:
-///   1. a routable IPv4 address (most broadly reachable; what local test
-///      harnesses dial and what a user can paste to a peer),
-///   2. otherwise any routable address,
-///   3. otherwise the first address (even loopback), as a last resort.
-///
-/// "Routable" excludes loopback: `/127.0.0.1/` (IPv4) **and** `/::1/` (IPv6).
-/// The previous inline filter only excluded the IPv4 loopback, so a node whose
-/// listen set happened to order `/ip6/::1/...` first would advertise that
-/// useless loopback address. Returns `None` only for an empty set.
-pub fn select_display_base_addr(addrs: &[String]) -> Option<String> {
-    let is_loopback = |a: &String| a.contains("/127.0.0.1/") || a.contains("/::1/");
-    let is_ip4 = |a: &String| a.contains("/ip4/");
-    addrs
-        .iter()
-        .find(|a| is_ip4(a) && !is_loopback(a))
-        .or_else(|| addrs.iter().find(|a| !is_loopback(a)))
-        .or_else(|| addrs.first())
-        .cloned()
+/// The address `status` shows as `node_addr` (network-i27; R2a: no relay
+/// circuits yet), without the `/p2p/` of this node (the caller appends it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeAddr {
+    pub addr: Multiaddr,
+    /// Not routable from the internet (a private or loopback address): another
+    /// home cannot dial it. `status` says "(LAN only)".
+    pub lan_only: bool,
+}
+
+/// Pick `node_addr`: a confirmed external address first, else the best listen
+/// address. Within a set: global before private before loopback, QUIC before
+/// TCP, IPv4 before IPv6. Circuit, unspecified, link-local and documentation
+/// addresses are never picked (`kad_feed::reach`); when nothing else is left,
+/// the first listen address, marked LAN only. `None` only for two empty sets.
+pub fn select_node_addr(external: &[Multiaddr], listen: &[Multiaddr]) -> Option<NodeAddr> {
+    /// The address without a terminal `/p2p/<us>` (not a relay hop) and its
+    /// rank, or `None` when nobody else can dial it.
+    fn ranked(a: &Multiaddr) -> Option<((Reach, u8, u8), Multiaddr)> {
+        let mut addr = a.clone();
+        if matches!(addr.iter().last(), Some(Protocol::P2p(_))) {
+            addr.pop();
+        }
+        let reach = reach(&addr)?;
+        let quic = addr.iter().any(|p| matches!(p, Protocol::QuicV1));
+        let tcp = addr.iter().any(|p| matches!(p, Protocol::Tcp(_)));
+        let transport = if quic {
+            0
+        } else if tcp {
+            1
+        } else {
+            2
+        };
+        let family = u8::from(!matches!(addr.iter().next(), Some(Protocol::Ip4(_))));
+        Some(((reach, transport, family), addr))
+    }
+    let best = |set: &[Multiaddr]| {
+        set.iter()
+            .filter_map(ranked)
+            .min_by_key(|(r, _)| *r)
+            .map(|((reach, _, _), addr)| NodeAddr {
+                addr,
+                lan_only: reach != Reach::Global,
+            })
+    };
+    best(external).or_else(|| best(listen)).or_else(|| {
+        listen.first().map(|a| NodeAddr {
+            addr: a.clone(),
+            lan_only: true,
+        })
+    })
 }
 
 /// Error returned by `parse_node_addr`.

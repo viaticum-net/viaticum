@@ -394,6 +394,10 @@ enum SwarmCommand {
     ListenAddrs {
         reply: oneshot::Sender<Vec<Multiaddr>>,
     },
+    /// The confirmed external addresses (`status` node_addr, network-i27).
+    ExternalAddrs {
+        reply: oneshot::Sender<Vec<Multiaddr>>,
+    },
     /// Snapshot of swarm peer-set: connected_count vs authenticated_count.
     /// Connected = libp2p has a live transport-level link (post-Noise+identify).
     /// Authenticated = our cert exchange has succeeded (heavy messages allowed).
@@ -1190,6 +1194,16 @@ impl SwarmHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(SwarmCommand::ListenAddrs { reply: reply_tx })
+            .await
+            .map_err(|_| SwarmError::ChannelClosed)?;
+        reply_rx.await.map_err(|_| SwarmError::ChannelClosed)
+    }
+
+    /// Return the confirmed external addresses.
+    pub async fn external_addrs(&self) -> Result<Vec<Multiaddr>, SwarmError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::ExternalAddrs { reply: reply_tx })
             .await
             .map_err(|_| SwarmError::ChannelClosed)?;
         reply_rx.await.map_err(|_| SwarmError::ChannelClosed)
@@ -2781,6 +2795,9 @@ impl EventLoopState {
             SwarmCommand::ListenAddrs { reply } => {
                 let addrs: Vec<Multiaddr> = self.swarm.listeners().cloned().collect();
                 let _ = reply.send(addrs);
+            }
+            SwarmCommand::ExternalAddrs { reply } => {
+                let _ = reply.send(self.swarm.external_addresses().cloned().collect());
             }
             SwarmCommand::PeerCounts { reply } => {
                 let connected = self.swarm.connected_peers().count() as u32;

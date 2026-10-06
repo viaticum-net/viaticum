@@ -7,6 +7,7 @@ fn make_status(peers: Vec<PeerSummary>) -> StatusData {
         node_identity: "abcdef0123456789".to_string(),
         device_id: "abcdef0123456789".to_string(),
         node_addr: "test-addr".to_string(),
+        node_addr_lan_only: false,
         peer_count: peers.len() as u32,
         peer_count_connected: peers.len() as u32,
         peer_count_authenticated: peers.len() as u32,

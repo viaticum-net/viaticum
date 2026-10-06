@@ -32,7 +32,12 @@ pub fn render_status(data: &StatusData) -> String {
     }
     out.push_str(&format!("  identity:       {}\n", data.node_identity));
     if !data.node_addr.is_empty() {
-        out.push_str(&format!("  addr:           {}\n", data.node_addr));
+        let lan_only = if data.node_addr_lan_only {
+            "  (LAN only)"
+        } else {
+            ""
+        };
+        out.push_str(&format!("  addr:           {}{lan_only}\n", data.node_addr));
     }
     out.push_str(&format!(
         "  peers:          {}  (avg trust: {:.2})\n",

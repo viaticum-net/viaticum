@@ -255,21 +255,18 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
     let node_identity = hex_encode(&state.identity_pub.0);
     let device_id = bytes_to_hex_8(&state.device_id.0);
 
-    let node_addr = match state.swarm_handle.as_ref() {
+    // network-i27 (R2a): a confirmed external address first, else a listen
+    // address, which `status` marks LAN only when another home cannot dial it.
+    let (node_addr, node_addr_lan_only) = match state.swarm_handle.as_ref() {
         Some(swarm) => {
-            let addrs = swarm.listen_addrs().await.unwrap_or_default();
-            // Prefer a routable IPv4 address, then any routable, then anything.
-            // Excludes both IPv4 (127.0.0.1) and IPv6 (::1) loopback.
-            let addr_strings: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
-            let base = crate::daemon::network::addr::select_display_base_addr(&addr_strings)
-                .unwrap_or_default();
-            if base.is_empty() {
-                swarm.peer_id.to_string()
-            } else {
-                format!("{}/p2p/{}", base, swarm.peer_id)
+            let external = swarm.external_addrs().await.unwrap_or_default();
+            let listen = swarm.listen_addrs().await.unwrap_or_default();
+            match crate::daemon::network::addr::select_node_addr(&external, &listen) {
+                Some(a) => (format!("{}/p2p/{}", a.addr, swarm.peer_id), a.lan_only),
+                None => (swarm.peer_id.to_string(), false),
             }
         }
-        None => hex_encode(&state.identity_pub.0),
+        None => (hex_encode(&state.identity_pub.0), false),
     };
 
     // network-i41: the cache fields and the connected / authenticated counts
@@ -351,6 +348,7 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         node_identity,
         device_id,
         node_addr,
+        node_addr_lan_only,
         peer_count: peers.len() as u32,
         peer_count_connected,
         peer_count_authenticated,
