@@ -357,11 +357,16 @@ fn render_status_marks_lan_only_node_addr() {
         .lines()
         .find(|l| l.contains("/p2p/"))
         .expect("an addr line");
-    assert!(line.contains("addr (LAN only):"), "got: {rendered}");
-    // Review N2: the address ends the line — its tail is a `connect` argument.
+    // The `addr:` line is a contract for scripts (`grep "addr:"`) and people: the
+    // label stays `addr:` and the address ends the line (a `connect` argument).
+    assert_eq!(
+        line,
+        format!("  addr:           {}", data.node_addr),
+        "got: {rendered}"
+    );
     assert!(
-        line.ends_with(&data.node_addr) && line.split_whitespace().last() == Some(&*data.node_addr),
-        "got: {line:?}"
+        rendered.contains("\n                  (LAN only: reachable from this network only)\n"),
+        "got: {rendered}"
     );
     data.node_addr_lan_only = false;
     let rendered = output::render_status(&data);

@@ -32,14 +32,13 @@ pub fn render_status(data: &StatusData) -> String {
     }
     out.push_str(&format!("  identity:       {}\n", data.node_identity));
     if !data.node_addr.is_empty() {
-        // The mark goes before the address: the address stays the last thing on
-        // the line, so copying the line's tail gives a `connect` argument.
-        let label = if data.node_addr_lan_only {
-            "addr (LAN only):"
-        } else {
-            "addr:"
-        };
-        out.push_str(&format!("  {label:<15} {}\n", data.node_addr));
+        // `addr: <address>` is a contract: scripts take the line by `addr:` and the
+        // address ends it (a `connect` argument as is). The LAN-only mark goes on
+        // its own line below.
+        out.push_str(&format!("  addr:           {}\n", data.node_addr));
+        if data.node_addr_lan_only {
+            out.push_str("                  (LAN only: reachable from this network only)\n");
+        }
     }
     out.push_str(&format!(
         "  peers:          {}  (avg trust: {:.2})\n",
