@@ -233,7 +233,7 @@ fn closing_peer_is_dialed_after_its_connection_closed() {
     };
     let w = waiter(&o, "SymbolOffer", t0);
     assert_eq!(o.admit(p, dev(1), w, vec![], sit), Next::Wait);
-    let (r, next) = o.on_closed(p, t0);
+    let (r, next) = o.on_closed(p, t0, false);
     assert!(r.is_none());
     assert_eq!(next, Next::Dial);
 }
@@ -247,7 +247,60 @@ fn our_connection_closed_before_cert_fails_and_caches() {
     let _ = o.admit(p, dev(1), w, vec![], Situation::default());
     o.dial_started(p, cid(3), t0);
     o.on_established(p, cid(3));
-    let (r, _) = o.on_closed(p, t0);
+    let (r, _) = o.on_closed(p, t0, false);
     assert!(matches!(r.map(|r| r.outcome), Some(Outcome::Failed(_))));
     assert!(o.is_cached(&p, t0));
+}
+
+#[test]
+fn our_dial_pending_only_until_our_connection_is_up() {
+    let t0 = Instant::now();
+    let mut o = od(16);
+    let p = PeerId::random();
+    assert!(!o.our_dial_pending(&p), "no waiters, no dial");
+    let w = waiter(&o, "RestoreRequest", t0);
+    assert_eq!(
+        o.admit(p, dev(1), w, vec![], Situation::default()),
+        Next::Dial
+    );
+    assert!(!o.our_dial_pending(&p), "admitted, not dialed yet");
+    o.dial_started(p, cid(7), t0);
+    assert!(o.our_dial_pending(&p));
+    // A foreign connection coming up does not end our dial.
+    o.on_established(p, cid(8));
+    assert!(o.our_dial_pending(&p));
+    o.on_established(p, cid(7));
+    assert!(!o.our_dial_pending(&p), "our connection is up");
+}
+
+/// e2e hold (W4): a refused connection — the peer's last — closing while our
+/// dial is still under way does not fail the waiters; our dial brings them out.
+/// The same close of a non-refused connection fails them as before.
+#[test]
+fn refused_last_connection_closed_during_our_dial_keeps_waiters() {
+    let t0 = Instant::now();
+    let mut o = od(16);
+    let p = PeerId::random();
+    let w = waiter(&o, "RestoreRequest", t0);
+    assert_eq!(
+        o.admit(p, dev(1), w, vec![], Situation::default()),
+        Next::Dial
+    );
+    o.dial_started(p, cid(11), t0);
+
+    let (r, next) = o.on_closed(p, t0, true);
+    assert!(r.is_none(), "the refused connection was not ours");
+    assert_eq!(next, Next::Wait, "our dial is still under way");
+    assert!(!o.is_cached(&p, t0));
+    o.on_established(p, cid(11));
+    let (device, waiters) = o.on_authenticated(&p).expect("waiters kept");
+    assert_eq!((device, waiters.len()), (dev(1), 1));
+
+    // Control: not refused → our pending dial's waiters fail (as before).
+    let q = PeerId::random();
+    let w = waiter(&o, "RestoreRequest", t0);
+    let _ = o.admit(q, dev(2), w, vec![], Situation::default());
+    o.dial_started(q, cid(12), t0);
+    let (r, _) = o.on_closed(q, t0, false);
+    assert!(matches!(r.map(|r| r.outcome), Some(Outcome::Failed(_))));
 }

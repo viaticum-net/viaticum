@@ -64,6 +64,8 @@ use super::kad_feed::{kad_dialed_addr, kad_feed_addrs, kad_replace_plan};
 use super::on_demand::OnDemand;
 
 mod conn_loop;
+#[cfg(feature = "e2e-tools")]
+mod e2e_hold_loop;
 mod policy;
 
 pub use policy::{ConnPolicy, ConnStats};
@@ -429,10 +431,12 @@ enum SwarmCommand {
         reply: oneshot::Sender<Vec<Multiaddr>>,
     },
     /// Test-only (`net-probe disconnect`, C-DK Р-16): close every connection to
-    /// `peer_id`. Replies whether there was one.
+    /// `peer_id`, then (`hold`) refuse every new one but our on-demand dial for
+    /// that long. Replies whether there was a connection.
     #[cfg(feature = "e2e-tools")]
     Disconnect {
         peer_id: PeerId,
+        hold: Option<Duration>,
         reply: oneshot::Sender<bool>,
     },
     /// Unit tests only: feed `peer_id`'s identify addresses to Kademlia by the
@@ -965,6 +969,8 @@ impl SwarmHandle {
             last_empty_lookup_warn: None,
             #[cfg(feature = "e2e-tools")]
             e2e_loopback_aliases,
+            #[cfg(feature = "e2e-tools")]
+            e2e_hold: super::e2e_hold::E2eHold::new(),
         };
         tokio::spawn(loop_state.run());
 
@@ -1292,13 +1298,22 @@ impl SwarmHandle {
     /// `device` (the PeerId is derived from the device key, so a peer that never
     /// authenticated can be named too). `Ok(false)` when there was none. The
     /// usual `ConnectionClosed` handling drops the peer from `authenticated`.
+    /// `hold`: for that long every new connection with the peer — Kademlia's,
+    /// the redial pass's, its own inbound — is closed before the cert exchange;
+    /// only our on-demand dial (`send_to_device`) reconnects it. A zero `hold`
+    /// only ends the peer's hold: nothing is closed, `Ok(connected now)`.
     #[cfg(feature = "e2e-tools")]
-    pub async fn disconnect_device(&self, device: DeviceId) -> Result<bool, SwarmError> {
+    pub async fn disconnect_device(
+        &self,
+        device: DeviceId,
+        hold: Option<Duration>,
+    ) -> Result<bool, SwarmError> {
         let peer_id = device_id_to_peer_id(&device)?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(SwarmCommand::Disconnect {
                 peer_id,
+                hold,
                 reply: reply_tx,
             })
             .await
@@ -1680,6 +1695,11 @@ struct EventLoopState {
     /// (test-only amplifier, C-DK Р-10); 0 once done or when off.
     #[cfg(feature = "e2e-tools")]
     e2e_loopback_aliases: usize,
+
+    /// Peers `net-probe disconnect --hold-secs` holds: only our on-demand dial
+    /// reconnects them until the hold ends (test-only, step 8b).
+    #[cfg(feature = "e2e-tools")]
+    e2e_hold: super::e2e_hold::E2eHold,
 }
 
 impl EventLoopState {
@@ -1754,6 +1774,11 @@ impl EventLoopState {
                 debug!(peer_id = %peer_id, "connection established");
                 // Clear dialing set entry now that connection is established.
                 self.dialing.remove(&peer_id);
+                // Test-only hold (step 8b): closed before any bookkeeping or cert.
+                #[cfg(feature = "e2e-tools")]
+                if self.e2e_hold_refuses(peer_id, connection_id, endpoint.is_dialer()) {
+                    return;
+                }
                 self.conn_established(peer_id, connection_id, endpoint.is_dialer(), Instant::now());
 
                 // Dialer sends the cert first; listener waits for inbound request.
@@ -1778,6 +1803,7 @@ impl EventLoopState {
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
+                connection_id,
                 num_established,
                 cause,
                 ..
@@ -1785,6 +1811,7 @@ impl EventLoopState {
                 // `cause` = KeepAliveTimeout would mean libp2p's idle timeout closed a
                 // link between live nodes (C-DK v3-C expects none).
                 debug!(peer_id = %peer_id, num_established, cause = ?cause, "connection closed");
+                let refused = self.e2e_refused_closed(connection_id);
                 if num_established > 0 {
                     // network-i19: another connection to this peer lives (a
                     // duplicate from simultaneous dials, closed by one side), so
@@ -1807,7 +1834,7 @@ impl EventLoopState {
                 self.pending_cert.remove(&peer_id);
                 let event = ProtocolEvent::ConnectionClosed { peer_id, device_id };
                 emit_event(&self.event_tx, event);
-                self.conn_closed(peer_id, Instant::now());
+                self.conn_closed(peer_id, Instant::now(), refused);
             }
             SwarmEvent::OutgoingConnectionError {
                 peer_id,
@@ -2062,20 +2089,28 @@ impl EventLoopState {
             // Listener side: receives dialer's cert request.
             request_response::Event::Message {
                 peer,
+                connection_id,
                 message:
                     request_response::Message::Request {
                         request, channel, ..
                     },
-                ..
             } => {
+                if self.e2e_is_refused(connection_id) {
+                    debug!(peer_id = %peer, "e2e: cert request on a held connection ignored");
+                    return;
+                }
                 self.on_cert_request(peer, request, channel).await;
             }
             // Dialer side: receives listener's cert response.
             request_response::Event::Message {
                 peer,
+                connection_id,
                 message: request_response::Message::Response { response, .. },
-                ..
             } => {
+                if self.e2e_is_refused(connection_id) {
+                    debug!(peer_id = %peer, "e2e: cert response on a held connection ignored");
+                    return;
+                }
                 self.on_cert_response(peer, response).await;
             }
             request_response::Event::OutboundFailure { peer, error, .. } => {
@@ -2654,6 +2689,18 @@ impl EventLoopState {
         info!(listen = %listen, "e2e: advertising {n} loopback aliases");
     }
 
+    /// A user build has no e2e hold: no connection is ever refused.
+    #[cfg(not(feature = "e2e-tools"))]
+    fn e2e_is_refused(&self, _cid: libp2p::swarm::ConnectionId) -> bool {
+        false
+    }
+
+    /// A user build has no e2e hold: no closed connection was refused.
+    #[cfg(not(feature = "e2e-tools"))]
+    fn e2e_refused_closed(&mut self, _cid: libp2p::swarm::ConnectionId) -> bool {
+        false
+    }
+
     fn handle_command(&mut self, cmd: SwarmCommand) {
         match cmd {
             SwarmCommand::SendOrDial {
@@ -2776,10 +2823,12 @@ impl EventLoopState {
                 let _ = reply.send(addrs);
             }
             #[cfg(feature = "e2e-tools")]
-            SwarmCommand::Disconnect { peer_id, reply } => {
-                let was_connected = self.swarm.disconnect_peer_id(peer_id).is_ok();
-                info!(peer_id = %peer_id, was_connected, "e2e: disconnect peer");
-                let _ = reply.send(was_connected);
+            SwarmCommand::Disconnect {
+                peer_id,
+                hold,
+                reply,
+            } => {
+                let _ = reply.send(self.e2e_disconnect(peer_id, hold));
             }
             #[cfg(test)]
             SwarmCommand::TestFeedKad {

@@ -17,18 +17,42 @@ fn disconnect_and_reach_map_to_their_endpoints() {
     assert_eq!(
         args.cmd,
         Cmd::Disconnect {
-            device: "0a0b0c0d0e0f1011".into()
+            device: "0a0b0c0d0e0f1011".into(),
+            hold_secs: None,
         }
     );
     let (path, body) = request_of(&args.cmd);
     assert_eq!(path, "/api/e2e/disconnect");
-    assert_eq!(body, serde_json::json!({ "device": "0a0b0c0d0e0f1011" }));
+    assert_eq!(
+        body,
+        serde_json::json!({ "device": "0a0b0c0d0e0f1011", "hold_secs": null })
+    );
 
     let args =
         Args::try_parse_from(["net-probe", "--data-dir", "/d", "reach", "ffff"]).expect("parse");
     let (path, body) = request_of(&args.cmd);
     assert_eq!(path, "/api/e2e/reach");
     assert_eq!(body, serde_json::json!({ "device": "ffff" }));
+}
+
+#[test]
+fn disconnect_hold_secs_goes_into_the_body() {
+    let args = Args::try_parse_from([
+        "net-probe",
+        "--data-dir",
+        "/d",
+        "disconnect",
+        "--hold-secs",
+        "120",
+        "0a0b0c0d0e0f1011",
+    ])
+    .expect("parse");
+    let (path, body) = request_of(&args.cmd);
+    assert_eq!(path, "/api/e2e/disconnect");
+    assert_eq!(
+        body,
+        serde_json::json!({ "device": "0a0b0c0d0e0f1011", "hold_secs": 120 })
+    );
 }
 
 #[test]

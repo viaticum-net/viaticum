@@ -35,6 +35,11 @@ mod kad_stats;
 #[cfg(feature = "e2e-tools")]
 mod e2e_amp;
 
+// Test-only hold of a disconnected peer (`net-probe disconnect --hold-secs`):
+// only our on-demand dial reconnects it meanwhile. Never in a user build.
+#[cfg(feature = "e2e-tools")]
+mod e2e_hold;
+
 // Transport wrapper that strips `PortUse::Reuse` from outgoing dials. Used by
 // swarm.rs to keep flows compatible with tun-based VPN/proxy stacks (sing-box,
 // some hysteria2 setups) that drop TCP whose source port matches a listener.

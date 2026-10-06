@@ -395,12 +395,23 @@ async fn handle_connect(
 
 // ── Test-only network probes (C-DK Р-16) ──────────────────────────────────────
 
-/// Body of `/api/e2e/disconnect` and `/api/e2e/reach`.
+/// Body of `/api/e2e/reach`.
 #[cfg(feature = "e2e-tools")]
 #[derive(serde::Deserialize)]
 struct E2eProbeBody {
     /// DeviceId prefix, at least 16 hex chars.
     device: String,
+}
+
+/// Body of `/api/e2e/disconnect`.
+#[cfg(feature = "e2e-tools")]
+#[derive(serde::Deserialize)]
+struct E2eDisconnectBody {
+    /// DeviceId prefix, at least 16 hex chars.
+    device: String,
+    /// Hold the peer this long: only our on-demand dial reconnects it.
+    #[serde(default)]
+    hold_secs: Option<u64>,
 }
 
 /// 200 `{device, detail, elapsed_ms}` on success; 500 with the reason otherwise.
@@ -427,10 +438,11 @@ fn e2e_probe_response(resp: CliResponse) -> Result<Json<serde_json::Value>, (Sta
 #[cfg(feature = "e2e-tools")]
 async fn handle_e2e_disconnect(
     State(state): State<Arc<DaemonState>>,
-    Json(body): Json<E2eProbeBody>,
+    Json(body): Json<E2eDisconnectBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let req = CliRequest::E2eDisconnect {
         device_hex: body.device,
+        hold_secs: body.hold_secs,
     };
     e2e_probe_response(dispatch(req, &state).await)
 }
