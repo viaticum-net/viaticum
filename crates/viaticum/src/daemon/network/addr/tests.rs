@@ -104,3 +104,28 @@ fn node_addr_drops_terminal_p2p_of_external() {
         Some(("/ip4/198.18.0.7/tcp/23817".to_string(), false))
     );
 }
+
+// Review W1: an unconfirmed global IPv6 we listen on does not beat a private
+// IPv4 and, when it is all there is, is still LAN only (a home router usually
+// drops inbound IPv6). Mutation: listen ranked reach-first or lan_only from
+// reach alone → red.
+#[test]
+fn node_addr_unconfirmed_global_ipv6_is_lan_only_and_after_ipv4() {
+    let listen = ["/ip6/2a01:4f8::5/tcp/23817", "/ip4/192.168.1.5/tcp/23817"];
+    assert_eq!(
+        pick(&[], &listen),
+        Some(("/ip4/192.168.1.5/tcp/23817".to_string(), true))
+    );
+    assert_eq!(
+        pick(&[], &["/ip6/2a01:4f8::5/tcp/23817"]),
+        Some(("/ip6/2a01:4f8::5/tcp/23817".to_string(), true))
+    );
+    // A global IPv4 we listen on (a VPS) is reachable as is.
+    assert_eq!(
+        pick(
+            &[],
+            &["/ip4/192.168.1.5/tcp/23817", "/ip4/198.18.0.7/tcp/23817"]
+        ),
+        Some(("/ip4/198.18.0.7/tcp/23817".to_string(), false))
+    );
+}
