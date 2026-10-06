@@ -56,8 +56,8 @@ pub(crate) struct NoAnswerPauses {
     used: usize,
     /// Holders that failed in a `NoAnswer` round and have not answered since.
     silent: HashSet<DeviceId>,
-    /// Holders whose request failed anywhere in this job: asked last for the rest of it
-    /// (restore-i44). Unlike `silent`, an answer does not take a holder out.
+    /// Holders that did not answer a request in time anywhere in this job: asked last for
+    /// the rest of it (restore-i44). Unlike `silent`, an answer does not take a holder out.
     failed_in_job: FailedInTask,
 }
 

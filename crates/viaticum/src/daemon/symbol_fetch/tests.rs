@@ -230,6 +230,10 @@ enum Behavior {
     /// Fail this many requests, then serve.
     FailFirst(AtomicU32),
     AlwaysFail,
+    /// Every request runs into the request timeout (restore-i44: a silent holder).
+    TimesOut,
+    /// Every request ends on a dropped connection (EOF: the holder evicted us).
+    Closed,
     Empty,
     EvenOnly,
     Hang,
@@ -301,6 +305,10 @@ impl SymbolSource for ScriptedHolders {
                 }
             }
             Behavior::AlwaysFail => Err(FetchError::Swarm("dial failed".into())),
+            Behavior::TimesOut => Err(FetchError::Timeout),
+            Behavior::Closed => Err(FetchError::Swarm(
+                "request failed: Connection closed before a response was received".into(),
+            )),
             Behavior::Empty => Ok(Vec::new()),
             Behavior::EvenOnly => {
                 let even: Vec<u32> = req

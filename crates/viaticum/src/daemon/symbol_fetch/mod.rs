@@ -29,7 +29,7 @@ use viaticum_core::erasure::{ErasureEncoder, Symbol};
 use viaticum_core::messages::{Message, RestoreRequestMsg};
 use viaticum_core::types::{DeviceId, ErasureParams, SourceBlockId, SymbolPlacement};
 
-use crate::daemon::network::swarm::SwarmHandle;
+use crate::daemon::network::swarm::{SwarmError, SwarmHandle};
 
 mod rounds;
 
@@ -62,6 +62,11 @@ pub enum FetchError {
     /// returned by `fetch_unbound_symbols`: it skips the holder for the round.
     #[error("swarm error: {0}")]
     Swarm(String),
+
+    /// The holder did not answer the request in time (restore-i44: only this puts a
+    /// holder last for the rest of the task; a dropped connection is `Swarm`).
+    #[error("holder did not answer in time")]
+    Timeout,
 
     /// The daemon is stopping; the fetch was abandoned.
     #[error("fetch cancelled: the daemon is stopping")]
@@ -172,7 +177,7 @@ pub(crate) fn chunk_esis(chunk_bytes: u64, t: u16) -> usize {
 /// Collect `k_eff` distinct unbound symbols for `block_id` (restore-i12).
 ///
 /// Rounds over the candidate placements (Alive | Uncertain | PresumedLost): the holders
-/// that failed earlier in `task` last (restore-i44), connected holders first, each group
+/// that timed out earlier in `task` last (restore-i44), connected holders first, each group
 /// in a per-block shuffled order (restore-i43). Within a
 /// round each holder is asked in chunks of at most
 /// `max(1, RESTORE_FETCH_CHUNK_BYTES / params.t)` ESIs from its assigned ranges that
@@ -302,7 +307,10 @@ async fn fetch_symbols_from_holder(
     let response = swarm
         .send_to_device(*holder_device, Message::RestoreRequest(request))
         .await
-        .map_err(|e| FetchError::Swarm(e.to_string()))?;
+        .map_err(|e| match e {
+            SwarmError::Timeout => FetchError::Timeout,
+            e => FetchError::Swarm(e.to_string()),
+        })?;
 
     match response {
         Message::RestoreResponse(resp) => {

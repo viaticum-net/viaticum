@@ -123,6 +123,7 @@ impl RestoreError {
                 RestoreError::InsufficientSymbols { block, got, need }
             }
             FetchError::Swarm(s) => RestoreError::Swarm(s),
+            e @ FetchError::Timeout => RestoreError::Swarm(e.to_string()),
             FetchError::Cancelled => RestoreError::Cancelled,
         }
     }

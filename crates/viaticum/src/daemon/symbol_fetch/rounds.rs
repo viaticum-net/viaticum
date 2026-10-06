@@ -13,9 +13,11 @@
 // holder serves nearly every block just for a small device id, and a cold holder
 // costs a dial only when the connected ones are not enough.
 //
-// A holder whose request failed in this task (restore-i44: a restore job, a DR run) is
-// asked after every other holder in every later round of every block of the task: a
-// connected holder that keeps silent costs the task one timeout, not one per block.
+// A holder that did not answer a request in time in this task (restore-i44: a restore
+// job, a DR run) is asked after every other holder in every later round of every block
+// of the task: a connected holder that keeps silent costs the task one timeout, not one
+// per block. A dropped connection (EOF, closed: a holder evicting us, network-i45) is
+// retried as before, without the tail.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -73,8 +75,9 @@ struct HolderRound<'a> {
     exhausted: bool,
 }
 
-/// The holders whose request failed in one task — a restore job or a DR run — shared by
-/// the fetches of all its blocks (restore-i44). Only the task's memory: never stored.
+/// The holders that did not answer a request in time (`FetchError::Timeout`) in one task —
+/// a restore job or a DR run — shared by the fetches of all its blocks (restore-i44).
+/// Only the task's memory: never stored.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FailedInTask(Arc<Mutex<HashSet<DeviceId>>>);
 
@@ -104,7 +107,7 @@ pub(crate) struct BlockFetch<'a> {
     /// size of this set, never a raw symbol count (CS-DR-5).
     accepted_esis: HashSet<u32>,
     round: u32,
-    /// The task's failed holders: asked last (restore-i44).
+    /// The task's holders that timed out: asked last (restore-i44).
     failed_in_task: FailedInTask,
 }
 
@@ -166,8 +169,8 @@ impl<'a> BlockFetch<'a> {
         self.accepted_esis.len()
     }
 
-    /// One round: each holder not exhausted is asked — holders that failed in this task
-    /// last (restore-i44), connected ones first, each group in the per-block shuffled
+    /// One round: each holder not exhausted is asked — holders that timed out in this
+    /// task last (restore-i44), connected ones first, each group in the per-block shuffled
     /// order (restore-i43) — in chunks of at most `chunk`
     /// ESIs from its ranges not yet accepted and not yet asked-and-not-returned by
     /// it, until it has nothing left for us, fails, is exhausted, or the block is
@@ -288,7 +291,9 @@ impl<'a> BlockFetch<'a> {
                             "fetch: holder did not answer; skipped this round, asked again next round"
                         );
                         failed.push(holder_id);
-                        self.failed_in_task.insert(holder_id);
+                        if matches!(e, FetchError::Timeout) {
+                            self.failed_in_task.insert(holder_id);
+                        }
                         break;
                     }
                 }

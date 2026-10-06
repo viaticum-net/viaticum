@@ -460,7 +460,7 @@ async fn restore_cancel_during_pause_interrupts_job_at_once_and_pause_is_visible
 
 // ─── restore-i44: a holder that failed in the job is asked last ───────────────
 
-/// The connected holder (asked first, restore-i43) fails every request; the two others
+/// The connected holder (asked first, restore-i43) times out on every request; the two others
 /// hold enough. With one budget for the job it is asked on the first block only; with a
 /// budget per block (the job's memory lost between blocks) it is asked on each block.
 /// Mutation: `fetch_from_holders` without `.in_task(&pauses.failed_in_job)` → reddens.
@@ -477,7 +477,7 @@ async fn holder_failing_in_the_job_is_asked_on_the_first_block_only() {
     let s = setup(&files).await;
     s.holders.offline.store(false, Ordering::SeqCst);
     let silent = fake_holder_ids()[0];
-    s.holders.dead.lock().unwrap().insert(silent);
+    s.holders.timing_out.lock().unwrap().insert(silent);
     s.holders.connected.lock().unwrap().insert(silent);
     let coord = s.coord();
     let asked_silent = || {
@@ -496,7 +496,7 @@ async fn holder_failing_in_the_job_is_asked_on_the_first_block_only() {
             .await
             .expect("the two others hold enough");
     }
-    assert_eq!(asked_silent(), 1, "one failed request for the whole job");
+    assert_eq!(asked_silent(), 1, "one timeout for the whole job");
 
     for i in 0..FILES {
         s.decode(&coord, i, &mut NoAnswerPauses::new(JobId::new(), 1))

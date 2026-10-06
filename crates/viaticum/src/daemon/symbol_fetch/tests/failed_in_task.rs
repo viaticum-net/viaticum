@@ -1,6 +1,7 @@
-// restore-i44: a holder whose request failed in a task (a restore job, a DR run) is asked
-// after every other holder for the rest of the task, so a connected holder that keeps
-// silent costs the task one failed request, not one per block. Child of
+// restore-i44: a holder that did not answer in time in a task (a restore job, a DR run) is
+// asked after every other holder for the rest of the task, so a connected holder that
+// keeps silent costs the task one timeout, not one per block. A dropped connection (EOF:
+// the holder evicted us, network-i45) is no silence: retried without the tail. Child of
 // `symbol_fetch/tests.rs` (reuses `ScriptedHolders`).
 
 use viaticum_core::types::{DeviceId, SourceBlockId};
@@ -20,14 +21,14 @@ fn blk(i: u8) -> SourceBlockId {
 }
 
 /// Three connected holders of every block, 5 ESIs each, k_eff = 5: any one that answers
-/// completes the block. `silent` fails every request.
-fn holders(silent: DeviceId, ids: &[DeviceId]) -> ScriptedHolders {
+/// completes the block. `failing` fails every request as `how` says.
+fn holders(failing: DeviceId, how: fn() -> Behavior, ids: &[DeviceId]) -> ScriptedHolders {
     let mut h = ScriptedHolders::new(
         T,
         ids.iter()
             .map(|d| {
-                let b = if *d == silent {
-                    Behavior::AlwaysFail
+                let b = if *d == failing {
+                    how()
                 } else {
                     Behavior::Serve
                 };
@@ -57,18 +58,24 @@ async fn fetch_all(source: &ScriptedHolders, ids: &[DeviceId], task: Option<&Fai
     }
 }
 
-/// Mutation: the failure not kept in the task, or not used in the order → the silent
+/// Mutation: the timeout not kept in the task, or not used in the order → the silent
 /// holder is asked on every block where restore-i43 puts it first; reddens.
+/// On how many of the `BLOCKS` blocks `holder` comes first by the restore-i43 order
+/// (all of `ids` connected).
+fn first_on(holder: DeviceId, ids: &[DeviceId]) -> usize {
+    (0..BLOCKS)
+        .filter(|i| {
+            let b = blk(*i);
+            ids.iter().min_by_key(|d| holder_order_key(&b, d)) == Some(&holder)
+        })
+        .count()
+}
+
 #[tokio::test]
 async fn a_silent_connected_holder_costs_the_task_one_request_not_one_per_block() {
     let ids = [dev(0x11), dev(0x22), dev(0x33)];
     let silent = ids[0];
-    let first_on: usize = (0..BLOCKS)
-        .filter(|i| {
-            let b = blk(*i);
-            ids.iter().min_by_key(|d| holder_order_key(&b, d)) == Some(&silent)
-        })
-        .count();
+    let first_on = first_on(silent, &ids);
     assert!(
         first_on >= 2,
         "the silent holder is first by the per-block order on {first_on} blocks: \
@@ -76,13 +83,13 @@ async fn a_silent_connected_holder_costs_the_task_one_request_not_one_per_block(
     );
 
     // Without the task's memory: asked on every block where it is first (the cost).
-    let alone = holders(silent, &ids);
+    let alone = holders(silent, || Behavior::TimesOut, &ids);
     fetch_all(&alone, &ids, None).await;
     assert_eq!(alone.asked(silent).len(), first_on);
 
     // With it: asked once, on the first block where it came first.
     let task = FailedInTask::default();
-    let shared = holders(silent, &ids);
+    let shared = holders(silent, || Behavior::TimesOut, &ids);
     fetch_all(&shared, &ids, Some(&task)).await;
     assert_eq!(
         shared.asked(silent).len(),
@@ -104,9 +111,10 @@ async fn a_holder_that_failed_earlier_is_still_asked_when_the_others_are_not_eno
     let task = FailedInTask::default();
     let mut source = ScriptedHolders::new(
         T,
-        vec![(silent, Behavior::AlwaysFail), (other, Behavior::Serve)],
+        vec![(silent, Behavior::TimesOut), (other, Behavior::Serve)],
     );
-    source.connected = [silent, other].into_iter().collect();
+    // Only the silent holder is connected: by restore-i43 alone it would be asked first.
+    source.connected = [silent].into_iter().collect();
     let (enc, p) = (encoder(), params(5, T as u16));
 
     // Block 0: only the silent holder holds it — its request fails, the task remembers.
@@ -127,5 +135,29 @@ async fn a_holder_that_failed_earlier_is_still_asked_when_the_others_are_not_eno
         order,
         vec![other, silent],
         "the others first, then the tail"
+    );
+}
+
+/// network-i45: a holder whose full connection cache evicts us drops our request (EOF);
+/// that is no silence. With the task's memory it is still asked first wherever the
+/// restore-i43 order puts it. Mutation "EOF = silence" (any failure into the task) →
+/// asked once; reddens.
+#[tokio::test]
+async fn a_dropped_connection_does_not_put_the_holder_last() {
+    let ids = [dev(0x11), dev(0x22), dev(0x33)];
+    let evicting = ids[0];
+    let first_on = first_on(evicting, &ids);
+    assert!(
+        first_on >= 2,
+        "the test needs at least two blocks, has {first_on}"
+    );
+
+    let task = FailedInTask::default();
+    let source = holders(evicting, || Behavior::Closed, &ids);
+    fetch_all(&source, &ids, Some(&task)).await;
+    assert_eq!(
+        source.asked(evicting).len(),
+        first_on,
+        "retried where it comes first, no tail"
     );
 }
