@@ -1551,6 +1551,8 @@ pub(super) struct FakeHolders {
     pub(super) offline: std::sync::atomic::AtomicBool,
     /// Holders that never answer: every request to them fails at once.
     pub(super) dead: Mutex<std::collections::HashSet<DeviceId>>,
+    /// Holders connected but silent: every request runs into the 30 s timeout.
+    pub(super) timing_out: Mutex<std::collections::HashSet<DeviceId>>,
     /// `reconnect` call number at which `offline` clears (the redial worked).
     pub(super) online_after_reconnects: Mutex<Option<usize>>,
     /// Every `reconnect` call: when (tokio clock) and with which holders.
@@ -1580,6 +1582,10 @@ impl SymbolSource for FakeHolders {
         }
         if self.hang {
             std::future::pending::<()>().await;
+        }
+        if self.timing_out.lock().unwrap().contains(&holder) {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            return Err(FetchError::Timeout);
         }
         let silent = self.silent_first.lock().unwrap().remove(&holder);
         if silent {
