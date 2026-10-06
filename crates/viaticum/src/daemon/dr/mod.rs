@@ -39,6 +39,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use viaticum_core::config::AppConfig;
 use viaticum_core::constants::DR_KAD_STABILIZE_TIMEOUT_SECS;
 use viaticum_core::mailbox::MailboxAddress;
 use viaticum_core::mailbox::seal::{PointerPlace, RendezvousKeys};
@@ -53,6 +54,7 @@ use viaticum_core::types::{DeviceId, IdentityPub, Timestamp, hex_encode};
 use crate::daemon::handle::shutdown::ShutdownSignals;
 use crate::daemon::identity::{IdentityKeyFile, MnemonicProblem, derive_keys};
 use crate::daemon::mailbox::routing::MailboxRouter;
+use crate::daemon::network::listen_port::port_change_notice;
 use crate::daemon::network::swarm::{SwarmConfig, SwarmHandle};
 
 mod commit;
@@ -186,6 +188,8 @@ struct RecoveredSummary {
     lineage: CatalogLineageId,
     /// The history it was restored from.
     source_lineage: CatalogLineageId,
+    /// The lost node's libp2p port, if its snapshot knew it (network-i47).
+    lost_listen_port: Option<u16>,
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -252,6 +256,22 @@ pub async fn run_dr(opts: DrOptions) -> Result<(), DrError> {
         "  Catalog:       {} (a new history, restored from {})",
         summary.lineage, summary.source_lineage
     );
+    // network-i47: a new machine drew a new port in `init`; the router still
+    // forwards the old one.
+    let config_path = opts
+        .data_dir
+        .join(crate::daemon::identity::CONFIG_FILE_NAME);
+    let new_port = match AppConfig::load(&config_path) {
+        Ok(c) => c.network.listen_port,
+        Err(e) => {
+            tracing::debug!(error = %e, "dr: config not readable; no listen-port notice");
+            0
+        }
+    };
+    if let Some(line) = port_change_notice(summary.lost_listen_port, new_port) {
+        tracing::warn!("dr: {line}");
+        println!("{line}");
+    }
     if let Some(bak) = &outcome.db_backup {
         println!("Previous database kept as: {}", bak.display());
         println!("  (to go back to it: stop the daemon and move it over db.redb)");
@@ -568,6 +588,7 @@ async fn recover_into_staging(
         peers,
         lineage,
         source_lineage,
+        lost_listen_port: state.listen_port,
     })
     // Everything holding the staging DB (router, db) and the swarm drops here.
 }

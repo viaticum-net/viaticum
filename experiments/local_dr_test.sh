@@ -8,7 +8,7 @@
 #               its DR pointer is published. Then the machine is lost; the friend recovers with
 #               the phrase, first making the classic mistakes, then correctly, restores the files
 #               from the network and puts them back one by one.
-# Intent:       dr-i1, dr-i2, dr-i3, dr-i4, dr-i5, dr-i9, dr-i10, dr-i64 (step 8), dr-i11,
+# Intent:       dr-i1, dr-i2, dr-i3, dr-i4, dr-i5, dr-i9, dr-i10, dr-i64 (step 8), network-i47 (step 6), dr-i11,
 #               dr-i18, dr-i19, dr-i22,
 #               restore-i1 (after DR), dr-i8 (step 9, with the unit tests);
 #               CROWN-1 C3a: mailbox-i39, i40 (pointer only in the rendezvous box, never in
@@ -759,6 +759,14 @@ if grep -aq "not re-protected" "$DR_LOG"; then
     pass "DR output says the files are not re-protected until they are back"
 else
     fail "DR output lacks the 'not re-protected' paragraph"
+fi
+# network-i47: the old node listened on PORT_BASE (published in its SystemState); the wiped
+# machine's DR writes a fresh config with a new random port, so DR must name both — the whole
+# chain push -> SS -> DR -> output (review of 10928cd, W1).
+if grep -aq "listen port changed: $PORT_BASE → " "$DR_LOG"; then
+    pass "DR output names the port change from $PORT_BASE (network-i47)"
+else
+    fail "DR output lacks 'listen port changed: $PORT_BASE → …' (network-i47; is listen_port in the published SystemState?)"
 fi
 write_config 0 $((PORT_BASE + 60))
 for i in "${H_UP[@]}"; do stop_daemon "$i"; done

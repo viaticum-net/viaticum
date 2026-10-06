@@ -29,10 +29,11 @@ rand = { workspace = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
 async-trait = { workspace = true }
 libp2p = { workspace = true }
-# The OS resolver configuration for libp2p's DNS transport, read up front: an
-# unreadable one (no resolv.conf, no nameserver) degrades to "DNS names do not
-# resolve" instead of refusing the start (network-i28). Already in the tree
-# through libp2p-dns, the same version and features; no new crate.
+# The OS resolver configuration for libp2p's DNS transport, read at the start
+# and re-read after a failed lookup: an unreadable one (no resolv.conf, no
+# nameserver) degrades to "DNS names do not resolve" instead of refusing the
+# start (network-i28, network-i46). Already in the tree through libp2p-dns, the
+# same version and features; no new crate.
 hickory-resolver = { version = "0.25", default-features = false, features = ["system-config", "tokio"] }
 futures = { workspace = true }
 ed25519-dalek = { workspace = true }

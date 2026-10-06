@@ -45,6 +45,10 @@ mod e2e_hold;
 // some hysteria2 setups) that drop TCP whose source port matches a listener.
 mod no_port_reuse;
 
+// libp2p-dns that re-reads the OS resolver configuration after a failed
+// lookup (network-i46). Used by swarm.rs.
+mod reloading_dns;
+
 // The random listen port `init` writes into config.toml (network-i31).
 pub mod listen_port;
 

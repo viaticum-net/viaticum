@@ -113,6 +113,10 @@ pub fn decrypt_and_restore(db: &Db, blob: &[u8], seed: &[u8]) -> anyhow::Result<
 /// device, so DR can move ownership of restored files to its own device, dr-i19) and
 /// the live file count of the state it restores.
 ///
+/// `listen_port` (the configured libp2p port, `None` for an ephemeral one) rides
+/// every snapshot so DR on a new machine can say the port forward must follow
+/// (network-i47).
+///
 /// The minimum interval is clamped to 60 seconds.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_periodic_push(
@@ -126,6 +130,7 @@ pub async fn run_periodic_push(
     cancel: CancellationToken,
     mailbox_router: Arc<MailboxRouter>,
     publisher: DeviceId,
+    listen_port: Option<u16>,
 ) -> anyhow::Result<()> {
     let clamped = interval_secs.max(60);
     let dr_key = identity_key_bytes_from_seed(&seed)?;
@@ -181,13 +186,14 @@ pub async fn run_periodic_push(
         }
 
         // 1. Snapshot (excludes our own SS blocks via the ledger — no self-reference).
-        let state = match snapshot_db(&db) {
+        let mut state = match snapshot_db(&db) {
             Ok(s) => s,
             Err(e) => {
                 error!(error = %e, "system_state push: snapshot failed");
                 continue;
             }
         };
+        state.listen_port = listen_port;
 
         // 2. First publish → base. Subsequent changes → diff blocks; compaction
         //    rebuilds the base when too many diffs accumulate.

@@ -719,25 +719,6 @@ impl SwarmHandle {
             }
         }
 
-        // The OS resolver configuration (resolv.conf / the hosts file, the
-        // Windows adapters) for the DNS transport. Unreadable — an offline box
-        // with no nameserver — the node still starts: IP addresses work, a
-        // DNS name fails its dial (one ERROR here says why).
-        let (dns_cfg, dns_opts) = match hickory_resolver::system_conf::read_system_conf() {
-            Ok(conf) => conf,
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "DNS: the system resolver configuration is unreadable; \
-                     seeds named by DNS will not resolve"
-                );
-                (
-                    libp2p::dns::ResolverConfig::new(),
-                    libp2p::dns::ResolverOpts::default(),
-                )
-            }
-        };
-
         // ── 3. Build Swarm (relay client comes from builder step) ─────────────
         // relay::client::Behaviour is produced by with_relay_client() and passed
         // as the second argument to with_behaviour(). relay_server and dcutr are
@@ -757,19 +738,22 @@ impl SwarmHandle {
                 use libp2p::core::muxing::StreamMuxerBox;
                 use libp2p::core::upgrade::Version;
                 let noise = libp2p::noise::Config::new(key)?;
+                let tcp = super::no_port_reuse::NoPortReuse::new(
+                    libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default()),
+                )
+                .upgrade(Version::V1Lazy)
+                .authenticate(noise)
+                .multiplex(libp2p::yamux::Config::default())
+                .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
+                // network-i28: a seed is named by DNS (`/dns4/<name>/tcp/…`).
+                // network-i46: the OS resolver configuration is re-read after a
+                // failed lookup, so a node that started before DHCP or changed
+                // networks resolves the seed without a restart.
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
-                    super::no_port_reuse::NoPortReuse::new(libp2p::tcp::tokio::Transport::new(
-                        libp2p::tcp::Config::default(),
-                    ))
-                    .upgrade(Version::V1Lazy)
-                    .authenticate(noise)
-                    .multiplex(libp2p::yamux::Config::default())
-                    .map(|(p, c), _| (p, StreamMuxerBox::new(c))),
+                    super::reloading_dns::ReloadingDns::system(tcp),
                 )
             })
             .map_err(|e| SwarmError::Transport(e.to_string()))?
-            // network-i28: a seed is named by DNS (`/dns4/<name>/tcp/…`).
-            .with_dns_config(dns_cfg, dns_opts)
             .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)
             .map_err(|e| SwarmError::Transport(e.to_string()))?
             .with_behaviour(|key, relay_client| ViaticumBehaviour {

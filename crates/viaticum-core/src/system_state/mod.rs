@@ -128,6 +128,17 @@ pub struct SystemState {
     /// existed: they decode with an empty vec instead of erroring.
     #[serde(default)]
     pub pair_ledgers: Vec<PairLedgerEntry>,
+
+    /// The libp2p port this node listened on (`[network] listen_port`), `None` for
+    /// an ephemeral port (0) or a blob packed before the field existed. Not a DB
+    /// table: the daemon's push fills it in after [`snapshot_db`]. DR on a new
+    /// machine compares it with the port `init` drew there and says that the
+    /// router's port forward must follow (network-i47).
+    ///
+    /// Base only, like `pair_ledgers` (no [`DiffOp`]): the port changes only with
+    /// the config, i.e. with a restart, and every restart publishes a new base.
+    #[serde(default)]
+    pub listen_port: Option<u16>,
 }
 
 /// One row of the `pair_ledger` table inside a [`SystemState`].
@@ -292,6 +303,7 @@ pub fn snapshot_db(db: &crate::db::Db) -> Result<SystemState, SystemStateError> 
         pos_weekly,
         cluster_state,
         pair_ledgers,
+        listen_port: None,
     };
 
     tracing::info!(
@@ -728,6 +740,7 @@ pub fn apply_diffs(base: SystemState, diffs: &[Vec<DiffOp>]) -> SystemState {
     // Carried through untouched: no DiffOp can change the ledger by design
     // (see SystemState::pair_ledgers), so the base's rows are the final answer.
     let pair_ledgers = base.pair_ledgers;
+    let listen_port = base.listen_port;
 
     for batch in diffs {
         for op in batch {
@@ -785,6 +798,7 @@ pub fn apply_diffs(base: SystemState, diffs: &[Vec<DiffOp>]) -> SystemState {
             .collect(),
         cluster_state,
         pair_ledgers,
+        listen_port,
     }
 }
 
