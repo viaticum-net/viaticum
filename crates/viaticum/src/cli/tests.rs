@@ -342,8 +342,9 @@ fn render_status_hides_restore_staging_when_empty() {
     assert!(!rendered.contains("restore staging"), "got: {rendered}");
 }
 
-// network-i27: a LAN address says so; `node_addr` itself stays pasteable into
-// `viaticum connect`. Mutation: drop the mark → red.
+// network-i27: a LAN address says so; the address itself stays pasteable into
+// `viaticum connect` (the mark is in the label, not after the address).
+// Mutation: drop the mark, or print it after the address → red.
 #[test]
 fn render_status_marks_lan_only_node_addr() {
     let mut data = make_status_zero_peers();
@@ -352,15 +353,23 @@ fn render_status_marks_lan_only_node_addr() {
             .into();
     data.node_addr_lan_only = true;
     let rendered = output::render_status(&data);
+    let line = rendered
+        .lines()
+        .find(|l| l.contains("/p2p/"))
+        .expect("an addr line");
+    assert!(line.contains("addr (LAN only):"), "got: {rendered}");
+    // Review N2: the address ends the line — its tail is a `connect` argument.
     assert!(
-        rendered.contains(
-            "/tcp/23817/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN  (LAN only)"
-        ),
-        "got: {rendered}"
+        line.ends_with(&data.node_addr) && line.split_whitespace().last() == Some(&*data.node_addr),
+        "got: {line:?}"
     );
     data.node_addr_lan_only = false;
     let rendered = output::render_status(&data);
     assert!(!rendered.contains("LAN only"), "got: {rendered}");
+    assert!(
+        rendered.contains(&format!("  addr:           {}\n", data.node_addr)),
+        "got: {rendered}"
+    );
 }
 
 /// Old daemons do not send the staging fields; the CLI still parses the status.
