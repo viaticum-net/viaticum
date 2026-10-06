@@ -13,7 +13,7 @@
 // (the 30 s request timeout, a dial failure) is skipped for the rest of the round and
 // asked again in the next one. A round with nothing new where some holder did not
 // answer is a separate outcome (`RoundEnd::NoAnswer`, restore-i33): restore retries
-// it after a redial and a pause (restore-i26); `fetch_in_rounds` (DR) stops there as
+// it after a redial and a pause (restore-i26); `fetch_unbound_symbols` (DR) stops there as
 // before.
 //
 // There is no restore gate on the holder (restore-i6): a holder either serves the
@@ -33,7 +33,7 @@ use crate::daemon::network::swarm::SwarmHandle;
 
 mod rounds;
 
-pub(crate) use rounds::{BlockFetch, Round, RoundEnd};
+pub(crate) use rounds::{BlockFetch, FailedInTask, Round, RoundEnd};
 
 /// Maximum ESI value the raptorq decoder accepts: ESI is a 24-bit field, so any
 /// value `>= 2^24` makes `PayloadId::new(0, esi)` assert-panic inside raptorq.
@@ -171,8 +171,9 @@ pub(crate) fn chunk_esis(chunk_bytes: u64, t: u16) -> usize {
 
 /// Collect `k_eff` distinct unbound symbols for `block_id` (restore-i12).
 ///
-/// Rounds over the candidate placements (Alive | Uncertain | PresumedLost), connected
-/// holders first, each group in a per-block shuffled order (restore-i43). Within a
+/// Rounds over the candidate placements (Alive | Uncertain | PresumedLost): the holders
+/// that failed earlier in `task` last (restore-i44), connected holders first, each group
+/// in a per-block shuffled order (restore-i43). Within a
 /// round each holder is asked in chunks of at most
 /// `max(1, RESTORE_FETCH_CHUNK_BYTES / params.t)` ESIs from its assigned ranges that
 /// are not yet accepted and not yet asked-and-not-returned by it. A holder whose
@@ -192,9 +193,11 @@ pub(crate) async fn fetch_unbound_symbols(
     placements: &[SymbolPlacement],
     params: &ErasureParams,
     cancel: Option<&CancellationToken>,
+    task: &FailedInTask,
 ) -> Result<Vec<Symbol>, FetchError> {
     let chunk = chunk_esis(RESTORE_FETCH_CHUNK_BYTES, params.t);
-    fetch_in_rounds(source, encoder, block_id, placements, params, cancel, chunk).await
+    let fetch = BlockFetch::new(encoder, block_id, placements, params, chunk).in_task(task);
+    rounds_until_no_progress(fetch, source, cancel).await
 }
 
 /// `fetch_unbound_symbols` with the chunk size given (seam for tests).
@@ -202,6 +205,7 @@ pub(crate) async fn fetch_unbound_symbols(
 /// Stops at the first round that accepted nothing, whatever the reason: a round
 /// nobody answered is not retried here (DR; restore retries it with a pause,
 /// restore-i26).
+#[cfg(test)]
 pub(crate) async fn fetch_in_rounds(
     source: &dyn SymbolSource,
     encoder: &Arc<dyn ErasureEncoder>,
@@ -211,7 +215,15 @@ pub(crate) async fn fetch_in_rounds(
     cancel: Option<&CancellationToken>,
     chunk: usize,
 ) -> Result<Vec<Symbol>, FetchError> {
-    let mut fetch = BlockFetch::new(encoder, block_id, placements, params, chunk);
+    let fetch = BlockFetch::new(encoder, block_id, placements, params, chunk);
+    rounds_until_no_progress(fetch, source, cancel).await
+}
+
+async fn rounds_until_no_progress(
+    mut fetch: BlockFetch<'_>,
+    source: &dyn SymbolSource,
+    cancel: Option<&CancellationToken>,
+) -> Result<Vec<Symbol>, FetchError> {
     while fetch.round(source, cancel).await?.end == RoundEnd::Progress {}
     fetch.finish()
 }

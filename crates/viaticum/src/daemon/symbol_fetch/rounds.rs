@@ -12,9 +12,13 @@
 // `blake3(block_id ‖ device_id)` — never the `SYMBOL_PLACEMENTS` key order, so no
 // holder serves nearly every block just for a small device id, and a cold holder
 // costs a dial only when the connected ones are not enough.
+//
+// A holder whose request failed in this task (restore-i44: a restore job, a DR run) is
+// asked after every other holder in every later round of every block of the task: a
+// connected holder that keeps silent costs the task one timeout, not one per block.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -69,6 +73,24 @@ struct HolderRound<'a> {
     exhausted: bool,
 }
 
+/// The holders whose request failed in one task — a restore job or a DR run — shared by
+/// the fetches of all its blocks (restore-i44). Only the task's memory: never stored.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FailedInTask(Arc<Mutex<HashSet<DeviceId>>>);
+
+impl FailedInTask {
+    fn snapshot(&self) -> HashSet<DeviceId> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    fn insert(&self, holder: DeviceId) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(holder);
+    }
+}
+
 /// The collected state of one block's fetch.
 pub(crate) struct BlockFetch<'a> {
     encoder: &'a Arc<dyn ErasureEncoder>,
@@ -82,6 +104,8 @@ pub(crate) struct BlockFetch<'a> {
     /// size of this set, never a raw symbol count (CS-DR-5).
     accepted_esis: HashSet<u32>,
     round: u32,
+    /// The task's failed holders: asked last (restore-i44).
+    failed_in_task: FailedInTask,
 }
 
 impl<'a> BlockFetch<'a> {
@@ -121,7 +145,15 @@ impl<'a> BlockFetch<'a> {
             unbound_symbols: Vec::new(),
             accepted_esis: HashSet::new(),
             round: 0,
+            failed_in_task: FailedInTask::default(),
         }
+    }
+
+    /// Share the failed holders of the task this block belongs to (restore-i44). Without
+    /// it the fetch is a task of its own.
+    pub(crate) fn in_task(mut self, task: &FailedInTask) -> Self {
+        self.failed_in_task = task.clone();
+        self
     }
 
     /// The candidate holders (for a redial before a pause).
@@ -134,8 +166,9 @@ impl<'a> BlockFetch<'a> {
         self.accepted_esis.len()
     }
 
-    /// One round: each holder not exhausted is asked — connected ones first, each
-    /// group in the per-block shuffled order (restore-i43) — in chunks of at most `chunk`
+    /// One round: each holder not exhausted is asked — holders that failed in this task
+    /// last (restore-i44), connected ones first, each group in the per-block shuffled
+    /// order (restore-i43) — in chunks of at most `chunk`
     /// ESIs from its ranges not yet accepted and not yet asked-and-not-returned by
     /// it, until it has nothing left for us, fails, is exhausted, or the block is
     /// complete. A holder whose request errors is skipped for the rest of the round
@@ -161,8 +194,15 @@ impl<'a> BlockFetch<'a> {
         } else {
             HashSet::new()
         };
-        self.holders
-            .sort_by_key(|h| (!connected.contains(&h.placement.holder_id), h.order_key));
+        let failed_before = self.failed_in_task.snapshot();
+        self.holders.sort_by_key(|h| {
+            let id = &h.placement.holder_id;
+            (
+                failed_before.contains(id),
+                !connected.contains(id),
+                h.order_key,
+            )
+        });
         let block_id = self.block_id;
         let (k_eff, chunk) = (self.k_eff, self.chunk);
         let before = self.accepted_esis.len();
@@ -248,6 +288,7 @@ impl<'a> BlockFetch<'a> {
                             "fetch: holder did not answer; skipped this round, asked again next round"
                         );
                         failed.push(holder_id);
+                        self.failed_in_task.insert(holder_id);
                         break;
                     }
                 }

@@ -221,8 +221,8 @@ use viaticum_core::messages::RestoreRequestMsg;
 use viaticum_core::types::{ErasureParams, PlacementStatus, SymbolPlacement, Timestamp};
 
 use super::{
-    BlockFetch, FetchError, RESTORE_FETCH_CHUNK_BYTES, RoundEnd, SymbolSource, chunk_esis,
-    fetch_in_rounds, fetch_unbound_symbols,
+    BlockFetch, FailedInTask, FetchError, RESTORE_FETCH_CHUNK_BYTES, RoundEnd, SymbolSource,
+    chunk_esis, fetch_in_rounds, fetch_unbound_symbols,
 };
 
 enum Behavior {
@@ -365,6 +365,7 @@ async fn each_request_asks_at_most_chunk_esis() {
         &[placement(A, 0, 300)],
         &p,
         None,
+        &FailedInTask::default(),
     )
     .await
     .unwrap();
@@ -758,3 +759,5 @@ async fn fetch_in_rounds_stops_at_no_answer() {
 mod holder_order;
 // restore-i43: the swarm's authenticated devices are the connected holders.
 mod connected;
+// restore-i44: a holder that failed in the task is asked last for the rest of it.
+mod failed_in_task;

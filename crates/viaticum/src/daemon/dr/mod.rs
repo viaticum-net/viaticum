@@ -473,6 +473,9 @@ async fn recover_into_staging(
         .map_err(|e| dr_failed(format!("DR key: {e}")))?;
     let encoder: Arc<dyn viaticum_core::erasure::ErasureEncoder> =
         Arc::new(viaticum_core::erasure::RaptorQEncoder::new());
+    // restore-i44: a holder that failed a request in this DR run is asked last for the
+    // rest of the run, whichever pointer and block.
+    let failed_in_dr = crate::daemon::symbol_fetch::FailedInTask::default();
     let fetched = first_fetchable(&attempts, async |p: &SelfPointer| {
         println!(
             "Selected self-pointer: generation={}, base={}, diffs={}, created_at={}",
@@ -492,6 +495,7 @@ async fn recover_into_staging(
             &dr_key,
             &mut memory,
             p,
+            &failed_in_dr,
         )
         .await
     })
@@ -672,6 +676,7 @@ async fn first_fetchable<T>(
 
 /// Dial the pointer's holders, fetch and decrypt its base and diff blocks, and apply the
 /// diffs: the SystemState the pointer describes.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_state(
     swarm: &Arc<SwarmHandle>,
     event_rx: &mut tokio::sync::mpsc::Receiver<crate::daemon::network::swarm::ProtocolEvent>,
@@ -680,16 +685,17 @@ async fn fetch_state(
     dr_key: &[u8; 32],
     memory: &mut memory::Memory,
     pointer: &SelfPointer,
+    failed_in_dr: &crate::daemon::symbol_fetch::FailedInTask,
 ) -> Result<SystemState, String> {
     net::dial_pointer_holders(swarm, event_rx, db, pointer).await;
     let base_state: SystemState =
-        net::fetch_ss_block(swarm, encoder, &pointer.base, dr_key, memory)
+        net::fetch_ss_block(swarm, encoder, &pointer.base, dr_key, memory, failed_in_dr)
             .await
             .map_err(|e| format!("failed to fetch SS base block: {e}"))?;
     let mut diffs: Vec<Vec<DiffOp>> = Vec::with_capacity(pointer.diffs.len());
     for dref in &pointer.diffs {
         diffs.push(
-            net::fetch_ss_block(swarm, encoder, dref, dr_key, memory)
+            net::fetch_ss_block(swarm, encoder, dref, dr_key, memory, failed_in_dr)
                 .await
                 .map_err(|e| format!("failed to fetch SS diff block: {e}"))?,
         );

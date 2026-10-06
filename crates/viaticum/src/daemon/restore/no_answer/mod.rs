@@ -36,7 +36,7 @@ use viaticum_core::types::{DeviceId, ErasureParams, SourceBlockId, SymbolPlaceme
 use super::{RestoreCoordinator, RestoreError};
 use crate::daemon::restore::staging::JobId;
 use crate::daemon::symbol_fetch::{
-    BlockFetch, RESTORE_FETCH_CHUNK_BYTES, RestoreSource, Round, RoundEnd, chunk_esis,
+    BlockFetch, FailedInTask, RESTORE_FETCH_CHUNK_BYTES, RestoreSource, Round, RoundEnd, chunk_esis,
 };
 
 #[cfg(test)]
@@ -56,6 +56,9 @@ pub(crate) struct NoAnswerPauses {
     used: usize,
     /// Holders that failed in a `NoAnswer` round and have not answered since.
     silent: HashSet<DeviceId>,
+    /// Holders whose request failed anywhere in this job: asked last for the rest of it
+    /// (restore-i44). Unlike `silent`, an answer does not take a holder out.
+    failed_in_job: FailedInTask,
 }
 
 impl NoAnswerPauses {
@@ -70,6 +73,7 @@ impl NoAnswerPauses {
                 .collect(),
             used: 0,
             silent: HashSet::new(),
+            failed_in_job: FailedInTask::default(),
         }
     }
 
@@ -131,7 +135,8 @@ impl RestoreCoordinator {
         };
         let cancel = &self.config.cancel;
         let chunk = chunk_esis(RESTORE_FETCH_CHUNK_BYTES, params.t);
-        let mut fetch = BlockFetch::new(&self.encoder, block_id, placements, params, chunk);
+        let mut fetch = BlockFetch::new(&self.encoder, block_id, placements, params, chunk)
+            .in_task(&pauses.failed_in_job);
         loop {
             let round = fetch
                 .round(source.as_ref(), Some(cancel))
