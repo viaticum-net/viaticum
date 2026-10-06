@@ -54,6 +54,8 @@ mod swarm_addr_tests;
 mod swarm_conn_tests;
 #[cfg(test)]
 mod swarm_discovery_tests;
+#[cfg(test)]
+mod swarm_dns_tests;
 #[cfg(all(test, feature = "e2e-tools"))]
 mod swarm_e2e_tests;
 #[cfg(test)]

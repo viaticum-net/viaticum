@@ -65,6 +65,7 @@ async-trait = "0.1"
 libp2p = { version = "0.56", features = [
     "tokio",
     "tcp",
+    "dns",
     "noise",
     "yamux",
     "request-response",

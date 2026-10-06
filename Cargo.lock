@@ -4335,6 +4335,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "futures",
+ "hickory-resolver",
  "hkdf 0.13.0",
  "ignore",
  "libc",
