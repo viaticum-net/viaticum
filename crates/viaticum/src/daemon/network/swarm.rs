@@ -1811,7 +1811,7 @@ impl EventLoopState {
                 // `cause` = KeepAliveTimeout would mean libp2p's idle timeout closed a
                 // link between live nodes (C-DK v3-C expects none).
                 debug!(peer_id = %peer_id, num_established, cause = ?cause, "connection closed");
-                let refused = self.e2e_refused_closed(connection_id);
+                self.e2e_forget_closed(connection_id);
                 if num_established > 0 {
                     // network-i19: another connection to this peer lives (a
                     // duplicate from simultaneous dials, closed by one side), so
@@ -1834,7 +1834,7 @@ impl EventLoopState {
                 self.pending_cert.remove(&peer_id);
                 let event = ProtocolEvent::ConnectionClosed { peer_id, device_id };
                 emit_event(&self.event_tx, event);
-                self.conn_closed(peer_id, Instant::now(), refused);
+                self.conn_closed(peer_id, Instant::now());
             }
             SwarmEvent::OutgoingConnectionError {
                 peer_id,
@@ -2695,11 +2695,9 @@ impl EventLoopState {
         false
     }
 
-    /// A user build has no e2e hold: no closed connection was refused.
+    /// A user build has no e2e hold: there is no refused connection to forget.
     #[cfg(not(feature = "e2e-tools"))]
-    fn e2e_refused_closed(&mut self, _cid: libp2p::swarm::ConnectionId) -> bool {
-        false
-    }
+    fn e2e_forget_closed(&mut self, _cid: libp2p::swarm::ConnectionId) {}
 
     fn handle_command(&mut self, cmd: SwarmCommand) {
         match cmd {
