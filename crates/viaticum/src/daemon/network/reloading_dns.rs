@@ -84,7 +84,7 @@ pub(super) struct ReloadingDns<T> {
     gate: RereadGate,
 }
 
-impl<T> ReloadingDns<T> {
+impl<T: Send> ReloadingDns<T> {
     /// The production transport: the OS configuration, re-read at most once
     /// per `RESOLVER_REREAD_MIN_INTERVAL`.
     pub(super) fn system(inner: T) -> Self {
