@@ -261,9 +261,13 @@ pub async fn run_dr(opts: DrOptions) -> Result<(), DrError> {
     let config_path = opts
         .data_dir
         .join(crate::daemon::identity::CONFIG_FILE_NAME);
-    let new_port = AppConfig::load(&config_path)
-        .map(|c| c.network.listen_port)
-        .unwrap_or(0);
+    let new_port = match AppConfig::load(&config_path) {
+        Ok(c) => c.network.listen_port,
+        Err(e) => {
+            tracing::debug!(error = %e, "dr: config not readable; no listen-port notice");
+            0
+        }
+    };
     if let Some(line) = port_change_notice(summary.lost_listen_port, new_port) {
         tracing::warn!("dr: {line}");
         println!("{line}");

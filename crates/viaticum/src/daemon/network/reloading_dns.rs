@@ -23,7 +23,7 @@ use futures::future::{BoxFuture, FutureExt as _, TryFutureExt as _};
 use libp2p::Multiaddr;
 use libp2p::core::transport::{DialOpts, ListenerId, Transport, TransportError, TransportEvent};
 use libp2p::dns::{ResolveError, ResolverConfig, ResolverOpts};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// At most one re-read of the OS resolver configuration per minute
 /// (network-i46): a node with no network fails a lookup on every dial.
@@ -82,6 +82,9 @@ pub(super) struct ReloadingDns<T> {
     dns: libp2p::dns::tokio::Transport<SharedTransport<T>>,
     read_conf: ReadResolverConf,
     gate: RereadGate,
+    /// Outcome of the last re-read (`true` = readable); a repeat of the same
+    /// outcome logs at DEBUG only, so an offline node does not log every minute.
+    last_reread_ok: Option<bool>,
 }
 
 impl<T: Send> ReloadingDns<T> {
@@ -122,6 +125,7 @@ impl<T: Send> ReloadingDns<T> {
             dns,
             read_conf,
             gate: RereadGate::new(Instant::now(), min_interval),
+            last_reread_ok: None,
         }
     }
 
@@ -135,12 +139,24 @@ impl<T: Send> ReloadingDns<T> {
                     cfg,
                     opts,
                 );
-                info!("DNS: re-read the system resolver configuration after a failed lookup");
+                if self.last_reread_ok == Some(true) {
+                    debug!("DNS: re-read the system resolver configuration after a failed lookup");
+                } else {
+                    info!("DNS: re-read the system resolver configuration after a failed lookup");
+                }
+                self.last_reread_ok = Some(true);
             }
-            Err(e) => warn!(
-                error = %e,
-                "DNS: a lookup failed and the system resolver configuration is still unreadable"
-            ),
+            Err(e) => {
+                if self.last_reread_ok == Some(false) {
+                    debug!(error = %e, "DNS: the system resolver configuration is still unreadable");
+                } else {
+                    warn!(
+                        error = %e,
+                        "DNS: a lookup failed and the system resolver configuration is still unreadable"
+                    );
+                }
+                self.last_reread_ok = Some(false);
+            }
         }
     }
 }
