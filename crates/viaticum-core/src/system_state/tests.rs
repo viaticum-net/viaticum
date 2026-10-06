@@ -450,6 +450,7 @@ fn base_state() -> SystemState {
             master: IdentityPub([10u8; 32]),
             ledger: make_ledger(1.0, 2.0),
         }],
+        listen_port: Some(24_567),
     }
 }
 
@@ -635,6 +636,7 @@ fn pair_ledgers_defaults_to_empty_for_a_blob_packed_before_the_field_existed() {
         decoded.pair_ledgers.is_empty(),
         "an older blob must decode with no ledgers, not fail to decode"
     );
+    assert_eq!(decoded.listen_port, None, "an older blob knows no port");
     assert_eq!(decoded.files.len(), 1, "the rest of the blob still arrives");
     assert_eq!(decoded.peers.len(), 1);
 }
@@ -674,6 +676,44 @@ fn apply_diffs_carries_the_base_pair_ledgers_through() {
     assert_eq!(
         to_cbor(&result.pair_ledgers[0].ledger),
         to_cbor(&base.pair_ledgers[0].ledger)
+    );
+}
+
+// network-i47: DR learns the lost node's port from the snapshot.
+#[test]
+fn listen_port_survives_pack_unpack() {
+    let db = test_db();
+    let mut state = snapshot_db(&db).unwrap();
+    assert_eq!(
+        state.listen_port, None,
+        "the DB knows no port; the push sets it"
+    );
+    state.listen_port = Some(24_567);
+
+    let key = make_key();
+    let blob = pack_system_state(&state, &key).unwrap();
+    let unpacked = unpack_system_state(&blob, &key).unwrap();
+    assert_eq!(unpacked.listen_port, Some(24_567));
+}
+
+// network-i47. Mutation: `listen_port: None` in apply_diffs → red.
+#[test]
+fn apply_diffs_carries_the_base_listen_port_through() {
+    let base = base_state();
+    let mut s1 = base.clone();
+    s1.files.push(make_file("new.txt", 99));
+    s1.listen_port = Some(1);
+    let diff = diff_states(&base, &s1);
+    assert!(
+        !diff.is_empty(),
+        "the file change makes a diff; the port alone would not"
+    );
+
+    let result = apply_diffs(base.clone(), std::slice::from_ref(&diff));
+    assert_eq!(
+        result.listen_port,
+        Some(24_567),
+        "the base's port, not lost"
     );
 }
 

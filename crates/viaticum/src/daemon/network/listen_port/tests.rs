@@ -79,3 +79,35 @@ fn pick_listen_port_is_none_when_every_candidate_fails() {
     );
     drop(busy);
 }
+
+// ── port_change_notice (network-i47) ──
+
+// Mutation: drop the `new == old` comparison → `..._same_port_...` red; return
+// `None` always → this one red.
+#[test]
+fn port_change_notice_when_old_port_differs_then_names_both() {
+    assert_eq!(
+        super::port_change_notice(Some(24_567), 21_034).as_deref(),
+        Some("listen port changed: 24567 → 21034; update the router's port forward")
+    );
+}
+
+#[test]
+fn port_change_notice_when_same_port_then_silent() {
+    assert_eq!(super::port_change_notice(Some(24_567), 24_567), None);
+}
+
+#[test]
+fn port_change_notice_when_old_port_unknown_then_silent() {
+    assert_eq!(super::port_change_notice(None, 21_034), None);
+    assert_eq!(
+        super::port_change_notice(Some(0), 21_034),
+        None,
+        "an ephemeral old port had no forward"
+    );
+}
+
+#[test]
+fn port_change_notice_when_new_port_ephemeral_then_silent() {
+    assert_eq!(super::port_change_notice(Some(24_567), 0), None);
+}

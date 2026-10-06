@@ -1368,6 +1368,8 @@ impl DaemonHandle {
             let ss_mailbox_router = std::sync::Arc::clone(&mailbox_router);
             // Spec B2 (dr-i19): pointers name the device that published them.
             let ss_publisher = device_id;
+            // network-i47: the port rides the snapshot; 0 (ephemeral) is no port.
+            let ss_listen_port = Some(app_config.network.listen_port).filter(|&p| p != 0);
             let cancel_ss = cancel.clone();
             tasks.push((
                 "system_state_push",
@@ -1383,6 +1385,7 @@ impl DaemonHandle {
                         cancel_ss,
                         ss_mailbox_router,
                         ss_publisher,
+                        ss_listen_port,
                     )
                     .await
                     {

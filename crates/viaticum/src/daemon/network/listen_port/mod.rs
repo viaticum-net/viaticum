@@ -71,3 +71,17 @@ fn is_free(port: u16, protocols: PortProtocols, ip: IpAddr) -> bool {
         PortProtocols::TcpAndUdp => UdpSocket::bind(addr).is_ok(),
     }
 }
+
+/// The line DR prints when the restored node listened on another port than the
+/// one this machine's config has (network-i47): `init` on a new machine draws a
+/// new port, and the router's port forward still points at the old one. `None`
+/// when the old port is unknown, either port is ephemeral (0), or they match.
+pub fn port_change_notice(old: Option<u16>, new: u16) -> Option<String> {
+    let old = old.filter(|&p| p != 0)?;
+    if new == 0 || new == old {
+        return None;
+    }
+    Some(format!(
+        "listen port changed: {old} → {new}; update the router's port forward"
+    ))
+}
