@@ -42,9 +42,11 @@ pub enum CliRequest {
     },
     /// Test-only (`net-probe disconnect`, C-DK Р-16): close every connection to
     /// the known peer whose DeviceId starts with `device_hex` (16+ hex chars).
+    /// `hold_secs`: for that long only our on-demand dial reconnects it.
     #[cfg(feature = "e2e-tools")]
     E2eDisconnect {
         device_hex: String,
+        hold_secs: Option<u64>,
     },
     /// Test-only (`net-probe reach`, C-DK Р-16): send a PeerAnnounce to that
     /// peer through `send_to_device`, the path production requests take.

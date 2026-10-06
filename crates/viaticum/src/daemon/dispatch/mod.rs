@@ -59,9 +59,10 @@ pub(crate) async fn dispatch(request: CliRequest, state: &DaemonState) -> CliRes
         CliRequest::Connect { addr } => dispatch_connect(state, addr).await,
 
         #[cfg(feature = "e2e-tools")]
-        CliRequest::E2eDisconnect { device_hex } => {
-            net_status::dispatch_e2e_disconnect(state, &device_hex).await
-        }
+        CliRequest::E2eDisconnect {
+            device_hex,
+            hold_secs,
+        } => net_status::dispatch_e2e_disconnect(state, &device_hex, hold_secs).await,
 
         #[cfg(feature = "e2e-tools")]
         CliRequest::E2eReach { device_hex } => {

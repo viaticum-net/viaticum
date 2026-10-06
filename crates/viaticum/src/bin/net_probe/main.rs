@@ -2,9 +2,12 @@
 // experiments/local_discovery_test.sh). NOT a user-facing CLI; built only with
 // the `e2e-tools` feature.
 //
-//   net-probe --data-dir D disconnect <DEVICE_HEX>
+//   net-probe --data-dir D disconnect [--hold-secs N] <DEVICE_HEX>
 //       Close every connection of D's daemon to that peer (both sides then drop
-//       it from `authenticated_devices`).
+//       it from `authenticated_devices`). --hold-secs N: for N seconds D's
+//       daemon closes every new connection with the peer before the cert
+//       exchange — Kademlia's dials, the redial pass, the peer's own inbound —
+//       except D's on-demand dial (`send_to_device`), which still reaches it.
 //   net-probe --data-dir D reach <DEVICE_HEX>
 //       Send the peer a PeerAnnounce through `send_to_device`, the path every
 //       production request takes; succeeds when the peer answered.
@@ -39,6 +42,9 @@ enum Cmd {
     Disconnect {
         /// DeviceId prefix (at least 16 hex chars).
         device: String,
+        /// Hold the peer this long: only the daemon's on-demand dial reconnects it.
+        #[arg(long)]
+        hold_secs: Option<u64>,
     },
     /// Send the peer a PeerAnnounce through send_to_device.
     Reach {
@@ -50,9 +56,9 @@ enum Cmd {
 /// The web-API path and JSON body of `cmd`.
 fn request_of(cmd: &Cmd) -> (&'static str, serde_json::Value) {
     match cmd {
-        Cmd::Disconnect { device } => (
+        Cmd::Disconnect { device, hold_secs } => (
             "/api/e2e/disconnect",
-            serde_json::json!({ "device": device }),
+            serde_json::json!({ "device": device, "hold_secs": hold_secs }),
         ),
         Cmd::Reach { device } => ("/api/e2e/reach", serde_json::json!({ "device": device })),
     }

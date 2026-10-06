@@ -116,8 +116,13 @@ mod e2e {
     }
 
     /// `net-probe disconnect`: close every connection to the peer (both sides
-    /// then drop it from `authenticated_devices`).
-    pub(crate) async fn dispatch_e2e_disconnect(state: &DaemonState, hex: &str) -> CliResponse {
+    /// then drop it from `authenticated_devices`); `hold_secs`: for that long
+    /// every new connection with it but our on-demand dial is refused.
+    pub(crate) async fn dispatch_e2e_disconnect(
+        state: &DaemonState,
+        hex: &str,
+        hold_secs: Option<u64>,
+    ) -> CliResponse {
         let device = match resolve(state, hex) {
             Ok(d) => d,
             Err(e) => return CliResponse::Error(e),
@@ -126,13 +131,15 @@ mod e2e {
             return CliResponse::Error("swarm not available".to_string());
         };
         let t0 = Instant::now();
-        match swarm.disconnect_device(device).await {
+        let hold = hold_secs.map(std::time::Duration::from_secs);
+        match swarm.disconnect_device(device, hold).await {
             Ok(was_connected) => CliResponse::E2eProbe {
                 device_hex: hex_encode(&device.0),
-                detail: if was_connected {
-                    "disconnected".to_string()
-                } else {
-                    "was not connected".to_string()
+                detail: match (was_connected, hold_secs) {
+                    (true, None) => "disconnected".to_string(),
+                    (false, None) => "was not connected".to_string(),
+                    (true, Some(s)) => format!("disconnected, held {s} s"),
+                    (false, Some(s)) => format!("was not connected, held {s} s"),
                 },
                 elapsed_ms: t0.elapsed().as_millis() as u64,
             },

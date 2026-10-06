@@ -306,18 +306,23 @@ impl EventLoopState {
         self.check_over_cap(now);
     }
 
-    /// The last connection of `peer` closed.
-    pub(super) fn conn_closed(&mut self, peer: PeerId, now: Instant) {
+    /// The last connection of `peer` closed. `refused`: it was one the
+    /// test-only e2e hold refused (always false in a user build) — while our
+    /// on-demand dial to the peer is still under way, that dial carries the
+    /// waiters on: the closed connection was never theirs.
+    pub(super) fn conn_closed(&mut self, peer: PeerId, now: Instant, refused: bool) {
         self.pending_close.remove(&peer);
         if let Some(lru) = self.lru.as_mut() {
             lru.on_disconnected(&peer);
         }
-        let (resolved, next) = self.on_demand.on_closed(peer, now);
-        if let Some(r) = resolved {
-            self.resolve_unreachable(r, now);
-        }
-        if next == Next::Dial {
-            self.on_demand_dial(peer);
+        if !(refused && self.on_demand.our_dial_pending(&peer)) {
+            let (resolved, next) = self.on_demand.on_closed(peer, now);
+            if let Some(r) = resolved {
+                self.resolve_unreachable(r, now);
+            }
+            if next == Next::Dial {
+                self.on_demand_dial(peer);
+            }
         }
         self.promote_queued();
         self.check_over_cap(now);

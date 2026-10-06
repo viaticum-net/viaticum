@@ -251,3 +251,24 @@ fn our_connection_closed_before_cert_fails_and_caches() {
     assert!(matches!(r.map(|r| r.outcome), Some(Outcome::Failed(_))));
     assert!(o.is_cached(&p, t0));
 }
+
+#[test]
+fn our_dial_pending_only_until_our_connection_is_up() {
+    let t0 = Instant::now();
+    let mut o = od(16);
+    let p = PeerId::random();
+    assert!(!o.our_dial_pending(&p), "no waiters, no dial");
+    let w = waiter(&o, "RestoreRequest", t0);
+    assert_eq!(
+        o.admit(p, dev(1), w, vec![], Situation::default()),
+        Next::Dial
+    );
+    assert!(!o.our_dial_pending(&p), "admitted, not dialed yet");
+    o.dial_started(p, cid(7), t0);
+    assert!(o.our_dial_pending(&p));
+    // A foreign connection coming up does not end our dial.
+    o.on_established(p, cid(8));
+    assert!(o.our_dial_pending(&p));
+    o.on_established(p, cid(7));
+    assert!(!o.our_dial_pending(&p), "our connection is up");
+}

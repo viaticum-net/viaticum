@@ -460,6 +460,14 @@ impl OnDemand {
         })
     }
 
+    /// Our dial to `peer` is under way and its connection is not up yet.
+    pub(crate) fn our_dial_pending(&self, peer: &PeerId) -> bool {
+        match self.peers.get(peer).map(|pw| pw.on) {
+            Some(WaitOn::OurDial(cid)) => self.our_dials.contains_key(&cid),
+            _ => false,
+        }
+    }
+
     /// The last connection of `peer` closed. Closing / Foreign → the loop dials
     /// now; our own connection closed before the cert → our dial failed.
     pub(crate) fn on_closed(&mut self, peer: PeerId, now: Instant) -> (Option<Resolved>, Next) {
