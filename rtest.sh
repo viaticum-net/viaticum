@@ -64,7 +64,12 @@ elif [ -z "$LOCAL" ]; then
 else
     echo "=== --local: testing on this machine ==="
     cargo fmt --all --check
-    cargo test $ARGS --features viaticum/e2e-tools
+    if command -v cargo-nextest >/dev/null; then
+        eval cargo nextest run --no-fail-fast $ARGS --features viaticum/e2e-tools $SIM_FILTER
+        cargo test --doc $ARGS
+    else
+        cargo test $ARGS --features viaticum/e2e-tools
+    fi
     cargo clippy --workspace --all-targets --features viaticum/e2e-tools -- -D warnings
     echo "=== Done (local) ==="
 fi
