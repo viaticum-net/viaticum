@@ -1025,11 +1025,9 @@ impl Db {
     /// Reads the record, applies the new values, and writes back. Returns `DbError::NotFound`
     /// if no record exists for `block_id`.
     ///
-    /// This is a read-modify-write inside a single logical operation but uses two separate
-    /// redb transactions (read then write) — the same pattern as
-    /// `transition_placement_offered_to_alive`.
-    /// Not atomic against concurrent writers, but the daemon is single-process and the migration
-    /// runs before any workers start, so no concurrent writes occur during migration.
+    /// Read and write are one transaction (backup-i28-c): a record deleted by another writer
+    /// (the retirement of an SS block) is not written back — a resurrected SS record would be
+    /// outside the SS ledger and pass for a user block.
     pub fn update_block_cached_fields(
         &self,
         block_id: &SourceBlockId,
@@ -1038,14 +1036,24 @@ impl Db {
         current_reliability: f64,
         target_reliability: f64,
     ) -> Result<(), DbError> {
-        let mut record = self
-            .get_source_block(block_id)?
-            .ok_or_else(|| DbError::NotFound(format!("SourceBlockRecord {block_id}")))?;
-        record.importance = importance;
-        record.current_alive = current_alive;
-        record.current_reliability = current_reliability;
-        record.target_reliability = target_reliability;
-        self.upsert_source_block(&record)
+        let tx = self.inner.begin_write()?;
+        {
+            let mut table = tx.open_table(SOURCE_BLOCKS)?;
+            let stored: Option<SourceBlockRecord> = match table.get(&block_id.0)? {
+                Some(v) => Some(from_cbor_bytes(v.value())?),
+                None => None,
+            };
+            let Some(mut record) = stored else {
+                return Err(DbError::NotFound(format!("SourceBlockRecord {block_id}")));
+            };
+            record.importance = importance;
+            record.current_alive = current_alive;
+            record.current_reliability = current_reliability;
+            record.target_reliability = target_reliability;
+            insert_source_block_keeping_high_water(&mut table, &record)?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Record a worker attempt on `block_id` (B-4). Cooldown lives only in RAM,
@@ -1269,8 +1277,6 @@ impl Db {
         keep: impl Fn(&SourceBlockRecord) -> bool,
     ) -> Result<Option<SourceBlockRecord>, DbError> {
         let all = self.list_all_source_blocks()?;
-        let cooldown_secs = cooldown.as_secs();
-        let parked_cooldown_secs = parked_cooldown.as_secs();
         // Cooldown state is RAM-only (B-4); take one read lock for the whole pass.
         let hot = self.hot();
         let cooldown_of = |id: &SourceBlockId| -> BlockCooldown {
@@ -1278,29 +1284,15 @@ impl Db {
         };
 
         let eligible = all.into_iter().filter(|b| {
-            if b.status != SourceBlockStatus::Active || !keep(b) {
-                return false;
-            }
-            if b.target_reliability <= 0.0
-                || crate::reliability::meets_target(b.current_reliability, b.target_reliability)
-            {
-                return false;
-            }
-            if current_pool_sig != 0 {
-                let cd = cooldown_of(&b.block_id);
-                if let Some(last_at) = cd.last_attempted_at {
-                    let elapsed = now.0.saturating_sub(last_at.0);
-                    let window = if cd.parked {
-                        parked_cooldown_secs
-                    } else {
-                        cooldown_secs
-                    };
-                    if elapsed < window && cd.last_pool_signature == current_pool_sig {
-                        return false;
-                    }
-                }
-            }
-            true
+            keep(b)
+                && work_eligible(
+                    b,
+                    cooldown_of(&b.block_id),
+                    cooldown,
+                    parked_cooldown,
+                    now,
+                    current_pool_sig,
+                )
         });
 
         let winner = eligible.max_by(|a, b| {
@@ -1317,6 +1309,64 @@ impl Db {
 
         Ok(winner)
     }
+
+    /// Whether one block may be worked now: the eligibility of `next_work_item` (Active, a
+    /// positive target not met, out of cooldown and parking), for a record the caller already
+    /// holds (backup-i28-b: the worker checks the few SS blocks one by one instead of
+    /// scanning every block). Read-only.
+    pub fn work_item_eligible(
+        &self,
+        record: &SourceBlockRecord,
+        cooldown: Duration,
+        parked_cooldown: Duration,
+        now: Timestamp,
+        current_pool_sig: u64,
+    ) -> bool {
+        work_eligible(
+            record,
+            self.block_cooldown(&record.block_id),
+            cooldown,
+            parked_cooldown,
+            now,
+            current_pool_sig,
+        )
+    }
+}
+
+/// The eligibility of `next_work_item` for one block with its RAM cooldown `cd` (B-4): Active,
+/// a positive target not met (repair-i3), and not in cooldown — attempted within the window
+/// (`parked_cooldown` when parked) with the same pool signature. Pool signature 0 skips the
+/// cooldown.
+fn work_eligible(
+    b: &SourceBlockRecord,
+    cd: BlockCooldown,
+    cooldown: Duration,
+    parked_cooldown: Duration,
+    now: Timestamp,
+    current_pool_sig: u64,
+) -> bool {
+    if b.status != SourceBlockStatus::Active {
+        return false;
+    }
+    if b.target_reliability <= 0.0
+        || crate::reliability::meets_target(b.current_reliability, b.target_reliability)
+    {
+        return false;
+    }
+    if current_pool_sig != 0
+        && let Some(last_at) = cd.last_attempted_at
+    {
+        let elapsed = now.0.saturating_sub(last_at.0);
+        let window = if cd.parked {
+            parked_cooldown.as_secs()
+        } else {
+            cooldown.as_secs()
+        };
+        if elapsed < window && cd.last_pool_signature == current_pool_sig {
+            return false;
+        }
+    }
+    true
 }
 
 // ============================================================
@@ -2986,6 +3036,28 @@ impl<'db> DbWriteTxn<'db> {
             let mut table = self.txn.open_table(SOURCE_BLOCKS)?;
             table.remove(&block_id.0)?;
         }
+        Ok(())
+    }
+
+    /// Mark `block_id` as a SystemState block of `generation` in the SS ledger, in this
+    /// transaction: with `upsert_source_block` here, the record and its mark are written
+    /// together or not at all (backup-i28-c). No hot cache entry.
+    pub fn mark_ss_block(
+        &mut self,
+        block_id: &SourceBlockId,
+        generation: u32,
+    ) -> Result<(), DbError> {
+        let bytes = to_cbor_bytes(&generation);
+        let mut table = self.txn.open_table(SS_BLOCKS)?;
+        table.insert(&block_id.0, bytes.as_slice())?;
+        Ok(())
+    }
+
+    /// Remove `block_id` from the SS ledger, in this transaction (the retirement of an SS
+    /// block drops the mark, the placements and the record together, backup-i28-c).
+    pub fn unmark_ss_block(&mut self, block_id: &SourceBlockId) -> Result<(), DbError> {
+        let mut table = self.txn.open_table(SS_BLOCKS)?;
+        table.remove(&block_id.0)?;
         Ok(())
     }
 

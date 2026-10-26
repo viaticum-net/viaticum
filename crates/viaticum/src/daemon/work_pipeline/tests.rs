@@ -146,6 +146,7 @@ pub(super) fn make_config() -> WorkPipelineConfig {
         mem_budget: crate::daemon::mem_budget::MemBudget::new(64 << 30),
         chunk_budget_bytes: viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,
         restore_pauses_backup: super::RESTORE_PAUSES_BACKUP,
+        time_scale: 1,
     }
 }
 

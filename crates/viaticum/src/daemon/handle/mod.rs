@@ -1068,6 +1068,7 @@ impl DaemonHandle {
                     chunk_budget_bytes:
                         viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,
                     restore_pauses_backup: crate::daemon::work_pipeline::RESTORE_PAUSES_BACKUP,
+                    time_scale,
                 };
                 let worker = crate::daemon::work_pipeline::WorkPipeline::new(
                     db.clone(),

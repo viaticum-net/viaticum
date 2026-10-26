@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use viaticum_core::db::Db;
+use viaticum_core::db::{Db, DbError};
 use viaticum_core::system_state::{
     BlockRef, CatalogLineageId, CatalogSummary, DiffOp, HolderHint, SelfPointer, SystemState,
     sign_self_pointer,
@@ -59,6 +59,10 @@ pub fn publish_diff_block(
 
 /// Shared: encrypt plaintext into an SS block, retain the blob, upsert the record,
 /// and record it in the SS ledger (so snapshot_db excludes it and retire can find it).
+///
+/// The record and its ledger mark are one transaction (backup-i28-c): an SS record outside
+/// the ledger would pass for a user block (the worker's class, backup-i28) and escape the
+/// sweep. A blob without a record (a failure after `store_retained_block`) is harmless.
 fn register_ss_block(
     db: &Db,
     data_dir: &Path,
@@ -69,14 +73,21 @@ fn register_ss_block(
     let (block_id, blob) = block::build_state_block(plaintext, dr_key)?;
     block::store_retained_block(data_dir, &block_id, &blob)?;
     let record = block::ss_source_block_record(block_id, blob.len())?;
-    db.upsert_source_block(&record)?;
-    db.mark_ss_block(&block_id, generation)?;
+    let mut txn = db.write_txn()?;
+    txn.upsert_source_block(&record)?;
+    txn.mark_ss_block(&block_id, generation)?;
+    txn.commit()?;
     Ok(block_id)
 }
 
 /// Retire a superseded SS block: drop it from the ledger, delete its source-block
 /// record + placements, and remove the retained blob. Best-effort — logs but does
-/// not fail the publish if individual steps error (the block simply ages out).
+/// not fail the publish.
+///
+/// The mark, the placements and the record go in one transaction (backup-i28-c): no
+/// moment exists where the record is still Active but no longer in the ledger (it would
+/// pass for a user block). If that transaction fails, nothing changed: the block stays in
+/// the ledger and the next sweep retires it.
 ///
 /// SAFETY GUARD: this deletes a source-block record + its placements, so it must only
 /// ever touch SS blocks. It refuses to act on a block_id that is not in the SS ledger —
@@ -96,24 +107,29 @@ pub fn retire_ss_block(db: &Db, data_dir: &Path, block_id: &SourceBlockId) {
             return;
         }
     }
-    if let Err(e) = db.unmark_ss_block(block_id) {
-        tracing::warn!(block = %block_id, error = %e, "retire SS block: unmark failed");
-    }
-    // Rows go with the retired block: its record is deleted right below, so no ESI cursor
-    // of a live block loses a range (repair-i8).
-    if let Ok(placements) = db.list_placements_for_block(block_id) {
-        for p in placements {
-            if let Err(e) = db.delete_placement(block_id, &p.holder_id) {
-                tracing::warn!(block = %block_id, error = %e, "retire SS block: delete placement failed");
-            }
-        }
-    }
-    if let Err(e) = db.delete_source_block(block_id) {
-        tracing::warn!(block = %block_id, error = %e, "retire SS block: delete record failed");
+    if let Err(e) = drop_ss_block_rows(db, block_id) {
+        tracing::warn!(block = %block_id, error = %e,
+            "retire SS block: the transaction failed, nothing removed (the next sweep retries)");
+        return;
     }
     if let Err(e) = block::remove_retained_block(data_dir, block_id) {
         tracing::warn!(block = %block_id, error = %e, "retire SS block: remove retained blob failed");
     }
+}
+
+/// The ledger mark, the placements and the record of an SS block, in one transaction
+/// (backup-i28-c). The placements are read inside it, so an offer the worker wrote a moment
+/// before is dropped too. Rows go with the retired block: its record goes in the same
+/// transaction, so no ESI cursor of a live block loses a range (repair-i8).
+fn drop_ss_block_rows(db: &Db, block_id: &SourceBlockId) -> Result<(), DbError> {
+    let mut txn = db.write_txn()?;
+    let placements = txn.placements_for_block(block_id)?;
+    txn.unmark_ss_block(block_id)?;
+    for p in &placements {
+        txn.delete_placement(block_id, &p.holder_id)?;
+    }
+    txn.delete_source_block(block_id)?;
+    txn.commit()
 }
 
 /// At most this many holder hints per block in a pointer (CROWN-1 V.3, AC-27′).

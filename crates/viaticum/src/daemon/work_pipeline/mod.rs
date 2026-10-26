@@ -23,6 +23,7 @@ use viaticum_core::types::{DeviceId, SourceBlockId, SourceBlockRecord, Timestamp
 use crate::daemon::mem_budget::MemBudget;
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
+use crate::daemon::system_state::strength::block_strength;
 
 mod esi_space;
 mod gate;
@@ -118,6 +119,9 @@ pub struct WorkPipelineConfig {
     /// restore gate is up. A field, so the tests can run both variants; the daemon passes the
     /// constant.
     pub restore_pauses_backup: bool,
+    /// The daemon's time scale (1 in production). Only for the strength of SS blocks
+    /// (backup-i28-b): a holder counts while seen within `7 days / time_scale`.
+    pub time_scale: u64,
 }
 
 // Only tests build a config this way (`..Default::default()`): the daemon sets every field, and
@@ -140,6 +144,7 @@ impl Default for WorkPipelineConfig {
             mem_budget: MemBudget::new(u64::MAX),
             chunk_budget_bytes: viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,
             restore_pauses_backup: RESTORE_PAUSES_BACKUP,
+            time_scale: 1,
         }
     }
 }
@@ -506,11 +511,13 @@ impl WorkPipeline {
     }
 
     /// The block of the next attempt (backup-i28). The service blocks of SystemState and the
-    /// user's blocks share the worker: after an attempt on an SS block, a user block that
-    /// waits goes next. Within SS, a block with no live holder that was never attempted (a new
-    /// base or diff) goes before a re-pick of a placed one, so the DR catalog does not fall
-    /// behind (backup-i28-a). Otherwise the plain order of `next_work_item`. The SS set is read for
-    /// every pick: it is small, and `next_work_item` scans every block anyway.
+    /// user's blocks share the worker. (a) After an attempt on an SS block, a user block that
+    /// waits goes next. (b) Else the oldest SS block that is not yet restorable (strength < 1)
+    /// goes first, so the DR catalog catches up: what was published is finished before what is
+    /// new (backup-i28-b). (c) Else the plain order of `next_work_item` (re-picks of restorable
+    /// SS blocks among the rest, by priority). "SS" is the SS ledger, not importance. (b) reads
+    /// the ledger and the few SS records one by one; (a) and (c) scan every block, so a pick
+    /// costs at most two scans.
     fn next_block(
         &self,
         cooldown: std::time::Duration,
@@ -519,33 +526,62 @@ impl WorkPipeline {
         pool_sig: u64,
     ) -> Result<Option<SourceBlockRecord>, viaticum_core::db::DbError> {
         let coef = self.config.completion_bonus_coef;
-        let ss = self.db.ss_block_id_set()?;
-        let is_ss = |b: &SourceBlockRecord| ss.contains(&b.block_id.0);
+        let ss = self.db.list_ss_blocks()?;
+        let ss_ids: std::collections::HashSet<[u8; 32]> = ss.iter().map(|(id, _)| id.0).collect();
         let pick = |keep: &dyn Fn(&SourceBlockRecord) -> bool| {
             self.db
                 .next_work_item_where(coef, cooldown, parked_cooldown, now, pool_sig, keep)
         };
         if self.last_was_ss
-            && let Some(user) = pick(&|b| !is_ss(b))?
+            && let Some(user) = pick(&|b| !ss_ids.contains(&b.block_id.0))?
         {
             return Ok(Some(user));
         }
-        // Never attempted: a new SS block jumps the queue once, not forever when every holder
-        // keeps refusing it (then the placed SS blocks get their turns again).
-        let untried: std::collections::HashSet<[u8; 32]> = ss
-            .iter()
-            .filter(|id| {
-                self.db
-                    .block_cooldown(&SourceBlockId(**id))
-                    .last_attempted_at
-                    .is_none()
-            })
-            .copied()
-            .collect();
-        if let Some(new_ss) = pick(&|b| b.current_alive == 0 && untried.contains(&b.block_id.0))? {
-            return Ok(Some(new_ss));
+        if let Some(weak) =
+            self.oldest_unrestorable_ss(&ss, cooldown, parked_cooldown, now, pool_sig)?
+        {
+            return Ok(Some(weak));
         }
         pick(&|_| true)
+    }
+
+    /// backup-i28-b: among the SS blocks of the ledger that may be worked now (the eligibility
+    /// of `next_work_item`), the oldest one whose strength is below 1 — not restorable by the
+    /// owner's estimate (`strength::block_strength`, the DR readiness estimator, dr-i49).
+    /// Oldest by the record's `created_at`, then the ledger generation, then the id. Not by the
+    /// generation first: it restarts at 1 with every process, while a pointer place may still
+    /// refer to the blocks of an earlier process (dr-i48). The membership does not depend on the
+    /// RAM cooldown: a cooldown reset (`PeerAuthenticated`, restart) changes only eligibility, as
+    /// in the plain order (review W2).
+    fn oldest_unrestorable_ss(
+        &self,
+        ss: &[(SourceBlockId, u32)],
+        cooldown: std::time::Duration,
+        parked_cooldown: std::time::Duration,
+        now: Timestamp,
+        pool_sig: u64,
+    ) -> Result<Option<SourceBlockRecord>, viaticum_core::db::DbError> {
+        let eligible_now = |r: &SourceBlockRecord| {
+            self.db
+                .work_item_eligible(r, cooldown, parked_cooldown, now, pool_sig)
+        };
+        let mut eligible: Vec<(SourceBlockRecord, u32)> = Vec::new();
+        for (id, generation) in ss {
+            let Some(record) = self.db.get_source_block(id)? else {
+                continue;
+            };
+            if eligible_now(&record) {
+                eligible.push((record, *generation));
+            }
+        }
+        eligible.sort_by_key(|(r, g)| (r.created_at, *g, r.block_id.0));
+        let ts = self.config.time_scale;
+        for (record, _) in eligible {
+            if block_strength(&self.db, &record.block_id, now.0, ts)? < 1.0 {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
     }
 
     /// One attempt on one block: log the pick, run the encode+deliver cycle, record
@@ -556,8 +592,8 @@ impl WorkPipeline {
         pool: &PoolSnapshot,
         now: Timestamp,
     ) -> anyhow::Result<BlockAttempt> {
-        // backup-i28: a fresh look at the SS ledger for the picked block (its record may be
-        // written a moment before its ledger entry: at most one extra SS attempt in a row).
+        // backup-i28: the class of the picked block, from the SS ledger (the record and its
+        // ledger entry are written in one transaction, backup-i28-c).
         let ss = self.db.is_ss_block(&block.block_id)?;
         self.last_was_ss = ss;
         tracing::info!(
