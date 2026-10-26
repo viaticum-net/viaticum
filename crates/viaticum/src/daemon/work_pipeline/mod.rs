@@ -23,6 +23,7 @@ use viaticum_core::types::{DeviceId, SourceBlockId, SourceBlockRecord, Timestamp
 use crate::daemon::mem_budget::MemBudget;
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
+use crate::daemon::system_state::strength::{block_strength, ss_blocks_awaiting_retirement};
 
 mod esi_space;
 mod gate;
@@ -34,6 +35,10 @@ mod worker;
 mod tests;
 #[cfg(test)]
 mod tests_budget;
+#[cfg(test)]
+mod tests_ss_fairness;
+#[cfg(test)]
+mod tests_ss_order;
 
 pub use esi_space::EsiSpace;
 pub use gate::{
@@ -116,6 +121,9 @@ pub struct WorkPipelineConfig {
     /// restore gate is up. A field, so the tests can run both variants; the daemon passes the
     /// constant.
     pub restore_pauses_backup: bool,
+    /// The daemon's time scale (1 in production). Only for the strength of SS blocks
+    /// (backup-i28-b): a holder counts while seen within `7 days / time_scale`.
+    pub time_scale: u64,
 }
 
 // Only tests build a config this way (`..Default::default()`): the daemon sets every field, and
@@ -138,6 +146,7 @@ impl Default for WorkPipelineConfig {
             mem_budget: MemBudget::new(u64::MAX),
             chunk_budget_bytes: viaticum_core::constants::SYMBOL_TRANSFER_CHUNK_BUDGET_BYTES,
             restore_pauses_backup: RESTORE_PAUSES_BACKUP,
+            time_scale: 1,
         }
     }
 }
@@ -263,6 +272,10 @@ pub struct WorkPipeline {
     restore_gate: Option<RestoreGate>,
     /// The INFO line «paused» was written for the pause that is on now (once per pause).
     pause_announced: bool,
+    /// The last attempt that sent offers was on a SystemState block (backup-i28): while a user
+    /// block waits, the next attempt is a user block's. An attempt without offers does not
+    /// change it (backup-i28-e). RAM only.
+    last_was_ss: bool,
 }
 
 /// Resolves when a source of the restore gate changed; never while there is no gate (or its
@@ -306,6 +319,7 @@ impl WorkPipeline {
             last_attempt: std::collections::HashMap::new(),
             restore_gate: None,
             pause_announced: false,
+            last_was_ss: false,
         }
     }
 
@@ -466,13 +480,7 @@ impl WorkPipeline {
         let mut picked_any = false;
         let mut tried: std::collections::HashSet<SourceBlockId> = std::collections::HashSet::new();
         for _ in 0..MAX_BLOCKS_PER_ITERATION {
-            let block = match self.db.next_work_item(
-                self.config.completion_bonus_coef,
-                cooldown,
-                parked_cooldown,
-                now,
-                pool.signature,
-            )? {
+            let block = match self.next_block(cooldown, parked_cooldown, now, pool.signature)? {
                 Some(b) => b,
                 None => {
                     if !picked_any {
@@ -494,7 +502,11 @@ impl WorkPipeline {
             }
             picked_any = true;
 
-            let attempt = self.work_on_block(&block, &pool, now).await?;
+            // backup-i28: the class of the picked block, from the SS ledger (the record and its
+            // ledger entry are written in one transaction, backup-i28-c).
+            let ss = self.db.is_ss_block(&block.block_id)?;
+            let attempt = self.work_on_block(&block, ss, &pool, now).await?;
+            self.end_turn(ss, attempt);
             if !matches!(
                 attempt,
                 BlockAttempt::NoCandidates | BlockAttempt::LeftService
@@ -505,16 +517,100 @@ impl WorkPipeline {
         Ok(picked_any)
     }
 
+    /// The block of the next attempt (backup-i28). The service blocks of SystemState and the
+    /// user's blocks share the worker. (a) After an attempt with offers on an SS block
+    /// (backup-i28-e), a user block that waits goes next. (b) Else the oldest SS block that is
+    /// not yet restorable (strength < 1) goes first, so the DR catalog catches up: what was
+    /// published is finished before what is new (backup-i28-b); a block displaced out of its
+    /// place and waiting to be retired (`to_retire`) is not in (b) (backup-i28-d). (c) Else the
+    /// plain order of `next_work_item` (re-picks of restorable SS blocks among the rest, by
+    /// priority). "SS" is the SS ledger, not importance. (b) reads the ledger, META and the few
+    /// SS records one by one; (a) and (c) scan every block, so a pick costs at most two scans.
+    fn next_block(
+        &self,
+        cooldown: std::time::Duration,
+        parked_cooldown: std::time::Duration,
+        now: Timestamp,
+        pool_sig: u64,
+    ) -> Result<Option<SourceBlockRecord>, viaticum_core::db::DbError> {
+        let coef = self.config.completion_bonus_coef;
+        let ss = self.db.list_ss_blocks()?;
+        let ss_ids: std::collections::HashSet<[u8; 32]> = ss.iter().map(|(id, _)| id.0).collect();
+        let pick = |keep: &dyn Fn(&SourceBlockRecord) -> bool| {
+            self.db
+                .next_work_item_where(coef, cooldown, parked_cooldown, now, pool_sig, keep)
+        };
+        if self.last_was_ss
+            && let Some(user) = pick(&|b| !ss_ids.contains(&b.block_id.0))?
+        {
+            return Ok(Some(user));
+        }
+        if let Some(weak) =
+            self.oldest_unrestorable_ss(&ss, cooldown, parked_cooldown, now, pool_sig)?
+        {
+            return Ok(Some(weak));
+        }
+        pick(&|_| true)
+    }
+
+    /// backup-i28-b: among the SS blocks of the ledger that may be worked now (the eligibility
+    /// of `next_work_item`), the oldest one whose strength is below 1 — not restorable by the
+    /// owner's estimate (`strength::block_strength`, the DR readiness estimator, dr-i49).
+    /// Oldest by the record's `created_at`, then the ledger generation, then the id. Not by the
+    /// generation first: it restarts at 1 with every process, while a pointer place may still
+    /// refer to the blocks of an earlier process (dr-i48). The membership does not depend on the
+    /// RAM cooldown: a cooldown reset (`PeerAuthenticated`, restart) changes only eligibility, as
+    /// in the plain order (review W2). backup-i28-d: a block of a pointer's `to_retire`
+    /// (displaced out of its place, retired once the replacement reaches the threshold; DR
+    /// readiness does not count it) is left to the plain order (c).
+    fn oldest_unrestorable_ss(
+        &self,
+        ss: &[(SourceBlockId, u32)],
+        cooldown: std::time::Duration,
+        parked_cooldown: std::time::Duration,
+        now: Timestamp,
+        pool_sig: u64,
+    ) -> Result<Option<SourceBlockRecord>, viaticum_core::db::DbError> {
+        let eligible_now = |r: &SourceBlockRecord| {
+            self.db
+                .work_item_eligible(r, cooldown, parked_cooldown, now, pool_sig)
+        };
+        let meta = self.db.pointer_publications()?;
+        let displaced = ss_blocks_awaiting_retirement(meta.as_ref());
+        let mut eligible: Vec<(SourceBlockRecord, u32)> = Vec::new();
+        for (id, generation) in ss {
+            if displaced.contains(id) {
+                continue;
+            }
+            let Some(record) = self.db.get_source_block(id)? else {
+                continue;
+            };
+            if eligible_now(&record) {
+                eligible.push((record, *generation));
+            }
+        }
+        eligible.sort_by_key(|(r, g)| (r.created_at, *g, r.block_id.0));
+        let ts = self.config.time_scale;
+        for (record, _) in eligible {
+            if block_strength(&self.db, &record.block_id, now.0, ts)? < 1.0 {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
     /// One attempt on one block: log the pick, run the encode+deliver cycle, record
     /// the cooldown (parked when nobody could take symbols).
     async fn work_on_block(
         &mut self,
         block: &SourceBlockRecord,
+        ss: bool,
         pool: &PoolSnapshot,
         now: Timestamp,
     ) -> anyhow::Result<BlockAttempt> {
         tracing::info!(
             block_id = %block.block_id,
+            ss,
             importance = block.importance,
             current_alive = block.current_alive,
             current_reliability = block.current_reliability,
@@ -609,6 +705,17 @@ impl WorkPipeline {
                 self.park_clearing_memory(block, pool, now, ParkReason::IterationError);
                 Ok(BlockAttempt::Error)
             }
+        }
+    }
+
+    /// backup-i28-e: the turn passes only with an attempt that sent offers. After one on an SS
+    /// block a waiting user block goes next; after one on a user block the order is free again.
+    /// An attempt without offers (nobody to offer to, the pool unusable, a pause of the restore
+    /// gate, the block left service, an error) leaves the turn where it was: it took nothing
+    /// from the other class, so it does not use up its own class's turn.
+    fn end_turn(&mut self, ss: bool, attempt: BlockAttempt) {
+        if attempt == BlockAttempt::Offered {
+            self.last_was_ss = ss;
         }
     }
 

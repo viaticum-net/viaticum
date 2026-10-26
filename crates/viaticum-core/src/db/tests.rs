@@ -4721,3 +4721,154 @@ fn avail_decay_keeps_concurrent_writes_to_the_record() {
     assert_eq!(rec.bytes_peer_stores_for_us, 300, "no bump lost");
     assert_eq!(rec.last_avail_sample, 3000);
 }
+
+/// backup-i28: `next_work_item_where` keeps the order of `next_work_item` among the blocks
+/// its predicate accepts; accepting all is `next_work_item`, accepting none is `None`.
+#[test]
+fn next_work_item_where_keeps_order_among_kept_blocks() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(9999);
+    // Priorities as in next_work_item_picks_highest_priority: C 1.4 > A ≈ 1.143 > B 1.0.
+    let a = make_block_with(1, SourceBlockStatus::Active, 0.5, 12, Some(14), 0.5, 0.999);
+    let b = make_block_with(2, SourceBlockStatus::Active, 1.0, 0, Some(12), 0.0, 0.999);
+    let c = make_block_with(3, SourceBlockStatus::Active, 0.8, 6, Some(12), 0.4, 0.999);
+    for r in [&a, &b, &c] {
+        db.upsert_source_block(r).unwrap();
+    }
+    let (cd, parked) = (
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(3600),
+    );
+    let pick = |keep: &dyn Fn(&SourceBlockRecord) -> bool| {
+        db.next_work_item_where(1.5, cd, parked, now, 0, keep)
+            .unwrap()
+            .map(|r| r.block_id)
+    };
+
+    assert_eq!(pick(&|_| true), Some(SourceBlockId([3; 32])));
+    assert_eq!(
+        pick(&|_| true),
+        db.next_work_item(1.5, cd, parked, now, 0)
+            .unwrap()
+            .map(|r| r.block_id)
+    );
+    assert_eq!(
+        pick(&|r| r.block_id != SourceBlockId([3; 32])),
+        Some(SourceBlockId([1; 32])),
+        "C left out: the next by priority"
+    );
+    assert_eq!(pick(&|_| false), None);
+}
+
+/// backup-i28-b: `work_item_eligible` on one record says what `next_work_item` says about
+/// that block alone — status, target, cooldown, parking, pool signature 0.
+#[test]
+fn work_item_eligible_agrees_with_next_work_item_per_block() {
+    let db = Db::open_in_memory().unwrap();
+    let now = Timestamp(10_000);
+    let (cd, parked) = (
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(3600),
+    );
+    let below = make_block_with(1, SourceBlockStatus::Active, 0.5, 0, Some(7), 0.0, 0.999);
+    let at_target = make_block_with(2, SourceBlockStatus::Active, 0.5, 7, Some(7), 0.999, 0.999);
+    let stale = make_block_with(3, SourceBlockStatus::Stale, 0.5, 0, Some(7), 0.0, 0.999);
+    let cooling = make_block_with(4, SourceBlockStatus::Active, 0.5, 0, Some(7), 0.0, 0.999);
+    let cooled = make_block_with(5, SourceBlockStatus::Active, 0.5, 0, Some(7), 0.0, 0.999);
+    let parked_b = make_block_with(6, SourceBlockStatus::Active, 0.5, 0, Some(7), 0.0, 0.999);
+    for r in [&below, &at_target, &stale, &cooling, &cooled, &parked_b] {
+        db.upsert_source_block(r).unwrap();
+    }
+    db.set_block_cooldown(&cooling.block_id, Some(Timestamp(9_990)), 7, false);
+    db.set_block_cooldown(&cooled.block_id, Some(Timestamp(9_960)), 7, false);
+    db.set_block_cooldown(&parked_b.block_id, Some(Timestamp(9_960)), 7, true);
+
+    let expected = [
+        (&below, true),
+        (&at_target, false),
+        (&stale, false),
+        (&cooling, false),
+        (&cooled, true),
+        (&parked_b, false),
+    ];
+    for (r, eligible) in expected {
+        assert_eq!(
+            db.work_item_eligible(r, cd, parked, now, 7),
+            eligible,
+            "block {}",
+            r.block_id
+        );
+        let alone = db
+            .next_work_item_where(1.5, cd, parked, now, 7, |b| b.block_id == r.block_id)
+            .unwrap();
+        assert_eq!(
+            alone.is_some(),
+            eligible,
+            "next_work_item, block {}",
+            r.block_id
+        );
+    }
+    // Pool signature 0: no cooldown applies.
+    assert!(db.work_item_eligible(&cooling, cd, parked, now, 0));
+    assert!(db.work_item_eligible(&parked_b, cd, parked, now, 0));
+}
+
+/// backup-i28-c: an SS record and its ledger mark written in one `DbWriteTxn` appear together
+/// on commit and not at all when the transaction is dropped; the same for their removal.
+#[test]
+fn ss_record_and_ledger_mark_in_one_write_txn_land_or_roll_back_together() {
+    let db = Db::open_in_memory().unwrap();
+    let rec = make_block_with(9, SourceBlockStatus::Active, 1.0, 0, Some(12), 0.0, 0.999);
+    let id = rec.block_id;
+
+    {
+        let mut txn = db.write_txn().unwrap();
+        txn.upsert_source_block(&rec).unwrap();
+        txn.mark_ss_block(&id, 3).unwrap();
+        // Dropped without commit: a crash between the two writes.
+    }
+    assert!(db.get_source_block(&id).unwrap().is_none());
+    assert!(!db.is_ss_block(&id).unwrap());
+
+    let mut txn = db.write_txn().unwrap();
+    txn.upsert_source_block(&rec).unwrap();
+    txn.mark_ss_block(&id, 3).unwrap();
+    txn.commit().unwrap();
+    assert!(db.get_source_block(&id).unwrap().is_some());
+    assert_eq!(db.list_ss_blocks().unwrap(), vec![(id, 3)]);
+
+    {
+        let mut txn = db.write_txn().unwrap();
+        txn.unmark_ss_block(&id).unwrap();
+        txn.delete_source_block(&id).unwrap();
+    }
+    assert!(
+        db.get_source_block(&id).unwrap().is_some(),
+        "dropped: record kept"
+    );
+    assert!(db.is_ss_block(&id).unwrap(), "dropped: mark kept");
+
+    let mut txn = db.write_txn().unwrap();
+    txn.unmark_ss_block(&id).unwrap();
+    txn.delete_source_block(&id).unwrap();
+    txn.commit().unwrap();
+    assert!(db.get_source_block(&id).unwrap().is_none());
+    assert!(!db.is_ss_block(&id).unwrap());
+}
+
+/// The cached-fields update of a block whose record is already gone is `NotFound` and writes
+/// nothing. This is the sequential door only: the old two-transaction code passes it too. The
+/// race backup-i28-c closes (the record retired BETWEEN the read and the write) is not reached
+/// by a unit; that read and write are one transaction is held by the structure of
+/// `update_block_cached_fields`, not by this test.
+#[test]
+fn update_block_cached_fields_of_a_deleted_record_is_not_found_and_writes_nothing() {
+    let db = Db::open_in_memory().unwrap();
+    let rec = make_block_with(8, SourceBlockStatus::Active, 1.0, 0, Some(12), 0.0, 0.999);
+    db.upsert_source_block(&rec).unwrap();
+    db.delete_source_block(&rec.block_id).unwrap();
+
+    let result = db.update_block_cached_fields(&rec.block_id, 1.0, 2, 0.5, 0.999);
+    assert!(matches!(result, Err(crate::db::DbError::NotFound(_))));
+    assert!(db.get_source_block(&rec.block_id).unwrap().is_none());
+}
