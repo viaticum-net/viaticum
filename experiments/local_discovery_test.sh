@@ -433,7 +433,8 @@ on_demand_dial_since() {
 #       outbound stream: …` (EOF), `… Connection was closed before a response was
 #       received`, `… Timeout while waiting for a response`, or send_to_device's own
 #       30 s `timeout` (the on-demand wait ends at 10 s as `peer unreachable`, so this one
-#       is a request in flight). Run 2 of 2026-10-06: the holder dialed the owner itself
+#       is a request in flight); since restore-i44 a response timeout is written as
+#       `holder did not answer in time` (the older texts are kept, they are cheap). Run 2 of 2026-10-06: the holder dialed the owner itself
 #       (its on-demand MailboxStoreRequest), its LRU then evicted the owner, and the
 #       RestoreRequest landed in the 1 s closing window (`dropping inbound request from a
 #       closing peer`) -> EOF. Setup noise, not i42;
@@ -474,7 +475,8 @@ no_answer_split() {
             if (!(h16 in known)) print "unmapped " h " round=" r
             else if (h16 in dialed) print "ondemand " h " round=" r
             else if (e ~ /^swarm error: request failed: (IO error on outbound stream|Connection was closed before a response was received|Timeout while waiting for a response)/ \
-                     || e == "swarm error: timeout") print "live " h " round=" r
+                     || e == "swarm error: timeout" \
+                     || e == "holder did not answer in time") print "live " h " round=" r
             else print "unreached " h " round=" r " err=" e
         }'
 }

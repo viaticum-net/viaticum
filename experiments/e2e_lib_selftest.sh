@@ -83,5 +83,20 @@ check "never picked: NOPICK" "NOPICK 1 1 -" "$(ss_turns_before_first_pick "$DIR/
 pick 01 bbbb000000000002 true 1.0 > "$DIR/noblock.log"
 check "no block: NOBLOCK" "NOBLOCK 0 0 -" "$(ss_turns_before_first_pick "$DIR/noblock.log" "$PHOTO")"
 
+# no_answer_split (step 8b of local_discovery_test.sh): the function is cut out of the script
+# (no full run). The post-restore-i44 timeout text and the older transport texts are a live
+# holder's non-answer; a dial failure is unreached.
+eval "$(sed -n '/^no_answer_split() {/,/^}/p' "$(dirname "${BASH_SOURCE[0]}")/local_discovery_test.sh")"
+PEER_ID=(12D3KooWselftest)
+DEV8=(cafe0000cafe0000)
+plain_log_since() { cat "$DIR/na.log"; }
+na_line() { echo "${T}10.000000Z  WARN viaticum::daemon::symbol_fetch::rounds: fetch: holder did not answer; skipped this round, asked again next round block=$PHOTO holder=cafe0000cafe0000 round=2 err=$1"; }
+na_class() { na_line "$1" > "$DIR/na.log"; no_answer_split 0 0 "$PHOTO" | cut -d' ' -f1; }
+check "8b: i44 timeout text is live" "live" "$(na_class 'holder did not answer in time')"
+check "8b: old timeout text is live" "live" "$(na_class 'swarm error: request failed: Timeout while waiting for a response')"
+check "8b: old swarm timeout is live" "live" "$(na_class 'swarm error: timeout')"
+check "8b: dial failure is unreached" "unreached" "$(na_class 'swarm error: request failed: Failed to dial the requested peer')"
+check "8b: connection refused is unreached" "unreached" "$(na_class 'swarm error: connection refused')"
+
 [ "$FAILS" -eq 0 ] && { echo "e2e_lib selftest: PASS"; exit 0; }
 echo "e2e_lib selftest: $FAILS FAIL"; exit 1
