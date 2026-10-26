@@ -4856,10 +4856,13 @@ fn ss_record_and_ledger_mark_in_one_write_txn_land_or_roll_back_together() {
     assert!(!db.is_ss_block(&id).unwrap());
 }
 
-/// backup-i28-c: the cached-fields update of a block whose record is gone writes nothing
-/// (read and write in one transaction: a retired SS record is not brought back).
+/// The cached-fields update of a block whose record is already gone is `NotFound` and writes
+/// nothing. This is the sequential door only: the old two-transaction code passes it too. The
+/// race backup-i28-c closes (the record retired BETWEEN the read and the write) is not reached
+/// by a unit; that read and write are one transaction is held by the structure of
+/// `update_block_cached_fields`, not by this test.
 #[test]
-fn update_block_cached_fields_does_not_recreate_a_deleted_record() {
+fn update_block_cached_fields_of_a_deleted_record_is_not_found_and_writes_nothing() {
     let db = Db::open_in_memory().unwrap();
     let rec = make_block_with(8, SourceBlockStatus::Active, 1.0, 0, Some(12), 0.0, 0.999);
     db.upsert_source_block(&rec).unwrap();

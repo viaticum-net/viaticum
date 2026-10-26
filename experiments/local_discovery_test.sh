@@ -15,7 +15,8 @@
 #               MODE=lru: CAP=12 (stress: k > cap), TIME_SCALE=60.
 #               MODE=hold: CAP=12, TIME_SCALE=1: converge, then 30 min at production cadence.
 # Intent:       network-i14, i15, i16 (final editions, v3.3), i17, i18, i19 (probabilistic),
-#               i20 (via the i18 path), i41, i42, i43 (network-i43); restore-i43 is
+#               i20 (via the i18 path), i41, i42, i43 (network-i43); backup-i28/i28-e (step 5
+#               bar), backup-i28-b (step 7, main: dr_ready under the diff stream); restore-i43 is
 #               NOT proved here — order: units only (see Cannot close)
 # Proves:       every node KNOWS >= 20 other owners within 300 s (a PeerRecord with a
 #               dialable address), symmetric on the OTHER node, never decreasing; every
@@ -34,7 +35,8 @@
 #               lands on >= 2 holders other than the seed
 #               (symbols on THEIR disks); the seed's crash goes unnoticed and the seed rejoins
 #               every live friend without `connect`; the late node is known by >= 10 old
-#               nodes (on THEIR status); no daemon ever opens a TCP socket (any state) to a
+#               nodes (on THEIR status) and its photo waits at most one SystemState turn
+#               for the work pipeline (backup-i28, from its own log); no daemon ever opens a TCP socket (any state) to a
 #               non-local address.
 # Adversarial:  SIGKILL of the seed; late joiner; node-39 carries the legacy key
 #               kademlia_disable_ipfs_bootstrap = false (it switched the IPFS bootstrap on
@@ -97,7 +99,13 @@
 #                  no connect, first auto-dial pass dialed + already_connected = 39 (i15, i43)
 #               5. node-40 joins, adds a file -> <= 180 s (lru*: 300) known >= 20, >= 10 old
 #                  non-seed nodes list it in THEIR known_devices, file on >= 2 non-seed
-#                  holders (i16)
+#                  holders (i16); node-40's log: from `backup: pipeline complete` of the
+#                  photo's block to its first `picked block for work`, <= 1 SystemState turn
+#                  (an `ss=true` pick whose `iteration complete` has offered > 0; picks
+#                  without offers are not turns) — backup-i28, i28-e. A pick without the
+#                  `ss=` field (a build before backup-i28), the block never picked or no
+#                  creation line = FAIL. Discriminates only under load (quiet host: 0 turns);
+#                  parser self-test: experiments/e2e_lib_selftest.sh
 #               6. whole run: no TCP socket (any state) of any daemon to a non-local address,
 #                  0 `outgoing connection error` with an IPFS bootstrap PeerId, node-39 keeps
 #                  its legacy key = false — the key must change nothing (i17)
@@ -147,7 +155,8 @@
 #                  (`mailbox-probe rendezvous --rank`, not the seed); node-05 runs with
 #                  VIATICUM_E2E_POINTER_POSTMEN=F from its first start ("its most trusted
 #                  friends are the three DR does not ask"). Step 7: node-05 dr_ready=true
-#                  within 15 min (FAIL otherwise; NOTE acks/held/near set and its last
+#                  within 15 min (FAIL otherwise; NOTE catalog blocks placed/total —
+#                  backup-i28-b under the diff stream of TS=1200 —, acks/held/near set and its last
 #                  `pointer kad-near set` line), then SIGKILL node-05, F1..F3 lose the
 #                  pointer box (stopped, `mailbox-probe remove`, restarted: they may hold
 #                  node-05's catalog blocks, so they stay alive), DR onto
@@ -1347,15 +1356,16 @@ if runs_step 2; then
         fail "after ${BAR2}s not placed:$(echo "$NOT_PLACED" | cut -c1-400)${CAP:+ (lru24: stop point v3-B)}"
         # Diagnostics only (fix round 1): how long the photo block waited for the work
         # pipeline. "file added -> first `work_pipeline: picked block for work`" of its
-        # block, and the picks of other blocks meanwhile (importance 1.0 = SystemState).
+        # block, and the picks of other blocks meanwhile (`ss=true` = SystemState, the SS
+        # ledger, backup-i28; `-` = a build without the field).
         for k in $NOT_PLACED; do
             k="${k%%(*}"; idx="${k%%:*}"
             blk=$(file_block_hex "$idx" "${FILE_PATH[$k]}")
             if [ -z "$blk" ]; then note "node-$idx: photo has no block yet (not backed up)"; continue; fi
-            first=$(events "$(node_log "$idx")" "work_pipeline: picked block for work" block_id importance \
+            first=$(events "$(node_log "$idx")" "work_pipeline: picked block for work" block_id ss \
                 | awk -v b="${blk:0:16}" -v t2=$(( T2 - T_BASE )) '$1 >= t2 && index($3, b) == 1 { print $1; exit }')
-            others=$(events "$(node_log "$idx")" "work_pipeline: picked block for work" block_id importance \
-                | awk -v b="${blk:0:16}" -v t2=$(( T2 - T_BASE )) '$1 >= t2 && index($3, b) != 1 { n++; if ($4 + 0 >= 1) hi++ } END { printf "%d (importance 1.0: %d)", n, hi }')
+            others=$(events "$(node_log "$idx")" "work_pipeline: picked block for work" block_id ss \
+                | awk -v b="${blk:0:16}" -v t2=$(( T2 - T_BASE )) '$1 >= t2 && index($3, b) != 1 { n++; if ($4 == "true") hi++; if ($4 == "-") na++ } END { printf "%d (ss=true: %d%s)", n, hi, (na ? ", no ss field: " na : "") }')
             if [ -n "$first" ]; then
                 note "node-$idx: photo block ${blk:0:16} first picked $(awk -v f="$first" -v t2=$(( T2 - T_BASE )) 'BEGIN { printf "%.0f", f - t2 }') s after the file was added; other picks since: $others"
             else
@@ -1628,6 +1638,27 @@ if runs_step 5; then
         else
             fail "node-$LATE's file not placed on >= 2 non-seed holders:$NOT_PLACED"
         fi
+        # backup-i28 (+ i28-e): between the creation of the photo's block and its first pick,
+        # at most one SystemState turn (an `ss=true` pick whose attempt sent offers) on
+        # node-40. Discriminates only under load (on a quiet host the photo is picked at
+        # once: 0 turns); the rule itself is proved by the units (work_pipeline/
+        # tests_ss_fairness.rs). A build without the `ss=` field = FAIL, not a pass.
+        blk5=$(file_block_hex "$LATE" "${FILE_PATH[$LATE:photo.jpg]}")
+        if [ -z "$blk5" ]; then
+            fail "backup-i28: node-$LATE's photo has no block (nothing to measure)"
+        else
+            read -r v5 turns5 picks5 wait5 <<< "$(ss_turns_before_first_pick "$(node_log "$LATE")" "$blk5")"
+            case "$v5" in
+                OK) if [ "$turns5" -le 1 ]; then
+                        pass "backup-i28: node-$LATE's photo block ${blk5:0:16} picked ${wait5}s after its creation, after $turns5 SS turn(s) with offers (<= 1; $picks5 ss=true pick(s))"
+                    else
+                        fail "backup-i28: node-$LATE's photo block ${blk5:0:16} waited $turns5 SS turns with offers (> 1; $picks5 ss=true picks) before its first pick (${wait5}s)"
+                    fi ;;
+                NOSS) fail "backup-i28: node-$LATE's picks have no ss= field (a build before backup-i28: cannot classify)" ;;
+                NOPICK) fail "backup-i28: node-$LATE's photo block ${blk5:0:16} never picked ($turns5 SS turns with offers, $picks5 ss=true picks since its creation)" ;;
+                *) fail "backup-i28: no 'backup: pipeline complete' line for node-$LATE's photo block ${blk5:0:16} (${v5:-no output})" ;;
+            esac
+        fi
     else
         fail "node-$LATE never added its file"
     fi
@@ -1898,7 +1929,7 @@ if runs_step 7; then
             [ "$RDY" = true ] && break
             sleep 5
         done
-        note "node-$DR_SOURCE before the kill: dr_ready=$RDY acks=$(status_num "$DR_SOURCE" dr_pointer_acks) held=$(status_num "$DR_SOURCE" dr_pointer_held) near_set=$(status_num "$DR_SOURCE" dr_pointer_near_set) threshold=$(status_num "$DR_SOURCE" dr_pointer_ack_threshold)"
+        note "node-$DR_SOURCE before the kill: dr_ready=$RDY catalog blocks placed=$(status_num "$DR_SOURCE" dr_ss_blocks_placed)/$(status_num "$DR_SOURCE" dr_ss_blocks_total) acks=$(status_num "$DR_SOURCE" dr_pointer_acks) held=$(status_num "$DR_SOURCE" dr_pointer_held) near_set=$(status_num "$DR_SOURCE" dr_pointer_near_set) threshold=$(status_num "$DR_SOURCE" dr_pointer_ack_threshold)"
         KN=$(sed 's/\x1b\[[0-9;]*m//g' "$(node_log "$DR_SOURCE")" | grep -a "pointer kad-near set" | tail -1 || true)
         note "node-$DR_SOURCE last near-set line: ${KN:-none (a build before the union)}"
         [ "$RDY" = true ] || fail "node-$DR_SOURCE never reported dr_ready=true in 15 min"

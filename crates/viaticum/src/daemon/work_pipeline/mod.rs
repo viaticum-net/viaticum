@@ -23,7 +23,7 @@ use viaticum_core::types::{DeviceId, SourceBlockId, SourceBlockRecord, Timestamp
 use crate::daemon::mem_budget::MemBudget;
 use crate::daemon::network::swarm::SwarmHandle;
 use crate::daemon::peer_backoff::PeerBackoff;
-use crate::daemon::system_state::strength::block_strength;
+use crate::daemon::system_state::strength::{block_strength, ss_blocks_awaiting_retirement};
 
 mod esi_space;
 mod gate;
@@ -37,6 +37,8 @@ mod tests;
 mod tests_budget;
 #[cfg(test)]
 mod tests_ss_fairness;
+#[cfg(test)]
+mod tests_ss_order;
 
 pub use esi_space::EsiSpace;
 pub use gate::{
@@ -270,8 +272,9 @@ pub struct WorkPipeline {
     restore_gate: Option<RestoreGate>,
     /// The INFO line «paused» was written for the pause that is on now (once per pause).
     pause_announced: bool,
-    /// The last attempt was on a SystemState block (backup-i28): while a user block waits, the
-    /// next attempt is a user block's. RAM only.
+    /// The last attempt that sent offers was on a SystemState block (backup-i28): while a user
+    /// block waits, the next attempt is a user block's. An attempt without offers does not
+    /// change it (backup-i28-e). RAM only.
     last_was_ss: bool,
 }
 
@@ -499,7 +502,11 @@ impl WorkPipeline {
             }
             picked_any = true;
 
-            let attempt = self.work_on_block(&block, &pool, now).await?;
+            // backup-i28: the class of the picked block, from the SS ledger (the record and its
+            // ledger entry are written in one transaction, backup-i28-c).
+            let ss = self.db.is_ss_block(&block.block_id)?;
+            let attempt = self.work_on_block(&block, ss, &pool, now).await?;
+            self.end_turn(ss, attempt);
             if !matches!(
                 attempt,
                 BlockAttempt::NoCandidates | BlockAttempt::LeftService
@@ -511,13 +518,14 @@ impl WorkPipeline {
     }
 
     /// The block of the next attempt (backup-i28). The service blocks of SystemState and the
-    /// user's blocks share the worker. (a) After an attempt on an SS block, a user block that
-    /// waits goes next. (b) Else the oldest SS block that is not yet restorable (strength < 1)
-    /// goes first, so the DR catalog catches up: what was published is finished before what is
-    /// new (backup-i28-b). (c) Else the plain order of `next_work_item` (re-picks of restorable
-    /// SS blocks among the rest, by priority). "SS" is the SS ledger, not importance. (b) reads
-    /// the ledger and the few SS records one by one; (a) and (c) scan every block, so a pick
-    /// costs at most two scans.
+    /// user's blocks share the worker. (a) After an attempt with offers on an SS block
+    /// (backup-i28-e), a user block that waits goes next. (b) Else the oldest SS block that is
+    /// not yet restorable (strength < 1) goes first, so the DR catalog catches up: what was
+    /// published is finished before what is new (backup-i28-b); a block displaced out of its
+    /// place and waiting to be retired (`to_retire`) is not in (b) (backup-i28-d). (c) Else the
+    /// plain order of `next_work_item` (re-picks of restorable SS blocks among the rest, by
+    /// priority). "SS" is the SS ledger, not importance. (b) reads the ledger, META and the few
+    /// SS records one by one; (a) and (c) scan every block, so a pick costs at most two scans.
     fn next_block(
         &self,
         cooldown: std::time::Duration,
@@ -552,7 +560,9 @@ impl WorkPipeline {
     /// generation first: it restarts at 1 with every process, while a pointer place may still
     /// refer to the blocks of an earlier process (dr-i48). The membership does not depend on the
     /// RAM cooldown: a cooldown reset (`PeerAuthenticated`, restart) changes only eligibility, as
-    /// in the plain order (review W2).
+    /// in the plain order (review W2). backup-i28-d: a block of a pointer's `to_retire`
+    /// (displaced out of its place, retired once the replacement reaches the threshold; DR
+    /// readiness does not count it) is left to the plain order (c).
     fn oldest_unrestorable_ss(
         &self,
         ss: &[(SourceBlockId, u32)],
@@ -565,8 +575,13 @@ impl WorkPipeline {
             self.db
                 .work_item_eligible(r, cooldown, parked_cooldown, now, pool_sig)
         };
+        let meta = self.db.pointer_publications()?;
+        let displaced = ss_blocks_awaiting_retirement(meta.as_ref());
         let mut eligible: Vec<(SourceBlockRecord, u32)> = Vec::new();
         for (id, generation) in ss {
+            if displaced.contains(id) {
+                continue;
+            }
             let Some(record) = self.db.get_source_block(id)? else {
                 continue;
             };
@@ -589,13 +604,10 @@ impl WorkPipeline {
     async fn work_on_block(
         &mut self,
         block: &SourceBlockRecord,
+        ss: bool,
         pool: &PoolSnapshot,
         now: Timestamp,
     ) -> anyhow::Result<BlockAttempt> {
-        // backup-i28: the class of the picked block, from the SS ledger (the record and its
-        // ledger entry are written in one transaction, backup-i28-c).
-        let ss = self.db.is_ss_block(&block.block_id)?;
-        self.last_was_ss = ss;
         tracing::info!(
             block_id = %block.block_id,
             ss,
@@ -693,6 +705,17 @@ impl WorkPipeline {
                 self.park_clearing_memory(block, pool, now, ParkReason::IterationError);
                 Ok(BlockAttempt::Error)
             }
+        }
+    }
+
+    /// backup-i28-e: the turn passes only with an attempt that sent offers. After one on an SS
+    /// block a waiting user block goes next; after one on a user block the order is free again.
+    /// An attempt without offers (nobody to offer to, the pool unusable, a pause of the restore
+    /// gate, the block left service, an error) leaves the turn where it was: it took nothing
+    /// from the other class, so it does not use up its own class's turn.
+    fn end_turn(&mut self, ss: bool, attempt: BlockAttempt) {
+        if attempt == BlockAttempt::Offered {
+            self.last_was_ss = ss;
         }
     }
 

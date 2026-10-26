@@ -295,6 +295,56 @@ events() {
         }' || true
 }
 
+# ss_turns_before_first_pick LOGFILE BLOCK_HEX (backup-i28, i28-e) -> one line
+#   "<verdict> <ss_turns> <ss_picks> <wait_s>"
+# The window: from the `backup: pipeline complete` line of BLOCK (the user block is created) to
+# the first `work_pipeline: picked block for work` of BLOCK. ss_turns = SystemState picks in the
+# window whose attempt sent offers (the `work_pipeline: iteration complete` of that block, before
+# the next pick, has offered > 0) — the turns the user block waited for (backup-i28-e: an attempt
+# without offers does not use up a turn); ss_picks = every `ss=true` pick in the window; wait_s =
+# seconds from creation to the first pick. Fields are read by name (key=value), block ids by
+# their 16-hex prefix (the log's Display form). Verdicts:
+#   OK      the window was read; the bar is the caller's (backup-i28: ss_turns <= 1);
+#   NOSS    a pick in the window (the block's own first pick included) has no `ss=` field: a
+#           build before backup-i28, the picks cannot be classified (never a pass);
+#   NOPICK  the block was created but never picked;
+#   NOBLOCK no `pipeline complete` line for the block (nothing to measure: never a pass).
+ss_turns_before_first_pick() {
+    sed 's/\x1b\[[0-9;]*m//g' "$1" 2>/dev/null | awk -v b="${2:0:16}" "$AWK_EPOCH"'
+        function field(k,   i, p) {
+            for (i = 2; i <= NF; i++) {
+                p = index($i, "=")
+                if (p > 1 && substr($i, 1, p - 1) == k) return substr($i, p + 1)
+            }
+            return ""
+        }
+        !open && index($0, "backup: pipeline complete") && index(field("block_id"), b) == 1 {
+            open = 1; t0 = epoch($1); next
+        }
+        open && index($0, "work_pipeline: picked block for work") {
+            pending = ""
+            ss = field("ss")
+            if (ss == "") noss = 1
+            if (index(field("block_id"), b) == 1) {
+                printf "%s %d %d %.0f\n", (noss ? "NOSS" : "OK"), turns, picks, epoch($1) - t0
+                done = 1; exit
+            }
+            if (ss == "") next
+            if (ss == "true") { picks++; pending = field("block_id") }
+            next
+        }
+        open && pending != "" && index($0, "work_pipeline: iteration complete") \
+            && field("block_id") == pending {
+            if (field("offered") + 0 > 0) turns++
+            pending = ""
+        }
+        END {
+            if (done) exit
+            if (!open) print "NOBLOCK 0 0 -"
+            else printf "NOPICK %d %d -\n", turns, picks
+        }' || true
+}
+
 # Lines of node IDX's log after line N, ANSI colors stripped.
 log_since() {
     tail -n +$(( $2 + 1 )) "$(node_log "$1")" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || true

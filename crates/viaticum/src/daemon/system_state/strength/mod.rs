@@ -161,6 +161,36 @@ pub(crate) fn ss_blocks_to_keep(
     keep
 }
 
+/// SS blocks displaced out of a place and waiting to be retired (`to_retire` of both places,
+/// bases and diffs), less any block a place still names (its base, its diffs, the diffs of the
+/// earlier envelope it keeps, dr-i52). DR readiness does not count them; they go once the
+/// replacement reaches the threshold. backup-i28-d: the worker does not put them first.
+pub(crate) fn ss_blocks_awaiting_retirement(
+    meta: Option<&PointerPublications>,
+) -> HashSet<SourceBlockId> {
+    let Some(meta) = meta else {
+        return HashSet::new();
+    };
+    let places: Vec<&PlacePublication> = [meta.current.as_ref(), meta.other.as_ref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut named = HashSet::new();
+    for r in &places {
+        named.insert(r.base);
+        named.extend(r.diffs.iter().copied());
+        if let Some(reached) = &r.reached {
+            named.extend(reached.diffs.iter().copied());
+        }
+    }
+    places
+        .iter()
+        .flat_map(|r| r.to_retire.iter())
+        .flat_map(|t| std::iter::once(t.base).chain(t.diffs.iter().copied()))
+        .filter(|b| !named.contains(b))
+        .collect()
+}
+
 /// Retire every SS-ledger block outside `ss_blocks_to_keep(meta, candidate)`. Only
 /// blocks still in the ledger are touched (V.17.2 NOTE-2). Returns how many.
 pub(crate) fn sweep_ss_ledger(

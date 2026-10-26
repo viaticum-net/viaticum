@@ -523,6 +523,38 @@ fn keep_set_holds_both_places_their_retire_lists_and_the_candidate() {
     assert!(ss_blocks_to_keep(None, None).is_empty());
 }
 
+/// backup-i28-d: the blocks waiting to be retired are the `to_retire` lists of both places
+/// (base and diffs), less what a place still names (a block both displaced and named stays
+/// out). Mutation «only `current`'s list» → b(10)/b(11) are missing; mutation «no `named`
+/// filter» → b(2) is in; each reddens.
+#[test]
+fn awaiting_retirement_is_both_retire_lists_less_what_a_place_names() {
+    let b = |x: u8| SourceBlockId([x; 32]);
+    let mut cur = record(PointerPlace::A, b(1), vec![b(2)], 10, 1);
+    cur.to_retire = vec![RetiredPointer {
+        base: b(3),
+        diffs: vec![b(4), b(2)],
+    }];
+    cur.reached = Some(ReachedEnvelope {
+        diffs: vec![b(9)],
+        generation: 1,
+        created_at: Timestamp(9),
+        files: 1,
+        acked: vec![],
+        expires_at: NOW,
+    });
+    let mut other = record(PointerPlace::B, b(5), vec![b(6)], 5, 1);
+    other.to_retire = vec![RetiredPointer {
+        base: b(10),
+        diffs: vec![b(11), b(9)],
+    }];
+    let m = meta(Some(cur), Some(other));
+    let got = ss_blocks_awaiting_retirement(Some(&m));
+    let want: HashSet<SourceBlockId> = [3, 4, 10, 11].into_iter().map(b).collect();
+    assert_eq!(got, want);
+    assert!(ss_blocks_awaiting_retirement(None).is_empty());
+}
+
 #[test]
 fn retire_skips_blocks_no_longer_in_ss_ledger() {
     let db = test_db();
