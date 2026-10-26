@@ -711,11 +711,18 @@ impl WorkPipeline {
     /// backup-i28-e: the turn passes only with an attempt that sent offers. After one on an SS
     /// block a waiting user block goes next; after one on a user block the order is free again.
     /// An attempt without offers (nobody to offer to, the pool unusable, a pause of the restore
-    /// gate, the block left service, an error) leaves the turn where it was: it took nothing
-    /// from the other class, so it does not use up its own class's turn.
+    /// gate) leaves the turn where it was: it took nothing from the other class, so it does not
+    /// use up its own class's turn.
+    ///
+    /// backup-i28-f: a USER attempt that read its source (`Error`, `LeftService`) passes the turn
+    /// like one with offers. Otherwise a user block with an unreadable source, un-parked by
+    /// `reset_all_cooldowns` before every iteration, would keep the turn from SystemState for
+    /// good. For SS blocks these outcomes change nothing.
     fn end_turn(&mut self, ss: bool, attempt: BlockAttempt) {
-        if attempt == BlockAttempt::Offered {
-            self.last_was_ss = ss;
+        match attempt {
+            BlockAttempt::Offered => self.last_was_ss = ss,
+            BlockAttempt::Error | BlockAttempt::LeftService if !ss => self.last_was_ss = false,
+            _ => {}
         }
     }
 

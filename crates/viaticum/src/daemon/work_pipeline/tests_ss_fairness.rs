@@ -328,6 +328,41 @@ async fn a_user_attempt_without_offers_keeps_the_turn_with_the_user_blocks() {
     );
 }
 
+/// backup-i28-f (integration review W2). A user attempt that read its source (here: failed on
+/// it) passes the turn like one with offers. Otherwise an unreadable source parks one block per
+/// iteration, `reset_all_cooldowns` (PeerAuthenticated) lifts the park before the next
+/// iteration, and the SS block never gets its turn. Mutation «`end_turn` only on `Offered`» →
+/// `ss_picks` is 0; reddens. (`LeftService` is not reproduced in the rig: only `Error`.)
+#[tokio::test]
+async fn ss_block_gets_the_turn_when_an_unreadable_user_block_is_re_eligible_every_iteration() {
+    let rig = Rig::new();
+    let ss = rig.ss(0x10, 3, 1000);
+    let mut broken = super::tests::make_block_record(super::tests::block_id(0x30), 0.5, 0.99999);
+    broken.k = 3;
+    broken.t = 1024;
+    rig.db.upsert_source_block(&broken).unwrap();
+    let mut config = make_config();
+    config.cooldown = Duration::from_secs(30);
+    config.data_dir = rig.dir.path().to_path_buf();
+    let mut p = pipeline_with(&rig.db, config, Some(lonely_swarm(0x57).await));
+
+    assert_eq!(attempt(&rig, &mut p).await, ss, "the SS block goes first");
+    assert!(p.last_was_ss);
+
+    let mut ss_picks = 0;
+    for _ in 0..6 {
+        p.reset_all_cooldowns();
+        assert!(p.run_iteration().await.unwrap());
+        if rig.db.block_cooldown(&ss).last_attempted_at.is_some() {
+            ss_picks += 1;
+        }
+    }
+    assert!(
+        ss_picks >= 1,
+        "the unreadable user block must not keep the turn from SS (ss_picks={ss_picks})"
+    );
+}
+
 /// The picked line says whether the block is SS (the E2E bar counts these).
 #[tokio::test]
 async fn picked_line_says_ss() {
