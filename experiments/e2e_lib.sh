@@ -37,6 +37,35 @@ export VIATICUM_TEST_MACHINE_LOCK_DIR
 
 info() { echo "  INFO: $1"; }
 
+# e2e_cleanup_on_pass DIR VERDICT — call from the EXIT cleanup AFTER the daemons are stopped.
+# VERDICT is the script's exit code (0 PASS, 3 ROUGH, anything else FAIL) or the word
+# PASS / ROUGH / FAIL. DIR is removed only on PASS, only when its real path is strictly inside
+# $E2E_TMP and named viaticum-*; VIATICUM_E2E_KEEP=1 always keeps it.
+e2e_cleanup_on_pass() {
+    local dir="${1:-}" v="${2:-}" verdict real real_tmp
+    case "$v" in
+        0|PASS) verdict=PASS ;;
+        3|ROUGH) verdict=ROUGH ;;
+        1|FAIL) verdict=FAIL ;;
+        *[!0-9]*|"") verdict="FAIL ($v)" ;;
+        *) verdict="FAIL (exit $v)" ;;
+    esac
+    if [ "$verdict" = PASS ] && [ -n "$dir" ] && [ "${VIATICUM_E2E_KEEP:-}" != 1 ] && [ -d "$dir" ]; then
+        real=$(realpath -m -- "$dir" 2>/dev/null) || real=""
+        real_tmp=$(realpath -m -- "${E2E_TMP:-}" 2>/dev/null) || real_tmp=""
+        if [ -n "$real" ] && [ -n "$real_tmp" ] && [ "$real" != "$real_tmp" ]; then
+            case "$real" in
+                "$real_tmp"/viaticum-*)
+                    echo "  Test dir removed (pass): $dir"
+                    rm -rf -- "$real"
+                    return 0 ;;
+            esac
+        fi
+    fi
+    [ "${VIATICUM_E2E_KEEP:-}" = 1 ] && [ "$verdict" = PASS ] && verdict="PASS, VIATICUM_E2E_KEEP=1"
+    echo "  Test dir kept ($verdict): $dir"
+}
+
 content_hash() { sha256sum "$1" | awk '{print $1}'; }
 file_size() { stat -c %s "$1"; }
 

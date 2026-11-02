@@ -193,7 +193,7 @@ cleanup() {
     sleep 1
     for pid in "${PIDS[@]}"; do kill -9 "$pid" 2>/dev/null || true; done
     echo "  Killed ${#PIDS[@]} daemon processes"
-    echo "  Test dir: $TEST_DIR"
+    e2e_cleanup_on_pass "$TEST_DIR" "$rc"
 }
 trap cleanup EXIT
 

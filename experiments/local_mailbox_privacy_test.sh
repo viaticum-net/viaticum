@@ -88,12 +88,13 @@ c4_step() {
 }
 
 cleanup() {
+    local rc=$?
     echo ""
     echo "=== Cleanup ==="
     for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
     sleep 1
     for pid in "${PIDS[@]}"; do kill -9 "$pid" 2>/dev/null || true; done
-    echo "  Test dir: $TEST_DIR (not removed, inspect if needed)"
+    e2e_cleanup_on_pass "$TEST_DIR" "$rc"
 }
 trap cleanup EXIT
 

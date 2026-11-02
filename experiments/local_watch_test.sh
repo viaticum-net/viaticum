@@ -167,6 +167,7 @@ get_addr() {
 }
 
 cleanup() {
+    local rc=$?
     echo ""
     echo "=== Cleanup ==="
     local i p
@@ -175,7 +176,7 @@ cleanup() {
     for i in "${!DPID[@]}"; do
         p="${DPID[$i]}"; kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true
     done
-    echo "  Test dir: $T"
+    e2e_cleanup_on_pass "$T" "$rc"
 }
 trap cleanup EXIT
 

@@ -98,5 +98,42 @@ check "8b: old swarm timeout is live" "live" "$(na_class 'swarm error: timeout')
 check "8b: dial failure is unreached" "unreached" "$(na_class 'swarm error: request failed: Failed to dial the requested peer')"
 check "8b: connection refused is unreached" "unreached" "$(na_class 'swarm error: connection refused')"
 
+# e2e_cleanup_on_pass: dirs inside a fictitious E2E_TMP.
+SAVED_E2E_TMP="$E2E_TMP"
+E2E_TMP="$DIR/fake-e2e-tmp"; mkdir -p "$E2E_TMP"
+mkrun() { mkdir -p "$1/node-00" && echo x > "$1/node-00/f"; }
+exists() { [ -e "$1" ] && echo kept || echo removed; }
+R="$E2E_TMP/viaticum-selftest-1"
+mkrun "$R"; e2e_cleanup_on_pass "$R" 0 >/dev/null
+check "cleanup: PASS (exit 0) removes the dir" removed "$(exists "$R")"
+mkrun "$R"; e2e_cleanup_on_pass "$R" PASS >/dev/null
+check "cleanup: PASS (word) removes the dir" removed "$(exists "$R")"
+mkrun "$R"; e2e_cleanup_on_pass "$R" 1 >/dev/null
+check "cleanup: FAIL (exit 1) keeps the dir" kept "$(exists "$R")"
+e2e_cleanup_on_pass "$R" 2 >/dev/null
+check "cleanup: exit 2 keeps the dir" kept "$(exists "$R")"
+e2e_cleanup_on_pass "$R" 3 >/dev/null
+check "cleanup: ROUGH (exit 3) keeps the dir" kept "$(exists "$R")"
+e2e_cleanup_on_pass "$R" ROUGH >/dev/null
+check "cleanup: ROUGH (word) keeps the dir" kept "$(exists "$R")"
+check "cleanup: kept message names the verdict" "  Test dir kept (ROUGH): $R" "$(e2e_cleanup_on_pass "$R" 3)"
+rm -rf "$R"; mkrun "$R"
+check "cleanup: removed message" "  Test dir removed (pass): $R" "$(e2e_cleanup_on_pass "$R" 0)"
+OUT="$DIR/outside-viaticum-selftest"; mkrun "$OUT"; e2e_cleanup_on_pass "$OUT" 0 >/dev/null
+check "cleanup: a path outside E2E_TMP is not removed" kept "$(exists "$OUT")"
+e2e_cleanup_on_pass "$E2E_TMP" 0 >/dev/null
+check "cleanup: E2E_TMP itself is not removed" kept "$(exists "$E2E_TMP")"
+mkrun "$E2E_TMP/other-name"; e2e_cleanup_on_pass "$E2E_TMP/other-name" 0 >/dev/null
+check "cleanup: a non-viaticum-* name is not removed" kept "$(exists "$E2E_TMP/other-name")"
+mkrun "$R"; e2e_cleanup_on_pass "$E2E_TMP/../fake-e2e-tmp/../outside-viaticum-selftest" 0 >/dev/null
+check "cleanup: a .. escape is not removed" kept "$(exists "$OUT")"
+ln -s "$OUT" "$E2E_TMP/viaticum-link"; e2e_cleanup_on_pass "$E2E_TMP/viaticum-link" 0 >/dev/null
+check "cleanup: a symlink out of E2E_TMP does not remove its target" kept "$(exists "$OUT")"
+e2e_cleanup_on_pass "" 0 >/dev/null
+check "cleanup: an empty path removes nothing" kept "$(exists "$E2E_TMP")"
+VIATICUM_E2E_KEEP=1 e2e_cleanup_on_pass "$R" 0 >/dev/null
+check "cleanup: VIATICUM_E2E_KEEP=1 keeps a PASS dir" kept "$(exists "$R")"
+E2E_TMP="$SAVED_E2E_TMP"
+
 [ "$FAILS" -eq 0 ] && { echo "e2e_lib selftest: PASS"; exit 0; }
 echo "e2e_lib selftest: $FAILS FAIL"; exit 1

@@ -225,6 +225,7 @@ get_addr() {
 }
 
 cleanup() {
+    local rc=$?
     echo ""
     echo "=== Cleanup ==="
     [ -n "$BLOCKER_PID" ] && kill "$BLOCKER_PID" 2>/dev/null || true
@@ -238,7 +239,7 @@ cleanup() {
         systemctl --user stop "$u" 2>/dev/null || true
         systemctl --user reset-failed "$u" 2>/dev/null || true
     done
-    echo "  Test dir: $TEST_DIR"
+    e2e_cleanup_on_pass "$TEST_DIR" "$rc"
 }
 trap cleanup EXIT
 
