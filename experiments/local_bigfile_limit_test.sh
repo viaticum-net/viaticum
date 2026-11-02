@@ -161,15 +161,8 @@ cleanup() {
     for i in "${!DPID[@]}"; do
         p="${DPID[$i]}"; kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true
     done
-    # Gigabytes of test data on tmpfs: keep the directory only when the run was not a PASS.
-    if [ "$rc" -eq 0 ]; then
-        case "$T" in
-            "$E2E_TMP"/viaticum-bigfile-limit-*) rm -rf "$T"; echo "  Test dir removed (pass)" ;;
-            *) echo "  Test dir: $T (unexpected path, kept)" ;;
-        esac
-    else
-        echo "  Test dir: $T (kept for inspection, exit $rc)"
-    fi
+    # Gigabytes of test data in $E2E_TMP: removed on PASS only.
+    e2e_cleanup_on_pass "$T" "$rc"
 }
 trap cleanup EXIT
 

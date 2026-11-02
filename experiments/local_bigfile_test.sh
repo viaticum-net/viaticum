@@ -66,13 +66,8 @@ cleanup() {
         kill -9 "$pid" 2>/dev/null || true
     done
     echo "  Killed ${#PIDS[@]} daemon processes"
-    # ~1 GB per run on a quota'd tmpfs: keep it only when the run failed.
-    if [ "$rc" -eq 0 ]; then
-        rm -rf "$TEST_DIR"
-        echo "  Test dir removed (pass)"
-    else
-        echo "  Test dir: $TEST_DIR (kept for inspection, exit $rc)"
-    fi
+    # ~1 GB per run: removed on PASS only.
+    e2e_cleanup_on_pass "$TEST_DIR" "$rc"
 }
 trap cleanup EXIT
 

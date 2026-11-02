@@ -115,6 +115,7 @@ BINARY="$(realpath "$(command -v "$BINARY" || echo "$BINARY")")"
 . "$(dirname "${BASH_SOURCE[0]}")/e2e_lib.sh"
 
 cleanup() {
+    local rc=$?
     if [ -n "$DPID" ] && kill -0 "$DPID" 2>/dev/null; then
         kill "$DPID" 2>/dev/null || true
         wait_pid_exit "$DPID" 10 || kill -9 "$DPID" 2>/dev/null || true
@@ -122,11 +123,8 @@ cleanup() {
     # A re-exec'd daemon step 5b could not find (not this shell's child) must not
     # outlive the run on the shared server.
     pkill -TERM -f -- "--data-dir $TEST_DIR/node-00 daemon" 2>/dev/null || true
-    if [ "$FAIL" -eq 0 ] && [ "$PASS" -gt 0 ]; then
-        rm -rf "$TEST_DIR"
-    else
-        echo "  Kept for inspection: $TEST_DIR"
-    fi
+    [ "$PASS" -gt 0 ] || rc=1 # no pass at all is not a PASS
+    e2e_cleanup_on_pass "$TEST_DIR" "$rc"
 }
 trap cleanup EXIT
 

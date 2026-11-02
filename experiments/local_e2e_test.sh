@@ -56,6 +56,7 @@ pass() { echo "  PASS: $1"; ((PASS++)) || true; }
 fail() { echo "  FAIL: $1"; ((FAIL++)) || true; }
 
 cleanup() {
+    local rc=$?
     echo ""
     echo "=== Cleanup ==="
     for pid in "${PIDS[@]}"; do
@@ -66,7 +67,7 @@ cleanup() {
         kill -9 "$pid" 2>/dev/null || true
     done
     echo "  Killed ${#PIDS[@]} daemon processes"
-    echo "  Test dir: $TEST_DIR"
+    e2e_cleanup_on_pass "$TEST_DIR" "$rc"
 }
 trap cleanup EXIT
 
