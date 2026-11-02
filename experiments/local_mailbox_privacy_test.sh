@@ -67,7 +67,8 @@ set -euo pipefail
 NUM_NODES=6            # node-06 (A's second device) joins with step 4 (C4)
 POSTMAN=5
 TIME_SCALE=100000      # PoS every ~6 s; SS push interval clamps to 60 s
-TEST_DIR="/tmp/viaticum-mbxpriv-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-mbxpriv-$$"
 BINARY="${BINARY:-viaticum}"
 RUST_LOG_NODES="info,viaticum=debug,viaticum_core=debug"
 S1_STAGE="${S1_STAGE:-c3a}"

@@ -156,7 +156,8 @@ W_MAX=96
 # Step 12: a reserve far above any disk of the run (tmpfs /tmp is 32 GB on the server), so
 # L's free disk is below it without filling a disk.
 BIG_RESERVE_GB="100000.0"
-TEST_DIR="/tmp/viaticum-photo-whale-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-photo-whale-$$"
 BINARY="${BINARY:-viaticum}"
 T_BASE=$(date -u +%s)
 

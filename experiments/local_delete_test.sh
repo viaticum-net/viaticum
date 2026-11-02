@@ -52,7 +52,8 @@ NUM_NODES="${1:-5}"
 # ~24s apiece, so the full owner-cooldown -> DeleteMsg -> holder-cooldown -> drop
 # chain finishes in ~60-90s wall-clock. Timeouts below allow generous slack.
 TIME_SCALE=100000
-TEST_DIR="/tmp/viaticum-delete-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-delete-$$"
 BINARY="${BINARY:-viaticum}"
 
 PASS=0; FAIL=0

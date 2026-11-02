@@ -44,7 +44,8 @@ set -euo pipefail
 
 NUM_NODES=7
 TIME_SCALE=1000
-TEST_DIR="/tmp/viaticum-fault-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-fault-$$"
 BINARY="${BINARY:-viaticum}"
 
 PASS=0; FAIL=0

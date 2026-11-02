@@ -13,7 +13,8 @@ set -euo pipefail
 
 NUM_NODES=${1:-4}
 TIME_SCALE=1
-TEST_DIR="/tmp/viaticum-cluster"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-cluster"
 WEB_PORT_BASE=8400
 BINARY="${BINARY:-/home/ilya/projects/syncback/target/release/viaticum}"
 STATIC_DIR="/home/ilya/projects/syncback/web-ui/dist"

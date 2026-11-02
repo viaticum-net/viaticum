@@ -88,7 +88,8 @@ set -euo pipefail
 
 NUM_NODES=4
 TIME_SCALE=1000
-TEST_DIR="/tmp/viaticum-dh-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-dh-$$"
 BINARY="${BINARY:-viaticum}"
 UNIT_PREFIX="viaticum-dh-$$"
 

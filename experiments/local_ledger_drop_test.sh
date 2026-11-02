@@ -160,7 +160,8 @@ H_RUST_LOG="info,viaticum::daemon::processor::pos=debug"
 L_DROP="0.017857142857142856"   # 1/56
 MAX_STEP="28"
 OBS_WINDOW="3.4722222222222223"  # observed_window_days(100000)
-TEST_DIR="/tmp/viaticum-ledger-drop-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-ledger-drop-$$"
 BINARY="${BINARY:-viaticum}"
 T_BASE=$(date -u +%s)
 

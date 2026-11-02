@@ -79,7 +79,8 @@
 
 set -euo pipefail
 
-TEST_DIR="/tmp/viaticum-fi-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-fi-$$"
 BINARY="${BINARY:-viaticum}"
 STATUS_DEADLINE=30
 # The folder the README tells the friend to watch (`--watch-dir ~/Documents`).

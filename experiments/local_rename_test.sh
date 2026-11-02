@@ -161,7 +161,8 @@ NUM_NODES=5
 # ≈ 60 s; periodic rescan max(604800 / ts, 60) = 60 s; idle flush 1 s, fallback flush 4 s;
 # watcher debounce 1800 s * 1000 / ts = 90 ms.
 TIME_SCALE=20000
-T="/tmp/viaticum-rename-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+T="$E2E_TMP/viaticum-rename-$$"
 BINARY="${BINARY:-viaticum}"
 HOLDERS=(1 2 3 4)
 # Keep in sync with crates/viaticum-core/src/mailbox/mod.rs (class_config::DELETE_REQUEST_TTL).
