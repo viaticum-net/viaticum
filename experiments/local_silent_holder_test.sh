@@ -59,7 +59,8 @@ set -euo pipefail
 
 NUM_NODES=6
 TIME_SCALE=100000
-TEST_DIR="/tmp/viaticum-silent-holder-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-silent-holder-$$"
 BINARY="${BINARY:-viaticum}"
 # Must match RELIABILITY_TARGET_REL_TOL in crates/viaticum-core/src/constants.rs.
 REL_TOL=1e-6

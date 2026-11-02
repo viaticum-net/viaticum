@@ -26,7 +26,8 @@ pass() { echo "    PASS: $1"; }
 fail() { echo "    FAIL: $1"; }
 
 for SCALE in "${SCALES[@]}"; do
-    TEST_DIR="/tmp/viaticum-stress-$$-${SCALE}"
+    E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+    TEST_DIR="$E2E_TMP/viaticum-stress-$$-${SCALE}"
     PIDS=()
     SIM_WEEKS=$(echo "scale=1; $WAIT * $SCALE / 604800" | bc)
 

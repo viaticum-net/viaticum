@@ -74,7 +74,8 @@
 
 set -euo pipefail
 
-TEST_DIR="/tmp/viaticum-drguard-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-drguard-$$"
 BINARY="${BINARY:-viaticum}"
 DR_TIMEOUT=300
 

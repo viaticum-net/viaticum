@@ -104,7 +104,8 @@ TIME_SCALE=20000
 NOTICE_TTL=60
 O_RUST_LOG="info,viaticum::ledger=debug"
 H_RUST_LOG="info"
-TEST_DIR="/tmp/viaticum-drop-loop-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-drop-loop-$$"
 BINARY="${BINARY:-viaticum}"
 T_BASE=$(date -u +%s)
 

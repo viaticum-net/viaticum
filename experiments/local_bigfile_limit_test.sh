@@ -68,7 +68,8 @@ run_b() { [ "$PHASE" = b ] || [ "$PHASE" = all ]; }
 
 NUM_NODES=5
 TIME_SCALE=20000
-T="/tmp/viaticum-bigfile-limit-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+T="$E2E_TMP/viaticum-bigfile-limit-$$"
 BINARY="${BINARY:-viaticum}"
 HOLDERS=(1 2 3 4)
 
@@ -163,7 +164,7 @@ cleanup() {
     # Gigabytes of test data on tmpfs: keep the directory only when the run was not a PASS.
     if [ "$rc" -eq 0 ]; then
         case "$T" in
-            /tmp/viaticum-bigfile-limit-*) rm -rf "$T"; echo "  Test dir removed (pass)" ;;
+            "$E2E_TMP"/viaticum-bigfile-limit-*) rm -rf "$T"; echo "  Test dir removed (pass)" ;;
             *) echo "  Test dir: $T (unexpected path, kept)" ;;
         esac
     else

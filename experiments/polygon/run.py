@@ -47,7 +47,7 @@
 #   ./rbuild.sh                                   # build ./target/release/viaticum first
 #   python3 run.py scenarios/steady_fairness.json
 #   python3 run.py scenarios/steady_fairness.json --dry-run
-#   BINARY=/path/to/viaticum python3 run.py scenarios/x.json --results-base /tmp/poly
+#   BINARY=/path/to/viaticum python3 run.py scenarios/x.json --results-base ~/e2e-tmp/poly
 
 from __future__ import annotations
 

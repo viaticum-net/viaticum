@@ -42,7 +42,8 @@ set -euo pipefail
 
 NUM_NODES=7
 TIME_SCALE=100000   # PoS fires every ~3s, repair every ~1s
-TEST_DIR="/tmp/viaticum-pos-repair-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-pos-repair-$$"
 BINARY="${BINARY:-viaticum}"
 
 PASS=0; FAIL=0

@@ -43,7 +43,8 @@ NUM_NODES=5
 # 4-week owner and holder delete windows / 40000 ≈ 60 s each: long enough for three
 # network restores inside the window of X2..X4, short enough to run both windows twice.
 TIME_SCALE=40000
-TEST_DIR="/tmp/viaticum-packdel-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-packdel-$$"
 BINARY="${BINARY:-viaticum}"
 HOLDERS=(1 2 3 4)
 

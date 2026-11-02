@@ -89,7 +89,8 @@ export LC_ALL=C
 
 NUM_NODES=5
 TIME_SCALE=100
-T="/tmp/viaticum-watch-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+T="$E2E_TMP/viaticum-watch-$$"
 BINARY="${BINARY:-viaticum}"
 HOME_DIR="$T/home"
 DATA_00="$HOME_DIR/vdata"

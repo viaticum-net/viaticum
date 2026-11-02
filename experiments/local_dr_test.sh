@@ -172,7 +172,8 @@ set -euo pipefail
 NUM_NODES=5
 TIME_SCALE=1000        # pointer push interval = max(6 h / 1000, 60 s) = 60 s
 TIME_SCALE_DELETE=20000
-TEST_DIR="/tmp/viaticum-test-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-test-$$"
 BINARY="${BINARY:-viaticum}"
 PORT_BASE=$(( 21000 + (RANDOM % 400) * 100 ))
 DR_ROUGH_SECS=300

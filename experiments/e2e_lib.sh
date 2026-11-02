@@ -5,6 +5,8 @@
 # and `fail` (and `node_log IDX` for the log helpers, `T_BASE` for `events`), and source
 # this file AFTER those definitions.
 #
+# Run directories live in $E2E_TMP (default ~/e2e-tmp), not in /tmp: /tmp is a tmpfs (RAM).
+#
 # Anti-false-green rules these helpers exist to enforce:
 #   - restore is checked only after the local source is gone (otherwise the
 #     owner rebuilds the block from its own file and the network is never used);
@@ -17,6 +19,8 @@
 # leak into a test run.
 unset VIATICUM_SERVER VIATICUM_TOKEN
 
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"; export E2E_TMP
+
 # Machine-lock isolation (R1-d-b K-b6, v3.11a NOTE): the lock of the daemon's memory budget is
 # per uid on a machine, so a scenario's nodes must not meet the lock of a live node of the
 # same user (a dogfood node on the build server). The test-only variable is read by builds
@@ -26,7 +30,7 @@ unset VIATICUM_SERVER VIATICUM_TOKEN
 if [ -z "${VIATICUM_TEST_MACHINE_LOCK_DIR:-}" ]; then
     case "${T:-${TEST_DIR:-}}" in
         /*) VIATICUM_TEST_MACHINE_LOCK_DIR="${T:-$TEST_DIR}/lock" ;;
-        *) VIATICUM_TEST_MACHINE_LOCK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/viaticum-e2e-lock-XXXXXX")" ;;
+        *) VIATICUM_TEST_MACHINE_LOCK_DIR="$(mktemp -d "$E2E_TMP/viaticum-e2e-lock-XXXXXX")" ;;
     esac
 fi
 export VIATICUM_TEST_MACHINE_LOCK_DIR

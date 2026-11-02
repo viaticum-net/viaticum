@@ -34,7 +34,8 @@ set -euo pipefail
 
 NUM_NODES=${1:-10}
 TIME_SCALE=1000
-TEST_DIR="/tmp/viaticum-scale-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-scale-$$"
 BINARY="${BINARY:-viaticum}"
 NUM_FILES=5
 

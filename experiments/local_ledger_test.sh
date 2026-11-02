@@ -137,7 +137,8 @@ H_RUST_LOG="info,viaticum::daemon::processor::pos=debug"
 #   PAIR_LEDGER_LAMBDA_DEM = 1/365; observed window at 100000 = 3 * 100000 / 86400 days.
 L_DEM="0.0027397260273972603"   # 1/365
 OBS_WINDOW="3.4722222222222223"  # observed_window_days(100000)
-TEST_DIR="/tmp/viaticum-ledger-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-ledger-$$"
 BINARY="${BINARY:-viaticum}"
 T_BASE=$(date -u +%s)
 

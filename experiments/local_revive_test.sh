@@ -97,7 +97,8 @@ NUM_NODES=5
 # ≈ 60 s; mailbox sweep 6 h / 20000 → 1 s; periodic rescan max(604800 / ts, 60) = 60 s;
 # idle flush 1 s; reconcile max(3600 / ts, 60) = 60 s.
 TIME_SCALE=20000
-T="/tmp/viaticum-revive-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+T="$E2E_TMP/viaticum-revive-$$"
 BINARY="${BINARY:-viaticum}"
 HOLDERS=(1 2 3 4)
 # Keep in sync with crates/viaticum-core/src/mailbox/mod.rs (class_config::DELETE_REQUEST_TTL),

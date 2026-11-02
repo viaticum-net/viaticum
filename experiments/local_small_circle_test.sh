@@ -55,7 +55,8 @@
 set -euo pipefail
 
 TIME_SCALE=30
-TEST_DIR="/tmp/viaticum-small-circle-$$"
+E2E_TMP="${VIATICUM_E2E_TMP:-$HOME/e2e-tmp}"; mkdir -p "$E2E_TMP"
+TEST_DIR="$E2E_TMP/viaticum-small-circle-$$"
 BINARY="${BINARY:-viaticum}"
 
 PASS=0; FAIL=0
