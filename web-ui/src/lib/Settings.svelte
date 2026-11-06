@@ -209,7 +209,7 @@
         'Daemon did not come back within 60s. The child may still be retrying ' +
         'to acquire the DB lock from the parent — wait a few more seconds and ' +
         'reload the page. If the daemon is truly stuck, check the daemon log ' +
-        '(typically ~/.viaticum/main/daemon.log). To restore previous config: ' +
+        '(journalctl --user -u viaticum). To restore previous config: ' +
         'rename config.toml.bak → config.toml, then restart the daemon.';
     }
   }
