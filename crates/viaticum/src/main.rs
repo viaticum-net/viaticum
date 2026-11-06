@@ -4,7 +4,6 @@ use clap::Parser;
 use viaticum::cli::{Cli, Command};
 use viaticum::daemon::handle::shutdown::{SHUTDOWN_DRAIN, ShutdownSignals};
 use viaticum::daemon::handle::{DaemonConfig, DaemonHandle};
-use viaticum_core::types::hex_encode;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
@@ -55,7 +54,19 @@ async fn main() -> ExitCode {
             new_device,
         } => {
             let dir = global_dir.clone();
-            let result = match (mnemonic, new_device) {
+            let from_mnemonic = mnemonic.is_some();
+            let phrase = match mnemonic {
+                Some(Some(m)) => Some(m.clone()),
+                Some(None) => match viaticum::cli::read_phrase_stdin() {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                None => None,
+            };
+            let result = match (&phrase, new_device) {
                 (Some(m), true) => viaticum::daemon::identity::init_identity_new_device(&dir, m),
                 (Some(m), false) => {
                     viaticum::daemon::identity::init_identity_from_mnemonic(&dir, m)
@@ -64,16 +75,12 @@ async fn main() -> ExitCode {
             };
             match result {
                 Ok(keyfile) => {
-                    println!("Identity initialized.");
-                    println!("Public key: {}", hex_encode(&keyfile.identity_pub));
-                    println!("Device ID:  {}", hex_encode(&keyfile.device_id));
-                    println!("\nMnemonic (SAVE THIS):\n  {}", keyfile.mnemonic);
-                    if mnemonic.is_some() && !*new_device {
-                        println!(
-                            "\nIf you are recovering a lost machine, stop here and use \
-                             'viaticum dr' instead: a node started from an empty catalog does \
-                             not bring your files back."
-                        );
+                    print!(
+                        "{}",
+                        viaticum::cli::render_init_output(&keyfile, from_mnemonic, *new_device)
+                    );
+                    if from_mnemonic && let Err(e) = viaticum::cli::phrase::mark_confirmed(&dir) {
+                        eprintln!("warning: could not write phrase-confirmed: {e}");
                     }
                 }
                 Err(e) => {
@@ -97,13 +104,70 @@ async fn main() -> ExitCode {
                 Some(d) => viaticum::cli::expand_data_dir(Some(d)),
                 None => global_dir.clone(),
             };
+            let phrase = match mnemonic {
+                Some(Some(m)) => m.clone(),
+                Some(None) => match viaticum::cli::read_phrase_stdin() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                None => {
+                    eprintln!("error: pass --mnemonic (with or without a value) to dr");
+                    std::process::exit(1);
+                }
+            };
             let opts = viaticum::daemon::dr::DrOptions {
-                mnemonic: mnemonic.clone(),
+                mnemonic: phrase,
                 peers: peer.clone(),
-                data_dir: dr_dir,
+                data_dir: dr_dir.clone(),
                 catalog: catalog.clone(),
             };
             if let Err(e) = viaticum::daemon::dr::run_dr(opts).await {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            if let Err(e) = viaticum::cli::phrase::mark_confirmed(&dr_dir) {
+                eprintln!("warning: could not write phrase-confirmed: {e}");
+            }
+        }
+        Command::Setup {
+            mode,
+            watch,
+            quota_gb,
+            seed,
+            phrase_file,
+            yes,
+            skip_phrase_check,
+            allow_root,
+            json,
+        } => {
+            let opts = viaticum::cli::setup::SetupOptions {
+                data_dir: global_dir.clone(),
+                mode: *mode,
+                watch: watch.clone(),
+                quota_gb: *quota_gb,
+                seed: seed.clone(),
+                phrase_file: phrase_file.clone(),
+                yes: *yes,
+                skip_phrase_check: *skip_phrase_check,
+                allow_root: *allow_root,
+                json: *json,
+            };
+            if let Err(e) = viaticum::cli::setup::run_setup(opts).await {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Phrase { action } => {
+            let result = match action {
+                viaticum::cli::PhraseAction::Show => viaticum::cli::phrase::run_show(&global_dir),
+                viaticum::cli::PhraseAction::Check { positions, all } => {
+                    viaticum::cli::phrase::run_check(&global_dir, positions.clone(), *all)
+                }
+            };
+            if let Err(e) = result {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }

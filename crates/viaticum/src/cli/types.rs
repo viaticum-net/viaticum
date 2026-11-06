@@ -146,6 +146,11 @@ pub struct StatusData {
     /// release build); the same string as `viaticum --version` (install-i11).
     #[serde(default)]
     pub daemon_version: String,
+    /// The two-line verdict (install-i4, i14): the same server answer for CLI
+    /// and Dashboard. `None` from an older daemon; `#[serde(default)]` keeps
+    /// that JSON readable.
+    #[serde(default)]
+    pub verdict: Option<crate::daemon::dispatch::verdict::Verdict>,
     /// This node's identity pubkey (hex).
     pub node_identity: String,
     /// This node's DeviceId, first 8 bytes hex (16 chars). Matches PeerSummary.identity_hex.

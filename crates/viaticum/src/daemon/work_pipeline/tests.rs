@@ -14,7 +14,7 @@ use viaticum_core::types::{
 };
 
 use crate::daemon::work_pipeline::{
-    WorkPipeline, WorkPipelineConfig, pool_signature, snapshot_pool,
+    WorkPipeline, WorkPipelineConfig, online_count, pool_signature, snapshot_pool,
 };
 
 // ─── Filesystem helpers ───────────────────────────────────────────────────────
@@ -1472,6 +1472,51 @@ fn get_existing_holder_ids_excludes_alive_uncertain_presumed_lost() {
     assert_eq!(excluded.awaiting_verdict, 2);
 }
 
+// ─── snapshot_pool: the verdict's holder pool (A11, M9) ─────────────────────
+
+/// The verdict's `holder_pool` must be the authenticated candidates the worker
+/// places on, NOT the unfiltered fallback `snapshot_pool` uses when fewer than
+/// `min_size` friends are online. A node that sees only the seed: one online
+/// candidate, three DB records → holder_pool = 1 (yellow), while the worker's
+/// fallback list has three.
+#[test]
+fn holder_pool_matches_worker_candidates() {
+    let all = vec![
+        HolderCandidate {
+            device_id: device_id(0x81),
+            trust: 0.9,
+        },
+        HolderCandidate {
+            device_id: device_id(0x82),
+            trust: 0.8,
+        },
+        HolderCandidate {
+            device_id: device_id(0x83),
+            trust: 0.7,
+        },
+    ];
+    let authenticated: std::collections::HashSet<DeviceId> =
+        [device_id(0x81)].into_iter().collect();
+
+    let online = online_count(&all, &authenticated);
+    assert_eq!(online, 1, "only the seed is online");
+    // What the worker would place on with min_size = 2: the fallback (all 3).
+    let worker_candidates = all.clone();
+    assert_eq!(
+        worker_candidates.len(),
+        3,
+        "the worker falls back to all DB peers"
+    );
+    assert_ne!(
+        online,
+        worker_candidates.len() as u32,
+        "the verdict must not count the fallback as online holders"
+    );
+
+    let all_online: std::collections::HashSet<DeviceId> = all.iter().map(|c| c.device_id).collect();
+    assert_eq!(online_count(&all, &all_online), 3);
+}
+
 // ─── snapshot_pool: sibling exclusion tests ───────────────────────────────────
 
 fn master_pub(byte: u8) -> IdentityPub {
@@ -1886,6 +1931,7 @@ async fn worker_iteration_does_not_overwrite_uncertain_placement() {
             device_id: x,
             trust: 0.9,
         }],
+        online_count: 1,
         signature: 7,
     };
     let swarm = lonely_swarm(0x31).await;
@@ -1938,6 +1984,7 @@ async fn worker_does_not_read_source_when_no_candidates() {
                 trust: 0.9,
             })
             .collect(),
+        online_count: peers.len() as u32,
         signature: 7,
     };
     let swarm = lonely_swarm(0x32).await;
@@ -2250,6 +2297,7 @@ async fn worker_iteration_delivers_only_recorded_offers() {
                 trust: 0.9,
             })
             .collect(),
+        online_count: peers.len() as u32,
         signature: 7,
     };
     let mut config = make_config();

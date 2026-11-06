@@ -1,5 +1,7 @@
 pub mod output;
+pub mod phrase;
 pub mod restore;
+pub mod setup;
 pub mod types;
 
 #[cfg(test)]
@@ -25,6 +27,61 @@ pub fn expand_data_dir(path: Option<&str>) -> std::path::PathBuf {
     }
 }
 
+/// The exact stdout of `viaticum init` (byte-identical since R2: E2E scripts
+/// and `experiments/polygon/fleet.py` parse `Mnemonic (SAVE THIS):`).
+pub fn render_init_output(
+    keyfile: &crate::daemon::identity::IdentityKeyFile,
+    from_mnemonic: bool,
+    new_device: bool,
+) -> String {
+    use viaticum_core::types::hex_encode;
+    let mut out = String::new();
+    out.push_str("Identity initialized.\n");
+    out.push_str(&format!(
+        "Public key: {}\n",
+        hex_encode(&keyfile.identity_pub)
+    ));
+    out.push_str(&format!("Device ID:  {}\n", hex_encode(&keyfile.device_id)));
+    out.push_str(&format!(
+        "\nMnemonic (SAVE THIS):\n  {}\n",
+        keyfile.mnemonic
+    ));
+    if from_mnemonic && !new_device {
+        out.push_str(
+            "\nIf you are recovering a lost machine, stop here and use \
+             'viaticum dr' instead: a node started from an empty catalog does \
+             not bring your files back.\n",
+        );
+    }
+    out
+}
+
+/// Read a recovery phrase from stdin (one line, trimmed). Used by
+/// `dr --mnemonic` / `init --mnemonic` without a value, so the phrase never
+/// lands in shell history or `ps` (install-i2).
+pub fn read_phrase_stdin() -> Result<String, CliError> {
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| CliError::InvalidArgument(format!("cannot read the recovery phrase: {e}")))?;
+    let phrase = line.trim().to_string();
+    if phrase.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "the recovery phrase is empty (stdin closed?)".into(),
+        ));
+    }
+    Ok(phrase)
+}
+
+/// Read one line from any reader, trimmed; `None` at end of input.
+pub fn read_phrase_line(reader: &mut impl std::io::BufRead) -> std::io::Result<Option<String>> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(line.trim().to_string()))
+}
+
 fn platform_default_data_dir() -> std::path::PathBuf {
     dirs::data_dir()
         .expect("could not determine platform data directory (HOME/APPDATA unset?)")
@@ -39,10 +96,6 @@ fn platform_default_data_dir() -> std::path::PathBuf {
 #[derive(Debug, Parser)]
 #[command(name = "viaticum", version = crate::build_info::build_id())]
 pub struct Cli {
-    /// Path to config file. Default: ~/.viaticum/config.toml
-    #[arg(long, global = true)]
-    pub config: Option<String>,
-
     /// Data directory. Default: platform-native
     /// (Linux: ~/.local/share/viaticum, macOS: ~/Library/Application Support/viaticum,
     /// Windows: %APPDATA%/viaticum).
@@ -122,9 +175,10 @@ pub enum Command {
 
     /// Initialize a new Viaticum identity
     Init {
-        /// BIP39 mnemonic phrase (24 words). If omitted, generates a new one.
-        #[arg(long)]
-        mnemonic: Option<String>,
+        /// BIP39 mnemonic phrase (24 words). If omitted, generates a new one;
+        /// with the flag but no value, the phrase is read from stdin.
+        #[arg(long, num_args = 0..=1)]
+        mnemonic: Option<Option<String>>,
         /// Add this machine as a new device to an existing cluster.
         /// Must be combined with --mnemonic. Generates a random device ID
         /// so this device has its own keys while sharing the cluster identity.
@@ -158,7 +212,8 @@ pub enum Command {
         date: Option<String>,
 
         /// Restore to this destination path instead of the original location.
-        #[arg(long)]
+        /// Accepted for older scripts; restore always writes into `restore/`.
+        #[arg(long, hide = true)]
         dest: Option<String>,
 
         /// Submit the job and exit without waiting for it.
@@ -208,9 +263,10 @@ pub enum Command {
 
     /// Disaster recovery: restore node state from seed phrase
     Dr {
-        /// BIP39 mnemonic phrase (24 words)
-        #[arg(long)]
-        mnemonic: String,
+        /// BIP39 mnemonic phrase (24 words). With the flag but no value, the
+        /// phrase is read from stdin.
+        #[arg(long, num_args = 0..=1)]
+        mnemonic: Option<Option<String>>,
         /// Seed peer multiaddr, e.g. /ip4/1.2.3.4/tcp/4001/p2p/<peer id> (repeatable)
         #[arg(long, num_args = 1..)]
         peer: Vec<String>,
@@ -220,6 +276,45 @@ pub enum Command {
         /// Restore this catalog (hex prefix, at least 8 characters) when DR finds several
         #[arg(long)]
         catalog: Option<String>,
+    },
+
+    /// Set up a node: new install or restore from 24 words
+    Setup {
+        /// New installation or restore; without it, setup asks first.
+        #[arg(long, value_enum)]
+        mode: Option<setup::SetupMode>,
+        /// Folder to keep safe (repeatable).
+        #[arg(long = "watch", value_name = "DIR")]
+        watch: Vec<std::path::PathBuf>,
+        /// Space to give friends, in GB (at least 1).
+        #[arg(long)]
+        quota_gb: Option<f64>,
+        /// Seed multiaddr (repeatable); replaces the template's seeds and is
+        /// used as `dr --peer` in restore mode.
+        #[arg(long = "seed", value_name = "MULTIADDR")]
+        seed: Vec<String>,
+        /// Restore without a tty: file with the 24 words, mode 0600.
+        #[arg(long)]
+        phrase_file: Option<std::path::PathBuf>,
+        /// Non-interactive new install: defaults for the unanswered questions,
+        /// phrase never printed and not confirmed.
+        #[arg(long)]
+        yes: bool,
+        /// Test-only: accept the phrase without asking (E2E).
+        #[arg(long, hide = true)]
+        skip_phrase_check: bool,
+        /// Allow running as root (the friend's files would belong to root).
+        #[arg(long)]
+        allow_root: bool,
+        /// Print the result as one JSON line for the installer.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show or check your 24 recovery words
+    Phrase {
+        #[command(subcommand)]
+        action: PhraseAction,
     },
 
     /// Open the web UI in the default browser
@@ -236,6 +331,21 @@ pub enum Command {
     /// (release checks, install-i11). Needs no daemon.
     #[command(hide = true)]
     BuildInfo,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PhraseAction {
+    /// Check words from your paper; success writes `phrase-confirmed`
+    Check {
+        /// Positions to ask, 1-based, comma-separated (default: 3 random).
+        #[arg(long, value_delimiter = ',')]
+        positions: Vec<usize>,
+        /// Ask all 24 positions.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show the phrase from `identity.key` (terminal only)
+    Show,
 }
 
 #[derive(Debug, Subcommand)]
@@ -283,30 +393,113 @@ pub fn render_build_info() -> String {
         .expect("BuildInfo is plain strings and serializes")
 }
 
-/// `viaticum open` — launch the default browser on /auth/start.
+/// `viaticum open` — print the Dashboard URL (always), print an SSH tunnel
+/// line when there is no local display, and try the browser as a courtesy
+/// (install-i9). A missing browser is not an error: the URL is the product.
 pub fn cmd_open(conn: &Connection) -> Result<(), CliError> {
     let url = build_auth_start_url(conn);
-    launch_browser(&url).map_err(|e| CliError::Io(std::io::Error::other(e.to_string())))
+    let headless = ssh_connection().is_some() || !has_local_display();
+    print!(
+        "{}",
+        render_open(&url, headless, &current_user(), &current_host())
+    );
+    if let Err(e) = launch_browser(&url) {
+        eprintln!("Could not open a browser ({e}); use the URL above.");
+    }
+    Ok(())
+}
+
+/// The exact text `open` prints. Kept pure for the unit test (install-i9).
+pub fn render_open(url: &str, headless: bool, user: &str, host: &str) -> String {
+    let mut out = format!("Dashboard: {url}\n");
+    if headless {
+        let port = url_port(url).unwrap_or(0);
+        out.push_str(&format!(
+            "On another machine, run: ssh -L {port}:127.0.0.1:{port} {user}@{host}\n"
+        ));
+    }
+    out
+}
+
+fn url_port(url: &str) -> Option<u16> {
+    let rest = url.split("://").nth(1)?;
+    let authority = rest.split('/').next()?;
+    let port = authority.rsplit_once(':')?.1;
+    port.parse().ok()
+}
+
+fn has_local_display() -> bool {
+    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+/// `SSH_CONNECTION` is "client_ip client_port server_ip server_port". The server
+/// address is what the friend typed into SSH (or the box's address as seen by
+/// the client), so the tunnel line works from the same machine they came from.
+fn ssh_connection() -> Option<(String, String)> {
+    let raw = std::env::var("SSH_CONNECTION").ok()?;
+    let mut parts = raw.split_whitespace();
+    let _client_ip = parts.next()?;
+    let _client_port = parts.next()?;
+    let server_ip = parts.next()?;
+    Some((server_ip.to_string(), current_user()))
+}
+
+fn current_user() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "user".to_string())
+}
+
+fn current_host() -> String {
+    if let Some((host, _)) = ssh_connection() {
+        return host;
+    }
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+        .unwrap_or_else(|| "localhost".to_string())
 }
 
 fn launch_browser(url: &str) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg(url).status()?;
+        if !std::process::Command::new("open")
+            .arg(url)
+            .status()?
+            .success()
+        {
+            return Err(std::io::Error::other("open exited with an error"));
+        }
     }
     #[cfg(target_os = "linux")]
     {
-        std::process::Command::new("xdg-open").arg(url).status()?;
+        if !std::process::Command::new("xdg-open")
+            .arg(url)
+            .status()?
+            .success()
+        {
+            return Err(std::io::Error::other("xdg-open exited with an error"));
+        }
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
+        if !std::process::Command::new("cmd")
             .args(["/C", "start", "", url])
-            .status()?;
+            .status()?
+            .success()
+        {
+            return Err(std::io::Error::other("start exited with an error"));
+        }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        println!("Open this URL in your browser:\n  {url}");
+        let _ = url;
     }
     Ok(())
 }
@@ -396,8 +589,12 @@ fn command_to_http(cmd: &Command) -> Result<(reqwest::Method, String, Option<Str
         Command::Daemon { .. } | Command::Init { .. } | Command::Dr { .. } => {
             unreachable!("local-only command routed to HTTP dispatch")
         }
-        Command::Open | Command::Token { .. } | Command::BuildInfo => {
-            unreachable!("Open/Token/BuildInfo handled locally in main.rs before run_command")
+        Command::Open
+        | Command::Token { .. }
+        | Command::BuildInfo
+        | Command::Phrase { .. }
+        | Command::Setup { .. } => {
+            unreachable!("local-only command routed to HTTP dispatch")
         }
         Command::Restore { .. } => unreachable!("restore is handled by restore::run_restore"),
         Command::Status { .. } => Ok((Method::GET, "/api/status".into(), None)),

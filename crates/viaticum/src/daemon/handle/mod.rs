@@ -65,6 +65,9 @@ pub struct DaemonConfig {
 pub struct DaemonState {
     /// Open database handle.
     pub db: Db,
+    /// When this process opened the state: the verdict's no-peer red line uses
+    /// uptime, not wall-clock guesses (monotonic, survives clock jumps).
+    pub started_at: std::time::Instant,
     /// This node's master identity public key.
     pub identity_pub: IdentityPub,
     /// This device's ID.
@@ -755,6 +758,7 @@ impl DaemonHandle {
         // The original is held by the cancel task (dropped on shutdown to close channel).
         let state = Arc::new(DaemonState {
             db: db.clone(),
+            started_at: std::time::Instant::now(),
             identity_pub,
             device_id,
             restore_tx: restore_tx.clone(),
@@ -1163,6 +1167,10 @@ impl DaemonHandle {
                     .watch_admin
                     .as_ref()
                     .map(|a| Arc::clone(&a.watch_states)),
+                startup_scan_done: state
+                    .watch_admin
+                    .as_ref()
+                    .map(|a| Arc::clone(&a.startup_scan_done)),
                 time_scale,
                 recheck_rx: Some(recheck_rx),
                 resubmit_rx: Some(resubmit_rx),
@@ -1594,6 +1602,29 @@ pub(crate) fn disk_available_bytes(path: &std::path::Path) -> Option<u64> {
 /// when the path is missing or no mount point matches (unknown — never read as "disk full").
 /// `std::path::absolute`, not `canonicalize`: on Windows the latter returns a verbatim
 /// `\\?\C:\…` path that never `starts_with` the mount point `C:\`.
+/// Total size of the filesystem holding `path` via `statvfs` (R3b: the reserve
+/// is `0.1 × size`). The sibling of `disk_available_bytes`, same path rule.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn disk_size_bytes(path: &std::path::Path) -> Option<u64> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let st = rustix::fs::statvfs(&canonical).ok()?;
+    Some(st.f_blocks.saturating_mul(st.f_frsize))
+}
+
+/// Total size of the filesystem holding `path` via `sysinfo`.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn disk_size_bytes(path: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(path).ok()?;
+    let abs = std::path::absolute(path).ok()?;
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|d| abs.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.total_space())
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn disk_available_bytes(path: &std::path::Path) -> Option<u64> {
     std::fs::metadata(path).ok()?;

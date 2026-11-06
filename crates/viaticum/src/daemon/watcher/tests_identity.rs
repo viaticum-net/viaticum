@@ -544,6 +544,7 @@ async fn recheck_channel_full_does_not_block_watch_admin_commands() {
         data_dir: data.clone(),
         rescan_interval_secs: 604800,
         watch_states: None,
+        startup_scan_done: None,
         time_scale: 1,
         recheck_rx: Some(recheck_rx),
         resubmit_rx: None,

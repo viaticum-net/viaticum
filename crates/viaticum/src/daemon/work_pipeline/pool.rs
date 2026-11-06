@@ -13,11 +13,32 @@ use crate::daemon::peer_backoff::PeerBackoff;
 /// Snapshot of the current holder pool.
 pub struct PoolSnapshot {
     /// Authenticated peers with non-zero trust (filtered, ready for allocation).
+    /// When fewer than `min_size` authenticated peers are online, this is the
+    /// unfiltered fallback (boot, tests) — see `online_count`.
     pub candidates: Vec<HolderCandidate>,
+    /// Authenticated candidates BEFORE the "too few online" fallback. The
+    /// verdict counts THIS (A11, M9): a node that sees only the seed must be
+    /// yellow, never green because offline PeerRecords filled the fallback.
+    pub online_count: u32,
     /// Stable hash of this pool's composition.
     /// Changes when the peer set or trust buckets change.
     /// `0` = empty pool (sentinel used by `reset_all_cooldowns` and `next_work_item`).
     pub signature: u64,
+}
+
+/// How many of `candidates` are authenticated right now — the pool the worker
+/// would actually place on, with the bootstrap fallback excluded (A11, M9).
+pub fn online_count(
+    candidates: &[HolderCandidate],
+    authenticated: &std::collections::HashSet<DeviceId>,
+) -> u32 {
+    u32::try_from(
+        candidates
+            .iter()
+            .filter(|c| authenticated.contains(&c.device_id))
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
 }
 
 /// FNV-1a 64-bit. Deterministic and stable across compiler/std versions, unlike
@@ -101,6 +122,7 @@ pub async fn snapshot_pool(
             tracing::error!("snapshot_pool: list_all_peers failed: {e}");
             return PoolSnapshot {
                 candidates: vec![],
+                online_count: 0,
                 signature: 0,
             };
         }
@@ -133,6 +155,7 @@ pub async fn snapshot_pool(
     };
 
     // Online filter.
+    let online_count = online_count(&candidates_after_backoff, &authenticated);
     let auth_filtered: Vec<HolderCandidate> = candidates_after_backoff
         .iter()
         .filter(|c| authenticated.contains(&c.device_id))
@@ -140,7 +163,8 @@ pub async fn snapshot_pool(
         .collect();
 
     let candidates = if auth_filtered.len() < min_size.max(2) {
-        // Fallback: not enough authenticated peers (boot, no swarm, test).
+        // Fallback: not enough authenticated peers (boot, no swarm, test). The
+        // worker may try them, but the verdict counts only `online_count`.
         candidates_after_backoff
     } else {
         auth_filtered
@@ -149,6 +173,7 @@ pub async fn snapshot_pool(
     let signature = pool_signature(&candidates);
     PoolSnapshot {
         candidates,
+        online_count,
         signature,
     }
 }

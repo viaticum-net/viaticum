@@ -55,6 +55,7 @@ fn state_with(db: Db, jobs: RestoreJobs) -> (Arc<DaemonState>, mpsc::Receiver<Re
     let (restore_tx, restore_rx) = mpsc::channel::<RestoreRequest>(4);
     let state = Arc::new(DaemonState {
         db,
+        started_at: std::time::Instant::now(),
         identity_pub: IdentityPub(master_key.verifying_key().to_bytes()),
         device_id: DeviceId([0u8; 32]),
         restore_tx,

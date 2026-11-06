@@ -46,6 +46,7 @@ async fn make_test_state_with(
 
     Arc::new(DaemonState {
         db,
+        started_at: std::time::Instant::now(),
         identity_pub,
         device_id,
         restore_tx,
@@ -95,6 +96,34 @@ async fn dispatch_status_carries_daemon_version() {
     assert_eq!(data.daemon_version, crate::build_info::build_id());
     let json = serde_json::to_value(&*data).expect("serialize");
     assert_eq!(json["daemon_version"], crate::build_info::build_id());
+}
+
+/// install-i4: one status snapshot carries both the build id and the server's
+/// verdict; the CLI and Dashboard read the same JSON shape.
+#[tokio::test]
+async fn status_json_carries_verdict_and_version() {
+    let state = make_test_state().await;
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    let json = serde_json::to_value(&*data).expect("serialize");
+    assert_eq!(json["daemon_version"], crate::build_info::build_id());
+    assert!(
+        matches!(
+            json["verdict"]["node"]["level"].as_str(),
+            Some("green" | "yellow" | "red")
+        ),
+        "verdict.node.level missing: {json}"
+    );
+    assert!(
+        matches!(
+            json["verdict"]["protection"]["level"].as_str(),
+            Some("green" | "yellow")
+        ),
+        "protection is never red in R3: {json}"
+    );
+    assert!(json["verdict"]["node"]["headline"].is_string());
+    assert!(json["verdict"]["protection"]["detail"].is_string());
 }
 
 #[tokio::test]
@@ -295,6 +324,7 @@ async fn dispatch_device_revoke_returns_device_revoked_with_no_router() {
 
     let state = Arc::new(DaemonState {
         db,
+        started_at: std::time::Instant::now(),
         identity_pub,
         device_id: device_id_a,
         restore_tx,
@@ -930,6 +960,7 @@ async fn revocation_published_only_to_storage_relationship_peers() {
 
     let state = Arc::new(DaemonState {
         db,
+        started_at: std::time::Instant::now(),
         identity_pub: our_master,
         device_id: our_device_id,
         restore_tx,
@@ -1081,6 +1112,7 @@ pub(crate) fn after_dr_revoke_fixture() -> (
     let (router, sender) = make_router_for_revocation(&db);
     let state = Arc::new(DaemonState {
         db,
+        started_at: std::time::Instant::now(),
         identity_pub: our_master,
         device_id: our_device_id,
         restore_tx,
@@ -1229,6 +1261,7 @@ async fn revocation_dedup_peer_is_holder_and_owner() {
 
     let state = Arc::new(DaemonState {
         db,
+        started_at: std::time::Instant::now(),
         identity_pub: our_master,
         device_id: our_device_id,
         restore_tx,
@@ -1381,6 +1414,7 @@ async fn _removed_dispatch_connect_two_daemons_registers_peer() {
     let (restore_tx, _restore_rx) = mpsc::channel::<crate::daemon::restore::RestoreRequest>(4);
     let state_a = Arc::new(DaemonState {
         db: db_a.clone(),
+        started_at: std::time::Instant::now(),
         identity_pub: pk_a,
         device_id: did_a,
         network: handle_a.clone(),
@@ -1471,6 +1505,7 @@ fn staging_test_state(
     let master_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
     Arc::new(DaemonState {
         db: Db::open_in_memory().unwrap(),
+        started_at: std::time::Instant::now(),
         identity_pub: IdentityPub(master_key.verifying_key().to_bytes()),
         device_id: DeviceId([0u8; 32]),
         restore_tx,

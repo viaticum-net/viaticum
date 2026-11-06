@@ -17,9 +17,11 @@ use crate::cli::types::{
 use crate::daemon::handle::DaemonState;
 use crate::daemon::restore::staging::JobId;
 use crate::daemon::restore::{RestoreCoordinator, RestoreRequest, VersionSelector};
+use crate::daemon::work_pipeline::snapshot_pool;
 
 pub mod missing_sources;
 mod net_status;
+pub mod verdict;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -125,6 +127,37 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         .as_ref()
         .map(|set| net_status::devices_hex8_sorted(set.iter()));
     let auth_devices = auth_snapshot.unwrap_or_default();
+    // install-i4 / A11: the network check counts the SAME placement candidates
+    // as the worker, with the "few authenticated peers" fallback excluded. A
+    // node that knows about offline peers but sees only the seed is yellow.
+    let holder_pool = snapshot_pool(
+        state.swarm_handle.as_deref(),
+        &state.db,
+        Some(state.peer_backoff.as_ref()),
+        &state.device_id,
+        &state.identity_pub,
+        2,
+    )
+    .await
+    .online_count;
+    // install-i14 / T10: folders and the watcher's startup signal.
+    let (folders_total, folders_error, scan_settled) = match state.watch_admin.as_ref() {
+        Some(admin) => {
+            let watches = admin.list_watches();
+            let scanning = watches
+                .iter()
+                .any(|w| w.status == crate::daemon::watch_admin::WatchStatus::Scanning);
+            (
+                watches.len() as u32,
+                watches
+                    .iter()
+                    .filter(|w| w.status == crate::daemon::watch_admin::WatchStatus::Error)
+                    .count() as u32,
+                admin.startup_scan_done() && !scanning,
+            )
+        }
+        None => (0, 0, false),
+    };
     // network-i14: knowledge, from the PeerRecords (another master + a dialable
     // address). "Another" = not the cluster's master, as in the swarm's known set.
     let status_master = net_status::status_cluster_master(state);
@@ -343,8 +376,57 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
     let mut dr = dr_readiness(&state.db, Timestamp::now().0, state.time_scale);
     dr.files_without_source = state.missing_sources.get(&state.db).await;
 
+    // install-i14: "the latest version of each file is in Restorable" — the
+    // same owner-side status `viaticum files` shows, counted once here.
+    let mut files_restorable = 0u32;
+    let mut files_degraded = 0u32;
+    for f in &files {
+        let Some(latest) = f.versions.last() else {
+            continue;
+        };
+        match compute_effective_status(state, latest) {
+            EffectiveStatus::Restorable { .. } => files_restorable += 1,
+            EffectiveStatus::Degraded { .. } => files_degraded += 1,
+            _ => {}
+        }
+    }
+    let supervisor = crate::daemon::dispatch::verdict::Supervisor::from_env();
+    let linger = if supervisor == crate::daemon::dispatch::verdict::Supervisor::SystemdUser {
+        crate::daemon::dispatch::verdict::systemd_user_linger()
+    } else {
+        None
+    };
+    let verdict = crate::daemon::dispatch::verdict::compute_verdict(
+        &crate::daemon::dispatch::verdict::VerdictInputs {
+            supervisor,
+            linger,
+            uptime_secs: state.started_at.elapsed().as_secs(),
+            peers_authenticated: peer_count_authenticated,
+            holder_pool,
+            folders_total,
+            folders_error,
+            scan_settled,
+            files_total: files.len() as u32,
+            files_restorable,
+            files_degraded,
+            // ST-1 is not in this tree: no counter to read yet. The inputs stay
+            // wired so the merge is one assignment (brief: comment it here).
+            blocks_waiting_for_space: 0,
+            blocks_in_flight: 0,
+            dr_ready: dr.ready,
+            phrase_confirmed: crate::cli::phrase::is_confirmed(&state.data_dir),
+            effective_quota_bytes,
+            // R1-b3 `health` is not in a2: no check exists, and the verdict does
+            // not pretend one does (node_check omits Health for `None`).
+            health_state: None,
+            // `relay_limited` has no producer in a2.
+            reachability: None,
+        },
+    );
+
     CliResponse::Status(Box::new(StatusData {
         daemon_version: crate::build_info::build_id().to_string(),
+        verdict: Some(verdict),
         node_identity,
         device_id,
         node_addr,
