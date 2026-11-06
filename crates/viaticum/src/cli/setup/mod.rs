@@ -486,7 +486,7 @@ fn catalog_watch_roots(data_dir: &Path) -> Option<Vec<PathBuf>> {
     let db =
         viaticum_core::db::Db::open(&data_dir.join(crate::daemon::identity::DB_FILE_NAME)).ok()?;
     let files = db.list_all_files().ok()?;
-    let home = dirs::home_dir().map(|h| absolute_path(h));
+    let home = dirs::home_dir().map(absolute_path);
     let mut roots = Vec::new();
     for file in files {
         let path = PathBuf::from(&file.path);
