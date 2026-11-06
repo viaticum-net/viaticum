@@ -33,6 +33,7 @@ import fcntl
 GRID_WORD = re.compile(rb"(\d{1,2})\.\s+([a-z]+)")
 CHECK_PROMPT = re.compile(rb"Word #(\d+)\?")
 QUOTA = re.compile(rb"in GB \[[^\]]*\]: ")
+MODE = re.compile(rb"Choose 1 or 2 \[1\]: ")
 PHRASE_ENTER = re.compile(rb"Press Enter when you have written them down: ")
 
 
@@ -49,6 +50,7 @@ class Driver:
         self.quit = False
         self.exit_code = None
         self.debug = False
+        self.stderr_file = None
         self.child_pid = None
 
     def log(self, msg):
@@ -82,6 +84,12 @@ class Driver:
             # terminal has the default; restore it before exec.
             signal.signal(signal.SIGINT, signal.SIG_DFL)
             signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+            # Keep stderr (tracing and prompts that are not the phrase grid)
+            # in a file the leak scan reads. The grid stays on the pty stdout.
+            if self.stderr_file:
+                fd = os.open(self.stderr_file, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+                os.dup2(fd, 2)
+                os.close(fd)
 
         proc = subprocess.Popen(
             self.argv,
@@ -126,6 +134,12 @@ class Driver:
             text = bytes(self.buf)
 
             # Quota prompt: accept the default with Enter.
+            if MODE.search(text[-200:]):
+                self.log("mode prompt: 1 (new)")
+                self.send(master, b"1\n")
+                self.buf.clear()
+                continue
+
             if text.endswith(b"]: ") and b"in GB [" in text[-200:]:
                 self.log("quota prompt: Enter")
                 self.send(master, b"\n")
@@ -185,6 +199,7 @@ def main():
     ap.add_argument("--stop-at-check", action="store_true")
     ap.add_argument("--wrong-once", action="store_true")
     ap.add_argument("--timeout", type=int, default=300)
+    ap.add_argument("--stderr-file", help="copy the child's stderr here (leak scan; no phrase grid)")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("extra", nargs=argparse.REMAINDER)
     args = ap.parse_args()
@@ -201,6 +216,7 @@ def main():
     d.stop_at_check = args.stop_at_check
     d.wrong_left = 1 if args.wrong_once else 0
     d.debug = args.debug
+    d.stderr_file = args.stderr_file
     code = d.run()
     # The transcript goes to stdout only. It contains the phrase: the caller
     # must keep it in memory, never `tee` it to a file.

@@ -77,10 +77,10 @@ pub enum SetupError {
     )]
     DataDirHasIdentity(PathBuf),
     #[error(
-        "the phrase file {0} is readable by other users (mode {1:04o}); it must be 0600 \
-         (or stricter). Nothing was changed."
+        "the phrase file {0} is readable by other users; it must be 0600 (or stricter). \
+         Nothing was changed."
     )]
-    PhraseFileMode(PathBuf, u32),
+    PhraseFileMode(PathBuf),
     #[error("disaster recovery failed: {0}")]
     Dr(String),
     #[error(transparent)]
@@ -150,10 +150,11 @@ async fn run_new(opts: SetupOptions, tty: bool, ui: Ui) -> Result<SetupReport, S
     if !tty && !opts.yes {
         return Err(SetupError::NoTty);
     }
-    let watch = resolve_watch(&opts, tty, &ui)?;
+    let watch = resolve_watch(&opts, tty, &ui, None)?;
     let (free, size) = free_and_size(&opts.data_dir);
     let quota = resolve_quota(&opts, free, tty, &ui)?;
     let reserve = size.map(default_reserve_gb).unwrap_or(2.0);
+    warn_if_quota_over_room(&ui, free, quota, reserve);
 
     let keyfile = if opts.data_dir.join(KEYFILE_NAME).exists() {
         load_identity(&opts.data_dir)?
@@ -168,7 +169,11 @@ async fn run_new(opts: SetupOptions, tty: bool, ui: Ui) -> Result<SetupReport, S
                 ui.say("Your 24 recovery words. Write them on paper, in order, and keep the paper safe.");
                 ui.say("Do not store them in a file, a photo or a password manager.");
                 ui.say("");
-                ui.raw(&grid);
+                // The phrase goes to stdout, the stream a tty check covers; in
+                // --json mode nothing but the report reaches stdout without a
+                // tty (a redirected stderr must never receive the grid).
+                print!("{grid}");
+                io::stdout().flush()?;
                 ui.say("");
                 ui.wait_for_enter("Press Enter when you have written them down: ")?;
             }
@@ -215,10 +220,12 @@ async fn run_restore(opts: SetupOptions, tty: bool, ui: Ui) -> Result<SetupRepor
     crate::cli::phrase::mark_confirmed(&opts.data_dir)?;
     write_default_config_if_absent(&opts.data_dir)?;
 
-    let watch = resolve_watch(&opts, tty, &ui)?;
+    let catalog_roots = catalog_watch_roots(&opts.data_dir);
+    let watch = resolve_watch(&opts, tty, &ui, catalog_roots)?;
     let (free, size) = free_and_size(&opts.data_dir);
     let quota = resolve_quota(&opts, free, tty, &ui)?;
     let reserve = size.map(default_reserve_gb).unwrap_or(2.0);
+    warn_if_quota_over_room(&ui, free, quota, reserve);
     finish(SetupMode::Restore, &opts, &watch, quota, reserve, &ui)
 }
 
@@ -241,6 +248,13 @@ fn finish(
     let seeds = if opts.seed.is_empty() {
         None
     } else {
+        for seed in &opts.seed {
+            if !seed.starts_with('/') || !seed.contains("/p2p/") {
+                return Err(SetupError::Toml(format!(
+                    "--seed {seed} is not a multiaddr with /p2p/<peer id>"
+                )));
+            }
+        }
         Some(opts.seed.clone())
     };
     let answers = SetupAnswers {
@@ -319,14 +333,6 @@ impl Ui {
         }
     }
 
-    fn raw(&self, text: &str) {
-        if self.json {
-            eprint!("{text}");
-        } else {
-            print!("{text}");
-        }
-    }
-
     fn ask(&self, prompt: &str) -> io::Result<String> {
         if self.json {
             eprint!("{prompt}");
@@ -373,23 +379,31 @@ fn ask_phrase(ui: &Ui) -> Result<String, SetupError> {
     Ok(phrase)
 }
 
-fn resolve_watch(opts: &SetupOptions, tty: bool, ui: &Ui) -> Result<Vec<PathBuf>, SetupError> {
+fn resolve_watch(
+    opts: &SetupOptions,
+    tty: bool,
+    ui: &Ui,
+    preferred: Option<Vec<PathBuf>>,
+) -> Result<Vec<PathBuf>, SetupError> {
     if !opts.watch.is_empty() {
         return validate_watch(opts.watch.clone());
     }
-    let suggested = suggested_folders();
+    let configured = configured_watch(&opts.data_dir);
+    let defaults = configured
+        .clone()
+        .or_else(|| preferred.map(|roots| validate_watch(roots).unwrap_or_default()))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(suggested_folders);
     if !tty {
         // A re-run without --watch keeps the folders already configured; a fresh
-        // non-tty install starts from the suggestions (usually empty in CI).
-        if let Some(existing) = configured_watch(&opts.data_dir) {
-            return Ok(existing);
-        }
-        return Ok(suggested);
+        // restore defaults to roots read from the recovered catalog; otherwise
+        // the suggestions (usually empty in CI).
+        return Ok(configured.unwrap_or(defaults));
     }
-    let default_text = if suggested.is_empty() {
+    let default_text = if defaults.is_empty() {
         "none".to_string()
     } else {
-        suggested
+        defaults
             .iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
@@ -400,7 +414,7 @@ fn resolve_watch(opts: &SetupOptions, tty: bool, ui: &Ui) -> Result<Vec<PathBuf>
             "Folders to keep safe (comma-separated, empty = {default_text}): "
         ))?;
         let paths = if answer.is_empty() {
-            suggested.clone()
+            defaults.clone()
         } else {
             answer
                 .split(',')
@@ -464,6 +478,36 @@ pub fn suggested_folders() -> Vec<PathBuf> {
     out
 }
 
+/// install-i13: after DR, suggest the folders the recovered catalog was
+/// watching. The catalog holds file paths, not watch roots, so for a path under
+/// `$HOME` the root is the first component under home; outside it, the file's
+/// parent. Only existing directories are returned, deduplicated.
+fn catalog_watch_roots(data_dir: &Path) -> Option<Vec<PathBuf>> {
+    let db =
+        viaticum_core::db::Db::open(&data_dir.join(crate::daemon::identity::DB_FILE_NAME)).ok()?;
+    let files = db.list_all_files().ok()?;
+    let home = dirs::home_dir().map(|h| absolute_path(h));
+    let mut roots = Vec::new();
+    for file in files {
+        let path = PathBuf::from(&file.path);
+        let root = match &home {
+            Some(home) if path.starts_with(home) => path
+                .strip_prefix(home)
+                .ok()
+                .and_then(|rel| rel.components().next())
+                .map(|first| home.join(first)),
+            _ => path.parent().map(Path::to_path_buf),
+        };
+        if let Some(root) = root
+            && root.is_dir()
+            && !roots.contains(&root)
+        {
+            roots.push(root);
+        }
+    }
+    if roots.is_empty() { None } else { Some(roots) }
+}
+
 fn resolve_quota(
     opts: &SetupOptions,
     free: Option<u64>,
@@ -477,7 +521,7 @@ fn resolve_quota(
     if !tty && let Some(q) = configured_quota(&opts.data_dir) {
         return Ok(q);
     }
-    let default = free.map(default_quota_gb);
+    let default = configured_quota(&opts.data_dir).or_else(|| free.map(default_quota_gb));
     if tty {
         loop {
             let prompt = match default {
@@ -505,6 +549,21 @@ fn resolve_quota(
     match default {
         Some(q) => Ok(q),
         None => Err(SetupError::NoFreeSpaceInfo(opts.data_dir.clone())),
+    }
+}
+
+/// install-i3: a quota above `free − reserve` is accepted but the friend is
+/// told; the daemon may then evict or refuse friends' data sooner.
+fn warn_if_quota_over_room(ui: &Ui, free: Option<u64>, quota_gb: f64, reserve_gb: f64) {
+    let Some(free) = free else { return };
+    let free_gb = free as f64 / 1_073_741_824.0;
+    let room = free_gb - reserve_gb;
+    if quota_gb > room {
+        ui.say(&format!(
+            "Warning: you offered {quota_gb:.1} GB but only {room:.1} GB is free above the \
+             {reserve_gb:.1} GB reserve. The node keeps that much of friends' data only while \
+             the disk allows it."
+        ));
     }
 }
 
@@ -648,9 +707,9 @@ fn write_config(path: &Path, text: &str) -> Result<(), SetupError> {
 
 /// Restore without a tty requires a 0600 phrase file. Anything outside 0600
 /// (group/other access, or execute bits) is refused before DR touches anything.
-pub fn check_phrase_file_mode(mode: u32) -> Result<(), SetupError> {
+pub fn check_phrase_file_mode(path: &Path, mode: u32) -> Result<(), SetupError> {
     if mode & !0o600 != 0 {
-        return Err(SetupError::PhraseFileMode(PathBuf::new(), mode));
+        return Err(SetupError::PhraseFileMode(path.to_path_buf()));
     }
     Ok(())
 }
@@ -661,9 +720,7 @@ fn read_phrase_file(path: &Path) -> Result<String, SetupError> {
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = meta.permissions().mode() & 0o777;
-        if mode & !0o600 != 0 {
-            return Err(SetupError::PhraseFileMode(path.to_path_buf(), mode));
-        }
+        check_phrase_file_mode(path, mode)?;
     }
     #[cfg(not(unix))]
     {

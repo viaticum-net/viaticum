@@ -77,6 +77,26 @@ fn node_yellow_when_only_seed() {
     );
 }
 
+/// M9 (second half): the network level is the HOLDER POOL, never the raw
+/// authenticated peer count. Three peers online but only one placement
+/// candidate is still yellow.
+#[test]
+fn node_network_uses_holder_pool_not_peer_count() {
+    let mut i = ok_inputs();
+    i.peers_authenticated = 3;
+    i.holder_pool = 1;
+    let v = compute_verdict(&i);
+    assert_eq!(v.node.level, VerdictLevel::Yellow);
+    assert_eq!(check_of(&v, CheckId::Network).level, VerdictLevel::Yellow);
+    assert!(
+        check_of(&v, CheckId::Network)
+            .detail
+            .contains("few friends online, need ≥ 2"),
+        "{:?}",
+        check_of(&v, CheckId::Network)
+    );
+}
+
 #[test]
 fn node_red_after_15_min_without_peers() {
     let mut i = ok_inputs();
@@ -206,6 +226,28 @@ fn protection_waiting_for_space_reason() {
         v.protection.detail
     );
     assert!(v.protection.detail.contains("normal for a new node"));
+}
+
+/// dr_ready true but not every file restorable yet: the phrase WOULD bring the
+/// catalog back, so the text must not say "recovery ... not ready yet".
+#[test]
+fn protection_partial_with_dr_ready_says_recovery_is_ready() {
+    let mut i = ok_inputs();
+    i.files_total = 3;
+    i.files_restorable = 1;
+    i.dr_ready = true;
+    let v = compute_verdict(&i);
+    assert_eq!(v.protection.level, VerdictLevel::Yellow);
+    assert_eq!(v.protection.reason, ProtectionReason::Uploading);
+    assert!(v.protection.dr_ready);
+    assert!(
+        v.protection
+            .detail
+            .contains("Recovery with your 24 words: ready."),
+        "{}",
+        v.protection.detail
+    );
+    assert!(!v.protection.detail.contains("not ready yet"));
 }
 
 #[test]

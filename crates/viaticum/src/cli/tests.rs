@@ -279,12 +279,16 @@ fn open_prints_url_always_and_tunnel_when_headless() {
 fn dashboard_uses_status_verdict() {
     let dashboard = include_str!("../../../../web-ui/src/lib/Dashboard.svelte");
     assert!(
-        dashboard.contains("status.verdict.node.level"),
-        "Node card must use the server's verdict level"
+        dashboard.contains("class=\"card verdict verdict-{status.verdict.node.level}\""),
+        "Node card class must be the server's verdict level"
     );
     assert!(
-        dashboard.contains("status.verdict.protection.level"),
-        "Protection card must use the server's verdict level"
+        dashboard.contains("class=\"card verdict verdict-{status.verdict.protection.level}\""),
+        "Protection card class must be the server's verdict level"
+    );
+    assert!(
+        dashboard.contains("data-node-level={status.verdict.node.level}")
+            && dashboard.contains("data-protection-level={status.verdict.protection.level}")
     );
     assert!(dashboard.contains("status.verdict.node.headline"));
     assert!(dashboard.contains("status.verdict.protection.detail"));

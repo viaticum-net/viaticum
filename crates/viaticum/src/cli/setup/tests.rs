@@ -175,18 +175,20 @@ fn setup_never_prints_phrase_without_tty() {
 
 #[test]
 fn phrase_file_with_wide_mode_is_refused() {
-    assert!(check_phrase_file_mode(0o600).is_ok());
-    assert!(check_phrase_file_mode(0o400).is_ok());
-    assert!(check_phrase_file_mode(0o640).is_err());
-    assert!(check_phrase_file_mode(0o644).is_err());
+    let path = PathBuf::from("/home/friend/phrase");
+    assert!(check_phrase_file_mode(&path, 0o600).is_ok());
+    assert!(check_phrase_file_mode(&path, 0o400).is_ok());
+    assert!(check_phrase_file_mode(&path, 0o640).is_err());
+    assert!(check_phrase_file_mode(&path, 0o644).is_err());
     assert!(
-        check_phrase_file_mode(0o700).is_err(),
+        check_phrase_file_mode(&path, 0o700).is_err(),
         "execute bits are wider than 0600 too"
     );
 }
 
 /// F-Q: the quota is computed from the filesystem of the data directory's
 /// symlink target, not from the path prefix (N3).
+#[cfg(unix)]
 #[test]
 fn setup_quota_uses_statvfs_of_symlink_target() {
     let root = tempfile::tempdir().unwrap();

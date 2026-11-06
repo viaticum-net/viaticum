@@ -401,7 +401,10 @@ fn protection_verdict(i: &VerdictInputs) -> ProtectionVerdict {
         ProtectionReason::Repairing
     } else if i.blocks_waiting_for_space > 0 {
         ProtectionReason::WaitingForSpace
-    } else if i.blocks_in_flight > 0 {
+    } else if i.blocks_in_flight > 0 || (i.dr_ready && total > 0) {
+        // With `dr_ready` true the catalog is recoverable by phrase; what is
+        // left is the files still reaching their holders. Until СТ-1 provides
+        // the refusal counters, this is the honest i14 wording.
         ProtectionReason::Uploading
     } else {
         ProtectionReason::RecoveryNotReady
@@ -433,7 +436,7 @@ fn protection_verdict(i: &VerdictInputs) -> ProtectionVerdict {
         ),
         ProtectionReason::RecoveryNotReady | ProtectionReason::None => format!(
             "{pct}% of your files can be restored from the network. \
-             Recovery with your 24 words: not ready yet."
+             Recovery with your 24 words: {recovery}."
         ),
     };
     ProtectionVerdict {

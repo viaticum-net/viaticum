@@ -1479,42 +1479,39 @@ fn get_existing_holder_ids_excludes_alive_uncertain_presumed_lost() {
 /// `min_size` friends are online. A node that sees only the seed: one online
 /// candidate, three DB records → holder_pool = 1 (yellow), while the worker's
 /// fallback list has three.
-#[test]
-fn holder_pool_matches_worker_candidates() {
-    let all = vec![
-        HolderCandidate {
-            device_id: device_id(0x81),
-            trust: 0.9,
-        },
-        HolderCandidate {
-            device_id: device_id(0x82),
-            trust: 0.8,
-        },
-        HolderCandidate {
-            device_id: device_id(0x83),
-            trust: 0.7,
-        },
-    ];
-    let authenticated: std::collections::HashSet<DeviceId> =
-        [device_id(0x81)].into_iter().collect();
+#[tokio::test]
+async fn holder_pool_matches_worker_candidates() {
+    let db = make_db();
+    let peers = [device_id(0x81), device_id(0x82), device_id(0x83)];
+    add_pool_peers(&db, &peers);
+    let own_device = device_id(0x01);
+    let own_master = master_pub(0xAA);
 
-    let online = online_count(&all, &authenticated);
-    assert_eq!(online, 1, "only the seed is online");
-    // What the worker would place on with min_size = 2: the fallback (all 3).
-    let worker_candidates = all.clone();
+    // No authenticated peer: the worker's snapshot falls back to all DB
+    // records (3 candidates) — the verdict must NOT count them as online.
+    let pool = snapshot_pool(None, &db, None, &own_device, &own_master, 2).await;
     assert_eq!(
-        worker_candidates.len(),
+        pool.candidates.len(),
         3,
-        "the worker falls back to all DB peers"
+        "worker fallback sees three DB peers"
+    );
+    assert_eq!(
+        pool.online_count, 0,
+        "no authenticated peer means online_count = 0 (M9), not the fallback size"
     );
     assert_ne!(
-        online,
-        worker_candidates.len() as u32,
-        "the verdict must not count the fallback as online holders"
+        pool.online_count,
+        pool.candidates.len() as u32,
+        "the verdict must never count the fallback as holders online"
     );
 
-    let all_online: std::collections::HashSet<DeviceId> = all.iter().map(|c| c.device_id).collect();
-    assert_eq!(online_count(&all, &all_online), 3);
+    // One authenticated seed: exactly one online candidate, while the worker
+    // still falls back to all three.
+    let authenticated: std::collections::HashSet<DeviceId> = [peers[0]].into_iter().collect();
+    assert_eq!(online_count(&pool.candidates, &authenticated), 1);
+    let all_online: std::collections::HashSet<DeviceId> =
+        pool.candidates.iter().map(|c| c.device_id).collect();
+    assert_eq!(online_count(&pool.candidates, &all_online), 3);
 }
 
 // ─── snapshot_pool: sibling exclusion tests ───────────────────────────────────

@@ -143,6 +143,14 @@ async fn main() -> ExitCode {
             allow_root,
             json,
         } => {
+            // Setup logs go to stderr (its questions and the phrase grid are
+            // stdout); RUST_LOG=info is enough to see them. A log line that
+            // carries the phrase is a leak, and step 9 of local_setup_test
+            // scans this stream for one.
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .init();
             let opts = viaticum::cli::setup::SetupOptions {
                 data_dir: global_dir.clone(),
                 mode: *mode,

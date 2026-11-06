@@ -198,7 +198,9 @@ phrase_leaks() {
     read -r -a words <<< "$PHRASE1"
     for ((i = 0; i + 2 < ${#words[@]}; i++)); do
         triples="${words[i]} ${words[i+1]} ${words[i+2]}"
-        if grep -qF -- "$triples" <<< "$text"; then
+        local regex
+        regex=$(sed 's/ /[[:space:]]+/g' <<< "$triples")
+        if grep -qE -- "$regex" <<< "$text"; then
             echo "    leaked triple: ${triples}"
             return 0
         fi
@@ -253,10 +255,10 @@ WATCH_DIR="$FRIEND_DIR/files"
 mkdir -p "$WATCH_DIR"
 
 set +e
-OUT1=$(python3 "$(dirname "${BASH_SOURCE[0]}")/setup_pty.py" \
+OUT1=$(RUST_LOG=info python3 "$(dirname "${BASH_SOURCE[0]}")/setup_pty.py" \
     --binary "$BINARY" --data-dir "$FRIEND_DIR" --watch "$WATCH_DIR" \
-    --stop-at-check --timeout 180 -- \
-    --mode new --seed "$ADDR_00" 2>&1)
+    --stop-at-check --timeout 180 --stderr-file "$TEST_DIR/logs/setup-1.err" -- \
+    --seed "$ADDR_00" 2>&1)
 RC1=$?
 set -e
 PHRASE1=$(grid_phrase "$OUT1")
@@ -290,10 +292,10 @@ KEY_MODE1=$(stat -c %a "$FRIEND_DIR/identity.key")
 echo ""
 echo "=== Step 2: re-run shows the same phrase; one wrong word; then success ==="
 set +e
-OUT2=$(python3 "$(dirname "${BASH_SOURCE[0]}")/setup_pty.py" \
+OUT2=$(RUST_LOG=info python3 "$(dirname "${BASH_SOURCE[0]}")/setup_pty.py" \
     --binary "$BINARY" --data-dir "$FRIEND_DIR" --watch "$WATCH_DIR" \
     --wrong-once --timeout 240 -- \
-    --mode new --seed "$ADDR_00" --json 2>&1)
+    --seed "$ADDR_00" --json 2>&1)
 RC2=$?
 set -e
 PHRASE2=$(grid_phrase "$OUT2")
@@ -302,8 +304,17 @@ IDENTITY2=$(jq -r '.identity_pub // empty' <<< "${REPORT:-{}}" 2>/dev/null || tr
 if [ "$RC2" -eq 0 ]; then
     pass "setup finished after the right words (exit 0)"
 else
-    fail "setup exited $RC2 after the right words"
-    tail -40 <<< "$OUT2" | sed 's/^/    | /'
+    fail "setup exited $RC2 after the right words (details hidden: the transcript holds the phrase)"
+fi
+if grep -q "Word #[0-9]*?" <<< "$OUT2"; then
+    pass "the check really asked for words by position (M3)"
+else
+    fail "the pty transcript has no 'Word #N?' prompt: the check may be skipped (M3)"
+fi
+if grep -q "does not match" <<< "$OUT2"; then
+    pass "the one wrong word was rejected and asked again"
+else
+    fail "the one wrong word produced no retry"
 fi
 if [ "$PHRASE1" = "$PHRASE2" ] && [ -n "$PHRASE2" ]; then
     pass "the re-run showed the same 24 words"
@@ -375,6 +386,7 @@ else
     fail "setup --mode new without --yes: rc=$RC_NOTTY, identity=$( [ -e "$NONTTY/identity.key" ] && echo yes || echo no )"
 fi
 
+rm -f "$PHRASE_CONFIRMED"
 set +e
 OUT_YES=$("$BINARY" --data-dir "$FRIEND_DIR" setup --mode new --yes < /dev/null 2>&1)
 RC_YES=$?
@@ -388,6 +400,31 @@ if phrase_leaks "$OUT_YES"; then
     fail "setup --yes printed three consecutive phrase words"
 else
     pass "setup --yes printed no three consecutive phrase words"
+fi
+if [ ! -e "$PHRASE_CONFIRMED" ]; then
+    pass "without a tty the phrase is not confirmed (M3″)"
+else
+    fail "without a tty setup wrote phrase-confirmed"
+fi
+# `phrase check` with stdin answers writes the marker back (install-i2).
+read -r -a PHRASE_WORDS <<< "$PHRASE1"
+printf '%s\n%s\n%s\n' "${PHRASE_WORDS[0]}" "${PHRASE_WORDS[1]}" "${PHRASE_WORDS[2]}" \
+    | "$BINARY" --data-dir "$FRIEND_DIR" phrase check --positions 1,2,3 > "$TEST_DIR/logs/phrase-check.out" 2>&1
+if [ -f "$PHRASE_CONFIRMED" ]; then
+    pass "phrase check with stdin answers writes phrase-confirmed"
+else
+    fail "phrase check did not write phrase-confirmed"
+fi
+# `phrase show` without a tty must refuse and print nothing.
+set +e
+"$BINARY" --data-dir "$FRIEND_DIR" phrase show \
+    > "$TEST_DIR/logs/phrase-show.stdout" 2> "$TEST_DIR/logs/phrase-show.stderr"
+RC_SHOW=$?
+set -e
+if [ "$RC_SHOW" -ne 0 ] && [ ! -s "$TEST_DIR/logs/phrase-show.stdout" ]; then
+    pass "phrase show refuses outside a tty and prints nothing on stdout"
+else
+    fail "phrase show outside a tty: rc=$RC_SHOW, $(wc -c < "$TEST_DIR/logs/phrase-show.stdout") bytes on stdout"
 fi
 
 NONTTY_RESTORE="$TEST_DIR/nontty-restore"
@@ -404,7 +441,7 @@ else
 fi
 
 phrase_file_unused="$PHASE_DIR/wide-mode-$$"
-printf '%s\n' "$PHRASE1" > "$phrase_file_unused"
+printf '%s\n' "this is not a phrase and must never be read" > "$phrase_file_unused"
 chmod 0644 "$phrase_file_unused"
 set +e
 "$BINARY" --data-dir "$NONTTY_RESTORE" setup --mode restore \
@@ -454,6 +491,7 @@ for i in 1 2 3; do
 done
 wait_auth_peers 0 3 90 || fail "H0 does not see H1..H3 after the restart"
 for i in 1 2 3; do run_cli_q "$FRIEND" connect "${ADDR[$i]}" > /dev/null; done
+wait_auth_peers "$FRIEND" 4 240 || fail "the friend did not authenticate all four hosts"
 if wait_level green 240; then
     pass "with all four hosts the node verdict is green"
 else
@@ -559,6 +597,13 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
 done
 [ "$DR_OK" -eq 1 ] && pass "dr_ready is true (recovery by phrase)" \
     || fail "dr_ready stayed false for 900 s"
+if [ "$FILES_READY" -eq 1 ] && [ "$(friend_protection_level)" = "green" ]; then
+    pass "protection is green with 3 files at 100% (scan_settled true, T10)"
+elif [ "$FILES_READY" -eq 1 ]; then
+    fail "protection is '$(friend_protection_level)' with 3 files at 100%: scan_settled never became true"
+else
+    fail "protection green is not proven: the files never became restorable"
+fi
 
 # ── STEP 8: MACHINE LOST; RESTORE BY PHRASE ───────────────────────────────────
 echo ""
@@ -639,17 +684,24 @@ read -r -a PHRASE_WORDS <<< "$PHRASE1"
 LEAK=""
 for ((i = 0; i + 2 < ${#PHRASE_WORDS[@]}; i++)); do
     triple="${PHRASE_WORDS[i]} ${PHRASE_WORDS[i+1]} ${PHRASE_WORDS[i+2]}"
-    hit=$(grep -ralF --exclude=identity.key -- "$triple" "$TEST_DIR" 2>/dev/null || true)
+    regex=$(sed 's/ /[[:space:]]+/g' <<< "$triple")
+    hit=$(grep -ralE --exclude=identity.key -- "$regex" "$TEST_DIR" 2>/dev/null || true)
     if [ -n "$hit" ]; then
         LEAK="$triple in $hit"
         break
     fi
 done
 if [ -z "$LEAK" ]; then
-    pass "no three consecutive phrase words in logs, captures or config (identity.key excluded)"
+    pass "no three consecutive phrase words in logs, config or files (identity.key excluded)"
 else
     fail "phrase leak: $LEAK"
 fi
+for capture in "$OUT_YES" "$RESTORE_SETUP_OUT" "$OPEN_OUT"; do
+    if [ -n "$capture" ] && phrase_leaks "$capture"; then
+        fail "phrase leak in a non-tty captured stdout/stderr stream"
+    fi
+done
+pass "non-tty CLI captures hold no three consecutive phrase words"
 # Positive control: the scanner really reads the logs (a known daemon line).
 if grep -qa "daemon started" "$(node_log 0)" 2>/dev/null; then
     pass "the leak scanner's corpus contains the daemons' logs"

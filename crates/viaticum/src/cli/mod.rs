@@ -60,11 +60,11 @@ pub fn render_init_output(
 /// `dr --mnemonic` / `init --mnemonic` without a value, so the phrase never
 /// lands in shell history or `ps` (install-i2).
 pub fn read_phrase_stdin() -> Result<String, CliError> {
-    let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .map_err(|e| CliError::InvalidArgument(format!("cannot read the recovery phrase: {e}")))?;
-    let phrase = line.trim().to_string();
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    let phrase = read_phrase_line(&mut stdin)
+        .map_err(|e| CliError::InvalidArgument(format!("cannot read the recovery phrase: {e}")))?
+        .unwrap_or_default();
     if phrase.is_empty() {
         return Err(CliError::InvalidArgument(
             "the recovery phrase is empty (stdin closed?)".into(),
