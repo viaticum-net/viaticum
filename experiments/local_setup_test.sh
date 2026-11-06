@@ -194,13 +194,13 @@ grid_phrase() {
 
 # True when no three consecutive words of PHRASE occur in TEXT.
 phrase_leaks() {
-    local text="$1" words triples i
+    local text="$1" words triples i norm
+    # Normalize the grid form too: "1. word 2. word" becomes "word word".
+    norm=$(sed -E 's/[0-9]{1,2}\.[[:space:]]*//g' <<< "$text" | tr -s '[:space:]' ' ')
     read -r -a words <<< "$PHRASE1"
     for ((i = 0; i + 2 < ${#words[@]}; i++)); do
         triples="${words[i]} ${words[i+1]} ${words[i+2]}"
-        local regex
-        regex=$(sed 's/ /[[:space:]]+/g' <<< "$triples")
-        if grep -qE -- "$regex" <<< "$text"; then
+        if grep -qF -- "$triples" <<< "$norm"; then
             echo "    leaked triple: ${triples}"
             return 0
         fi
@@ -681,13 +681,17 @@ fi
 echo ""
 echo "=== Step 9: no three consecutive phrase words under the run dir ==="
 read -r -a PHRASE_WORDS <<< "$PHRASE1"
+LEAK_CORPUS="$TEST_DIR/logs/leak-corpus.txt"
+: > "$LEAK_CORPUS"
+while IFS= read -r -d '' f; do
+    sed -E 's/[0-9]{1,2}\.[[:space:]]*//g' "$f" 2>/dev/null >> "$LEAK_CORPUS" || true
+    echo >> "$LEAK_CORPUS"
+done < <(find "$TEST_DIR" -type f ! -name identity.key ! -path "$LEAK_CORPUS" -print0)
 LEAK=""
 for ((i = 0; i + 2 < ${#PHRASE_WORDS[@]}; i++)); do
     triple="${PHRASE_WORDS[i]} ${PHRASE_WORDS[i+1]} ${PHRASE_WORDS[i+2]}"
-    regex=$(sed 's/ /[[:space:]]+/g' <<< "$triple")
-    hit=$(grep -ralE --exclude=identity.key -- "$regex" "$TEST_DIR" 2>/dev/null || true)
-    if [ -n "$hit" ]; then
-        LEAK="$triple in $hit"
+    if tr -s '[:space:]' ' ' < "$LEAK_CORPUS" | grep -qF -- "$triple"; then
+        LEAK="$triple"
         break
     fi
 done
