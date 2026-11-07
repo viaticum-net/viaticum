@@ -127,19 +127,6 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
         .as_ref()
         .map(|set| net_status::devices_hex8_sorted(set.iter()));
     let auth_devices = auth_snapshot.unwrap_or_default();
-    // install-i4 / A11: the network check counts the SAME placement candidates
-    // as the worker, with the "few authenticated peers" fallback excluded. A
-    // node that knows about offline peers but sees only the seed is yellow.
-    let holder_pool = snapshot_pool(
-        state.swarm_handle.as_deref(),
-        &state.db,
-        Some(state.peer_backoff.as_ref()),
-        &state.device_id,
-        &state.identity_pub,
-        2,
-    )
-    .await
-    .online_count;
     // install-i14 / T10: folders and the watcher's startup signal.
     let (folders_total, folders_error, scan_settled) = match state.watch_admin.as_ref() {
         Some(admin) => {
@@ -376,53 +363,18 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
     let mut dr = dr_readiness(&state.db, Timestamp::now().0, state.time_scale);
     dr.files_without_source = state.missing_sources.get(&state.db).await;
 
-    // install-i14: "the latest version of each file is in Restorable" — the
-    // same owner-side status `viaticum files` shows, counted once here.
-    let mut files_restorable = 0u32;
-    let mut files_degraded = 0u32;
-    for f in &files {
-        let Some(latest) = f.versions.last() else {
-            continue;
-        };
-        match compute_effective_status(state, latest) {
-            EffectiveStatus::Restorable { .. } => files_restorable += 1,
-            EffectiveStatus::Degraded { .. } => files_degraded += 1,
-            _ => {}
-        }
-    }
-    let supervisor = crate::daemon::dispatch::verdict::Supervisor::from_env();
-    let linger = if supervisor == crate::daemon::dispatch::verdict::Supervisor::SystemdUser {
-        crate::daemon::dispatch::verdict::systemd_user_linger()
-    } else {
-        None
-    };
-    let verdict = crate::daemon::dispatch::verdict::compute_verdict(
-        &crate::daemon::dispatch::verdict::VerdictInputs {
-            supervisor,
-            linger,
-            uptime_secs: state.started_at.elapsed().as_secs(),
-            peers_authenticated: peer_count_authenticated,
-            holder_pool,
-            folders_total,
-            folders_error,
-            scan_settled,
-            files_total: files.len() as u32,
-            files_restorable,
-            files_degraded,
-            // ST-1 is not in this tree: no counter to read yet. The inputs stay
-            // wired so the merge is one assignment (brief: comment it here).
-            blocks_waiting_for_space: 0,
-            blocks_in_flight: 0,
-            dr_ready: dr.ready,
-            phrase_confirmed: crate::cli::phrase::is_confirmed(&state.data_dir),
-            effective_quota_bytes,
-            // R1-b3 `health` is not in a2: no check exists, and the verdict does
-            // not pretend one does (node_check omits Health for `None`).
-            health_state: None,
-            // `relay_limited` has no producer in a2.
-            reachability: None,
-        },
-    );
+    let inputs = verdict_inputs(
+        state,
+        peer_count_authenticated,
+        folders_total,
+        folders_error,
+        scan_settled,
+        &files,
+        dr.ready,
+        effective_quota_bytes,
+    )
+    .await;
+    let verdict = crate::daemon::dispatch::verdict::compute_verdict(&inputs);
 
     CliResponse::Status(Box::new(StatusData {
         daemon_version: crate::build_info::build_id().to_string(),
@@ -504,6 +456,91 @@ pub(crate) async fn dispatch_status(state: &DaemonState) -> CliResponse {
                 revoked: s.revoked,
             }),
     }))
+}
+
+/// The daemon's own verdict inputs: the holder pool from the SAME function the
+/// worker places on (fallback excluded), and the per-file counts from the same
+/// owner-side status `viaticum files` shows. Extracted so a unit can feed it a
+/// real `DaemonState`/DB instead of a hand-made `VerdictInputs`.
+#[allow(clippy::too_many_arguments)]
+async fn verdict_inputs(
+    state: &DaemonState,
+    peers_authenticated: u32,
+    folders_total: u32,
+    folders_error: u32,
+    scan_settled: bool,
+    files: &[FileRecord],
+    dr_ready: bool,
+    effective_quota_bytes: u64,
+) -> crate::daemon::dispatch::verdict::VerdictInputs {
+    // install-i4 / A11: the network check counts the SAME placement candidates
+    // as the worker, with the "few authenticated peers" fallback excluded. A
+    // node that knows about offline peers but sees only the seed is yellow.
+    let holder_pool = snapshot_pool(
+        state.swarm_handle.as_deref(),
+        &state.db,
+        Some(state.peer_backoff.as_ref()),
+        &state.device_id,
+        &state.identity_pub,
+        2,
+    )
+    .await
+    .online_count;
+
+    // install-i14: "the latest version of each file is in Restorable" — the
+    // same owner-side status `viaticum files` shows, counted once here. Files
+    // whose latest version is Queued or Replicating are the daemon's real
+    // "in flight" source until СТ-1 provides refusal counters (the ST-1
+    // reasons are not in this tree); this is what makes a newcomer hear
+    // "normal for a new node" instead of "recovery not ready".
+    let mut files_restorable = 0u32;
+    let mut files_degraded = 0u32;
+    let mut blocks_in_flight = 0u32;
+    for f in files {
+        let Some(latest) = f.versions.last() else {
+            continue;
+        };
+        match compute_effective_status(state, latest) {
+            EffectiveStatus::Restorable { .. } => files_restorable += 1,
+            EffectiveStatus::Degraded { .. } => files_degraded += 1,
+            EffectiveStatus::Queued | EffectiveStatus::Replicating { .. } => {
+                blocks_in_flight += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let supervisor = crate::daemon::dispatch::verdict::Supervisor::from_env();
+    let linger = if supervisor == crate::daemon::dispatch::verdict::Supervisor::SystemdUser {
+        crate::daemon::dispatch::verdict::systemd_user_linger()
+    } else {
+        None
+    };
+    crate::daemon::dispatch::verdict::VerdictInputs {
+        supervisor,
+        linger,
+        uptime_secs: state.started_at.elapsed().as_secs(),
+        peers_authenticated,
+        holder_pool,
+        folders_total,
+        folders_error,
+        scan_settled,
+        files_total: files.len() as u32,
+        files_restorable,
+        files_degraded,
+        // ST-1 is not in this tree: no counter to read yet. The inputs stay
+        // wired so the merge is one assignment (brief: comment it here).
+        blocks_waiting_for_space: 0,
+        blocks_in_flight,
+        dr_ready,
+        phrase_confirmed: crate::cli::phrase::is_confirmed(&state.data_dir),
+        effective_quota_bytes,
+        // R1-b3 `health` is not in a2: no check exists, and the verdict does
+        // not pretend one does (node_check omits Health for `None`).
+        health_state: None,
+        // `relay_limited` has no producer in a2.
+        reachability: None,
+    }
 }
 
 /// repair-i8 ceiling: blocks the worker found out of ESI numbers that are still in service.
