@@ -16,6 +16,16 @@ fn parse(args: &[&str]) -> Command {
     Cli::parse_from(args).command
 }
 
+/// B1/F1: interactive means both ends are a terminal. `setup | tee` and a
+/// browser/CI capture are stdin-tty/stdout-pipe and must not be interactive.
+#[test]
+fn is_interactive_requires_both_ends() {
+    assert!(super::is_interactive(true, true));
+    assert!(!super::is_interactive(true, false));
+    assert!(!super::is_interactive(false, true));
+    assert!(!super::is_interactive(false, false));
+}
+
 #[test]
 fn command_status_parses_correctly() {
     assert!(matches!(

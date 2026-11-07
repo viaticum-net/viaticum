@@ -71,9 +71,9 @@ pub enum SetupError {
     #[error("watch folder does not exist or is not a directory: {0}")]
     FolderMissing(PathBuf),
     #[error(
-        "{0} already holds a Viaticum identity: restore would replace a live node. Use \
-         another --data-dir, or remove this one with `viaticum --uninstall --purge` \
-         (after the phrase is confirmed). Nothing was changed."
+        "{0} already holds a Viaticum identity: restore would replace a live node. \
+         To finish setting up this machine, run `viaticum setup --mode new`; it keeps \
+         the existing identity and completes the config. Nothing was changed."
     )]
     DataDirHasIdentity(PathBuf),
     #[error(
@@ -127,10 +127,21 @@ const NEXT_RESTORE: &str =
 
 /// `setup` entry point. Local only: no daemon, no service (R3c owns those).
 pub async fn run_setup(opts: SetupOptions) -> Result<SetupReport, SetupError> {
+    run_setup_with_ttys(opts, io::stdin().is_terminal(), io::stdout().is_terminal()).await
+}
+
+/// The same entry point with the two tty facts passed in, so a unit can drive
+/// the half-tty case (`setup | tee`) through the real `run_new`/`run_restore`
+/// code instead of testing the grid helper.
+async fn run_setup_with_ttys(
+    opts: SetupOptions,
+    stdin_tty: bool,
+    stdout_tty: bool,
+) -> Result<SetupReport, SetupError> {
     if root_refused(euid(), opts.allow_root) {
         return Err(SetupError::Root);
     }
-    let tty = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let tty = crate::cli::is_interactive(stdin_tty, stdout_tty);
     let ui = Ui { json: opts.json };
     let mode = match opts.mode {
         Some(m) => m,
@@ -150,12 +161,17 @@ async fn run_new(opts: SetupOptions, tty: bool, ui: Ui) -> Result<SetupReport, S
     if !tty && !opts.yes {
         return Err(SetupError::NoTty);
     }
+    // Validate everything that would leave a half-written node before the
+    // identity and the phrase exist (the same rule restore now follows).
+    let seeds = validated_seeds(&opts.seed)?;
     let watch = resolve_watch(&opts, tty, &ui, None)?;
     let (free, size) = free_and_size(&opts.data_dir);
     let quota = resolve_quota(&opts, free, tty, &ui)?;
     let reserve = size.map(default_reserve_gb).unwrap_or(2.0);
     warn_if_quota_over_room(&ui, free, quota, reserve);
 
+    // A re-run must keep the ports the first run wrote (install-i9, NOTE 2).
+    let config_existed = opts.data_dir.join(CONFIG_FILE_NAME).is_file();
     let keyfile = if opts.data_dir.join(KEYFILE_NAME).exists() {
         load_identity(&opts.data_dir)?
     } else {
@@ -187,7 +203,16 @@ async fn run_new(opts: SetupOptions, tty: bool, ui: Ui) -> Result<SetupReport, S
         crate::cli::phrase::mark_confirmed(&opts.data_dir)?;
     }
 
-    finish(SetupMode::New, &opts, &watch, quota, reserve, &ui)
+    finish(
+        SetupMode::New,
+        &opts,
+        &watch,
+        quota,
+        reserve,
+        seeds,
+        &ui,
+        config_existed,
+    )
 }
 
 async fn run_restore(opts: SetupOptions, tty: bool, ui: Ui) -> Result<SetupReport, SetupError> {
@@ -200,6 +225,29 @@ async fn run_restore(opts: SetupOptions, tty: bool, ui: Ui) -> Result<SetupRepor
         None if tty => ask_phrase(&ui)?,
         None => return Err(SetupError::NoTty),
     };
+    // Everything the finish step would reject is checked BEFORE `run_dr`:
+    // once DR has committed, a `FolderMissing`/bad seed/invalid quota leaves an
+    // identity and no usable config, and `--mode restore` refuses to run again
+    // (W1, install-i13).
+    let seeds_for_config = validated_seeds(&opts.seed)?;
+    let prepared_watch = if opts.watch.is_empty() {
+        None
+    } else {
+        // Files come back into staging, so the folder may not exist on the new
+        // machine yet: create it 0700 instead of failing after the commit.
+        Some(ensure_watch_dirs(opts.watch.clone())?)
+    };
+    let prepared_quota = if let Some(q) = opts.quota_gb {
+        validate_quota(q)?;
+        Some(q)
+    } else if !tty {
+        let (free, _) = free_and_size(&opts.data_dir);
+        Some(resolve_quota(&opts, free, false, &ui)?)
+    } else {
+        None
+    };
+    let config_existed = opts.data_dir.join(CONFIG_FILE_NAME).is_file();
+
     let seeds = if opts.seed.is_empty() {
         viaticum_core::constants::DEFAULT_SEEDS
             .iter()
@@ -220,22 +268,39 @@ async fn run_restore(opts: SetupOptions, tty: bool, ui: Ui) -> Result<SetupRepor
     crate::cli::phrase::mark_confirmed(&opts.data_dir)?;
     write_default_config_if_absent(&opts.data_dir)?;
 
-    let catalog_roots = catalog_watch_roots(&opts.data_dir);
-    let watch = resolve_watch(&opts, tty, &ui, catalog_roots)?;
+    let watch = match prepared_watch {
+        Some(paths) => paths,
+        None => resolve_watch(&opts, tty, &ui, catalog_watch_roots(&opts.data_dir))?,
+    };
     let (free, size) = free_and_size(&opts.data_dir);
-    let quota = resolve_quota(&opts, free, tty, &ui)?;
+    let quota = match prepared_quota {
+        Some(q) => q,
+        None => resolve_quota(&opts, free, tty, &ui)?,
+    };
     let reserve = size.map(default_reserve_gb).unwrap_or(2.0);
     warn_if_quota_over_room(&ui, free, quota, reserve);
-    finish(SetupMode::Restore, &opts, &watch, quota, reserve, &ui)
+    finish(
+        SetupMode::Restore,
+        &opts,
+        &watch,
+        quota,
+        reserve,
+        seeds_for_config,
+        &ui,
+        config_existed,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish(
     mode: SetupMode,
     opts: &SetupOptions,
     watch: &[PathBuf],
     quota: f64,
     reserve: f64,
+    seeds: Option<Vec<String>>,
     ui: &Ui,
+    config_existed: bool,
 ) -> Result<SetupReport, SetupError> {
     let config_path = opts.data_dir.join(CONFIG_FILE_NAME);
     let config_text = std::fs::read_to_string(&config_path)?;
@@ -244,19 +309,7 @@ fn finish(
         .network
         .listen_port;
     let existing_web_port = existing_web_port(&config_text).unwrap_or(0);
-    let web_port = choose_web_port(existing_web_port, listen_port);
-    let seeds = if opts.seed.is_empty() {
-        None
-    } else {
-        for seed in &opts.seed {
-            if !seed.starts_with('/') || !seed.contains("/p2p/") {
-                return Err(SetupError::Toml(format!(
-                    "--seed {seed} is not a multiaddr with /p2p/<peer id>"
-                )));
-            }
-        }
-        Some(opts.seed.clone())
-    };
+    let web_port = choose_web_port(existing_web_port, listen_port, config_existed);
     let answers = SetupAnswers {
         watch: watch.to_vec(),
         quota_gb: quota,
@@ -363,12 +416,21 @@ fn ask_mode(ui: &Ui) -> Result<SetupMode, SetupError> {
         "  2) Restore from my 24 words — the old machine is gone; bring its catalog back first.",
     );
     loop {
-        let answer = ui.ask("Choose 1 or 2 [1]: ")?;
-        match answer.as_str() {
-            "" | "1" | "new" | "n" => return Ok(SetupMode::New),
-            "2" | "restore" | "r" => return Ok(SetupMode::Restore),
-            _ => ui.say("Please answer 1 (new installation) or 2 (restore from 24 words)."),
+        let answer = ui.ask("Choose 1 or 2: ")?;
+        if let Some(mode) = parse_mode_answer(&answer) {
+            return Ok(mode);
         }
+        // No default: an empty Enter (and a typo) re-asks (NOTE 6, pre-mortem 13).
+        ui.say("Please answer 1 (new installation) or 2 (restore from 24 words).");
+    }
+}
+
+/// The mode question has no default: an empty line is not an answer (NOTE 6).
+fn parse_mode_answer(answer: &str) -> Option<SetupMode> {
+    match answer {
+        "1" | "new" | "n" => Some(SetupMode::New),
+        "2" | "restore" | "r" => Some(SetupMode::Restore),
+        _ => None,
     }
 }
 
@@ -456,6 +518,54 @@ fn absolute_path(path: PathBuf) -> PathBuf {
     } else {
         std::path::absolute(&path).unwrap_or(path)
     }
+}
+
+/// Restore preflight: a watch folder that does not exist yet is where the
+/// recovered files will land, so create it (0700) instead of failing after
+/// `run_dr` has committed the identity (W1, install-i13).
+fn ensure_watch_dirs(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, SetupError> {
+    let mut out = Vec::new();
+    for path in paths {
+        let path = absolute_path(path);
+        if !path.is_dir() {
+            create_private_dir(&path)?;
+        }
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
+/// `--seed` is written into the config: refuse a value the daemon would not
+/// parse. Called before the identity and before DR (W1).
+fn validated_seeds(seeds: &[String]) -> Result<Option<Vec<String>>, SetupError> {
+    if seeds.is_empty() {
+        return Ok(None);
+    }
+    for seed in seeds {
+        if !seed.starts_with('/') || !seed.contains("/p2p/") {
+            return Err(SetupError::Toml(format!(
+                "--seed {seed} is not a multiaddr with /p2p/<peer id>"
+            )));
+        }
+    }
+    Ok(Some(seeds.to_vec()))
 }
 
 /// Directories a friend is likely to want: only those that exist right now.
@@ -595,8 +705,9 @@ pub fn free_and_size(data_dir: &Path) -> (Option<u64>, Option<u64>) {
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 /// Apply setup answers to the `init` template with `toml_edit`, preserving
-/// comments. Idempotent: applying the same answers twice yields the same text
-/// and never duplicates `[[watch]]` (install-i3).
+/// comments. Re-runs merge `[[watch]]` instead of replacing the array: a
+/// folder that stays keeps its other keys (`importance_multiplier`) and its
+/// decor, so a hand-edited config is not reset (NOTE 3, install-i3).
 pub fn apply_setup_to_config(toml_text: &str, a: &SetupAnswers) -> Result<String, SetupError> {
     let mut doc: toml_edit::DocumentMut = toml_text
         .parse()
@@ -621,14 +732,34 @@ pub fn apply_setup_to_config(toml_text: &str, a: &SetupAnswers) -> Result<String
         web["bind"] = toml_edit::value(format!("127.0.0.1:{}", a.web_port));
     }
 
+    let existing = doc
+        .get("watch")
+        .and_then(|item| item.as_array_of_tables())
+        .cloned();
     let mut watches = toml_edit::ArrayOfTables::new();
     for path in &a.watch {
-        let mut table = toml_edit::Table::new();
-        table["path"] = toml_edit::value(path.to_string_lossy().to_string());
+        let wanted = path.to_string_lossy();
+        let table = existing
+            .as_ref()
+            .and_then(|array| {
+                array
+                    .iter()
+                    .find(|t| t.get("path").and_then(|p| p.as_str()) == Some(wanted.as_ref()))
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                let mut table = toml_edit::Table::new();
+                table["path"] = toml_edit::value(wanted.to_string());
+                table
+            });
         watches.push(table);
     }
-    doc.remove("watch");
-    if !watches.is_empty() {
+    // Replacing the key in place (or inserting it once) keeps the `[web_api]`
+    // trailing `# bind = …` hint where it was; `remove` + `insert` moved it
+    // under `[[watch]]` (NOTE 3).
+    if watches.is_empty() {
+        doc.remove("watch");
+    } else {
         doc.insert("watch", toml_edit::Item::ArrayOfTables(watches));
     }
     Ok(doc.to_string())
@@ -668,25 +799,48 @@ fn existing_web_port(toml_text: &str) -> Option<u16> {
 }
 
 /// 7383 when it is free and not the libp2p port, else a random free TCP port on
-/// loopback that differs from the libp2p one (two users on one machine). An
-/// existing non-default web port is never rewritten (R3b brief).
-pub fn choose_web_port(existing: u16, listen_port: u16) -> u16 {
+/// loopback that differs from the libp2p one (two users on one machine). Once
+/// a config exists, its port is kept even if it is busy now — usually the
+/// node's own daemon holds it (install-i9, NOTE 2). The libp2p `listen_port`
+/// is never rewritten here either.
+pub fn choose_web_port(existing: u16, listen_port: u16, keep_existing: bool) -> u16 {
+    use crate::daemon::network::listen_port::{PortProtocols, pick_listen_port};
+    choose_web_port_with(
+        existing,
+        listen_port,
+        keep_existing,
+        tcp_free_on_loopback,
+        |exclude| {
+            let local = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+            pick_listen_port(
+                viaticum_core::constants::LISTEN_PORT_RANGE,
+                exclude,
+                PortProtocols::Tcp,
+                local,
+            )
+        },
+    )
+}
+
+fn choose_web_port_with<F, P>(
+    existing: u16,
+    listen_port: u16,
+    keep_existing: bool,
+    default_is_free: F,
+    pick: P,
+) -> u16
+where
+    F: Fn(u16) -> bool,
+    P: Fn(&[u16]) -> Option<u16>,
+{
     let default = crate::daemon::identity::DEFAULT_WEB_PORT;
-    if existing != 0 && existing != default && existing != listen_port {
+    if existing != 0 && existing != listen_port && (keep_existing || existing != default) {
         return existing;
     }
-    if existing == default && listen_port != default && tcp_free_on_loopback(default) {
+    if existing == default && listen_port != default && default_is_free(default) {
         return default;
     }
-    use crate::daemon::network::listen_port::{PortProtocols, pick_listen_port};
-    let local = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-    pick_listen_port(
-        viaticum_core::constants::LISTEN_PORT_RANGE,
-        &[listen_port, default],
-        PortProtocols::Tcp,
-        local,
-    )
-    .unwrap_or(default)
+    pick(&[listen_port, default]).unwrap_or(default)
 }
 
 fn tcp_free_on_loopback(port: u16) -> bool {
