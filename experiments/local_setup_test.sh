@@ -675,11 +675,19 @@ DR_OK=0
 DEADLINE=$(( $(date +%s) + 900 ))
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     protection_poll || break
-    if [ "$(status_num "$FRIEND" dr_ready)" = "true" ]; then DR_OK=1; break; fi
+    # dr_ready alone is not enough for the crash below: the pointer must also
+    # name the three files, otherwise DR on the new machine restores an empty
+    # catalog and the failure looks like a restore bug (it is a publication
+    # timing gap). This is the bar the scenario actually needs.
+    if [ "$(status_num "$FRIEND" dr_ready)" = "true" ] \
+        && [ "$(status_num "$FRIEND" dr_pointer_files)" -ge 3 ]; then
+        DR_OK=1
+        break
+    fi
     sleep 5
 done
-[ "$DR_OK" -eq 1 ] && pass "dr_ready is true (recovery by phrase)" \
-    || fail "dr_ready stayed false for 900 s"
+[ "$DR_OK" -eq 1 ] && pass "dr_ready is true and the pointer names all 3 files (recovery by phrase)" \
+    || fail "dr_ready/pointer stayed incomplete for 900 s (ready=$(status_num "$FRIEND" dr_ready), files=$(status_num "$FRIEND" dr_pointer_files))"
 if [ "$FILES_READY" -eq 1 ] && [ "$(friend_protection_level)" = "green" ]; then
     pass "protection is green with 3 files at 100% (scan_settled true, T10)"
 elif [ "$FILES_READY" -eq 1 ]; then
