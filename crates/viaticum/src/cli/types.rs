@@ -10,7 +10,7 @@ pub enum CliRequest {
         version: Option<u32>,
         /// ISO-8601 date string, e.g. "2026-01-15". None = latest.
         date: Option<String>,
-        /// Destination path override. None = restore in place.
+        /// Accepted for older scripts; the daemon always restores into staging.
         dest: Option<String>,
     },
     DeviceList,
@@ -37,7 +37,7 @@ pub enum CliRequest {
     RestoreJobList,
     /// Connect to a peer by node address string.
     Connect {
-        /// Node address of the peer (format: <device_id_hex>@<ip>:<port>).
+        /// Node address of the peer (libp2p multiaddr, e.g. /ip4/1.2.3.4/tcp/4500/p2p/<peer id>).
         addr: String,
     },
     /// Test-only (`net-probe disconnect`, C-DK Р-16): close every connection to

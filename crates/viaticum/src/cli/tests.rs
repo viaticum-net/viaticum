@@ -2250,3 +2250,193 @@ fn status_json_without_daemon_version_decodes_as_empty() {
     let data: StatusData = serde_json::from_value(v).expect("decode without the field");
     assert_eq!(data.daemon_version, "");
 }
+
+// ============================================================
+// Public docs (install-i10)
+// ============================================================
+
+/// Phrases the public docs and UI must not teach (install-i10).
+const FORBIDDEN_IN_DOCS: &[&str] = &[
+    "--watch ",
+    "@<ip>",
+    "--dest",
+    "in place",
+    "safe to delete",
+    "~/.viaticum",
+    "--mnemonic \"",
+];
+
+/// A doc line as argv for `Cli::try_parse_from`.
+///
+/// Placeholder rule: `<name>` (no spaces inside) becomes `name`, so
+/// `viaticum connect <multiaddr>` parses as `viaticum connect multiaddr`.
+/// A ` # …` tail is a doc comment. Quotes are dropped before splitting, so
+/// `viaticum device add "laptop"` parses as two arguments. The leading path
+/// (`./target/release/viaticum`) becomes plain `viaticum`.
+fn doc_argv(line: &str) -> Vec<String> {
+    let mut filled = String::new();
+    let mut rest = line;
+    while let Some(open) = rest.find('<') {
+        filled.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find('>') {
+            Some(close) => {
+                filled.push_str(&after[..close]);
+                rest = &after[close + 1..];
+            }
+            None => {
+                filled.push_str(&rest[open..]);
+                rest = "";
+                break;
+            }
+        }
+    }
+    filled.push_str(rest);
+
+    let text = filled.split(" #").next().unwrap_or("").trim();
+    let text = text.replace(['"', '\''], "");
+    let mut argv: Vec<String> = text.split_whitespace().map(str::to_string).collect();
+    if let Some(first) = argv.first_mut() {
+        let file = first.rsplit('/').next().unwrap_or(first.as_str());
+        if file == "viaticum" {
+            *first = "viaticum".to_string();
+        }
+    }
+    argv
+}
+
+fn is_viaticum_command(line: &str) -> bool {
+    line.starts_with("viaticum ") || line.starts_with("$ viaticum ") || line.contains("/viaticum ")
+}
+
+/// `viaticum …` lines inside Markdown fenced code blocks.
+fn fenced_commands(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            let line = line.trim();
+            if is_viaticum_command(line) {
+                out.push(line.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `viaticum …` inside `<code>…</code>` spans of the Svelte sources.
+fn code_span_commands(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<code>") {
+        let body = &rest[start + "<code>".len()..];
+        let Some(end) = body.find("</code>") else {
+            break;
+        };
+        let span = body[..end].trim();
+        if is_viaticum_command(span) {
+            out.push(span.to_string());
+        }
+        rest = &body[end + "</code>".len()..];
+    }
+    out
+}
+
+fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, out);
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+}
+
+/// install-i10: every command the public docs and the UI show parses, and none
+/// of them teaches a flag or a phrase we removed. Mutation M13: `--watch` back
+/// in the README, or `--mnemonic "<24 words>"` in `Connect.svelte`, turns this
+/// test RED.
+#[test]
+fn docs_commands_parse() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut sources: Vec<(String, Vec<String>)> = Vec::new();
+
+    for name in ["README.md", "docs/usage.md", "docs/install.md"] {
+        // docs/install.md arrives with the installer; until then it must not
+        // exist (DS3 brief: a guide to nothing is a lie).
+        let Ok(text) = std::fs::read_to_string(root.join(name)) else {
+            continue;
+        };
+        for bad in FORBIDDEN_IN_DOCS {
+            assert!(
+                !text.contains(bad),
+                "{name} still teaches {bad:?}; the CLI does not do that"
+            );
+        }
+        sources.push((name.to_string(), fenced_commands(&text)));
+    }
+
+    let promises =
+        std::fs::read_to_string(root.join("docs/promises.md")).expect("docs/promises.md exists");
+    assert!(
+        !promises.contains("{{"),
+        "docs/promises.md still has a template placeholder"
+    );
+    for name in ["README.md", "docs/usage.md"] {
+        let text = std::fs::read_to_string(root.join(name)).expect("public doc exists");
+        assert!(
+            text.contains("promises.md"),
+            "{name} must link docs/promises.md"
+        );
+    }
+
+    let mut ui_files = Vec::new();
+    collect_files(&root.join("web-ui/src"), &mut ui_files);
+    ui_files.sort();
+    for path in ui_files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        for bad in FORBIDDEN_IN_DOCS {
+            assert!(
+                !text.contains(bad),
+                "{rel} still teaches {bad:?}; the CLI does not do that"
+            );
+        }
+        let commands = code_span_commands(&text);
+        if !commands.is_empty() {
+            sources.push((rel, commands));
+        }
+    }
+
+    let mut checked = 0;
+    for (name, commands) in &sources {
+        for line in commands {
+            let argv = doc_argv(line);
+            checked += 1;
+            assert!(
+                argv.first().is_some_and(|a| a == "viaticum"),
+                "{name}: `{line}` does not start with viaticum"
+            );
+            assert!(
+                Cli::try_parse_from(&argv).is_ok(),
+                "{name}: `{line}` does not parse: {:?}",
+                Cli::try_parse_from(&argv).err()
+            );
+        }
+    }
+    assert!(checked > 0, "the test found no viaticum commands to check");
+}

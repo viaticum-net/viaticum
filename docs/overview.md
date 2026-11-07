@@ -42,7 +42,7 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 
 ### Peer Discovery
 
-1. Bootstrap peers from config: `[network] bootstrap_peers = ["DeviceId@ip:port"]`
+1. Bootstrap peers from config: `[network] kademlia_bootstrap_peers = ["/dns4/seed.example.org/tcp/443/p2p/12D3KooW..."]`
 2. **Bootstrap auto-connect:** on daemon startup, connect to bootstrap peers and join the Kademlia DHT
 3. On connect: DeviceCertExchange + PeerAnnounce (identity, addresses, keys)
 4. Kademlia DHT: discover further peers via `get_closest_peers` (PeerDiscoveryRequest/Response were removed in ε.2)
