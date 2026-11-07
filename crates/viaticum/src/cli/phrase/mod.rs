@@ -161,7 +161,7 @@ pub fn run_check(data_dir: &Path, positions: Vec<usize>, all: bool) -> Result<()
         Some(positions)
     };
 
-    let tty = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let tty = crate::cli::is_interactive(io::stdin().is_terminal(), io::stdout().is_terminal());
     if tty {
         confirm_in_tty(&keyfile.mnemonic, explicit, None)?;
     } else {
@@ -274,24 +274,48 @@ fn ask_positions(
     let mut stdin = stdin.lock();
     let mut answers = Vec::with_capacity(positions.len());
     for &position in positions {
-        print!("Word #{position}? ");
-        io::stdout().flush()?;
-        let mut line = String::new();
-        let n = stdin.read_line(&mut line)?;
-        if n == 0 {
-            return Err(PhraseError::Invalid(format!(
-                "no answer for word #{position}"
-            )));
+        loop {
+            print!("Word #{position}? ");
+            io::stdout().flush()?;
+            match read_answer_line(&mut stdin)? {
+                AnswerLine::Word(word) => {
+                    answers.push((position, word));
+                    break;
+                }
+                // An empty Enter is a failed answer, not an abort: ask the
+                // same word again (NOTE 5). It does not use up one of the
+                // three attempts.
+                AnswerLine::Empty => println!("Please type word #{position}."),
+                AnswerLine::Eof => {
+                    return Err(PhraseError::Invalid(format!(
+                        "no answer for word #{position}"
+                    )));
+                }
+            }
         }
-        let got = normalize_phrase(&line);
-        if got.is_empty() {
-            return Err(PhraseError::Invalid(format!(
-                "empty answer for word #{position}"
-            )));
-        }
-        answers.push((position, got));
     }
     Ok(answers)
+}
+
+/// One line from the terminal for a phrase word. `Empty` means "ask again";
+/// only end of input aborts.
+enum AnswerLine {
+    Word(String),
+    Empty,
+    Eof,
+}
+
+fn read_answer_line(reader: &mut impl BufRead) -> io::Result<AnswerLine> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(AnswerLine::Eof);
+    }
+    let got = normalize_phrase(&line);
+    if got.is_empty() {
+        Ok(AnswerLine::Empty)
+    } else {
+        Ok(AnswerLine::Word(got))
+    }
 }
 
 fn wait_for_enter(prompt: &str) -> Result<(), PhraseError> {

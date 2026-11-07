@@ -12,6 +12,14 @@ use clap::{Parser, Subcommand};
 pub use types::CliError;
 use types::CliResponse;
 
+/// Both ends have to be a terminal before `setup`/`phrase check` treat the
+/// session as interactive (install-i2 M3″, B1). stdin is a tty in
+/// `setup | tee install.log`, stdout is not; a phrase printed there would land
+/// in the installer log, so half-tty must behave like a pipe.
+pub fn is_interactive(stdin_tty: bool, stdout_tty: bool) -> bool {
+    stdin_tty && stdout_tty
+}
+
 /// Resolve the data directory path.
 /// - `None` → platform-native `dirs::data_dir()/viaticum`.
 /// - `Some("~/foo")` / `Some("~")` → expanded via `dirs::home_dir()`.

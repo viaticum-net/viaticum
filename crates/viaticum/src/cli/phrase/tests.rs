@@ -118,3 +118,27 @@ fn read_answers_short_stdin_fails() {
     let err = read_answers(&mut input, &[2, 3], false, false).unwrap_err();
     assert!(err.to_string().contains("word #3"), "{err}");
 }
+
+/// NOTE 5: an empty Enter on `Word #N?` is not an answer; the tty path re-asks
+/// the same word instead of aborting setup.
+#[test]
+fn empty_answer_line_is_re_asked_not_an_abort() {
+    let mut input = Cursor::new(b"\n   \n able \n");
+    assert!(matches!(
+        read_answer_line(&mut input).unwrap(),
+        AnswerLine::Empty
+    ));
+    assert!(matches!(
+        read_answer_line(&mut input).unwrap(),
+        AnswerLine::Empty
+    ));
+    match read_answer_line(&mut input).unwrap() {
+        AnswerLine::Word(w) => assert_eq!(w, "able"),
+        _ => panic!("a non-empty line must be the answer"),
+    }
+    // End of input is still an abort (the terminal is gone).
+    assert!(matches!(
+        read_answer_line(&mut Cursor::new(b"")).unwrap(),
+        AnswerLine::Eof
+    ));
+}
