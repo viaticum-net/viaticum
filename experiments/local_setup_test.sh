@@ -39,13 +39,16 @@
 # Steps:        1. hosts H0..H3 up; setup --mode new in a pty; Ctrl-C at check
 #               2. re-run in a pty: same words/identity, one wrong word, success
 #               3. config: quota, watch, web; plain `init` output untouched
-#               4. without a tty: refusals and the --yes path; phrase file mode
-#               5. daemon with only H0: node yellow, network says few friends;
-#                  H1..H3 connected: green; protection never red
+#               4. without a tty: refusals and the --yes path; phrase file mode;
+#                  half-tty (`setup | tee`): stdin pty, stdout file, no phrase
+#               5. all four hosts: green; then H1..H3 stopped: yellow "few
+#                  friends"; back to green; protection never red
 #               6. `viaticum open` without DISPLAY: URL + ssh -L, exit 0
-#               7. three files restorable (100%) with >= k symbols on hosts; dr_ready
+#               7. files are Queued/Replicating: protection.reason "uploading"
+#                  with the i14 wording; then 100% restorable, dr_ready
 #               8. lose the machine; setup --mode restore --phrase-file; same
-#                  identity; restore the folder; sha256 of the three files match
+#                  identity; a second restore creates a missing --watch folder;
+#                  restore the folder; sha256 of the three files match
 #               9. no three consecutive phrase words under the run dir
 #
 # Usage:
@@ -158,6 +161,14 @@ friend_protection_level() {
 friend_network_detail() {
     run_cli_q "$FRIEND" status --json \
         | jq -r '.verdict.node.checks[] | select(.id == "network") | .detail // empty' 2>/dev/null || true
+}
+friend_protection_reason() {
+    run_cli_q "$FRIEND" status --json \
+        | jq -r '.verdict.protection.reason // empty' 2>/dev/null || true
+}
+friend_protection_detail() {
+    run_cli_q "$FRIEND" status --json \
+        | jq -r '.verdict.protection.detail // empty' 2>/dev/null || true
 }
 
 # A phrase red line for PROTECTION: red in any poll is a FAIL, even if the
@@ -427,6 +438,30 @@ else
     fail "phrase show outside a tty: rc=$RC_SHOW, $(wc -c < "$TEST_DIR/logs/phrase-show.stdout") bytes on stdout"
 fi
 
+# F1/B1: `setup | tee install.log` — stdin is a pty, stdout is a file. This is
+# the leak path the old `&&` vs `||` guard was blind to. It must refuse and put
+# zero bytes, hence zero phrase words, into the installer log.
+HALF_TTY_DATA="$TEST_DIR/half-tty-new"
+HALF_TTY_OUT="$TEST_DIR/logs/half-tty-install.log"
+mkdir -p "$HALF_TTY_DATA"
+set +e
+RUST_LOG=info python3 "$(dirname "${BASH_SOURCE[0]}")/setup_pty.py" \
+    --binary "$BINARY" --data-dir "$HALF_TTY_DATA" --stdout-file "$HALF_TTY_OUT" \
+    --timeout 30 -- --mode new --watch "$WATCH_DIR" --quota-gb 2 \
+    > "$TEST_DIR/logs/half-tty.pty" 2>&1
+RC_HALF=$?
+set -e
+if [ "$RC_HALF" -ne 0 ] && [ ! -e "$HALF_TTY_DATA/identity.key" ]; then
+    pass "half-tty (setup | tee) refuses without --yes and writes no identity"
+else
+    fail "half-tty setup: rc=$RC_HALF, identity=$( [ -e "$HALF_TTY_DATA/identity.key" ] && echo yes || echo no )"
+fi
+if [ ! -s "$HALF_TTY_OUT" ] && ! phrase_leaks "$(cat "$HALF_TTY_OUT" 2>/dev/null || true)"; then
+    pass "the half-tty stdout log is empty (zero phrase words)"
+else
+    fail "half-tty stdout log has $(wc -c < "$HALF_TTY_OUT") bytes: phrase words reached the installer log"
+fi
+
 NONTTY_RESTORE="$TEST_DIR/nontty-restore"
 mkdir -p "$NONTTY_RESTORE"
 set +e
@@ -456,19 +491,34 @@ else
     fail "a phrase file with mode 0644 was not refused (rc=$RC_PM)"
 fi
 
-# ── STEP 5: ONLY THE SEED; THEN ALL HOSTS ─────────────────────────────────────
+# ── STEP 5: ALL HOSTS; THEN ONLY THE SEED ─────────────────────────────────────
 echo ""
-echo "=== Step 5: only the seed → yellow; all hosts → green; protection never red ==="
-# "Only the seed reachable": H1..H3 are stopped, not merely unconnected. They
-# have been up and authenticated (step 1) and come back for the green half.
-for i in 1 2 3; do stop_node "$i"; done
+echo "=== Step 5: all hosts → green; then H1..H3 stopped → yellow; back to green ==="
+# B2: first the good morning state — the friend sees all four hosts and the
+# verdict is green. Then H1..H3 are stopped. Their records stay in the friend's
+# DB, so a fallback-counting implementation (`.candidates.len()`) would stay
+# green; the correct holder pool is the authenticated set (= H0 only) and the
+# verdict must return to yellow "few friends".
 start_node "$FRIEND" "$TIME_SCALE"
 wait_daemon "$FRIEND" || { fail "friend daemon did not answer status"; exit 1; }
 wait_auth_peers "$FRIEND" 1 120 || fail "the friend did not authenticate with the seed H0"
-if wait_level yellow 120; then
-    pass "with only the seed the node verdict is yellow"
+for i in 1 2 3; do run_cli_q "$FRIEND" connect "${ADDR[$i]}" > /dev/null; done
+wait_auth_peers "$FRIEND" 4 240 || fail "the friend did not authenticate all four hosts"
+if wait_level green 240; then
+    pass "with all four hosts the node verdict is green"
 else
-    fail "with only the seed the node verdict is '$(friend_level)' (want yellow)"
+    fail "with all four hosts the node verdict is '$(friend_level)'"
+fi
+protection_poll && pass "protection was never red while the node became green" || true
+
+# Only the seed reachable now: H1..H3 are stopped, but the friend has met them
+# (their PeerRecords remain). This is the ordinary morning after a restart or a
+# host outage, and the case that makes the pool fallback visible.
+for i in 1 2 3; do stop_node "$i"; done
+if wait_level yellow 180; then
+    pass "after H1..H3 stop, the node verdict returns to yellow"
+else
+    fail "after H1..H3 stop, the node verdict is '$(friend_level)' (want yellow)"
 fi
 NET_DETAIL=$(friend_network_detail)
 if grep -qF "few friends online, need ≥ 2" <<< "$NET_DETAIL"; then
@@ -484,6 +534,7 @@ CLI_IDENTITY=$(run_cli "$FRIEND" status --json | jq -r '.node_identity')
     && pass "the running node has identity_pub ${IDENTITY2:0:16}… (same as setup)" \
     || fail "status identity ${CLI_IDENTITY:0:16}… != setup ${IDENTITY2:0:16}…"
 
+# Restore H1..H3 for the green half and the rest of the scenario.
 for i in 1 2 3; do
     start_node "$i" "$TIME_SCALE" "$(node_dir "$i")/files"
     wait_daemon "$i" || fail "host H$i did not come back"
@@ -491,13 +542,13 @@ for i in 1 2 3; do
 done
 wait_auth_peers 0 3 90 || fail "H0 does not see H1..H3 after the restart"
 for i in 1 2 3; do run_cli_q "$FRIEND" connect "${ADDR[$i]}" > /dev/null; done
-wait_auth_peers "$FRIEND" 4 240 || fail "the friend did not authenticate all four hosts"
+wait_auth_peers "$FRIEND" 4 240 || fail "the friend did not authenticate all four hosts again"
 if wait_level green 240; then
-    pass "with all four hosts the node verdict is green"
+    pass "with H1..H3 back the node verdict is green again"
 else
-    fail "with all four hosts the node verdict is '$(friend_level)'"
+    fail "with H1..H3 back the node verdict is '$(friend_level)'"
 fi
-protection_poll && pass "protection was never red while the node became green" || true
+protection_poll && pass "protection was never red on the way back to green" || true
 [ "$(friend_protection_level)" != "red" ] && pass "protection is '$(friend_protection_level)'" || fail "protection is red"
 
 # ── STEP 6: OPEN WITHOUT A DISPLAY ────────────────────────────────────────────
@@ -540,6 +591,38 @@ for f in "${FILES[@]}"; do
     FILE_HASH[$f]=$(content_hash "$p")
 done
 pass "three files written to the watch folder (sha256 kept in this shell)"
+
+# NOTE 1 / i14: while the files are Queued/Replicating the protection reason
+# must be "uploading" with the newcomer wording. `holder_pool` is 4 here (all
+# hosts are authenticated), so the only way to get there is `blocks_in_flight`
+# being wired from the same per-file loop that counts Restorable.
+REASON_UPLOADING=0
+DEADLINE=$(( $(date +%s) + 300 ))
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+    reason=$(friend_protection_reason)
+    if [ "$reason" = "uploading" ]; then
+        REASON_UPLOADING=1
+        break
+    fi
+    all_restorable=1
+    for f in "${FILES[@]}"; do
+        kind=$(file_field "$FRIEND" "$WATCH_DIR/$f" '.effective_status.kind // "none"')
+        [ "$kind" = "restorable" ] || all_restorable=0
+    done
+    [ "$all_restorable" -eq 1 ] && break
+    sleep 0.2
+done
+if [ "$REASON_UPLOADING" -eq 1 ]; then
+    pass "protection.reason is 'uploading' while the files are in flight"
+    PROT_DETAIL=$(friend_protection_detail)
+    if grep -qF "normal for a new node, can take weeks" <<< "$PROT_DETAIL"; then
+        pass "the protection reason says this is normal for a new node (i14)"
+    else
+        fail "protection detail lacks the i14 wording: '$PROT_DETAIL'"
+    fi
+else
+    fail "protection.reason never said 'uploading' while files were Queued/Replicating (last: '$(friend_protection_reason)')"
+fi
 
 # Wait for the files to enter the catalog and become restorable FIRST: a fresh
 # node with zero files is green by design (0 files after the scan = 100%), so
@@ -635,6 +718,42 @@ if [ "$RESTORED_ID" = "$IDENTITY2" ] && [ -n "$RESTORED_ID" ]; then
 else
     fail "restored identity '$RESTORED_ID' != '$IDENTITY2'"
 fi
+
+# F3/W1: on a new machine the watch folder may not exist yet (files come back
+# into staging). Restore must create it before DR commits and still exit 0 with
+# a usable config; the old order failed with FolderMissing after the identity.
+MISSING_DATA="$TEST_DIR/restore-missing-data"
+MISSING_WATCH="$TEST_DIR/restore-missing-folder"
+mkdir -p "$MISSING_DATA"
+set +e
+RESTORE_MISS_OUT=$("$BINARY" --data-dir "$MISSING_DATA" setup --mode restore \
+    --phrase-file "$PHASE_FILE" --seed "$ADDR_00" --watch "$MISSING_WATCH" \
+    --quota-gb 2 --json < /dev/null 2>&1)
+RC_RM=$?
+set -e
+if [ "$RC_RM" -eq 0 ]; then
+    pass "restore with a missing --watch folder exits 0"
+else
+    fail "restore with a missing --watch folder exited $RC_RM"
+    tail -40 <<< "$RESTORE_MISS_OUT" | sed 's/^/    | /'
+fi
+if [ -d "$MISSING_WATCH" ] && [ "$(stat -c %a "$MISSING_WATCH")" = "700" ]; then
+    pass "restore created the missing watch folder 0700"
+else
+    fail "missing watch folder: dir=$( [ -d "$MISSING_WATCH" ] && echo yes || echo no ), mode=$(stat -c %a "$MISSING_WATCH" 2>/dev/null || echo none)"
+fi
+if python3 - "$MISSING_DATA/config.toml" "$MISSING_WATCH" <<'PY'
+import sys, tomllib
+with open(sys.argv[1], "rb") as f:
+    cfg = tomllib.load(f)
+sys.exit(0 if any(w.get("path") == sys.argv[2] for w in cfg.get("watch", [])) else 1)
+PY
+then
+    pass "the restore config lists the folder that did not exist yet"
+else
+    fail "the restore config does not list $MISSING_WATCH"
+fi
+
 rm -f -- "$PHASE_FILE"
 
 start_node "$FRIEND" "$TIME_SCALE"

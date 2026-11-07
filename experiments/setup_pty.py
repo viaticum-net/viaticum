@@ -33,7 +33,7 @@ import fcntl
 GRID_WORD = re.compile(rb"(\d{1,2})\.\s+([a-z]+)")
 CHECK_PROMPT = re.compile(rb"Word #(\d+)\?")
 QUOTA = re.compile(rb"in GB \[[^\]]*\]: ")
-MODE = re.compile(rb"Choose 1 or 2 \[1\]: ")
+MODE = re.compile(rb"Choose 1 or 2: ")
 PHRASE_ENTER = re.compile(rb"Press Enter when you have written them down: ")
 
 
@@ -51,6 +51,7 @@ class Driver:
         self.exit_code = None
         self.debug = False
         self.stderr_file = None
+        self.stdout_file = None
         self.child_pid = None
 
     def log(self, msg):
@@ -91,10 +92,13 @@ class Driver:
                 os.dup2(fd, 2)
                 os.close(fd)
 
+        out_file = None
+        if self.stdout_file:
+            out_file = open(self.stdout_file, "wb")
         proc = subprocess.Popen(
             self.argv,
             stdin=slave,
-            stdout=slave,
+            stdout=out_file if out_file is not None else slave,
             stderr=slave,
             close_fds=True,
             start_new_session=True,
@@ -179,6 +183,8 @@ class Driver:
                 self.buf.clear()
                 continue
 
+        if out_file is not None:
+            out_file.close()
         try:
             os.close(master)
         except OSError:
@@ -200,6 +206,11 @@ def main():
     ap.add_argument("--wrong-once", action="store_true")
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--stderr-file", help="copy the child's stderr here (leak scan; no phrase grid)")
+    ap.add_argument(
+        "--stdout-file",
+        help="redirect the child's stdout here (models `setup | tee install.log`); "
+        "stdin stays a pty",
+    )
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("extra", nargs=argparse.REMAINDER)
     args = ap.parse_args()
@@ -217,6 +228,7 @@ def main():
     d.wrong_left = 1 if args.wrong_once else 0
     d.debug = args.debug
     d.stderr_file = args.stderr_file
+    d.stdout_file = args.stdout_file
     code = d.run()
     # The transcript goes to stdout only. It contains the phrase: the caller
     # must keep it in memory, never `tee` it to a file.
