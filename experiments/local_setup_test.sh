@@ -719,43 +719,6 @@ else
     fail "restored identity '$RESTORED_ID' != '$IDENTITY2'"
 fi
 
-# F3/W1: on a new machine the watch folder may not exist yet (files come back
-# into staging). Restore must create it before DR commits and still exit 0 with
-# a usable config; the old order failed with FolderMissing after the identity.
-MISSING_DATA="$TEST_DIR/restore-missing-data"
-MISSING_WATCH="$TEST_DIR/restore-missing-folder"
-mkdir -p "$MISSING_DATA"
-set +e
-RESTORE_MISS_OUT=$("$BINARY" --data-dir "$MISSING_DATA" setup --mode restore \
-    --phrase-file "$PHASE_FILE" --seed "$ADDR_00" --watch "$MISSING_WATCH" \
-    --quota-gb 2 --json < /dev/null 2>&1)
-RC_RM=$?
-set -e
-if [ "$RC_RM" -eq 0 ]; then
-    pass "restore with a missing --watch folder exits 0"
-else
-    fail "restore with a missing --watch folder exited $RC_RM"
-    tail -40 <<< "$RESTORE_MISS_OUT" | sed 's/^/    | /'
-fi
-if [ -d "$MISSING_WATCH" ] && [ "$(stat -c %a "$MISSING_WATCH")" = "700" ]; then
-    pass "restore created the missing watch folder 0700"
-else
-    fail "missing watch folder: dir=$( [ -d "$MISSING_WATCH" ] && echo yes || echo no ), mode=$(stat -c %a "$MISSING_WATCH" 2>/dev/null || echo none)"
-fi
-if python3 - "$MISSING_DATA/config.toml" "$MISSING_WATCH" <<'PY'
-import sys, tomllib
-with open(sys.argv[1], "rb") as f:
-    cfg = tomllib.load(f)
-sys.exit(0 if any(w.get("path") == sys.argv[2] for w in cfg.get("watch", [])) else 1)
-PY
-then
-    pass "the restore config lists the folder that did not exist yet"
-else
-    fail "the restore config does not list $MISSING_WATCH"
-fi
-
-rm -f -- "$PHASE_FILE"
-
 start_node "$FRIEND" "$TIME_SCALE"
 wait_daemon "$FRIEND" || { fail "restored daemon did not answer status"; exit 1; }
 for i in 1 2 3; do run_cli_q "$FRIEND" connect "${ADDR[$i]}" > /dev/null; done
@@ -795,6 +758,43 @@ if staging_matches_job "$JOB_JSON"; then
 else
     fail "$RESTORE_MSG"
 fi
+
+# F3/W1: on a new machine the watch folder may not exist yet (files come back
+# into staging). Restore must create it before DR commits and still exit 0 with
+# a usable config; the old order failed with FolderMissing after the identity.
+# Runs after the main restore so its second DR pointer cannot affect it.
+MISSING_DATA="$TEST_DIR/restore-missing-data"
+MISSING_WATCH="$TEST_DIR/restore-missing-folder"
+mkdir -p "$MISSING_DATA"
+set +e
+RESTORE_MISS_OUT=$("$BINARY" --data-dir "$MISSING_DATA" setup --mode restore \
+    --phrase-file "$PHASE_FILE" --seed "$ADDR_00" --watch "$MISSING_WATCH" \
+    --quota-gb 2 --json < /dev/null 2>&1)
+RC_RM=$?
+set -e
+if [ "$RC_RM" -eq 0 ]; then
+    pass "restore with a missing --watch folder exits 0"
+else
+    fail "restore with a missing --watch folder exited $RC_RM"
+    tail -40 <<< "$RESTORE_MISS_OUT" | sed 's/^/    | /'
+fi
+if [ -d "$MISSING_WATCH" ] && [ "$(stat -c %a "$MISSING_WATCH")" = "700" ]; then
+    pass "restore created the missing watch folder 0700"
+else
+    fail "missing watch folder: dir=$( [ -d "$MISSING_WATCH" ] && echo yes || echo no ), mode=$(stat -c %a "$MISSING_WATCH" 2>/dev/null || echo none)"
+fi
+if python3 - "$MISSING_DATA/config.toml" "$MISSING_WATCH" <<'PY'
+import sys, tomllib
+with open(sys.argv[1], "rb") as f:
+    cfg = tomllib.load(f)
+sys.exit(0 if any(w.get("path") == sys.argv[2] for w in cfg.get("watch", [])) else 1)
+PY
+then
+    pass "the restore config lists the folder that did not exist yet"
+else
+    fail "the restore config does not list $MISSING_WATCH"
+fi
+rm -f -- "$PHASE_FILE"
 
 # ── STEP 9: NO PHRASE LEAK ────────────────────────────────────────────────────
 echo ""
