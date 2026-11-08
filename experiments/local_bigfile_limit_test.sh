@@ -541,7 +541,7 @@ step3() {
     info "step 3: VmHWM-RSS0 = $((d / 1024)) MiB, E = $((S3_K * SYMBOL_BYTES / MIB)) MiB, p = $p; model 3.047 + R = $model (bar 3.1 + R + 1.0 = $(awk -v r="$r" 'BEGIN { printf "%.2f", 4.1 + r }'), ROUGH below 3.1 + R - 2 = $(awk -v r="$r" 'BEGIN { printf "%.2f", 1.1 + r }'))"
     S3_P=$p; S3_R=$r
     if [ "$S3_K" -le 0 ] || [ -z "${S3_TENC:-}" ]; then
-        fail "step 3: cannot read k ($S3_K) or t_encode (${S3_TENC:-none}) — the check would be blind"; return 0
+        s3_fail "step 3: cannot read k ($S3_K) or t_encode (${S3_TENC:-none}) — the check would be blind"; return 0
     fi
     local fb_hex; fb_hex=$(file_block_hex 0 "$FILES/$S3_NAME")
     if [ -n "$fb_hex" ] && [ "${fb_hex:0:16}" != "$NB" ]; then
@@ -1285,7 +1285,14 @@ else
 fi
 # Window [LINE, +180 s]: exactly one WARN for GB; no PoS answers in [+60, +180].
 while [ "$(date +%s)" -lt $((T4 + 180)) ]; do sleep 2; done
-hwm_delta_check "backup-i5 (grown grow.bin not read)" $((64 * 1024))
+# PHASE=all: the big files of PHASE b are still in work here (1792 MiB budget), so node-00's
+# peak says nothing about grow.bin; the bar is judged in PHASE=a only (run 11-08: 1332 MiB in
+# all, pass in a).
+if [ "$PHASE" = all ]; then
+    note "backup-i5 VmHWM (PHASE=all, not judged: PHASE b work shares node-00): ΔVmHWM = $(( $(hwm_delta_kb "${DPID[0]}") / 1024 )) MiB"
+else
+    hwm_delta_check "backup-i5 (grown grow.bin not read)" $((64 * 1024))
+fi
 # The same text is logged at WARN (once per unscaled day per block) and at DEBUG (every other
 # tick), so the level decides. tracing's fmt prints the level as " WARN " / "DEBUG".
 PWARN_TXT="cannot load source block for PoS"
