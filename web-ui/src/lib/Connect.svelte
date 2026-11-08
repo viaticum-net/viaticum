@@ -63,8 +63,9 @@
       Both flows currently exist as CLI only:
     </p>
     <ul class="hint">
-      <li><code>viaticum init --new-device --mnemonic "&lt;24 words&gt;"</code> — join an existing cluster as a new device.</li>
-      <li><code>viaticum dr --mnemonic "&lt;24 words&gt;"</code> — disaster recovery: rebuild node state from the seed phrase.</li>
+      <li><code>viaticum init --new-device --mnemonic</code> — join an existing cluster as a new device. Without a value, the command asks for the 24 words.</li>
+      <li><code>viaticum dr --mnemonic</code> — disaster recovery: rebuild node state from the seed phrase. Without a value, the command asks for the 24 words.</li>
+      <li><code>viaticum setup</code> — on a new machine, choose <em>Restore from my 24 words</em>.</li>
     </ul>
     <p class="hint">
       UI flows for both are tracked as a feature in <code>docs/features.md</code>.

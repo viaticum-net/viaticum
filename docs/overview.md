@@ -42,7 +42,7 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 
 ### Peer Discovery
 
-1. Bootstrap peers from config: `[network] bootstrap_peers = ["DeviceId@ip:port"]`
+1. Bootstrap peers from config: `[network] kademlia_bootstrap_peers = ["/dns4/seed.example.org/tcp/443/p2p/12D3KooW..."]`
 2. **Bootstrap auto-connect:** on daemon startup, connect to bootstrap peers and join the Kademlia DHT
 3. On connect: DeviceCertExchange + PeerAnnounce (identity, addresses, keys)
 4. Kademlia DHT: discover further peers via `get_closest_peers` (PeerDiscoveryRequest/Response were removed in ε.2)
@@ -50,7 +50,7 @@ Decentralized P2P cold backup system. Peers store encrypted fragments of each ot
 
 ### Disaster Recovery
 
-1. `viaticum dr --mnemonic "24 words" --peer <addr>` — standalone, no daemon needed
+1. `viaticum dr --mnemonic --peer <addr>` (asks for the 24 words) — standalone, no daemon needed
 2. Derive identity from seed phrase; check the folder (no foreign key, no running node) and work in a staging DB; the --peer addresses bootstrap the DHT
 3. Join the Kademlia DHT, `get_closest_peers(master)` (libp2p hashes it to where the postmen are ranked) → dial and authenticate them
 4. Collect every signed SelfPointer of the identity from the mailbox (expanding batches [100, 300, 1000], each peer asked once); one catalog history → restore its freshest pointer; several (e.g. a node started by mistake with the same phrase) → list them and require `--catalog`

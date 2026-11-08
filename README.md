@@ -18,7 +18,9 @@ Self-hosters who would rather not hand their data to a cloud: people running Tru
 
 Pre-release, and rough. You can run the daemon, back up folders and get them back, but breaking changes are still coming, including the wire protocol. Don't point it at data you can't afford to lose.
 
-If you want to poke at it or help test, you're welcome. Today there's a web UI and a Linux daemon. Windows and macOS builds are work in progress.
+If you want to poke at it or help test, you're welcome. Today there's a web UI and a Linux daemon. Windows and macOS: help wanted.
+
+What the alpha does and does not promise is in [`docs/promises.md`](docs/promises.md).
 
 ### Where the work is (autumn 2026)
 
@@ -32,29 +34,32 @@ If you want to poke at it or help test, you're welcome. Today there's a web UI a
 
 ## Try it
 
-There's no prebuilt package yet, so you build from source. You need Rust (stable) and Node.js.
+There is no installer or release yet. A one-command installer is coming; until then, build from source and run `viaticum setup`. You need Rust (stable) and Node.js.
+
+### Build from source
 
 ```sh
-# build the web UI — the daemon embeds it at compile time
-cd web-ui && npm install && npm run build && cd ..
+# build the web UI: the daemon embeds it at compile time
+cd web-ui && npm ci && npm run build && cd ..
 
 # build the daemon and CLI
 cargo build --release --workspace
 
-# create an identity (writes a 24-word recovery phrase — keep it safe)
-./target/release/viaticum init
+# choose a new install or a restore, answer its questions, write the 24 words on paper
+./target/release/viaticum setup
 
-# run the daemon and watch a folder
-./target/release/viaticum daemon --watch-dir ~/Documents
+# start the daemon
+./target/release/viaticum daemon
 
 # open the web UI in your browser
 ./target/release/viaticum open
 ```
 
-To back up with a friend, swap node addresses (`viaticum status` prints yours) and run `viaticum connect <addr>` on each side.
+To back up with a friend, swap node addresses (`viaticum status` prints yours as a multiaddr) and run `viaticum connect <multiaddr>` on each side.
 
 ## Documentation
 
+- [`docs/promises.md`](docs/promises.md) — what Viaticum promises today (alpha)
 - [`docs/overview.md`](docs/overview.md) — what Viaticum is, module map, end-to-end flows
 - [`docs/usage.md`](docs/usage.md) — how to use it: CLI and web UI, from first run to disaster recovery
 - [`docs/why.md`](docs/why.md) — why Viaticum exists, where it sits in the field, the reasoning behind the design
