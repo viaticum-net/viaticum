@@ -72,8 +72,10 @@ pub enum SetupError {
     FolderMissing(PathBuf),
     #[error(
         "{0} already holds a Viaticum identity: restore would replace a live node. \
-         To finish setting up this machine, run `viaticum setup --mode new`; it keeps \
-         the existing identity and completes the config. Nothing was changed."
+         To restore your files onto this machine, use another data directory \
+         (`--data-dir`). To finish setting up the identity already here, run \
+         `viaticum setup --mode new`: it keeps that identity and completes the config. \
+         Nothing was changed."
     )]
     DataDirHasIdentity(PathBuf),
     #[error(
