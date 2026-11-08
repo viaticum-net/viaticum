@@ -1207,7 +1207,6 @@ GB=$(file_block_hex 0 "$GROW")
 [ -n "$GB" ] || { fail "setup: grow.bin has no block"; exit 1; }
 T_GB_READY=$(date +%s)
 info "grow.bin block GB = ${GB:0:16}.., importance-0 folder target $(file_field 0 "$GROW" '.effective_status.target')"
-stub_b "step 2 (b): files/r.bin 200 MiB, full copy on node-01 or node-02"
 
 fi  # run_a (steps 0a..2a)
 
