@@ -38,16 +38,16 @@ If a check fails, record it in an issue with the details from section 6. Do not 
 
 ## 3. macOS
 
-Run `41526134452`, 2026-11-02, `macos-14`: 9 failed, 1986 passed, 1 ignored. The old report described 21 failures out of 1183 on 2026-09-28. Most of those are gone; the groups below keep the old labels.
+Run `41526134452`, 2026-11-02, `macos-14`: 9 failed, 1986 passed, 1 ignored. An earlier analysis of the 29 September runs described 21 failures out of 1183 on 2026-09-28. Most of those are gone; the groups below keep the old labels.
 
 ### Fix first
 
-1. **Deletion is reported as a modification.** `watcher_detects_file_deletion` fails with `left: Modified, right: Deleted`. A deleted file is not marked deleted, and the backup handler then fails to read it. This is a product defect, small but real. See M-A.
+1. **Deletion is reported as a modification.** `watcher_detects_file_deletion` fails with `left: Modified, right: Deleted`. A deleted file is not marked deleted, and the backup handler then fails to read it. This is probably a product defect, but the mechanism is not confirmed: FSEvents may report a path with several flags at once (created, modified, removed), and `classify_event` takes one kind. The backup side re-checks a path that has gone (`crates/viaticum/src/daemon/backup/gone.rs`), so the user-visible effect may be smaller than the test suggests. The porter should confirm the event flags on a real Mac before changing code. See M-A.
 2. The other eight failures are test-only. Fix them in the order M-D, M-C, M-A, because M-D blocks five tests with one helper and M-C is a platform assumption.
 
 ### M-A: watcher events
 
-The old report had nine failing tests in `crates/viaticum/src/daemon/watcher/tests.rs`. All nine were blamed on FSEvents returning a canonical temporary path with an extra `/private` prefix where the test expected the plain path; the ninth also saw a pre-existing file reported again. Seven of the nine pass now. Two still fail, for different reasons.
+The earlier analysis had nine failing tests in `crates/viaticum/src/daemon/watcher/tests.rs`. All nine were blamed on FSEvents returning a canonical temporary path with an extra `/private` prefix where the test expected the plain path; the ninth also saw a pre-existing file reported again. Seven of the nine pass now. Two still fail, for different reasons.
 
 - `daemon::watcher::tests::watcher_detects_file_deletion` (`tests.rs:179`). The path assertion now passes. The event kind does not: the run shows `left: Modified`, `right: Deleted`. Cause from the code: `classify_event` maps `Modify(Data | Any | Other)` to `Modified` (`crates/viaticum/src/daemon/watcher/mod.rs:492-494`), and `resolve()` emits that event without checking the disk (`crates/viaticum/src/daemon/watcher/event_loop.rs:285-292`). `handle_added_or_modified` then tries to read the path and returns an error when the read fails (`crates/viaticum/src/daemon/backup/events.rs:129-143`), which the backup loop logs and drops (`crates/viaticum/src/daemon/backup/mod.rs:770-773`). Class: **product**. First fix: on a `Modified` event, stat the path; if it is gone, take the deletion path already used for `Remove` and for a rename.
 - `daemon::watcher::tests::watcher_keeps_watching_other_dirs_when_one_is_missing` (`tests.rs:947`). The run shows the second event is `before.txt`, the file that existed before the watch, while the test expects `after.txt`, created after it. Cause from the test and the run: the pre-existing file is reported a second time after the watch starts, and the test does not filter by path. Class: **test**. First fix: receive until the event path is the created one, or accept a duplicate event for the pre-existing file and ignore it.
@@ -56,11 +56,11 @@ The other seven old M-A tests now pass: `file_deleted_before_debounce_emits_dele
 
 ### M-B: canonical paths in `tests_exclude`
 
-The old report had five failures in `crates/viaticum/src/daemon/watcher/tests_exclude.rs`, all from comparing a control path that FSEvents had canonicalized. They pass in the current run: `flush_drops_live_event_inside_data_dir`, `watcher_does_not_emit_live_event_from_hidden_subdir`, `watcher_does_not_emit_live_event_through_symlinked_directory`, `watcher_drops_live_event_of_file_symlink_into_data_dir`, and the control inside `watcher_marks_refused_config_folder_error_and_never_scans_it`. No action.
+The earlier analysis had five failures in `crates/viaticum/src/daemon/watcher/tests_exclude.rs`, all from comparing a control path that FSEvents had canonicalized. They pass in the current run: `flush_drops_live_event_inside_data_dir`, `watcher_does_not_emit_live_event_from_hidden_subdir`, `watcher_does_not_emit_live_event_through_symlinked_directory`, `watcher_drops_live_event_of_file_symlink_into_data_dir`, and the control inside `watcher_marks_refused_config_folder_error_and_never_scans_it`. No action.
 
 ### M-B′: one file under two path forms
 
-The old report said a file arrived once from the scan under the plain temporary path and once from a live event under the canonical one with the `/private` prefix, producing two catalog entries. The test `watcher_marks_refused_config_folder_error_and_never_scans_it` passes now, so the current path handling no longer produces that split in this case. No action.
+The earlier analysis said a file arrived once from the scan under the plain temporary path and once from a live event under the canonical one with the `/private` prefix, producing two catalog entries. The test `watcher_marks_refused_config_folder_error_and_never_scans_it` passes now, so the current path handling no longer produces that split in this case. No action.
 
 ### M-C: a watch that should fail
 
@@ -88,7 +88,7 @@ CONTROL FAILED: the filesystem of .../target/dr-inode-tests/dr-... never reused 
 inode number in 32 rounds of create/remove/create.
 ```
 
-The run proves that the runner's filesystem under `target/` did not reuse a freed inode in 32 rounds; the old report attributes this to APFS. The control therefore refuses to let the test pass blind. Class: **test**. First fix: run the tests with `target/` on a filesystem that reuses inode numbers, or skip the control on macOS with a clear message. Do not make the control silently pass; the DR identity check is supposed to be exercised, and on a filesystem without reuse it cannot be.
+The run proves that the runner's filesystem under `target/` did not reuse a freed inode in 32 rounds; the earlier analysis attributes this to APFS. The control therefore refuses to let the test pass blind. Class: **test**. First fix: run the tests with `target/` on a filesystem that reuses inode numbers, or skip the control on macOS with a clear message. Do not make the control silently pass; the DR identity check is supposed to be exercised, and on a filesystem without reuse it cannot be.
 
 ## 4. Windows
 
@@ -105,7 +105,7 @@ Nine compile errors at seven sites, all in test modules:
 
 The scheduler helper `Unblock` uses a non-blocking open on a FIFO; the source-read test makes a file unreadable with mode `0o000`. Both are Unix ideas. First fix: gate with `#[cfg(unix)]`, or write a Windows equivalent. `Unblock` itself and its callers need the gate, not only the test functions, because the imports are inside `Unblock::now` and `Unblock::release_all`; `issue_batch.rs:814` also uses `Unblock`. A read-only attribute is not enough for the source-read test because it still allows reading; use an ACL that denies read, or a share lock. Gate the FIFO tests as well: they call `mkfifo` from `issue_mem.rs:869`, `:952` and `issue_batch.rs:808`, `:887`, and `mkfifo` does not exist on Windows. The point is to let the test target compile and the remaining tests run.
 
-After that, rerun the workflow. The groups below are from the last run where tests started, `36449003139` on 2026-09-28: 52 failed of 1130. They are **not current**; the names are given so the porter can find the same tests after the build is fixed.
+After that, rerun the workflow. The same log shows three `unused import` warnings in Windows-only builds of the test targets (`crates/viaticum/src/daemon/dr/commit/tests.rs:9` and `:13`, `crates/viaticum/src/daemon/watcher/event_loop.rs:49`); once the build passes, `clippy -D warnings` will stop on them, so remove or gate those imports too. The groups below are from the last run where tests started, `36449003139` on 2026-09-28: 52 failed of 1130. They are **not current**; the names are given so the porter can find the same tests after the build is fixed.
 
 ### W-A: restore rejects every Windows path (product)
 
@@ -179,7 +179,7 @@ The old run has two kinds of Windows lock failure, both in test code:
 
 Class: **test** as far as the code shows; **to be checked by the porter** after the build fix. First fix: put the Windows `unlock()` into the test helper the same way `recover_into_staging` does, and make the snapshots list names or metadata instead of reading a locked file. Then run. If DR still fails on Windows with a lock error in product code, the old product classification stands.
 
-A Windows user cannot rely on disaster recovery until this is green. In September it was a real DR blocker; the current production code looks fixed, but that has not been confirmed on Windows.
+A Windows user cannot rely on disaster recovery until this is green. The failures in the old run came from the tests: the production path already calls `unlock()` before redb opens the staging file (`crates/viaticum/src/daemon/dr/mod.rs:333-338`). That the real recovery works on Windows has not been confirmed.
 
 ### W-G: importance classification never matches a Windows path (product)
 
@@ -203,7 +203,7 @@ Five tests:
 - `daemon::restore::cleanup::tests::run_staging_monitor_refreshes_cache_from_startup_report`
 - `daemon::restore::cleanup::tests::run_staging_monitor_ticks_refresh_cache_and_never_delete`
 
-The old failure was `Access is denied` (os 5). Cause: `age_path` opens the path as a `File` and calls `set_modified` (`crates/viaticum/src/daemon/restore/cleanup/tests.rs:79-82`); several tests pass a directory (`:179`, `:228`, `:253`, `:280`, `:326`). Windows does not open a directory as a file this way. Class: **test**. First fix: set directory mtime with a platform helper, or skip the directory mtime on Windows; the tests only need an old timestamp, not a specific API.
+The old failure was `Access is denied` (os 5). Cause: `age_path` opens the path as a `File` and calls `set_modified` (`crates/viaticum/src/daemon/restore/cleanup/tests.rs:79-82`). In the failing run four tests fail at the `File::open` of a directory (`:81`, first call), and `startup_report_never_deletes_old_staging_dirs` fails at `set_modified` (`:81`, second call) on an ordinary file that `age_path` has opened read-only. Windows does not open a directory as a file this way, and `set_modified` needs write access. Class: **test**. First fix: open directories with a Windows-specific call (backup semantics) or skip the directory mtime there, and open ordinary files with write access before `set_modified`; the tests only need an old timestamp, not a specific API.
 
 ### W-F: a taken restore target
 
@@ -217,13 +217,13 @@ Three tests:
 - `daemon::handle::tests::disk_available_bytes_returns_positive_for_existing_path`
 - `daemon::watch_admin::tests::add_watch_fails_with_not_a_directory_for_nonexistent_path`
 
-- The dispatch test builds a test state with `data_dir = "/tmp"` and expects `restore_staging_path == "/tmp/restore"` (`crates/viaticum/src/daemon/dispatch/tests.rs:31`, `:1532`). On Windows that data directory has no drive, and the joined path is not `/tmp/restore`. Class: **test**. Fix: use a temporary directory and compare with the path the code actually returns.
-- The handle test calls `disk_available_bytes(Path::new("/"))` (`crates/viaticum/src/daemon/handle/tests.rs:34-40`). The old report said `/` has no drive on Windows. The current Windows branch uses `std::path::absolute` and `sysinfo` instead of `statvfs` (`crates/viaticum/src/daemon/handle/mod.rs:1597-1607`), so this may be fixed. **To be checked by the porter**; if it still fails, use the drive root from `std::env::temp_dir()`.
+- The dispatch test builds a test state with `data_dir = "/tmp"` and expects `restore_staging_path == "/tmp/restore"` (`crates/viaticum/src/daemon/dispatch/tests.rs:31`, `:1532`). On Windows the joined path uses the native separator (`/tmp\restore`), so the comparison with `/tmp/restore` fails. Class: **test**. Fix: use a temporary directory and compare with the path the code actually returns.
+- The handle test calls `disk_available_bytes(Path::new("/"))` (`crates/viaticum/src/daemon/handle/tests.rs:34-40`). The earlier analysis said `/` has no drive on Windows. The current Windows branch uses `std::path::absolute` and `sysinfo` instead of `statvfs` (`crates/viaticum/src/daemon/handle/mod.rs:1597-1607`), so this may be fixed. **To be checked by the porter**; if it still fails, use the drive root from `std::env::temp_dir()`.
 - The watch-admin test passes `/nonexistent/path/does/not/exist` and expects `NotADirectory` (`crates/viaticum/src/daemon/watch_admin/tests.rs:205-220`). On Windows that string is not absolute, so `add_watch` returns `NotAbsolute` first (`crates/viaticum/src/daemon/watch_admin/mod.rs:421-429`). Class: **test**. Fix: build a missing path under a real temporary root.
 
 ### W-I: watcher error text
 
-One test: `daemon::watcher::tests::watcher_keeps_watching_other_dirs_when_one_is_missing`. The old run shows `left: Some("Input watch path is neither a file nor a directory.")`, `right: Some("folder does not exist")`. Cause: on Windows `notify` reports the missing path as `ErrorKind::Generic`; `describe_watch_error` maps only `PathNotFound` and `Io(NotFound)` to `folder does not exist`, and `Generic` falls through to `e.to_string()` (`crates/viaticum/src/daemon/watcher/mod.rs:507-521`, fallback at `:519`). Class: **product, minor**, as in the old report. First fix: check that the folder exists before calling `watch()`, or map the Generic message to `folder does not exist`. This test is the same one that fails for another reason on macOS (M-A); fix this one first on Windows, then look at the event order.
+One test: `daemon::watcher::tests::watcher_keeps_watching_other_dirs_when_one_is_missing`. The old run shows `left: Some("Input watch path is neither a file nor a directory.")`, `right: Some("folder does not exist")`. Cause: on Windows `notify` reports the missing path as `ErrorKind::Generic`; `describe_watch_error` maps only `PathNotFound` and `Io(NotFound)` to `folder does not exist`, and `Generic` falls through to `e.to_string()` (`crates/viaticum/src/daemon/watcher/mod.rs:507-521`, fallback at `:519`). Class: **product, minor**, as in the earlier analysis. First fix: check that the folder exists before calling `watch()`, or map the Generic message to `folder does not exist`. This test is the same one that fails for another reason on macOS (M-A); fix this one first on Windows, then look at the event order.
 
 ## 5. Building and running the tests
 
