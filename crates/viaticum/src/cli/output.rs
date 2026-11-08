@@ -30,6 +30,22 @@ pub fn render_status(data: &StatusData) -> String {
     if !data.daemon_version.is_empty() {
         out.push_str(&format!("  version:        {}\n", data.daemon_version));
     }
+    if let Some(v) = &data.verdict {
+        out.push_str(&format!("  node:           {}\n", v.node.headline));
+        out.push_str(&format!("  protection:     {}\n", v.protection.detail));
+        for check in v
+            .node
+            .checks
+            .iter()
+            .filter(|c| c.level != crate::daemon::dispatch::verdict::VerdictLevel::Green)
+        {
+            out.push_str(&format!(
+                "                  - {}: {}\n",
+                check.id.as_str(),
+                check.detail
+            ));
+        }
+    }
     out.push_str(&format!("  identity:       {}\n", data.node_identity));
     if !data.node_addr.is_empty() {
         // `addr: <address>` is a contract: scripts take the line by `addr:` and the

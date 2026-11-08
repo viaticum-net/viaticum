@@ -45,7 +45,7 @@ pub use gate::{
     BACKUP_PAUSE_WARN_AFTER, GateWake, PauseWatch, RestoreGate, new_gate_wake, notify_gate,
     restore_gate,
 };
-pub use pool::{PoolSnapshot, pool_signature, snapshot_pool};
+pub use pool::{PoolSnapshot, online_count, pool_signature, snapshot_pool};
 
 // ─── Q-V9: restore or backup first ────────────────────────────────────────────
 

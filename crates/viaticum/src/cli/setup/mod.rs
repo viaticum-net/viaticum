@@ -1,0 +1,920 @@
+// `viaticum setup` (R3b b3): one command, two questions, 24 words on paper.
+//
+// The first question is the mode, BEFORE any identity is created: "restore"
+// runs `dr` in the data directory first (F18, M16). A new installation creates
+// the identity, asks for folders and disk space, shows the phrase in a grid
+// (tty only) and checks three words. Interrupting at the check leaves
+// `identity.key` and no `phrase-confirmed`: a re-run shows the same phrase.
+//
+// `setup` does not start a daemon and does not install a service (R3c does
+// that). Its last line says what to do next; `--json` carries the result for
+// the future installer.
+
+#[cfg(test)]
+mod tests;
+
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+
+use viaticum_core::config::{AppConfig, expand_watch_path};
+
+use crate::daemon::handle::{disk_available_bytes, disk_size_bytes};
+use crate::daemon::identity::{
+    CONFIG_FILE_NAME, IdentityError, KEYFILE_NAME, default_config_toml, init_identity,
+    load_identity, parse_mnemonic, write_default_config_if_absent,
+};
+
+/// First question of `setup` (install-i13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SetupMode {
+    New,
+    Restore,
+}
+
+impl SetupMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SetupMode::New => "new",
+            SetupMode::Restore => "restore",
+        }
+    }
+}
+
+/// Answers that end up in `config.toml` (spec §2.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetupAnswers {
+    pub watch: Vec<PathBuf>,
+    pub quota_gb: f64,
+    pub reserve_gb: f64,
+    pub seeds: Option<Vec<String>>,
+    pub web_port: u16,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SetupError {
+    #[error(
+        "setup does not run as root: it would leave root-owned files in the friend's \
+         home. Run it as the user who will own the node, or pass --allow-root if you \
+         really mean it."
+    )]
+    Root,
+    #[error(
+        "setup needs a terminal for this mode. Without one: `--mode new --yes` (the \
+         phrase is never shown and stays unconfirmed), or `--mode restore --phrase-file \
+         FILE` with a file readable only by you (mode 0600)."
+    )]
+    NoTty,
+    #[error("could not read the free space of {0}; pass --quota-gb")]
+    NoFreeSpaceInfo(PathBuf),
+    #[error("quota must be at least 1 GB (0 means no limit and is not accepted): {0}")]
+    InvalidQuota(f64),
+    #[error("watch folder does not exist or is not a directory: {0}")]
+    FolderMissing(PathBuf),
+    #[error(
+        "{0} already holds a Viaticum identity: restore would replace a live node. \
+         To restore your files onto this machine, use another data directory \
+         (`--data-dir`). To finish setting up the identity already here, run \
+         `viaticum setup --mode new`: it keeps that identity and completes the config. \
+         Nothing was changed."
+    )]
+    DataDirHasIdentity(PathBuf),
+    #[error(
+        "the phrase file {0} is readable by other users; it must be 0600 (or stricter). \
+         Nothing was changed."
+    )]
+    PhraseFileMode(PathBuf),
+    #[error("disaster recovery failed: {0}")]
+    Dr(String),
+    #[error(transparent)]
+    Identity(#[from] IdentityError),
+    #[error("io error: {0}")]
+    Io(#[from] io::Error),
+    #[error("config error: {0}")]
+    Toml(String),
+}
+
+#[derive(Debug)]
+pub struct SetupOptions {
+    pub data_dir: PathBuf,
+    pub mode: Option<SetupMode>,
+    pub watch: Vec<PathBuf>,
+    pub quota_gb: Option<f64>,
+    pub seed: Vec<String>,
+    pub phrase_file: Option<PathBuf>,
+    pub yes: bool,
+    pub skip_phrase_check: bool,
+    pub allow_root: bool,
+    pub json: bool,
+}
+
+/// What the installer reads from `--json` (and what the human summary repeats).
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct SetupReport {
+    pub mode: String,
+    pub data_dir: String,
+    pub identity_pub: String,
+    pub device_id: String,
+    pub phrase_confirmed: bool,
+    pub watch: Vec<String>,
+    pub quota_gb: f64,
+    pub reserve_gb: f64,
+    pub web_port: u16,
+    pub next: String,
+}
+
+const NEXT_NEW: &str =
+    "start the Viaticum service (the installer does this), then run `viaticum open`";
+const NEXT_RESTORE: &str =
+    "start the service, then run `viaticum restore <folder>/`; files come back into staging";
+
+/// `setup` entry point. Local only: no daemon, no service (R3c owns those).
+pub async fn run_setup(opts: SetupOptions) -> Result<SetupReport, SetupError> {
+    run_setup_with_ttys(opts, io::stdin().is_terminal(), io::stdout().is_terminal()).await
+}
+
+/// The same entry point with the two tty facts passed in, so a unit can drive
+/// the half-tty case (`setup | tee`) through the real `run_new`/`run_restore`
+/// code instead of testing the grid helper.
+async fn run_setup_with_ttys(
+    opts: SetupOptions,
+    stdin_tty: bool,
+    stdout_tty: bool,
+) -> Result<SetupReport, SetupError> {
+    if root_refused(euid(), opts.allow_root) {
+        return Err(SetupError::Root);
+    }
+    let tty = crate::cli::is_interactive(stdin_tty, stdout_tty);
+    let ui = Ui { json: opts.json };
+    let mode = match opts.mode {
+        Some(m) => m,
+        None if tty => ask_mode(&ui)?,
+        None => return Err(SetupError::NoTty),
+    };
+
+    std::fs::create_dir_all(&opts.data_dir)?;
+
+    if mode == SetupMode::Restore {
+        return run_restore(opts, tty, ui).await;
+    }
+    run_new(opts, tty, ui).await
+}
+
+async fn run_new(opts: SetupOptions, tty: bool, ui: Ui) -> Result<SetupReport, SetupError> {
+    if !tty && !opts.yes {
+        return Err(SetupError::NoTty);
+    }
+    // Validate everything that would leave a half-written node before the
+    // identity and the phrase exist (the same rule restore now follows).
+    let seeds = validated_seeds(&opts.seed)?;
+    let watch = resolve_watch(&opts, tty, &ui, None)?;
+    let (free, size) = free_and_size(&opts.data_dir);
+    let quota = resolve_quota(&opts, free, tty, &ui)?;
+    let reserve = size.map(default_reserve_gb).unwrap_or(2.0);
+    warn_if_quota_over_room(&ui, free, quota, reserve);
+
+    // A re-run must keep the ports the first run wrote (install-i9, NOTE 2).
+    let config_existed = opts.data_dir.join(CONFIG_FILE_NAME).is_file();
+    let keyfile = if opts.data_dir.join(KEYFILE_NAME).exists() {
+        load_identity(&opts.data_dir)?
+    } else {
+        init_identity(&opts.data_dir)?
+    };
+    write_default_config_if_absent(&opts.data_dir)?;
+
+    if !opts.skip_phrase_check && !crate::cli::phrase::is_confirmed(&opts.data_dir) {
+        if tty {
+            if let Some(grid) = phrase_grid_for_setup(tty, &keyfile.mnemonic) {
+                ui.say("Your 24 recovery words. Write them on paper, in order, and keep the paper safe.");
+                ui.say("Do not store them in a file, a photo or a password manager.");
+                ui.say("");
+                // The phrase goes to stdout, the stream a tty check covers; in
+                // --json mode nothing but the report reaches stdout without a
+                // tty (a redirected stderr must never receive the grid).
+                print!("{grid}");
+                io::stdout().flush()?;
+                ui.say("");
+                ui.wait_for_enter("Press Enter when you have written them down: ")?;
+            }
+            crate::cli::phrase::confirm_in_tty(&keyfile.mnemonic, None, None)
+                .map_err(|e| SetupError::Io(io::Error::other(e)))?;
+            crate::cli::phrase::mark_confirmed(&opts.data_dir)?;
+        }
+        // Without a tty the phrase is never printed and never confirmed: the
+        // friend runs `viaticum phrase show` in a terminal (install-i2, N9).
+    } else if opts.skip_phrase_check {
+        crate::cli::phrase::mark_confirmed(&opts.data_dir)?;
+    }
+
+    finish(
+        SetupMode::New,
+        &opts,
+        &watch,
+        quota,
+        reserve,
+        seeds,
+        &ui,
+        config_existed,
+    )
+}
+
+async fn run_restore(opts: SetupOptions, tty: bool, ui: Ui) -> Result<SetupReport, SetupError> {
+    let identity_path = opts.data_dir.join(KEYFILE_NAME);
+    if identity_path.exists() {
+        return Err(SetupError::DataDirHasIdentity(opts.data_dir.clone()));
+    }
+    let phrase = match &opts.phrase_file {
+        Some(path) => read_phrase_file(path)?,
+        None if tty => ask_phrase(&ui)?,
+        None => return Err(SetupError::NoTty),
+    };
+    // Everything the finish step would reject is checked BEFORE `run_dr`:
+    // once DR has committed, a `FolderMissing`/bad seed/invalid quota leaves an
+    // identity and no usable config, and `--mode restore` refuses to run again
+    // (W1, install-i13).
+    let seeds_for_config = validated_seeds(&opts.seed)?;
+    let prepared_watch = if opts.watch.is_empty() {
+        None
+    } else {
+        // Files come back into staging, so the folder may not exist on the new
+        // machine yet: create it 0700 instead of failing after the commit.
+        Some(ensure_watch_dirs(opts.watch.clone())?)
+    };
+    let prepared_quota = if let Some(q) = opts.quota_gb {
+        validate_quota(q)?;
+        Some(q)
+    } else if !tty {
+        let (free, _) = free_and_size(&opts.data_dir);
+        Some(resolve_quota(&opts, free, false, &ui)?)
+    } else {
+        None
+    };
+    let config_existed = opts.data_dir.join(CONFIG_FILE_NAME).is_file();
+
+    let seeds = if opts.seed.is_empty() {
+        viaticum_core::constants::DEFAULT_SEEDS
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    } else {
+        opts.seed.clone()
+    };
+    let dr = crate::daemon::dr::DrOptions {
+        mnemonic: phrase,
+        peers: seeds,
+        data_dir: opts.data_dir.clone(),
+        catalog: None,
+    };
+    crate::daemon::dr::run_dr(dr)
+        .await
+        .map_err(|e| SetupError::Dr(e.to_string()))?;
+    crate::cli::phrase::mark_confirmed(&opts.data_dir)?;
+    write_default_config_if_absent(&opts.data_dir)?;
+
+    let watch = match prepared_watch {
+        Some(paths) => paths,
+        None => resolve_watch(&opts, tty, &ui, catalog_watch_roots(&opts.data_dir))?,
+    };
+    let (free, size) = free_and_size(&opts.data_dir);
+    let quota = match prepared_quota {
+        Some(q) => q,
+        None => resolve_quota(&opts, free, tty, &ui)?,
+    };
+    let reserve = size.map(default_reserve_gb).unwrap_or(2.0);
+    warn_if_quota_over_room(&ui, free, quota, reserve);
+    finish(
+        SetupMode::Restore,
+        &opts,
+        &watch,
+        quota,
+        reserve,
+        seeds_for_config,
+        &ui,
+        config_existed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish(
+    mode: SetupMode,
+    opts: &SetupOptions,
+    watch: &[PathBuf],
+    quota: f64,
+    reserve: f64,
+    seeds: Option<Vec<String>>,
+    ui: &Ui,
+    config_existed: bool,
+) -> Result<SetupReport, SetupError> {
+    let config_path = opts.data_dir.join(CONFIG_FILE_NAME);
+    let config_text = std::fs::read_to_string(&config_path)?;
+    let listen_port = AppConfig::load(&config_path)
+        .map_err(|e| SetupError::Toml(e.to_string()))?
+        .network
+        .listen_port;
+    let existing_web_port = existing_web_port(&config_text).unwrap_or(0);
+    let web_port = choose_web_port(existing_web_port, listen_port, config_existed);
+    let answers = SetupAnswers {
+        watch: watch.to_vec(),
+        quota_gb: quota,
+        reserve_gb: reserve,
+        seeds,
+        web_port,
+    };
+    let text = apply_setup_to_config(&config_text, &answers)?;
+    write_config(&config_path, &text)?;
+
+    let keyfile = load_identity(&opts.data_dir)?;
+    let next = if mode == SetupMode::Restore {
+        NEXT_RESTORE
+    } else {
+        NEXT_NEW
+    };
+    let report = SetupReport {
+        mode: mode.as_str().to_string(),
+        data_dir: opts.data_dir.display().to_string(),
+        identity_pub: viaticum_core::types::hex_encode(&keyfile.identity_pub),
+        device_id: viaticum_core::types::hex_encode(&keyfile.device_id),
+        phrase_confirmed: crate::cli::phrase::is_confirmed(&opts.data_dir),
+        watch: watch.iter().map(|p| p.display().to_string()).collect(),
+        quota_gb: quota,
+        reserve_gb: reserve,
+        web_port,
+        next: next.to_string(),
+    };
+    if opts.json {
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("SetupReport is plain data")
+        );
+    } else {
+        ui.say("Setup complete.");
+        ui.say(&format!("  data directory: {}", report.data_dir));
+        if report.watch.is_empty() {
+            ui.say("  folders: none yet (add one in Settings)");
+        } else {
+            ui.say(&format!("  folders: {}", report.watch.join(", ")));
+        }
+        ui.say(&format!(
+            "  space for friends: {:.1} GB (reserve {:.1} GB)",
+            report.quota_gb, report.reserve_gb
+        ));
+        ui.say(&format!(
+            "  Dashboard: http://127.0.0.1:{} (run `viaticum open`)",
+            report.web_port
+        ));
+        if !report.phrase_confirmed {
+            ui.say("  phrase NOT confirmed yet: run `viaticum phrase show` and `viaticum phrase check` in a terminal");
+        }
+        ui.say(&format!(
+            "SETUP_OK mode={} data_dir={} web_port={}",
+            report.mode, report.data_dir, report.web_port
+        ));
+        ui.say(&format!("Next: {}", report.next));
+    }
+    Ok(report)
+}
+
+// ─── Questions ───────────────────────────────────────────────────────────────
+
+struct Ui {
+    json: bool,
+}
+
+impl Ui {
+    fn say(&self, text: &str) {
+        if self.json {
+            eprintln!("{text}");
+        } else {
+            println!("{text}");
+        }
+    }
+
+    fn ask(&self, prompt: &str) -> io::Result<String> {
+        if self.json {
+            eprint!("{prompt}");
+        } else {
+            print!("{prompt}");
+        }
+        io::stdout().flush()?;
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "no answer (stdin closed)",
+            ));
+        }
+        Ok(line.trim().to_string())
+    }
+
+    fn wait_for_enter(&self, prompt: &str) -> Result<(), SetupError> {
+        self.ask(prompt)?;
+        Ok(())
+    }
+}
+
+fn ask_mode(ui: &Ui) -> Result<SetupMode, SetupError> {
+    ui.say("Is this a new installation, or are you restoring after losing a machine?");
+    ui.say("  1) New installation — this machine has no Viaticum node yet; create a new identity.");
+    ui.say(
+        "  2) Restore from my 24 words — the old machine is gone; bring its catalog back first.",
+    );
+    loop {
+        let answer = ui.ask("Choose 1 or 2: ")?;
+        if let Some(mode) = parse_mode_answer(&answer) {
+            return Ok(mode);
+        }
+        // No default: an empty Enter (and a typo) re-asks (NOTE 6, pre-mortem 13).
+        ui.say("Please answer 1 (new installation) or 2 (restore from 24 words).");
+    }
+}
+
+/// The mode question has no default: an empty line is not an answer (NOTE 6).
+fn parse_mode_answer(answer: &str) -> Option<SetupMode> {
+    match answer {
+        "1" | "new" | "n" => Some(SetupMode::New),
+        "2" | "restore" | "r" => Some(SetupMode::Restore),
+        _ => None,
+    }
+}
+
+fn ask_phrase(ui: &Ui) -> Result<String, SetupError> {
+    ui.say("Enter your 24 recovery words, separated by spaces.");
+    let phrase = ui.ask("Words: ")?;
+    parse_mnemonic(&phrase).map_err(SetupError::Identity)?;
+    Ok(phrase)
+}
+
+fn resolve_watch(
+    opts: &SetupOptions,
+    tty: bool,
+    ui: &Ui,
+    preferred: Option<Vec<PathBuf>>,
+) -> Result<Vec<PathBuf>, SetupError> {
+    if !opts.watch.is_empty() {
+        return validate_watch(opts.watch.clone());
+    }
+    let configured = configured_watch(&opts.data_dir);
+    let defaults = configured
+        .clone()
+        .or_else(|| preferred.map(|roots| validate_watch(roots).unwrap_or_default()))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(suggested_folders);
+    if !tty {
+        // A re-run without --watch keeps the folders already configured; a fresh
+        // restore defaults to roots read from the recovered catalog; otherwise
+        // the suggestions (usually empty in CI).
+        return Ok(configured.unwrap_or(defaults));
+    }
+    let default_text = if defaults.is_empty() {
+        "none".to_string()
+    } else {
+        defaults
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    loop {
+        let answer = ui.ask(&format!(
+            "Folders to keep safe (comma-separated, empty = {default_text}): "
+        ))?;
+        let paths = if answer.is_empty() {
+            defaults.clone()
+        } else {
+            answer
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| absolute_path(expand_watch_path(s)))
+                .collect()
+        };
+        match validate_watch(paths) {
+            Ok(paths) => return Ok(paths),
+            Err(SetupError::FolderMissing(p)) => {
+                ui.say(&format!(
+                    "{} does not exist or is not a directory.",
+                    p.display()
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn validate_watch(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, SetupError> {
+    let mut out = Vec::new();
+    for path in paths {
+        let path = absolute_path(path);
+        if !path.is_dir() {
+            return Err(SetupError::FolderMissing(path));
+        }
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
+fn absolute_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::path::absolute(&path).unwrap_or(path)
+    }
+}
+
+/// Restore preflight: a watch folder that does not exist yet is where the
+/// recovered files will land, so create it (0700) instead of failing after
+/// `run_dr` has committed the identity (W1, install-i13).
+fn ensure_watch_dirs(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, SetupError> {
+    let mut out = Vec::new();
+    for path in paths {
+        let path = absolute_path(path);
+        if !path.is_dir() {
+            create_private_dir(&path)?;
+        }
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
+/// `--seed` is written into the config: refuse a value the daemon would not
+/// parse. Called before the identity and before DR (W1).
+fn validated_seeds(seeds: &[String]) -> Result<Option<Vec<String>>, SetupError> {
+    if seeds.is_empty() {
+        return Ok(None);
+    }
+    for seed in seeds {
+        if !seed.starts_with('/') || !seed.contains("/p2p/") {
+            return Err(SetupError::Toml(format!(
+                "--seed {seed} is not a multiaddr with /p2p/<peer id>"
+            )));
+        }
+    }
+    Ok(Some(seeds.to_vec()))
+}
+
+/// Directories a friend is likely to want: only those that exist right now.
+/// Sorted, deduplicated, absolute.
+pub fn suggested_folders() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in [
+        dirs::document_dir(),
+        dirs::picture_dir(),
+        dirs::desktop_dir(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let dir = absolute_path(dir);
+        if dir.is_dir() && !out.contains(&dir) {
+            out.push(dir);
+        }
+    }
+    out
+}
+
+/// install-i13: after DR, suggest the folders the recovered catalog was
+/// watching. The catalog holds file paths, not watch roots, so for a path under
+/// `$HOME` the root is the first component under home; outside it, the file's
+/// parent. Only existing directories are returned, deduplicated.
+fn catalog_watch_roots(data_dir: &Path) -> Option<Vec<PathBuf>> {
+    let db =
+        viaticum_core::db::Db::open(&data_dir.join(crate::daemon::identity::DB_FILE_NAME)).ok()?;
+    let files = db.list_all_files().ok()?;
+    let home = dirs::home_dir().map(absolute_path);
+    let mut roots = Vec::new();
+    for file in files {
+        let path = PathBuf::from(&file.path);
+        let root = match &home {
+            Some(home) if path.starts_with(home) => path
+                .strip_prefix(home)
+                .ok()
+                .and_then(|rel| rel.components().next())
+                .map(|first| home.join(first)),
+            _ => path.parent().map(Path::to_path_buf),
+        };
+        if let Some(root) = root
+            && root.is_dir()
+            && !roots.contains(&root)
+        {
+            roots.push(root);
+        }
+    }
+    if roots.is_empty() { None } else { Some(roots) }
+}
+
+fn resolve_quota(
+    opts: &SetupOptions,
+    free: Option<u64>,
+    tty: bool,
+    ui: &Ui,
+) -> Result<f64, SetupError> {
+    if let Some(q) = opts.quota_gb {
+        validate_quota(q)?;
+        return Ok(q);
+    }
+    if !tty && let Some(q) = configured_quota(&opts.data_dir) {
+        return Ok(q);
+    }
+    let default = configured_quota(&opts.data_dir).or_else(|| free.map(default_quota_gb));
+    if tty {
+        loop {
+            let prompt = match default {
+                Some(d) => format!("Space to give friends on this disk, in GB [{d:.0}]: "),
+                None => "Free space could not be read. Space to give friends, in GB (at least 1): "
+                    .to_string(),
+            };
+            let answer = ui.ask(&prompt)?;
+            if answer.is_empty() {
+                if let Some(d) = default {
+                    return Ok(d);
+                }
+                ui.say("Enter a number of GB, at least 1.");
+                continue;
+            }
+            match answer.parse::<f64>() {
+                Ok(q) => match validate_quota(q) {
+                    Ok(()) => return Ok(q),
+                    Err(e) => ui.say(&e.to_string()),
+                },
+                Err(_) => ui.say("Enter a number, for example 20."),
+            }
+        }
+    }
+    match default {
+        Some(q) => Ok(q),
+        None => Err(SetupError::NoFreeSpaceInfo(opts.data_dir.clone())),
+    }
+}
+
+/// install-i3: a quota above `free − reserve` is accepted but the friend is
+/// told; the daemon may then evict or refuse friends' data sooner.
+fn warn_if_quota_over_room(ui: &Ui, free: Option<u64>, quota_gb: f64, reserve_gb: f64) {
+    let Some(free) = free else { return };
+    let free_gb = free as f64 / 1_073_741_824.0;
+    let room = free_gb - reserve_gb;
+    if quota_gb > room {
+        ui.say(&format!(
+            "Warning: you offered {quota_gb:.1} GB but only {room:.1} GB is free above the \
+             {reserve_gb:.1} GB reserve. The node keeps that much of friends' data only while \
+             the disk allows it."
+        ));
+    }
+}
+
+fn validate_quota(q: f64) -> Result<(), SetupError> {
+    if !q.is_finite() || q < 1.0 {
+        return Err(SetupError::InvalidQuota(q));
+    }
+    Ok(())
+}
+
+/// `max(1, floor(0.2 × free_gb))` (Р-11, install-i3).
+pub fn default_quota_gb(free_bytes: u64) -> f64 {
+    let free_gb = free_bytes as f64 / 1_073_741_824.0;
+    (free_gb * 0.2).floor().max(1.0)
+}
+
+/// `clamp(0.1 × size_gb, 2, 20)` (Р-11).
+pub fn default_reserve_gb(fs_size_bytes: u64) -> f64 {
+    let size_gb = fs_size_bytes as f64 / 1_073_741_824.0;
+    (size_gb * 0.1).clamp(2.0, 20.0)
+}
+
+/// Free bytes and filesystem size of the data directory via `statvfs` of the
+/// path itself (F-Q, N3: a symlink is resolved by the kernel, not by us).
+pub fn free_and_size(data_dir: &Path) -> (Option<u64>, Option<u64>) {
+    (disk_available_bytes(data_dir), disk_size_bytes(data_dir))
+}
+
+// ─── Config ──────────────────────────────────────────────────────────────────
+
+/// Apply setup answers to the `init` template with `toml_edit`, preserving
+/// comments. Re-runs merge `[[watch]]` instead of replacing the array: a
+/// folder that stays keeps its other keys (`importance_multiplier`) and its
+/// decor, so a hand-edited config is not reset (NOTE 3, install-i3).
+pub fn apply_setup_to_config(toml_text: &str, a: &SetupAnswers) -> Result<String, SetupError> {
+    let mut doc: toml_edit::DocumentMut = toml_text
+        .parse()
+        .map_err(|e: toml_edit::TomlError| SetupError::Toml(e.to_string()))?;
+
+    {
+        let storage = table_mut(&mut doc, "storage");
+        storage["soft_quota_gb"] = toml_edit::value(a.quota_gb);
+        storage["disk_reserve_gb"] = toml_edit::value(a.reserve_gb);
+    }
+    if let Some(seeds) = &a.seeds {
+        let mut arr = toml_edit::Array::new();
+        for s in seeds {
+            arr.push(s.as_str());
+        }
+        let network = table_mut(&mut doc, "network");
+        network["kademlia_bootstrap_peers"] = toml_edit::value(arr);
+    }
+    {
+        let web = table_mut(&mut doc, "web_api");
+        web["enabled"] = toml_edit::value(true);
+        web["bind"] = toml_edit::value(format!("127.0.0.1:{}", a.web_port));
+    }
+
+    let existing = doc
+        .get("watch")
+        .and_then(|item| item.as_array_of_tables())
+        .cloned();
+    let mut watches = toml_edit::ArrayOfTables::new();
+    for path in &a.watch {
+        let wanted = path.to_string_lossy();
+        let table = existing
+            .as_ref()
+            .and_then(|array| {
+                array
+                    .iter()
+                    .find(|t| t.get("path").and_then(|p| p.as_str()) == Some(wanted.as_ref()))
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                let mut table = toml_edit::Table::new();
+                table["path"] = toml_edit::value(wanted.to_string());
+                table
+            });
+        watches.push(table);
+    }
+    // Replacing the key in place (or inserting it once) keeps the `[web_api]`
+    // trailing `# bind = …` hint where it was; `remove` + `insert` moved it
+    // under `[[watch]]` (NOTE 3).
+    if watches.is_empty() {
+        doc.remove("watch");
+    } else {
+        doc.insert("watch", toml_edit::Item::ArrayOfTables(watches));
+    }
+    Ok(doc.to_string())
+}
+
+fn table_mut<'a>(doc: &'a mut toml_edit::DocumentMut, name: &str) -> &'a mut toml_edit::Table {
+    if !doc.contains_key(name) {
+        doc.insert(name, toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    doc[name]
+        .as_table_mut()
+        .expect("the table was just inserted")
+}
+
+fn configured_watch(data_dir: &Path) -> Option<Vec<PathBuf>> {
+    let cfg = AppConfig::load(&data_dir.join(CONFIG_FILE_NAME)).ok()?;
+    if cfg.watch.is_empty() {
+        return None;
+    }
+    Some(
+        cfg.watch
+            .iter()
+            .map(|w| absolute_path(expand_watch_path(&w.path)))
+            .collect(),
+    )
+}
+
+fn configured_quota(data_dir: &Path) -> Option<f64> {
+    let cfg = AppConfig::load(&data_dir.join(CONFIG_FILE_NAME)).ok()?;
+    (cfg.storage.soft_quota_gb >= 1.0).then_some(cfg.storage.soft_quota_gb)
+}
+
+fn existing_web_port(toml_text: &str) -> Option<u16> {
+    let doc: toml_edit::DocumentMut = toml_text.parse().ok()?;
+    let bind = doc.get("web_api")?.as_table()?.get("bind")?.as_str()?;
+    bind.rsplit_once(':')?.1.parse().ok()
+}
+
+/// 7383 when it is free and not the libp2p port, else a random free TCP port on
+/// loopback that differs from the libp2p one (two users on one machine). Once
+/// a config exists, its port is kept even if it is busy now — usually the
+/// node's own daemon holds it (install-i9, NOTE 2). The libp2p `listen_port`
+/// is never rewritten here either.
+pub fn choose_web_port(existing: u16, listen_port: u16, keep_existing: bool) -> u16 {
+    use crate::daemon::network::listen_port::{PortProtocols, pick_listen_port};
+    choose_web_port_with(
+        existing,
+        listen_port,
+        keep_existing,
+        tcp_free_on_loopback,
+        |exclude| {
+            let local = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+            pick_listen_port(
+                viaticum_core::constants::LISTEN_PORT_RANGE,
+                exclude,
+                PortProtocols::Tcp,
+                local,
+            )
+        },
+    )
+}
+
+fn choose_web_port_with<F, P>(
+    existing: u16,
+    listen_port: u16,
+    keep_existing: bool,
+    default_is_free: F,
+    pick: P,
+) -> u16
+where
+    F: Fn(u16) -> bool,
+    P: Fn(&[u16]) -> Option<u16>,
+{
+    let default = crate::daemon::identity::DEFAULT_WEB_PORT;
+    if existing != 0 && existing != listen_port && (keep_existing || existing != default) {
+        return existing;
+    }
+    if existing == default && listen_port != default && default_is_free(default) {
+        return default;
+    }
+    pick(&[listen_port, default]).unwrap_or(default)
+}
+
+fn tcp_free_on_loopback(port: u16) -> bool {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
+}
+
+fn write_config(path: &Path, text: &str) -> Result<(), SetupError> {
+    let tmp = path.with_extension("toml.setup-tmp");
+    std::fs::write(&tmp, text)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+// ─── Phrase file ─────────────────────────────────────────────────────────────
+
+/// Restore without a tty requires a 0600 phrase file. Anything outside 0600
+/// (group/other access, or execute bits) is refused before DR touches anything.
+pub fn check_phrase_file_mode(path: &Path, mode: u32) -> Result<(), SetupError> {
+    if mode & !0o600 != 0 {
+        return Err(SetupError::PhraseFileMode(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn read_phrase_file(path: &Path) -> Result<String, SetupError> {
+    let meta = std::fs::metadata(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        check_phrase_file_mode(path, mode)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = &meta;
+    }
+    let text = std::fs::read_to_string(path)?;
+    let phrase = crate::daemon::identity::normalize_phrase(&text);
+    if phrase.is_empty() {
+        return Err(SetupError::Dr("the phrase file is empty".into()));
+    }
+    parse_mnemonic(&phrase).map_err(SetupError::Identity)?;
+    Ok(phrase)
+}
+
+// ─── Small pure helpers (unit-tested) ────────────────────────────────────────
+
+/// The phrase grid is shown only when the output is a tty (M3″, N9). `None`
+/// means "print nothing": no log, no capture, no installer transcript.
+pub fn phrase_grid_for_setup(is_tty: bool, mnemonic: &str) -> Option<String> {
+    is_tty.then(|| crate::cli::phrase::format_grid(mnemonic))
+}
+
+/// Root is refused before the first write unless `--allow-root` (install-i8).
+pub fn root_refused(euid: u32, allow_root: bool) -> bool {
+    euid == 0 && !allow_root
+}
+
+#[cfg(unix)]
+fn euid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+#[cfg(not(unix))]
+fn euid() -> u32 {
+    1
+}
+
+/// The template DR/init wrote, for callers that need it before `setup` edits it.
+pub fn base_config(listen_port: u16, seeds: &[&str]) -> String {
+    default_config_toml(listen_port, seeds)
+}

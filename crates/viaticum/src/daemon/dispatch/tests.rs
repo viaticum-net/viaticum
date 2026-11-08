@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
 use viaticum_core::db::Db;
-use viaticum_core::types::{DeviceId, IdentityPub};
+use viaticum_core::types::{DeviceId, FileRecord, FileVersion, IdentityPub};
 
 use crate::cli::types::{CliRequest, CliResponse};
 use crate::cli::types::{
@@ -46,6 +46,7 @@ async fn make_test_state_with(
 
     Arc::new(DaemonState {
         db,
+        started_at: std::time::Instant::now(),
         identity_pub,
         device_id,
         restore_tx,
@@ -95,6 +96,34 @@ async fn dispatch_status_carries_daemon_version() {
     assert_eq!(data.daemon_version, crate::build_info::build_id());
     let json = serde_json::to_value(&*data).expect("serialize");
     assert_eq!(json["daemon_version"], crate::build_info::build_id());
+}
+
+/// install-i4: one status snapshot carries both the build id and the server's
+/// verdict; the CLI and Dashboard read the same JSON shape.
+#[tokio::test]
+async fn status_json_carries_verdict_and_version() {
+    let state = make_test_state().await;
+    let CliResponse::Status(data) = dispatch(CliRequest::Status, &state).await else {
+        panic!("expected Status");
+    };
+    let json = serde_json::to_value(&*data).expect("serialize");
+    assert_eq!(json["daemon_version"], crate::build_info::build_id());
+    assert!(
+        matches!(
+            json["verdict"]["node"]["level"].as_str(),
+            Some("green" | "yellow" | "red")
+        ),
+        "verdict.node.level missing: {json}"
+    );
+    assert!(
+        matches!(
+            json["verdict"]["protection"]["level"].as_str(),
+            Some("green" | "yellow")
+        ),
+        "protection is never red in R3: {json}"
+    );
+    assert!(json["verdict"]["node"]["headline"].is_string());
+    assert!(json["verdict"]["protection"]["detail"].is_string());
 }
 
 #[tokio::test]
@@ -295,6 +324,7 @@ async fn dispatch_device_revoke_returns_device_revoked_with_no_router() {
 
     let state = Arc::new(DaemonState {
         db,
+        started_at: std::time::Instant::now(),
         identity_pub,
         device_id: device_id_a,
         restore_tx,
@@ -930,6 +960,7 @@ async fn revocation_published_only_to_storage_relationship_peers() {
 
     let state = Arc::new(DaemonState {
         db,
+        started_at: std::time::Instant::now(),
         identity_pub: our_master,
         device_id: our_device_id,
         restore_tx,
@@ -1081,6 +1112,7 @@ pub(crate) fn after_dr_revoke_fixture() -> (
     let (router, sender) = make_router_for_revocation(&db);
     let state = Arc::new(DaemonState {
         db,
+        started_at: std::time::Instant::now(),
         identity_pub: our_master,
         device_id: our_device_id,
         restore_tx,
@@ -1229,6 +1261,7 @@ async fn revocation_dedup_peer_is_holder_and_owner() {
 
     let state = Arc::new(DaemonState {
         db,
+        started_at: std::time::Instant::now(),
         identity_pub: our_master,
         device_id: our_device_id,
         restore_tx,
@@ -1381,6 +1414,7 @@ async fn _removed_dispatch_connect_two_daemons_registers_peer() {
     let (restore_tx, _restore_rx) = mpsc::channel::<crate::daemon::restore::RestoreRequest>(4);
     let state_a = Arc::new(DaemonState {
         db: db_a.clone(),
+        started_at: std::time::Instant::now(),
         identity_pub: pk_a,
         device_id: did_a,
         network: handle_a.clone(),
@@ -1471,6 +1505,7 @@ fn staging_test_state(
     let master_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
     Arc::new(DaemonState {
         db: Db::open_in_memory().unwrap(),
+        started_at: std::time::Instant::now(),
         identity_pub: IdentityPub(master_key.verifying_key().to_bytes()),
         device_id: DeviceId([0u8; 32]),
         restore_tx,
@@ -2736,4 +2771,248 @@ async fn status_counts_only_acks_of_the_kad_near_set() {
     assert_eq!(data.dr_pointer_held, 3);
     assert_eq!(data.dr_pointer_near_set, 20);
     assert!(!data.dr_ready);
+}
+
+// ============================================================
+// R3b review fixes: B2 (network wiring), NOTE 1 (blocks_in_flight), NOTE 7
+// (startup_scan_done) — the guards sit where the daemon decides.
+// ============================================================
+
+fn peer_record(device_id: DeviceId, master: IdentityPub) -> viaticum_core::types::PeerRecord {
+    use viaticum_core::constants::{AVAIL_EWMA_INITIAL, INITIAL_TRUST_P};
+    viaticum_core::types::PeerRecord {
+        device_id,
+        master_identity: master,
+        trust_p: INITIAL_TRUST_P,
+        trust_i: 0.0,
+        trust_s: 1.0,
+        bytes_we_store_for_peer: 0,
+        bytes_peer_stores_for_us: 0,
+        first_seen: viaticum_core::types::Timestamp::now(),
+        last_seen: viaticum_core::types::Timestamp::now(),
+        revoked_device_pub_keys: vec![],
+        addrs: vec!["/ip4/127.0.0.1/tcp/4001".to_string()],
+        x25519_pub: None,
+        avail_ewma: AVAIL_EWMA_INITIAL,
+        last_avail_sample: 0,
+    }
+}
+
+/// B2: `dispatch_status` must take `holder_pool` from `snapshot_pool`'s
+/// authenticated count, not from the DB fallback. Three PeerRecords and no
+/// swarm: the fallback would say "3 friends", the network check must stay
+/// yellow ("few friends"/"looking for friends"). Mutation:
+/// `.online_count` → `.candidates.len() as u32` turns this green.
+#[tokio::test]
+async fn dispatch_status_network_check_uses_the_online_holder_pool() {
+    let state = make_test_state().await;
+    for seed in [41u8, 42, 43] {
+        let device = DeviceId(
+            ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        state
+            .db
+            .upsert_peer(&peer_record(device, IdentityPub([0x42; 32])))
+            .unwrap();
+    }
+    let data = status_of(&state).await;
+    let verdict = data.verdict.expect("status always carries a verdict");
+    let network = verdict
+        .node
+        .checks
+        .iter()
+        .find(|c| c.id == crate::daemon::dispatch::verdict::CheckId::Network)
+        .expect("network check");
+    assert_eq!(
+        network.level,
+        crate::daemon::dispatch::verdict::VerdictLevel::Yellow,
+        "offline PeerRecords are not an online holder pool: {network:?}"
+    );
+    assert!(
+        network.detail.contains("friend"),
+        "yellow network text: {:?}",
+        network.detail
+    );
+}
+
+/// A file whose latest version is Queued (no block yet).
+fn queued_file(id: u64, path: &str) -> FileRecord {
+    FileRecord {
+        file_id: viaticum_core::types::FileId(id),
+        path: path.to_string(),
+        importance: 0.5,
+        devices: vec![],
+        versions: vec![FileVersion {
+            content_hash: [id as u8; 32],
+            source_block_id: viaticum_core::types::SourceBlockId([0u8; 32]),
+            k: 4,
+            t: 1024,
+            created_at: Timestamp(1),
+            backed_up_at: None,
+        }],
+        first_seen: Timestamp(0),
+        on_disk_confirmed: true,
+    }
+}
+
+/// A file with a serviceable block and no Alive placements: Replicating.
+fn replicating_file(id: u64, path: &str) -> (FileRecord, viaticum_core::types::SourceBlockRecord) {
+    use viaticum_core::types::{
+        SourceBlockId, SourceBlockRecord, SourceBlockStatus, SourceBlockType,
+    };
+    let block_id = SourceBlockId([id as u8; 32]);
+    let block = SourceBlockRecord {
+        seal_generation: 0,
+        esi_high_water: 0,
+        block_id,
+        k: 4,
+        t: 1024,
+        block_type: SourceBlockType::Single,
+        status: SourceBlockStatus::Active,
+        created_at: Timestamp(1),
+        encrypted_size: Some(4096),
+        n: Some(8),
+        overhead: Some(1.5),
+        drop_notice_sent_at: None,
+        importance: 0.5,
+        current_alive: 0,
+        current_reliability: 0.0,
+        target_reliability: 0.95,
+    };
+    let file = FileRecord {
+        file_id: viaticum_core::types::FileId(id),
+        path: path.to_string(),
+        importance: 0.5,
+        devices: vec![],
+        versions: vec![FileVersion {
+            content_hash: [id as u8; 32],
+            source_block_id: block_id,
+            k: 4,
+            t: 1024,
+            created_at: Timestamp(1),
+            backed_up_at: Some(Timestamp(2)),
+        }],
+        first_seen: Timestamp(0),
+        on_disk_confirmed: true,
+    };
+    (file, block)
+}
+
+/// NOTE 1 / i14: a newcomer with files present, dr_ready=false and a pool of
+/// two must hear "normal for a new node". The input the daemon produces comes
+/// from the same `verdict_inputs` function `dispatch_status` calls: the count
+/// of latest versions in Queued|Replicating. Only `holder_pool` is set here
+/// (a unit cannot authenticate a live swarm); everything else is the real DB.
+/// Mutation: `blocks_in_flight` back to 0 → RecoveryNotReady → the i14 text is
+/// gone.
+#[tokio::test]
+async fn newcomer_with_files_in_flight_hears_i14_reason() {
+    let state = make_test_state().await;
+    state
+        .db
+        .upsert_file(&queued_file(11, "/home/friend/queued.bin"))
+        .unwrap();
+    let (replicating, block) = replicating_file(12, "/home/friend/replicating.bin");
+    state.db.upsert_source_block(&block).unwrap();
+    state.db.upsert_file(&replicating).unwrap();
+
+    let files = state.db.list_all_files().unwrap();
+    let mut inputs = super::verdict_inputs(&state, 0, 1, 0, true, &files, false, 1 << 30).await;
+    assert_eq!(inputs.files_total, 2);
+    assert_eq!(inputs.files_restorable, 0);
+    assert_eq!(
+        inputs.blocks_in_flight, 2,
+        "Queued + Replicating are the daemon's in-flight files (NOTE 1)"
+    );
+    assert!(!inputs.dr_ready, "a newcomer's DR pointer is not ready");
+
+    // A unit has no authenticated live swarm; set the one scalar needed to
+    // reach the i14 branch (it is what the E2E's four connected hosts give).
+    inputs.holder_pool = 2;
+    let verdict = crate::daemon::dispatch::verdict::compute_verdict(&inputs);
+    assert_eq!(
+        verdict.protection.reason,
+        crate::daemon::dispatch::verdict::ProtectionReason::Uploading,
+        "{:?}",
+        verdict.protection
+    );
+    assert!(
+        verdict
+            .protection
+            .detail
+            .contains("normal for a new node, can take weeks"),
+        "i14 wording missing: {}",
+        verdict.protection.detail
+    );
+}
+
+/// NOTE 7: `scan_settled` is false until the watcher's startup pass ends.
+/// `WatchAdmin::new` starts with `startup_scan_done == false`; the verdict must
+/// say `Scanning` then, and stop saying it only after the watcher reports the
+/// end of the pass. Mutation: `AtomicBool::new(false)` → `new(true)` in
+/// `WatchAdmin::new` makes the first assertion fail.
+#[tokio::test]
+async fn verdict_says_scanning_until_the_watcher_reports_the_startup_pass() {
+    use std::sync::{Arc, RwLock};
+
+    use viaticum_core::config::WatchConfig;
+
+    let watch_dir = tempfile::tempdir().unwrap();
+    let watch_path = watch_dir.path().to_path_buf();
+    let live = Arc::new(RwLock::new(vec![WatchConfig {
+        path: watch_path.to_string_lossy().into_owned(),
+        importance_multiplier: 1.0,
+        was_legacy_importance: false,
+        classification: None,
+        bursts: None,
+    }]));
+    let state = make_test_state().await;
+    let (tx, _rx) = mpsc::channel(8);
+    let admin = crate::daemon::watch_admin::WatchAdmin::new(
+        watch_dir.path().join("config.toml"),
+        live,
+        tx,
+        state.db.clone(),
+    );
+    let mut raw = match Arc::try_unwrap(state) {
+        Ok(state) => state,
+        Err(_) => panic!("the test state has one reference"),
+    };
+    raw.watch_admin = Some(Arc::new(admin));
+    let state = Arc::new(raw);
+
+    let data = status_of(&state).await;
+    assert_eq!(
+        data.verdict.unwrap().protection.reason,
+        crate::daemon::dispatch::verdict::ProtectionReason::Scanning,
+        "a fresh WatchAdmin has not finished its startup pass"
+    );
+
+    let admin = state.watch_admin.as_ref().unwrap();
+    admin
+        .startup_scan_done
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let data = status_of(&state).await;
+    assert_ne!(
+        data.verdict.unwrap().protection.reason,
+        crate::daemon::dispatch::verdict::ProtectionReason::Scanning,
+        "after the watcher's startup pass the verdict must not stay on Scanning"
+    );
+
+    // A folder that is still scanning keeps the reason Scanning even after the
+    // startup signal: `scan_settled` is `startup_scan_done && !any(Scanning)`.
+    admin
+        .watch_states
+        .write()
+        .unwrap()
+        .get_mut(&watch_path)
+        .unwrap()
+        .status = crate::daemon::watch_admin::WatcherStatusSignal::Scanning;
+    let data = status_of(&state).await;
+    assert_eq!(
+        data.verdict.unwrap().protection.reason,
+        crate::daemon::dispatch::verdict::ProtectionReason::Scanning,
+    );
 }

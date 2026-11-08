@@ -85,6 +85,7 @@ fn config(
         data_dir: data_dir.path().to_path_buf(),
         rescan_interval_secs: 604800,
         watch_states: states,
+        startup_scan_done: None,
         time_scale: 1,
         recheck_rx: None,
         resubmit_rx: None,

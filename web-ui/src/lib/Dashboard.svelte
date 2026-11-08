@@ -99,9 +99,31 @@
     <button onclick={fetchStatus}>Retry</button>
   </div>
 {:else if status}
+  {#if status.verdict}
+    <section class="verdicts" aria-label="Node and protection verdict">
+      <div class="card verdict verdict-{status.verdict.node.level}" data-node-level={status.verdict.node.level}>
+        <h2>Node</h2>
+        <p class="verdict-headline">{status.verdict.node.headline}</p>
+        <ul class="verdict-checks">
+          {#each status.verdict.node.checks as check}
+            <li class="verdict-check verdict-{check.level}">
+              <span class="verdict-check-id">{check.id}</span>: {check.detail}
+            </li>
+          {/each}
+        </ul>
+      </div>
+      <div class="card verdict verdict-{status.verdict.protection.level}" data-protection-level={status.verdict.protection.level}>
+        <h2>Protection</h2>
+        <p class="verdict-headline">{status.verdict.protection.detail}</p>
+        <p class="muted">{status.verdict.protection.restorable_pct}% restorable
+          · recovery by phrase: {status.verdict.protection.dr_ready ? 'ready' : 'not ready yet'}</p>
+      </div>
+    </section>
+  {/if}
+
   <div class="grid">
     <div class="card">
-      <h2>Node</h2>
+      <h2>This device</h2>
       <dl>
         <dt>Identity</dt>
         <dd class="mono">{status.node_identity.slice(0, 16)}...</dd>
@@ -311,4 +333,23 @@
   .status-degraded { background: #3d1b1b; color: #f85149; }
   .status-empty    { background: #21262d; color: #8b949e; }
   .warn-text { color: #d29922; }
+
+  /* The two-line verdict: the level comes from status.verdict, never computed here. */
+  .verdicts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 1rem;
+    margin-bottom: 1rem;
+  }
+  .verdict { border-left: 4px solid #8b949e; }
+  .verdict-green  { border-left-color: #3fb950; }
+  .verdict-yellow { border-left-color: #d29922; }
+  .verdict-red    { border-left-color: #f85149; }
+  .verdict-headline { font-size: 1.05rem; margin: 0.35rem 0 0.6rem; }
+  .verdict-checks { margin: 0; padding-left: 1.1rem; font-size: 0.9rem; }
+  .verdict-check { margin: 0.15rem 0; }
+  .verdict-check.verdict-green  { color: #3fb950; }
+  .verdict-check.verdict-yellow { color: #d29922; }
+  .verdict-check.verdict-red    { color: #f85149; }
+  .verdict-check-id { font-weight: 600; }
 </style>

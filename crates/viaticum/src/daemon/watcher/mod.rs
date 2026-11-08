@@ -245,6 +245,9 @@ pub struct WatcherConfig {
     /// Idle when complete, Error on failure. None in tests that don't use
     /// WatchAdmin.
     pub watch_states: Option<Arc<RwLock<HashMap<PathBuf, WatchEntryState>>>>,
+    /// Set by the watcher when the startup pass is over (scan, skip or an empty
+    /// list). Shared with WatchAdmin; `None` in tests that do not use it.
+    pub startup_scan_done: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Time acceleration: a recheck of the same path more often than once per
     /// `3600 / time_scale` s is ignored.
     pub time_scale: u64,
@@ -373,6 +376,9 @@ pub async fn start_watcher(
         tracing::info!("watcher started with empty watch list; awaiting Add commands");
     } else {
         tracing::info!("scan skipped (last scan recent enough)");
+    }
+    if let Some(done) = &config.startup_scan_done {
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     // Poll the std channel at quarter-debounce resolution (min 10 ms).

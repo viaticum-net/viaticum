@@ -74,10 +74,42 @@ fn config_for(dir: &TempDir) -> WatcherConfig {
         data_dir,
         rescan_interval_secs: 604800, // 1 week — effectively disabled for test duration
         watch_states: None,
+        startup_scan_done: None,
         time_scale: 1,
         recheck_rx: None,
         resubmit_rx: None,
     }
+}
+
+/// T10 / install-i14: the watcher reports the end of its startup pass even
+/// with an empty folder list; the verdict's `scan_settled` then stops saying
+/// "scanning" forever.
+#[tokio::test]
+async fn startup_scan_done_is_set_after_the_startup_pass() {
+    let dir = TempDir::new().unwrap();
+    let mut config = config_for(&dir);
+    config.watch_dirs.clear();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    config.startup_scan_done = Some(std::sync::Arc::clone(&done));
+    let (dirty_tx, _dirty_rx) = mpsc::channel(8);
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        start_watcher(config, dirty_tx, mpsc::channel(1).1, cancel_clone)
+            .await
+            .expect("watcher error");
+    });
+    for _ in 0..100 {
+        if done.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        done.load(std::sync::atomic::Ordering::Relaxed),
+        "startup_scan_done stayed false"
+    );
+    cancel.cancel();
 }
 
 #[tokio::test]
@@ -258,6 +290,7 @@ async fn watcher_starts_with_empty_dir_list_without_error() {
         data_dir: tmp.path().to_path_buf(),
         rescan_interval_secs: 0,
         watch_states: None,
+        startup_scan_done: None,
         time_scale: 1,
         recheck_rx: None,
         resubmit_rx: None,
@@ -296,6 +329,7 @@ async fn debounce_multiple_changes_emit_one_event() {
         data_dir: TempDir::new().unwrap().keep(),
         rescan_interval_secs: 0,
         watch_states: None,
+        startup_scan_done: None,
         time_scale: 1,
         recheck_rx: None,
         resubmit_rx: None,
@@ -358,6 +392,7 @@ async fn file_deleted_before_debounce_emits_deleted_event() {
         data_dir: TempDir::new().unwrap().keep(),
         rescan_interval_secs: 0,
         watch_states: None,
+        startup_scan_done: None,
         time_scale: 1,
         recheck_rx: None,
         resubmit_rx: None,
@@ -475,6 +510,7 @@ async fn rapid_changes_no_panic() {
         data_dir: TempDir::new().unwrap().keep(),
         rescan_interval_secs: 0,
         watch_states: None,
+        startup_scan_done: None,
         time_scale: 1,
         recheck_rx: None,
         resubmit_rx: None,
@@ -642,6 +678,7 @@ async fn watcher_initial_scan_respects_viaticumignore() {
         data_dir,
         rescan_interval_secs: 604800,
         watch_states: None,
+        startup_scan_done: None,
         time_scale: 1,
         recheck_rx: None,
         resubmit_rx: None,
@@ -761,6 +798,7 @@ async fn watcher_add_command_registers_new_dir_and_emits_dirty_events() {
         data_dir: data_dir.path().to_path_buf(),
         rescan_interval_secs: 604800,
         watch_states: None,
+        startup_scan_done: None,
         time_scale: 1,
         recheck_rx: None,
         resubmit_rx: None,
@@ -922,6 +960,7 @@ async fn watcher_keeps_watching_other_dirs_when_one_is_missing() {
         data_dir,
         rescan_interval_secs: 604800,
         watch_states: Some(Arc::clone(&states)),
+        startup_scan_done: None,
         time_scale: 1,
         recheck_rx: None,
         resubmit_rx: None,

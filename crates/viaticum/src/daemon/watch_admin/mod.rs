@@ -237,6 +237,10 @@ pub struct WatchAdmin {
     /// Per-folder live state (status signal + last_event_at).
     /// Written by the watcher task, read by WatchAdmin.list_watches.
     pub watch_states: Arc<RwLock<HashMap<PathBuf, WatchEntryState>>>,
+    /// True once the watcher has finished its startup pass (full scan, skip by
+    /// the recent-scan marker, or an empty watch list). `scan_settled` for the
+    /// verdict is this AND no folder currently in Scanning (T10, install-i14).
+    pub startup_scan_done: Arc<std::sync::atomic::AtomicBool>,
     /// Cached rollups keyed by expanded watch path.
     pub cached_rollups: Arc<RwLock<HashMap<PathBuf, CachedRollup>>>,
     /// Channel to send commands to the watcher task.
@@ -268,6 +272,7 @@ impl WatchAdmin {
             config_path,
             live_configs,
             watch_states,
+            startup_scan_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cached_rollups: Arc::new(RwLock::new(HashMap::new())),
             control_tx,
             db,
@@ -679,6 +684,12 @@ impl WatchAdmin {
             .map_err(|_| WatchAdminError::WatcherGone)?;
 
         Ok(())
+    }
+
+    /// The watcher's startup pass is over (T10). False while it is still scanning.
+    pub fn startup_scan_done(&self) -> bool {
+        self.startup_scan_done
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Return WatchEntry list with rollup counters.

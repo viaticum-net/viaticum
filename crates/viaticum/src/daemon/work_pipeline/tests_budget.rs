@@ -124,6 +124,7 @@ fn pool_of(devices: &[DeviceId]) -> PoolSnapshot {
                 trust: 0.9,
             })
             .collect(),
+        online_count: devices.len() as u32,
         signature: 7,
     }
 }

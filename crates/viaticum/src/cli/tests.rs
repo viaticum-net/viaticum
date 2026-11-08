@@ -16,6 +16,16 @@ fn parse(args: &[&str]) -> Command {
     Cli::parse_from(args).command
 }
 
+/// B1/F1: interactive means both ends are a terminal. `setup | tee` and a
+/// browser/CI capture are stdin-tty/stdout-pipe and must not be interactive.
+#[test]
+fn is_interactive_requires_both_ends() {
+    assert!(super::is_interactive(true, true));
+    assert!(!super::is_interactive(true, false));
+    assert!(!super::is_interactive(false, true));
+    assert!(!super::is_interactive(false, false));
+}
+
 #[test]
 fn command_status_parses_correctly() {
     assert!(matches!(
@@ -84,6 +94,224 @@ fn command_restore_parses_dest_flag() {
         panic!("expected Restore");
     };
     assert_eq!(dest, Some("/tmp/out".to_string()));
+}
+
+/// R2/R3: the `init` output is a contract for E2E scripts and the polygon
+/// fleet parser; it must stay byte-identical (R3b brief).
+#[test]
+fn init_output_format_unchanged() {
+    let keyfile = crate::daemon::identity::IdentityKeyFile {
+        mnemonic: "abandon ability able".into(),
+        seed: vec![0; 64],
+        identity_pub: [1; 32],
+        device_seed: [2; 32],
+        device_id: [3; 32],
+        created_at: 0,
+    };
+    let plain = super::render_init_output(&keyfile, false, false);
+    assert_eq!(
+        plain,
+        "Identity initialized.\n\
+         Public key: 0101010101010101010101010101010101010101010101010101010101010101\n\
+         Device ID:  0303030303030303030303030303030303030303030303030303030303030303\n\
+         \nMnemonic (SAVE THIS):\n  abandon ability able\n"
+    );
+    let recovering = super::render_init_output(&keyfile, true, false);
+    assert!(recovering.contains("Mnemonic (SAVE THIS):"));
+    assert!(recovering.contains("use 'viaticum dr' instead"));
+    assert!(!super::render_init_output(&keyfile, true, true).contains("viaticum dr"));
+}
+
+#[test]
+fn setup_parses_mode_folders_quota_seed_and_json() {
+    let Command::Setup {
+        mode,
+        watch,
+        quota_gb,
+        seed,
+        phrase_file,
+        yes,
+        skip_phrase_check,
+        allow_root,
+        json,
+    } = parse(&[
+        "viaticum",
+        "setup",
+        "--mode",
+        "restore",
+        "--watch",
+        "/home/friend/Documents",
+        "--watch",
+        "/home/friend/Pictures",
+        "--quota-gb",
+        "7",
+        "--seed",
+        "/ip4/1.2.3.4/tcp/4001/p2p/x",
+        "--phrase-file",
+        "/home/friend/phrase",
+        "--yes",
+        "--skip-phrase-check",
+        "--allow-root",
+        "--json",
+    ])
+    else {
+        panic!("expected setup");
+    };
+    assert_eq!(mode, Some(super::setup::SetupMode::Restore));
+    assert_eq!(
+        watch,
+        vec![
+            std::path::PathBuf::from("/home/friend/Documents"),
+            std::path::PathBuf::from("/home/friend/Pictures")
+        ]
+    );
+    assert_eq!(quota_gb, Some(7.0));
+    assert_eq!(seed.len(), 1);
+    assert_eq!(
+        phrase_file,
+        Some(std::path::PathBuf::from("/home/friend/phrase"))
+    );
+    assert!(yes && skip_phrase_check && allow_root && json);
+}
+
+/// R3b b5: the global --config was never read; it is gone from the CLI.
+#[test]
+fn global_config_flag_is_gone() {
+    let help = <Cli as clap::CommandFactory>::command()
+        .render_help()
+        .to_string();
+    assert!(!help.contains("--config"), "{help}");
+    assert!(
+        Cli::try_parse_from(["viaticum", "--config", "x.toml", "status"]).is_err(),
+        "--config must be refused now"
+    );
+}
+
+/// R3b b5: restore --dest is accepted for older scripts but hidden from help.
+#[test]
+fn restore_dest_is_hidden() {
+    let mut cmd = <Cli as clap::CommandFactory>::command();
+    let help = cmd
+        .find_subcommand_mut("restore")
+        .unwrap()
+        .render_help()
+        .to_string();
+    assert!(!help.contains("--dest"), "{help}");
+    assert!(matches!(
+        parse(&["viaticum", "restore", "x", "--dest", "/tmp/out"]),
+        Command::Restore { .. }
+    ));
+}
+
+#[test]
+fn phrase_check_parses_positions_and_all() {
+    let Command::Phrase {
+        action: super::PhraseAction::Check { positions, all },
+    } = parse(&["viaticum", "phrase", "check", "--positions", "3,11,20"])
+    else {
+        panic!("expected phrase check");
+    };
+    assert_eq!(positions, vec![3, 11, 20]);
+    assert!(!all);
+
+    let Command::Phrase {
+        action: super::PhraseAction::Check { positions, all },
+    } = parse(&["viaticum", "phrase", "check", "--all"])
+    else {
+        panic!("expected phrase check --all");
+    };
+    assert!(positions.is_empty());
+    assert!(all);
+}
+
+#[test]
+fn phrase_show_parses() {
+    assert!(matches!(
+        parse(&["viaticum", "phrase", "show"]),
+        Command::Phrase {
+            action: super::PhraseAction::Show
+        }
+    ));
+}
+
+/// `dr --mnemonic` with the flag and no value is `Some(None)`; the phrase then
+/// comes from stdin and never reaches argv (install-i2).
+#[test]
+fn dr_mnemonic_flag_without_value_reads_stdin() {
+    let Command::Dr { mnemonic, .. } = parse(&["viaticum", "dr", "--mnemonic"]) else {
+        panic!("expected dr");
+    };
+    assert_eq!(mnemonic, Some(None));
+
+    let Command::Dr { mnemonic, .. } = parse(&["viaticum", "dr", "--mnemonic", "one two three"])
+    else {
+        panic!("expected dr");
+    };
+    assert_eq!(mnemonic, Some(Some("one two three".to_string())));
+
+    let mut input = std::io::Cursor::new(b"  abandon ability  \n");
+    assert_eq!(
+        super::read_phrase_line(&mut input).unwrap().as_deref(),
+        Some("abandon ability")
+    );
+    assert_eq!(super::read_phrase_line(&mut input).unwrap(), None);
+}
+
+#[test]
+fn init_mnemonic_flag_without_value_is_accepted() {
+    let Command::Init { mnemonic, .. } = parse(&["viaticum", "init", "--mnemonic"]) else {
+        panic!("expected init");
+    };
+    assert_eq!(mnemonic, Some(None));
+}
+
+/// install-i9: the URL is printed always; without a display the SSH tunnel line
+/// is printed too, with the port from the URL.
+#[test]
+fn open_prints_url_always_and_tunnel_when_headless() {
+    let url = "http://127.0.0.1:7383/auth/start?token=t";
+    let headless = super::render_open(url, true, "friend", "nas.local");
+    assert!(headless.contains("Dashboard: http://127.0.0.1:7383/auth/start?token=t"));
+    assert!(
+        headless.contains("ssh -L 7383:127.0.0.1:7383 friend@nas.local"),
+        "{headless}"
+    );
+
+    let desktop = super::render_open(url, false, "friend", "laptop");
+    assert!(desktop.contains("Dashboard: "));
+    assert!(!desktop.contains("ssh -L"), "{desktop}");
+}
+
+/// M10: the Dashboard shows the server's verdict and computes no colour of
+/// its own. The card classes must come from `status.verdict.*.level`; the old
+/// local heuristics (peer count, quota) must not decide the colour.
+#[test]
+fn dashboard_uses_status_verdict() {
+    let dashboard = include_str!("../../../../web-ui/src/lib/Dashboard.svelte");
+    assert!(
+        dashboard.contains("class=\"card verdict verdict-{status.verdict.node.level}\""),
+        "Node card class must be the server's verdict level"
+    );
+    assert!(
+        dashboard.contains("class=\"card verdict verdict-{status.verdict.protection.level}\""),
+        "Protection card class must be the server's verdict level"
+    );
+    assert!(
+        dashboard.contains("data-node-level={status.verdict.node.level}")
+            && dashboard.contains("data-protection-level={status.verdict.protection.level}")
+    );
+    assert!(dashboard.contains("status.verdict.node.headline"));
+    assert!(dashboard.contains("status.verdict.protection.detail"));
+    for local in [
+        "peer_count_authenticated >= 2",
+        "effective_quota_bytes > 0 ? 'green'",
+        "files_restorable",
+    ] {
+        assert!(
+            !dashboard.contains(local),
+            "Dashboard computes a verdict colour itself: found {local}"
+        );
+    }
 }
 
 #[test]
@@ -255,6 +483,7 @@ fn format_bytes_gigabytes() {
 fn make_status_zero_peers() -> StatusData {
     StatusData {
         daemon_version: String::new(),
+        verdict: None,
         node_identity: "0000000000000000".into(),
         device_id: "0000000000000000".into(),
         node_addr: String::new(),
@@ -512,6 +741,7 @@ fn format_status_unknown_quota_names_the_path() {
 fn format_status_top_peers_printed() {
     let data = StatusData {
         daemon_version: String::new(),
+        verdict: None,
         node_identity: "a1b2c3d4e5f60708".into(),
         device_id: "a1b2c3d4e5f60708".into(),
         node_addr: String::new(),
@@ -1024,6 +1254,7 @@ fn cli_response_roundtrips_cbor() {
     let responses = vec![
         CliResponse::Status(Box::new(StatusData {
             daemon_version: String::new(),
+            verdict: None,
             node_identity: "aabbccdd11223344".into(),
             device_id: "aabbccdd11223344".into(),
             node_addr: String::new(),

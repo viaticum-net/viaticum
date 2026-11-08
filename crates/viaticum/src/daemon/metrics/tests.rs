@@ -4,6 +4,7 @@ use crate::cli::types::{PeerSummary, StatusData};
 fn make_status(peers: Vec<PeerSummary>) -> StatusData {
     StatusData {
         daemon_version: String::new(),
+        verdict: None,
         node_identity: "abcdef0123456789".to_string(),
         device_id: "abcdef0123456789".to_string(),
         node_addr: "test-addr".to_string(),
